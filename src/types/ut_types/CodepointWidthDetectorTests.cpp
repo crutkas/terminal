@@ -1355,4 +1355,293 @@ class CodepointWidthDetectorTests
             VERIFY_ARE_EQUAL(2, measureWidth(cwd, L"→"));
         }
     }
+
+    // Measures a single grapheme cluster in Graphemes mode by calling GraphemeNext/Prev end-to-end
+    // and returns (totalWidth, totalLen). Uses a fresh detector per call so state is never leaked.
+    static std::pair<int, int> MeasureGraphemesForward(std::wstring_view text)
+    {
+        CodepointWidthDetector cwd;
+        cwd.Reset(TextMeasurementMode::Graphemes);
+        GraphemeState state;
+        int totalWidth = 0;
+        int totalLen = 0;
+        for (;;)
+        {
+            const auto ok = cwd.GraphemeNext(state, text);
+            totalWidth = state.width; // single cluster under test → last observed width
+            totalLen += state.len;
+            if (!ok)
+            {
+                break;
+            }
+        }
+        return { totalWidth, totalLen };
+    }
+
+    static std::pair<int, int> MeasureGraphemesReverse(std::wstring_view text)
+    {
+        CodepointWidthDetector cwd;
+        cwd.Reset(TextMeasurementMode::Graphemes);
+        GraphemeState state;
+        int totalWidth = 0;
+        int totalLen = 0;
+        for (;;)
+        {
+            const auto ok = cwd.GraphemePrev(state, text);
+            totalWidth = state.width;
+            totalLen += state.len;
+            if (!ok)
+            {
+                break;
+            }
+        }
+        return { totalWidth, totalLen };
+    }
+
+    static int MeasureWcswidth(std::wstring_view text)
+    {
+        CodepointWidthDetector cwd;
+        cwd.Reset(TextMeasurementMode::Wcswidth);
+        GraphemeState state;
+        int total = 0;
+        for (;;)
+        {
+            const auto ok = cwd.GraphemeNext(state, text);
+            total += state.width;
+            if (!ok)
+            {
+                break;
+            }
+        }
+        return total;
+    }
+
+    TEST_METHOD(VS15NarrowsEmojiPresentationBase)
+    {
+        // U+231A WATCH has Emoji_Presentation=Yes, east-asian "W" (intrinsically wide).
+        // VS15 narrows it to 1 cell; VS16 keeps it wide.
+        const auto [w15, l15] = MeasureGraphemesForward(L"\u231A\uFE0E");
+        VERIFY_ARE_EQUAL(1, w15);
+        VERIFY_ARE_EQUAL(2, l15);
+
+        const auto [w16, l16] = MeasureGraphemesForward(L"\u231A\uFE0F");
+        VERIFY_ARE_EQUAL(2, w16);
+        VERIFY_ARE_EQUAL(2, l16);
+
+        // U+2764 HEAVY BLACK HEART: Emoji=Y, Emoji_Presentation=No, east-asian "N".
+        // Default presentation is text (width 1). VS15 is a no-op. VS16 promotes to wide.
+        VERIFY_ARE_EQUAL(1, MeasureGraphemesForward(L"\u2764\uFE0E").first);
+        VERIFY_ARE_EQUAL(2, MeasureGraphemesForward(L"\u2764\uFE0F").first);
+
+        // Additional spot checks: both default-emoji-presentation (U+1F5E1 DAGGER KNIFE)
+        // and default-text (U+2600 BLACK SUN WITH RAYS) collapse to <=1 under FE0E.
+        VERIFY_ARE_EQUAL(1, MeasureGraphemesForward(L"\u2600\uFE0E").first); // default text
+        VERIFY_ARE_EQUAL(1, MeasureGraphemesForward(L"\u26A0\uFE0E").first); // default text
+        VERIFY_ARE_EQUAL(1, MeasureGraphemesForward(L"\u2615\uFE0E").first); // Hot Beverage, EPres=Y
+        VERIFY_ARE_EQUAL(1, MeasureGraphemesForward(L"\U0001F5E1\uFE0E").first); // dagger, default text
+    }
+
+    TEST_METHOD(VS15DoesNotNarrowCJKIdeograph)
+    {
+        // U+4E00 CJK UNIFIED IDEOGRAPH-ONE is Emoji=No, east-asian "W".
+        // VS15 must NOT narrow it; it remains wide (2 cells).
+        VERIFY_ARE_EQUAL(2, MeasureGraphemesForward(L"\u4E00\uFE0E").first);
+        VERIFY_ARE_EQUAL(2, MeasureGraphemesReverse(L"\u4E00\uFE0E").first);
+    }
+
+    TEST_METHOD(VS15NoOpOnAsciiBase)
+    {
+        // VS15 after a non-emoji narrow base is a no-op; width stays 1.
+        VERIFY_ARE_EQUAL(1, MeasureGraphemesForward(L"A\uFE0E").first);
+        VERIFY_ARE_EQUAL(1, MeasureGraphemesReverse(L"A\uFE0E").first);
+    }
+
+    TEST_METHOD(VS15ForwardReverseParity)
+    {
+        struct Case
+        {
+            std::wstring_view input;
+            int expectedWidth;
+        };
+        const std::array cases{
+            Case{ L"\u231A\uFE0E", 1 },          // watch + VS15 = narrow
+            Case{ L"\u231A\uFE0F", 2 },          // watch + VS16 = wide
+            Case{ L"\u2764\uFE0E", 1 },          // heart + VS15 = narrow
+            Case{ L"\u2764\uFE0F", 2 },          // heart + VS16 = wide
+            Case{ L"\u4E00\uFE0E", 2 },          // CJK + VS15 = still wide
+            Case{ L"A\uFE0E", 1 },               // ASCII + VS15 = narrow (no-op)
+            Case{ L"\u2139\uFE0E", 1 },          // information source + VS15
+        };
+        for (const auto& c : cases)
+        {
+            const auto fwd = MeasureGraphemesForward(c.input);
+            const auto rev = MeasureGraphemesReverse(c.input);
+            VERIFY_ARE_EQUAL(c.expectedWidth, fwd.first, WEX::Common::String().Format(L"fwd width for case %d", static_cast<int>(c.input[0])));
+            VERIFY_ARE_EQUAL(c.expectedWidth, rev.first, WEX::Common::String().Format(L"rev width for case %d", static_cast<int>(c.input[0])));
+            VERIFY_ARE_EQUAL(fwd.second, rev.second);
+        }
+    }
+
+    TEST_METHOD(VS15LastSelectorWins)
+    {
+        // base + FE0F + FE0E: VS15 is last → narrow.
+        VERIFY_ARE_EQUAL(1, MeasureGraphemesForward(L"\u2764\uFE0F\uFE0E").first);
+        VERIFY_ARE_EQUAL(1, MeasureGraphemesReverse(L"\u2764\uFE0F\uFE0E").first);
+        // base + FE0E + FE0F: VS16 is last → wide.
+        VERIFY_ARE_EQUAL(2, MeasureGraphemesForward(L"\u2764\uFE0E\uFE0F").first);
+        VERIFY_ARE_EQUAL(2, MeasureGraphemesReverse(L"\u2764\uFE0E\uFE0F").first);
+        // Same precedence for an intrinsically-wide Emoji_Presentation base (⌚).
+        VERIFY_ARE_EQUAL(1, MeasureGraphemesForward(L"\u231A\uFE0F\uFE0E").first);
+        VERIFY_ARE_EQUAL(1, MeasureGraphemesReverse(L"\u231A\uFE0F\uFE0E").first);
+        VERIFY_ARE_EQUAL(2, MeasureGraphemesForward(L"\u231A\uFE0E\uFE0F").first);
+        VERIFY_ARE_EQUAL(2, MeasureGraphemesReverse(L"\u231A\uFE0E\uFE0F").first);
+    }
+
+    TEST_METHOD(VS15WcswidthModeIsNoOp)
+    {
+        // Mirroring VS16 scoping (only forwards, only Graphemes mode), VS15 must not affect
+        // Wcswidth. U+231A alone is wide in Wcswidth (east-asian "W") and FE0E contributes 0.
+        // The total width must be identical before and after appending FE0E.
+        const auto baseline = MeasureWcswidth(L"\u231A");
+        const auto withVS15 = MeasureWcswidth(L"\u231A\uFE0E");
+        VERIFY_ARE_EQUAL(baseline, withVS15);
+    }
+
+    TEST_METHOD(VS15OverridesAmbiguousWide)
+    {
+        // U+2139 INFORMATION SOURCE is east-asian Ambiguous, Emoji_Presentation=Yes.
+        // With AmbiguousWidth=2 the base would otherwise widen to 2; VS15 must still narrow to 1.
+        CodepointWidthDetector cwd;
+        cwd.Reset(TextMeasurementMode::Graphemes);
+        cwd.SetAmbiguousWidth(2);
+        GraphemeState state;
+        cwd.GraphemeNext(state, L"\u2139\uFE0E");
+        VERIFY_ARE_EQUAL(1, state.width);
+    }
+
+    TEST_METHOD(VS15ExistingFE0FUnchanged)
+    {
+        // Regression guard: pre-existing FE0F behavior must be byte-identical.
+        // U+2764 + FE0F yields width 2; plain U+2764 is narrow (1).
+        VERIFY_ARE_EQUAL(1, MeasureGraphemesForward(L"\u2764").first);
+        VERIFY_ARE_EQUAL(2, MeasureGraphemesForward(L"\u2764\uFE0F").first);
+        VERIFY_ARE_EQUAL(2, MeasureGraphemesReverse(L"\u2764\uFE0F").first);
+        // Rainbow flag still assembles correctly (VS16-qualified base + ZWJ + rainbow).
+        VERIFY_ARE_EQUAL(2, MeasureGraphemesForward(L"\U0001F3F3\uFE0F\u200D\U0001F308").first);
+    }
+
+    TEST_METHOD(VS15LoneSelectorWidthSane)
+    {
+        // FE0E alone must never produce a negative width; len must be non-zero.
+        const auto [w, l] = MeasureGraphemesForward(L"\uFE0E");
+        VERIFY_IS_GREATER_THAN_OR_EQUAL(w, 0);
+        VERIFY_IS_LESS_THAN_OR_EQUAL(w, 2);
+        VERIFY_IS_GREATER_THAN(l, 0);
+
+        // Combining diaeresis + FE0E must not underflow either.
+        const auto [w2, l2] = MeasureGraphemesForward(L"\u0301\uFE0E");
+        VERIFY_IS_GREATER_THAN_OR_EQUAL(w2, 0);
+        VERIFY_IS_LESS_THAN_OR_EQUAL(w2, 2);
+        VERIFY_IS_GREATER_THAN(l2, 0);
+    }
+
+    TEST_METHOD(VS15ChunkedAcrossBoundary)
+    {
+        // VS15 must work when the base and the selector arrive in separate chunks
+        // (mirrors the rainbow flag ChunkedText pattern above).
+        static constexpr std::array chunks{
+            std::wstring_view{ L"\u231A" },
+            std::wstring_view{ L"\uFE0E" },
+        };
+
+        CodepointWidthDetector cwd;
+        cwd.Reset(TextMeasurementMode::Graphemes);
+        GraphemeState state;
+
+        std::vector<int> widths;
+        for (const auto& chunk : chunks)
+        {
+            bool ok;
+            do
+            {
+                ok = cwd.GraphemeNext(state, chunk);
+                widths.emplace_back(state.width);
+            } while (ok);
+        }
+        // The final observed width must be 1 (VS15 narrowed the cluster).
+        VERIFY_ARE_EQUAL(1, widths.back());
+
+        // Astral-variant: U+1F5E1 (2-code-unit surrogate) split across a chunk boundary
+        // from the trailing VS15.
+        static constexpr std::array astral{
+            std::wstring_view{ L"\U0001F5E1" },
+            std::wstring_view{ L"\uFE0E" },
+        };
+        CodepointWidthDetector cwd2;
+        cwd2.Reset(TextMeasurementMode::Graphemes);
+        GraphemeState state2;
+        std::vector<int> widths2;
+        for (const auto& chunk : astral)
+        {
+            bool ok;
+            do
+            {
+                ok = cwd2.GraphemeNext(state2, chunk);
+                widths2.emplace_back(state2.width);
+            } while (ok);
+        }
+        VERIFY_ARE_EQUAL(1, widths2.back());
+    }
+
+    TEST_METHOD(VS15PropertyCannotEnlarge)
+    {
+        // For every base codepoint with width >= 1, appending VS15 must never increase the width
+        // and must never yield a negative width.
+        CodepointWidthDetector cwdPlain;
+        cwdPlain.Reset(TextMeasurementMode::Graphemes);
+        CodepointWidthDetector cwdVS;
+        cwdVS.Reset(TextMeasurementMode::Graphemes);
+
+        std::wstring buf;
+        std::wstring bufVS;
+        for (char32_t cp = 0x20; cp <= 0x1FFFF; ++cp)
+        {
+            // Skip surrogate halves.
+            if (cp >= 0xD800 && cp <= 0xDFFF)
+            {
+                continue;
+            }
+            buf.clear();
+            bufVS.clear();
+            if (cp < 0x10000)
+            {
+                buf.push_back(static_cast<wchar_t>(cp));
+            }
+            else
+            {
+                const auto c = cp - 0x10000;
+                buf.push_back(static_cast<wchar_t>(0xD800 | (c >> 10)));
+                buf.push_back(static_cast<wchar_t>(0xDC00 | (c & 0x3FF)));
+            }
+            bufVS = buf;
+            bufVS.push_back(L'\uFE0E');
+
+            GraphemeState sPlain;
+            cwdPlain.GraphemeNext(sPlain, buf);
+            GraphemeState sVS;
+            cwdVS.GraphemeNext(sVS, bufVS);
+
+            if (sPlain.width >= 1)
+            {
+                const bool ok = sVS.width <= sPlain.width && sVS.width >= 0;
+                if (!ok)
+                {
+                    WEX::Logging::Log::Error(
+                        WEX::Common::String().Format(L"cp=U+%04X plain=%d vs15=%d",
+                                                     static_cast<unsigned>(cp), sPlain.width, sVS.width));
+                    VERIFY_IS_TRUE(ok);
+                }
+            }
+        }
+    }
 };
