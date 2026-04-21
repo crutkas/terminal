@@ -45,6 +45,15 @@ struct GraphemeState
     // _state is stored ~flipped, so that we can differentiate between it being unset (0) and it being set to 0 (~0 = 255).
     int _state = 0;
     int _last = 0;
+
+    // Cluster-scoped VS15 (U+FE0E text-presentation selector) bookkeeping (Graphemes mode only).
+    // _baseLead holds the trie value of the cluster's base codepoint, used by GraphemeNext to decide
+    // whether the base has Emoji_Presentation=Yes (UTS #51).
+    // _pendingVS15 / _vsSelectorDecided implement last-selector-wins semantics for GraphemePrev,
+    // where we observe codepoints in reverse and the first variation selector seen is the winner.
+    int _baseLead = 0;
+    bool _pendingVS15 = false;
+    bool _vsSelectorDecided = false;
 };
 
 struct CodepointWidthDetector

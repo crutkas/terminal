@@ -202,7 +202,11 @@ buf.Append($"    return state == 3;\n");
 buf.Append("}\n");
 buf.Append("constexpr int ucdToCharacterWidth(const int val) noexcept\n");
 buf.Append("{\n");
-buf.Append("    return val >> 6;\n");
+buf.Append("    return (val >> 6) & 3;\n");
+buf.Append("}\n");
+buf.Append("constexpr bool ucdIsEmoji(const int val) noexcept\n");
+buf.Append("{\n");
+buf.Append("    return (val & (1 << 8)) != 0;\n");
 buf.Append("}\n");
 buf.Append("// clang-format on\n");
 
@@ -214,7 +218,7 @@ return;
 static Ucd ExtractValuesFromUcd(string path)
 {
     var values = new TrieType[1114112];
-    Array.Fill(values, TrieValue(ClusterBreak.Other, CharacterWidth.Narrow));
+    Array.Fill(values, TrieValue(ClusterBreak.Other, CharacterWidth.Narrow, false));
 
     XNamespace ns = "http://www.unicode.org/ns/2003/ucd/1.0";
     var doc = XDocument.Load(path);
@@ -228,6 +232,7 @@ static Ucd ExtractValuesFromUcd(string path)
         var groupIndicConjunctBreak = group.Attribute("InCB")?.Value;
         var groupExtendedPictographic = group.Attribute("ExtPict")?.Value;
         var groupEastAsian = group.Attribute("ea")?.Value;
+        var groupEmoji = group.Attribute("Emoji")?.Value;
 
         foreach (var ch in group.Elements())
         {
@@ -250,6 +255,13 @@ static Ucd ExtractValuesFromUcd(string path)
             var indicConjunctBreak = ch.Attribute("InCB")?.Value ?? groupIndicConjunctBreak ?? "";
             var extendedPictographic = ch.Attribute("ExtPict")?.Value ?? groupExtendedPictographic ?? "";
             var eastAsian = ch.Attribute("ea")?.Value ?? groupEastAsian ?? "";
+            var emoji = ch.Attribute("Emoji")?.Value ?? groupEmoji ?? "";
+            // Gate VS15 (U+FE0E) narrowing on the UCD `Emoji` property (UTS #51): any codepoint
+            // for which an emoji presentation is meaningful — including default-text emojis like
+            // U+2764 HEAVY BLACK HEART — should be narrowable by VS15. Codepoints that are not
+            // emoji (e.g. CJK ideographs) are intentionally excluded so that intrinsically-wide
+            // non-emoji glyphs do not collapse.
+            var isEmoji = emoji == "Y";
 
             var cb = graphemeClusterBreak switch
             {
@@ -319,7 +331,7 @@ static Ucd ExtractValuesFromUcd(string path)
                     break;
             }
 
-            Fill(firstCp, lastCp, TrieValue(cb, width));
+            Fill(firstCp, lastCp, TrieValue(cb, width, isEmoji));
         }
     }
 
@@ -329,12 +341,12 @@ static Ucd ExtractValuesFromUcd(string path)
     // a word break occurs, the text renderer should display a hyphen.
     // A terminal does not support computerized typesetting, but unlike the other
     // gc=Cf cases we give it a Narrow width, because that matches wcswidth().
-    Fill(0x00AD, 0x00AD, TrieValue(ClusterBreak.Control, CharacterWidth.Narrow));
+    Fill(0x00AD, 0x00AD, TrieValue(ClusterBreak.Control, CharacterWidth.Narrow, false));
 
     // U+2500 to U+257F: Box Drawing block
     // U+2580 to U+259F: Block Elements block
     // By default, CharacterWidth.Ambiguous, but by convention .Narrow in terminals.
-    Fill(0x2500, 0x259F, TrieValue(ClusterBreak.Other, CharacterWidth.Narrow));
+    Fill(0x2500, 0x259F, TrieValue(ClusterBreak.Other, CharacterWidth.Narrow, false));
 
     return new Ucd
     {
@@ -343,9 +355,12 @@ static Ucd ExtractValuesFromUcd(string path)
     };
 
     // Packs the arguments into a single integer that's stored as-is in the final trie stage.
-    TrieType TrieValue(ClusterBreak cb, CharacterWidth width)
+    // Bit layout: cb in bits 0-5, width in bits 6-7, UCD `Emoji` (UTS #51) in bit 8.
+    TrieType TrieValue(ClusterBreak cb, CharacterWidth width, bool isEmoji)
     {
-        return (TrieType)cb | (TrieType)width << 6;
+        return (TrieType)cb
+             | ((TrieType)width << 6)
+             | (isEmoji ? (TrieType)1 << 8 : 0);
     }
 
     void Fill(int first, int last, TrieType value)
