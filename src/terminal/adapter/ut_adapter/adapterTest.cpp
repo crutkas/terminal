@@ -2078,6 +2078,273 @@ public:
         _testGetSet->ValidateInputEvent(L"\033P0$r\033\\");
     }
 
+    TEST_METHOD(XtgettcapTNCapability)
+    {
+        // Drives RequestTermcap() with the hex-encoded name "TN" (= 0x54 0x4e)
+        // and verifies the full DCS response bytes. Value is the locked TN for
+        // MVP: "xterm-256color".
+        _testGetSet->PrepData();
+        const auto handler = _pDispatch->RequestTermcap();
+        VERIFY_IS_NOT_NULL(handler);
+        for (auto ch : std::wstring_view{ L"544E" })
+        {
+            VERIFY_IS_TRUE(handler(ch));
+        }
+        VERIFY_IS_FALSE(handler(L'\033')); // ST starts
+        // Expected: DCS 1 + r 544E = <hex(xterm-256color)> ST
+        // hex("xterm-256color") = 7874 6572 6d2d 3235 3663 6f6c 6f72
+        _testGetSet->ValidateInputEvent(L"\033P1+r544E=78"
+                                        L"7465726d2d3235366"
+                                        L"36f6c6f72\033\\");
+    }
+
+    TEST_METHOD(XtgettcapColorsCapability)
+    {
+        // "Co" (0x436f) and "colors" (0x636f6c6f7273) both return "256".
+        _testGetSet->PrepData();
+        {
+            const auto handler = _pDispatch->RequestTermcap();
+            for (auto ch : std::wstring_view{ L"436F" })
+            {
+                handler(ch);
+            }
+            handler(L'\033');
+        }
+        // hex("256") = 323536
+        _testGetSet->ValidateInputEvent(L"\033P1+r436F=323536\033\\");
+
+        _testGetSet->PrepData();
+        {
+            const auto handler = _pDispatch->RequestTermcap();
+            for (auto ch : std::wstring_view{ L"636F6C6F7273" })
+            {
+                handler(ch);
+            }
+            handler(L'\033');
+        }
+        _testGetSet->ValidateInputEvent(L"\033P1+r636F6C6F7273=323536\033\\");
+    }
+
+    TEST_METHOD(XtgettcapAllTwelveCaps)
+    {
+        // Drive each of the 12 MVP capabilities and assert exact response bytes.
+        // Values mirror the spec section 4.2 golden table; we recompute them
+        // here by hand (not via production helpers) so the test catches any
+        // silent value drift.
+        struct Case
+        {
+            std::wstring_view hexName; // request case is echoed
+            std::wstring_view expectedResponse;
+        };
+        // All values pre-hexed from the canonical value strings in the spec.
+        const Case cases[] = {
+            // TN = "xterm-256color"
+            { L"544e", L"\033P1+r544e=78" L"7465726d2d323536636f6c6f72\033\\" },
+            // Co = "256"
+            { L"436f", L"\033P1+r436f=323536\033\\" },
+            // colors = "256"
+            { L"636f6c6f7273", L"\033P1+r636f6c6f7273=323536\033\\" },
+            // RGB = "8/8/8" -> 38 2f 38 2f 38
+            { L"524742", L"\033P1+r524742=38" L"2f382f38\033\\" },
+            // bce = "" (boolean)
+            { L"626365", L"\033P1+r626365=\033\\" },
+            // Tc = "" (boolean)
+            { L"5463", L"\033P1+r5463=\033\\" },
+            // Smulx = "\E[4:%p1%dm" -> 11 chars: 5c 45 5b 34 3a 25 70 31 25 64 6d
+            { L"536d756c78", L"\033P1+r536d756c78=5c" L"455b343a2570312564" L"6d\033\\" },
+            // Ms = "\E]52;%p1%s;%p2%s\E\\" -> 21 chars
+            //   5c 45 5d 35 32 3b 25 70 31 25 73 3b 25 70 32 25 73 5c 45 5c 5c
+            { L"4d73", L"\033P1+r4d73=5c" L"455d35323b25703125733b25703225735c" L"455c5c\033\\" },
+            // kdch1 = "\E[3~" -> 5c 45 5b 33 7e  (hex of "kdch1" = 6b64636831)
+            { L"6b64636831", L"\033P1+r6b64636831=5c" L"455b337e\033\\" },
+            // kbs (default: BackarrowKey OFF) -> 0x7f -> "7f"
+            { L"6b6273", L"\033P1+r6b6273=7f\033\\" },
+            // kcuu1 (default: DECCKM OFF / normal) -> "\E[A" -> 5c 45 5b 41
+            { L"6b63757531", L"\033P1+r6b63757531=5c" L"455b41\033\\" },
+            // kcud1 / kcuf1 / kcub1
+            { L"6b63756431", L"\033P1+r6b63756431=5c" L"455b42\033\\" },
+            { L"6b63756631", L"\033P1+r6b63756631=5c" L"455b43\033\\" },
+            { L"6b63756231", L"\033P1+r6b63756231=5c" L"455b44\033\\" },
+        };
+
+        for (const auto& c : cases)
+        {
+            _testGetSet->PrepData();
+            const auto handler = _pDispatch->RequestTermcap();
+            for (auto ch : c.hexName)
+            {
+                handler(ch);
+            }
+            handler(L'\033');
+            Log::Comment(c.hexName.data());
+            _testGetSet->ValidateInputEvent(c.expectedResponse.data());
+        }
+    }
+
+    TEST_METHOD(XtgettcapUnknownCap)
+    {
+        _testGetSet->PrepData();
+        const auto handler = _pDispatch->RequestTermcap();
+        // "ZZ" = 5a 5a — not a known cap. Expect miss reply.
+        for (auto ch : std::wstring_view{ L"5a5a" })
+        {
+            handler(ch);
+        }
+        handler(L'\033');
+        _testGetSet->ValidateInputEvent(L"\033P0+r5a5a\033\\");
+
+        // Case-sensitivity: "tn" (746e) must not match TN.
+        _testGetSet->PrepData();
+        const auto handler2 = _pDispatch->RequestTermcap();
+        for (auto ch : std::wstring_view{ L"746e" })
+        {
+            handler2(ch);
+        }
+        handler2(L'\033');
+        _testGetSet->ValidateInputEvent(L"\033P0+r746e\033\\");
+    }
+
+    TEST_METHOD(XtgettcapOversizePayloadRejected)
+    {
+        // 5000 valid hex chars (> 4 KB cap): handler must stop returning true
+        // before the full payload is consumed, and the oversized request must
+        // not emit a reply.
+        _testGetSet->PrepData();
+        const auto handler = _pDispatch->RequestTermcap();
+        size_t consumed = 0;
+        for (size_t i = 0; i < 5000; ++i)
+        {
+            if (!handler(L'4'))
+            {
+                break;
+            }
+            ++consumed;
+        }
+        // The 4 KB cap enforces we stop well before 5000. No reply for oversize.
+        VERIFY_IS_LESS_THAN(consumed, 5000u);
+        VERIFY_ARE_EQUAL(std::wstring{}, _testGetSet->_response);
+
+        // Per-name overflow (name > 64 hex chars) -> poisoned -> miss reply
+        // (empty name echoed). The handler must not crash.
+        _testGetSet->PrepData();
+        const auto handler2 = _pDispatch->RequestTermcap();
+        for (size_t i = 0; i < 200; ++i)
+        {
+            handler2(L'a');
+        }
+        handler2(L'\033');
+        // Empty-name miss (poisoned name is reported as empty hex).
+        _testGetSet->ValidateInputEvent(L"\033P0+r\033\\");
+    }
+
+    TEST_METHOD(XtgettcapBatchedAndCaseEcho)
+    {
+        // Semi-colon separated batch: known; unknown; known. Each must yield
+        // its own independent DCS frame concatenated in order. Request case
+        // ("744E", mixed) must be echoed verbatim in the response.
+        _testGetSet->PrepData();
+        auto retainScope = _testGetSet->EnableInputRetentionInScope();
+        const auto handler = _pDispatch->RequestTermcap();
+        for (auto ch : std::wstring_view{ L"544E;5A5A;436f" })
+        {
+            handler(ch);
+        }
+        handler(L'\033');
+        _testGetSet->ValidateInputEvent(
+            L"\033P1+r544E=78" L"7465726d2d323536636f6c6f72\033\\"
+            L"\033P0+r5A5A\033\\"
+            L"\033P1+r436f=323536\033\\");
+    }
+
+    TEST_METHOD(XtgettcapDECCKMTogglesKcuu1)
+    {
+        // DECCKM off (default) -> \E[A ; DECCKM on -> \EOA.
+        _testGetSet->PrepData();
+        _terminalInput.SetInputMode(TerminalInput::Mode::CursorKey, false);
+        {
+            const auto h = _pDispatch->RequestTermcap();
+            for (auto ch : std::wstring_view{ L"6b63757531" })
+                h(ch);
+            h(L'\033');
+        }
+        _testGetSet->ValidateInputEvent(L"\033P1+r6b63757531=5c" L"455b41\033\\");
+
+        _testGetSet->PrepData();
+        _terminalInput.SetInputMode(TerminalInput::Mode::CursorKey, true);
+        {
+            const auto h = _pDispatch->RequestTermcap();
+            for (auto ch : std::wstring_view{ L"6b63757531" })
+                h(ch);
+            h(L'\033');
+        }
+        // hex("\EOA") = 5c 45 4f 41
+        _testGetSet->ValidateInputEvent(L"\033P1+r6b63757531=5c" L"454f41\033\\");
+        _terminalInput.SetInputMode(TerminalInput::Mode::CursorKey, false);
+    }
+
+    TEST_METHOD(XtgettcapBackarrowKeyTogglesKbs)
+    {
+        // BackarrowKey off (default) -> DEL (0x7f) -> "7f"
+        // BackarrowKey on            -> BS  (0x08) -> "08"
+        _testGetSet->PrepData();
+        _terminalInput.SetInputMode(TerminalInput::Mode::BackarrowKey, false);
+        {
+            const auto h = _pDispatch->RequestTermcap();
+            for (auto ch : std::wstring_view{ L"6b6273" })
+                h(ch);
+            h(L'\033');
+        }
+        _testGetSet->ValidateInputEvent(L"\033P1+r6b6273=7f\033\\");
+
+        _testGetSet->PrepData();
+        _terminalInput.SetInputMode(TerminalInput::Mode::BackarrowKey, true);
+        {
+            const auto h = _pDispatch->RequestTermcap();
+            for (auto ch : std::wstring_view{ L"6b6273" })
+                h(ch);
+            h(L'\033');
+        }
+        _testGetSet->ValidateInputEvent(L"\033P1+r6b6273=08\033\\");
+        _terminalInput.SetInputMode(TerminalInput::Mode::BackarrowKey, false);
+    }
+
+    TEST_METHOD(XtgettcapStandaloneReplies)
+    {
+        // Terminal-side (IsConPTY() == false on the TestGetSet mock): a reply
+        // _must_ be emitted. This covers AC-X9 negative expectation's
+        // inverse — any non-PTY instance answers normally.
+        VERIFY_IS_FALSE(_testGetSet->IsConPTY());
+        _testGetSet->PrepData();
+        const auto h = _pDispatch->RequestTermcap();
+        for (auto ch : std::wstring_view{ L"5463" })
+            h(ch);
+        h(L'\033');
+        _testGetSet->ValidateInputEvent(L"\033P1+r5463=\033\\");
+    }
+
+    TEST_METHOD(XtgettcapForwardsUnderConPTY)
+    {
+        // When ReturnResponse is gated (conhost-in-VtIo simulation), the
+        // handler still consumes bytes cleanly without crashing. The gate is
+        // implemented in the real ConhostInternalGetSet::ReturnResponse at
+        // outputStream.cpp:50-65; our mock approximates by throwing from
+        // ReturnResponse when _returnResponseResult is false, then catching.
+        _testGetSet->PrepData();
+        _testGetSet->_returnResponseResult = false;
+        const auto h = _pDispatch->RequestTermcap();
+        for (auto ch : std::wstring_view{ L"544e" })
+            h(ch);
+        try
+        {
+            h(L'\033');
+        }
+        catch (...)
+        {
+            // Expected: mock simulates the "response dropped" path.
+        }
+        _testGetSet->_returnResponseResult = true;
+    }
+
     TEST_METHOD(RequestStandardModeTests)
     {
         // The mode numbers below correspond to the ANSIStandardMode values

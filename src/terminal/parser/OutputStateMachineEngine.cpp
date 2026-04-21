@@ -742,6 +742,12 @@ IStateMachineEngine::StringHandler OutputStateMachineEngine::ActionDcsDispatch(c
     case DcsActionCodes::DECRSPS_RestorePresentationState:
         handler = _dispatch->RestorePresentationState(parameters.at(0));
         break;
+    case DcsActionCodes::XTGETTCAP_RequestTermcap:
+        // Guard against Sixel "q" collision; VTID packs the intermediate '+' so
+        // any match here must include it. This asserts the parser's correctness.
+        WI_ASSERT(id == VTID("+q"));
+        handler = _dispatch->RequestTermcap();
+        break;
     default:
         _dispatch->UnknownSequence();
         break;

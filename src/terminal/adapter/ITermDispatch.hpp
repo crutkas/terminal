@@ -187,6 +187,7 @@ public:
     virtual StringHandler RestoreTerminalState(const DispatchTypes::ReportFormat format) = 0; // DECRSTS
 
     virtual StringHandler RequestSetting() = 0; // DECRQSS
+    virtual StringHandler RequestTermcap() = 0; // XTGETTCAP (DCS +q)
 
     virtual void RequestPresentationStateReport(const DispatchTypes::PresentationReportFormat format) = 0; // DECRQPSR
     virtual StringHandler RestorePresentationState(const DispatchTypes::PresentationReportFormat format) = 0; // DECRSPS

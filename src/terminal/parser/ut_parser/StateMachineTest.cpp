@@ -161,6 +161,8 @@ class Microsoft::Console::VirtualTerminal::StateMachineTest
 
     TEST_METHOD(DcsDataStringsReceivedByHandler);
 
+    TEST_METHOD(XtgettcapDcsLifecycle);
+
     TEST_METHOD(VtParameterSubspanTest);
 };
 
@@ -341,6 +343,31 @@ void StateMachineTest::DcsDataStringsReceivedByHandler()
 
     // Verify the control characters were executed (if expected).
     VERIFY_ARE_EQUAL(expectedExecuted, engine.executed);
+}
+
+void StateMachineTest::XtgettcapDcsLifecycle()
+{
+    // Validates state machine traversal for the "+q" DCS path. Feeds a full
+    // XTGETTCAP request one byte at a time and asserts the dispatched VTID is
+    // exactly "+q" (not Sixel's "q"), the data string is forwarded byte-for-
+    // byte, and the terminator returns the machine to Ground.
+    auto enginePtr{ std::make_unique<TestStateMachineEngine>() };
+    auto& engine{ *enginePtr.get() };
+    StateMachine machine{ std::move(enginePtr) };
+
+    machine.ProcessString(L"\x1bP+q544E;436F\x1b\\");
+
+    VERIFY_ARE_EQUAL(VTID("+q"), engine.dcsId);
+    // The test-engine handler eats every byte including the ESC that leads ST.
+    VERIFY_ARE_EQUAL(L"544E;436F\x1b", engine.dcsDataString);
+
+    // Split write variant: ensure partial bytes accumulate.
+    engine.ResetTestState();
+    machine.ProcessString(L"\x1bP+q54");
+    machine.ProcessString(L"4E");
+    machine.ProcessString(L"\x1b\\");
+    VERIFY_ARE_EQUAL(VTID("+q"), engine.dcsId);
+    VERIFY_ARE_EQUAL(L"544E\x1b", engine.dcsDataString);
 }
 
 void StateMachineTest::VtParameterSubspanTest()

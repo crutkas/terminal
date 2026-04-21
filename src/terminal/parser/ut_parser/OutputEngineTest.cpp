@@ -907,6 +907,64 @@ class Microsoft::Console::VirtualTerminal::OutputEngineTest final
         VERIFY_ARE_EQUAL(mach._state, StateMachine::VTStates::Ground);
     }
 
+    TEST_METHOD(XtgettcapVsSixelDisambiguation)
+    {
+        // Risk R3 lockdown: the Sixel VTID is ("q"), ours is ("+q"). The
+        // dispatch must route each to a distinct handler based on the
+        // intermediate. We use a recording dispatch to observe which path
+        // fired.
+        class RecordingDispatch final : public TermDispatch
+        {
+        public:
+            void Print(const wchar_t) override {}
+            void PrintString(const std::wstring_view) override {}
+            StringHandler DefineSixelImage(const VTInt, const DispatchTypes::SixelBackground, const VTParameter) override
+            {
+                sixelFired = true;
+                return [](const auto) { return true; };
+            }
+            StringHandler RequestTermcap() override
+            {
+                termcapFired = true;
+                return [](const auto) { return true; };
+            }
+            bool sixelFired{ false };
+            bool termcapFired{ false };
+        };
+
+        // Case A: Sixel ("\x1bPq" ... "\x1b\\").
+        {
+            auto dispatch = std::make_unique<RecordingDispatch>();
+            auto* raw = dispatch.get();
+            auto engine = std::make_unique<OutputStateMachineEngine>(std::move(dispatch));
+            StateMachine mach(std::move(engine));
+            mach.ProcessString(L"\x1bPq#0;2;0;0;0\x1b\\");
+            VERIFY_IS_TRUE(raw->sixelFired);
+            VERIFY_IS_FALSE(raw->termcapFired);
+        }
+        // Case B: XTGETTCAP ("\x1bP+q544e\x1b\\").
+        {
+            auto dispatch = std::make_unique<RecordingDispatch>();
+            auto* raw = dispatch.get();
+            auto engine = std::make_unique<OutputStateMachineEngine>(std::move(dispatch));
+            StateMachine mach(std::move(engine));
+            mach.ProcessString(L"\x1bP+q544e\x1b\\");
+            VERIFY_IS_FALSE(raw->sixelFired);
+            VERIFY_IS_TRUE(raw->termcapFired);
+        }
+        // Case C: 8-bit DCS form (C1 \x90) with +q.
+        {
+            auto dispatch = std::make_unique<RecordingDispatch>();
+            auto* raw = dispatch.get();
+            auto engine = std::make_unique<OutputStateMachineEngine>(std::move(dispatch));
+            StateMachine mach(std::move(engine));
+            mach.SetParserMode(StateMachine::Mode::AcceptC1, true);
+            mach.ProcessString(L"\x90+q544e\x9c");
+            VERIFY_IS_TRUE(raw->termcapFired);
+            VERIFY_IS_FALSE(raw->sixelFired);
+        }
+    }
+
     TEST_METHOD(TestDcsIntermediateAndPassThrough)
     {
         auto dispatch = std::make_unique<DummyDispatch>();
