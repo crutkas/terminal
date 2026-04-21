@@ -4273,6 +4273,219 @@ ITermDispatch::StringHandler AdaptDispatch::RequestSetting()
 }
 
 // Method Description:
+// - XTGETTCAP (DCS +q) — Request Terminfo Capability. The client sends one or
+//   more semicolon-separated hex-encoded capability names inside a DCS +q ... ST
+//   frame. For each name we emit an independent DCS response:
+//     DCS 1 + r <hexname> = <hexvalue> ST     (known cap)
+//     DCS 0 + r <hexname> ST                  (unknown / malformed cap)
+//   The request's hex case is echoed verbatim in the response.
+// Security: payload is bounded to 4096 bytes total and 64 hex chars (32 bytes)
+//   per capability name. Oversized inputs cause the handler to return false,
+//   transitioning the state machine to DcsIgnore without emitting further
+//   replies. We never echo attacker-supplied bytes beyond the hex name itself,
+//   and the value side is always drawn from our static table or live input
+//   state (never from the request).
+// Arguments:
+// - None
+// Return Value:
+// - a function to receive the hex-encoded capability names
+ITermDispatch::StringHandler AdaptDispatch::RequestTermcap()
+{
+    return [this, name = std::wstring{}, total = size_t{ 0 }, poisoned = false](const auto ch) mutable -> bool {
+        // ESC indicates start of ST (or abort). Emit the pending name, then tell
+        // the state machine we're done so it can re-dispatch the ESC.
+        if (ch == AsciiChars::ESC)
+        {
+            if (!name.empty() || poisoned)
+            {
+                _ReportTermcap(poisoned ? std::wstring_view{} : std::wstring_view{ name });
+            }
+            name.clear();
+            poisoned = false;
+            return false;
+        }
+
+        // Cap the total payload at 4 KB to defeat DoS. On overflow, abort the
+        // whole DCS string without further replies.
+        if (++total > 4096)
+        {
+            return false;
+        }
+
+        if (ch == L';')
+        {
+            _ReportTermcap(poisoned ? std::wstring_view{} : std::wstring_view{ name });
+            name.clear();
+            poisoned = false;
+            return true;
+        }
+
+        const auto isHex = (ch >= L'0' && ch <= L'9') || // NOTE: inclusive '9' (avoids the 4258 bug)
+                           (ch >= L'A' && ch <= L'F') ||
+                           (ch >= L'a' && ch <= L'f');
+        if (!isHex)
+        {
+            // Malformed: mark this cap as poisoned so we reply miss on terminator.
+            poisoned = true;
+            return true;
+        }
+
+        // Cap the per-name length at 64 hex chars (32 decoded bytes). Exceeding
+        // this poisons the name (miss reply) but keeps parsing alive so we
+        // don't drop siblings after `;`.
+        if (name.size() >= 64)
+        {
+            poisoned = true;
+            return true;
+        }
+
+        name.push_back(gsl::narrow_cast<wchar_t>(ch));
+        return true;
+    };
+}
+
+// Routine Description:
+// - Decodes the given hex-encoded capability name and, if recognized, emits
+//   a DCS reply containing the terminfo value for that cap. Unknown caps
+//   produce a miss reply. Empty or odd-length names are treated as a miss.
+// Arguments:
+// - hexName - the ASCII-hex capability name, case-preserved from the request.
+//             Empty means the request was malformed (reply miss with no name).
+// Return Value:
+// - None
+void AdaptDispatch::_ReportTermcap(const std::wstring_view hexName)
+{
+    using namespace std::string_view_literals;
+
+    // Decode hex -> ASCII. Odd-length or non-ASCII-hex content (shouldn't
+    // happen by construction, but be defensive) produces a miss reply.
+    std::string decoded;
+    decoded.reserve(hexName.size() / 2);
+    auto decodeOk = !hexName.empty() && (hexName.size() % 2 == 0);
+    if (decodeOk)
+    {
+        const auto nibble = [](wchar_t c) -> int {
+            if (c >= L'0' && c <= L'9')
+                return c - L'0';
+            if (c >= L'A' && c <= L'F')
+                return c - L'A' + 10;
+            if (c >= L'a' && c <= L'f')
+                return c - L'a' + 10;
+            return -1;
+        };
+        for (size_t i = 0; i < hexName.size(); i += 2)
+        {
+            const auto hi = nibble(hexName[i]);
+            const auto lo = nibble(hexName[i + 1]);
+            if (hi < 0 || lo < 0)
+            {
+                decodeOk = false;
+                break;
+            }
+            decoded.push_back(gsl::narrow_cast<char>((hi << 4) | lo));
+        }
+    }
+
+    // Resolve the capability value. Dynamic caps consult the live TerminalInput
+    // state (DECCKM for cursor keys, BackarrowKey for kbs). Never duplicate
+    // string tables — we must stay in sync with the input encoder.
+    std::string_view value;
+    auto known = false;
+
+    if (decodeOk)
+    {
+        // Static caps first.
+        if (decoded == "TN")
+        {
+            value = "xterm-256color"sv;
+            known = true;
+        }
+        else if (decoded == "Co" || decoded == "colors")
+        {
+            value = "256"sv;
+            known = true;
+        }
+        else if (decoded == "RGB")
+        {
+            value = "8/8/8"sv;
+            known = true;
+        }
+        else if (decoded == "bce" || decoded == "Tc")
+        {
+            // Boolean caps: present, empty value.
+            value = ""sv;
+            known = true;
+        }
+        else if (decoded == "Smulx")
+        {
+            value = "\\E[4:%p1%dm"sv;
+            known = true;
+        }
+        else if (decoded == "Ms")
+        {
+            value = "\\E]52;%p1%s;%p2%s\\E\\\\"sv;
+            known = true;
+        }
+        else if (decoded == "kdch1")
+        {
+            value = "\\E[3~"sv;
+            known = true;
+        }
+        else if (decoded == "kbs")
+        {
+            // BackarrowKey mode OFF (default) -> DEL (0x7f); ON -> BS (0x08).
+            // Matches the input encoder in terminalInput.cpp (~line 843).
+            value = _terminalInput.GetInputMode(TerminalInput::Mode::BackarrowKey) ? "\x08"sv : "\x7f"sv;
+            known = true;
+        }
+        else if (decoded == "kcuu1" || decoded == "kcud1" || decoded == "kcuf1" || decoded == "kcub1")
+        {
+            // CursorKey mode (DECCKM) selects between CSI (\E[) and SS3 (\EO).
+            const auto app = _terminalInput.GetInputMode(TerminalInput::Mode::CursorKey);
+            if (decoded == "kcuu1")
+                value = app ? "\\EOA"sv : "\\E[A"sv;
+            else if (decoded == "kcud1")
+                value = app ? "\\EOB"sv : "\\E[B"sv;
+            else if (decoded == "kcuf1")
+                value = app ? "\\EOC"sv : "\\E[C"sv;
+            else // kcub1
+                value = app ? "\\EOD"sv : "\\E[D"sv;
+            known = true;
+        }
+    }
+
+    // Hex-encode the value (uppercase hex is xterm convention, but most
+    // clients accept either; we emit lowercase to stay byte-for-byte with the
+    // golden hex tables in the spec).
+    const auto toHex = [](unsigned char b, wchar_t out[2]) {
+        constexpr wchar_t digits[] = L"0123456789abcdef";
+        out[0] = digits[(b >> 4) & 0xF];
+        out[1] = digits[b & 0xF];
+    };
+
+    fmt::basic_memory_buffer<wchar_t, 128> response;
+    if (known)
+    {
+        response.append(L"1+r"sv);
+        response.append(hexName);
+        response.push_back(L'=');
+        wchar_t buf[2];
+        for (const auto c : value)
+        {
+            toHex(gsl::narrow_cast<unsigned char>(c), buf);
+            response.append(std::wstring_view{ buf, 2 });
+        }
+    }
+    else
+    {
+        response.append(L"0+r"sv);
+        response.append(hexName);
+    }
+
+    _ReturnDcsResponse({ response.data(), response.size() });
+}
+
+// Method Description:
 // - Reports the current SGR attributes in response to a DECRQSS query.
 // Arguments:
 // - None

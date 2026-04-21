@@ -183,6 +183,7 @@ namespace Microsoft::Console::VirtualTerminal
             DECRSTS_RestoreTerminalState = VTID("$p"),
             DECRQSS_RequestSetting = VTID("$q"),
             DECRSPS_RestorePresentationState = VTID("$t"),
+            XTGETTCAP_RequestTermcap = VTID("+q"),
         };
 
         enum Vt52ActionCodes : uint64_t

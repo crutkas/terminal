@@ -188,6 +188,7 @@ namespace Microsoft::Console::VirtualTerminal
         StringHandler RestoreTerminalState(const DispatchTypes::ReportFormat format) override; // DECRSTS
 
         StringHandler RequestSetting() override; // DECRQSS
+        StringHandler RequestTermcap() override; // XTGETTCAP (DCS +q)
 
         void RequestPresentationStateReport(const DispatchTypes::PresentationReportFormat format) override; // DECRQPSR
         StringHandler RestorePresentationState(const DispatchTypes::PresentationReportFormat format) override; // DECRSPS
@@ -294,6 +295,7 @@ namespace Microsoft::Console::VirtualTerminal
         void _ReportDECSCASetting() const;
         void _ReportDECSACESetting() const;
         void _ReportDECACSetting(const VTInt itemNumber) const;
+        void _ReportTermcap(const std::wstring_view hexName);
 
         void _ReportCursorInformation();
         StringHandler _RestoreCursorInformation();

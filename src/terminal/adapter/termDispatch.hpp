@@ -178,6 +178,7 @@ public:
     StringHandler RestoreTerminalState(const DispatchTypes::ReportFormat /*format*/) override { return nullptr; }; // DECRSTS
 
     StringHandler RequestSetting() override { return nullptr; }; // DECRQSS
+    StringHandler RequestTermcap() override { return nullptr; }; // XTGETTCAP (DCS +q)
 
     void RequestPresentationStateReport(const DispatchTypes::PresentationReportFormat /*format*/) override {} // DECRQPSR
     StringHandler RestorePresentationState(const DispatchTypes::PresentationReportFormat /*format*/) override { return nullptr; } // DECRSPS
