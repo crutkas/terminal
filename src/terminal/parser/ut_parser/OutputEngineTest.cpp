@@ -907,6 +907,51 @@ class Microsoft::Console::VirtualTerminal::OutputEngineTest final
         VERIFY_ARE_EQUAL(mach._state, StateMachine::VTStates::Ground);
     }
 
+    TEST_METHOD(XtgettcapEscAbortResetsAccumulator)
+    {
+        // P3: an ESC mid-DCS aborts the in-flight +q payload. A subsequent
+        // fresh +q request must dispatch with NO residual bytes from the
+        // aborted request. We use a recording dispatch that captures every
+        // character the parser delivers to each StringHandler the dispatch
+        // hands out, then assert the second handler's payload is exactly
+        // the new request's bytes.
+        class RecordingDispatch final : public TermDispatch
+        {
+        public:
+            void Print(const wchar_t) override {}
+            void PrintString(const std::wstring_view) override {}
+            StringHandler RequestTermcap() override
+            {
+                payloads.emplace_back();
+                const auto idx = payloads.size() - 1;
+                return [this, idx](const wchar_t ch) {
+                    payloads[idx].push_back(ch);
+                    // Return false on ESC so the parser can re-dispatch it.
+                    return ch != L'\033';
+                };
+            }
+            std::vector<std::wstring> payloads;
+        };
+
+        auto dispatch = std::make_unique<RecordingDispatch>();
+        auto* raw = dispatch.get();
+        auto engine = std::make_unique<OutputStateMachineEngine>(std::move(dispatch));
+        StateMachine mach(std::move(engine));
+
+        // Request A: start a +q DCS with payload "544", then abort with a
+        // bare ESC followed by 'P' to start a brand-new DCS (request B).
+        // This exercises the abort-and-restart path inside one byte stream.
+        // Request B's payload is "5463" terminated by ST.
+        mach.ProcessString(L"\x1bP+q544\x1bP+q5463\x1b\\");
+
+        VERIFY_ARE_EQUAL(2u, raw->payloads.size());
+
+        // A's accumulated bytes are "544" plus the abort ESC. B must NOT
+        // contain any of A's bytes — only "5463" plus its terminating ESC.
+        VERIFY_ARE_EQUAL(std::wstring{ L"544\033" }, raw->payloads[0]);
+        VERIFY_ARE_EQUAL(std::wstring{ L"5463\033" }, raw->payloads[1]);
+    }
+
     TEST_METHOD(XtgettcapVsSixelDisambiguation)
     {
         // Risk R3 lockdown: the Sixel VTID is ("q"), ours is ("+q"). The
