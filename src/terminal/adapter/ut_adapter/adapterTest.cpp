@@ -2308,27 +2308,13 @@ public:
         _terminalInput.SetInputMode(TerminalInput::Mode::BackarrowKey, false);
     }
 
-    TEST_METHOD(XtgettcapStandaloneReplies)
-    {
-        // Terminal-side (IsConPTY() == false on the TestGetSet mock): a reply
-        // _must_ be emitted. This covers AC-X9 negative expectation's
-        // inverse — any non-PTY instance answers normally.
-        VERIFY_IS_FALSE(_testGetSet->IsConPTY());
-        _testGetSet->PrepData();
-        const auto h = _pDispatch->RequestTermcap();
-        for (auto ch : std::wstring_view{ L"5463" })
-            h(ch);
-        h(L'\033');
-        _testGetSet->ValidateInputEvent(L"\033P1+r5463=\033\\");
-    }
-
     TEST_METHOD(XtgettcapForwardsUnderConPTY)
     {
-        // When ReturnResponse is gated (conhost-in-VtIo simulation), the
-        // handler still consumes bytes cleanly without crashing. The gate is
-        // implemented in the real ConhostInternalGetSet::ReturnResponse at
-        // outputStream.cpp:50-65; our mock approximates by throwing from
-        // ReturnResponse when _returnResponseResult is false, then catching.
+        // R10: under ConPTY (conhost-in-VtIo), ReturnResponse is gated and
+        // must not deliver bytes downstream. The TestGetSet mock approximates
+        // by throwing from ReturnResponse when _returnResponseResult==false.
+        // Regardless of whether the handler tolerates the throw or not, the
+        // observable contract is: zero response bytes captured by the mock.
         _testGetSet->PrepData();
         _testGetSet->_returnResponseResult = false;
         const auto h = _pDispatch->RequestTermcap();
@@ -2340,9 +2326,109 @@ public:
         }
         catch (...)
         {
-            // Expected: mock simulates the "response dropped" path.
+            // The mock raises to simulate the "response dropped" path; the
+            // assertion below is what proves no bytes leaked out.
         }
+        VERIFY_IS_TRUE(_testGetSet->_response.empty());
         _testGetSet->_returnResponseResult = true;
+    }
+
+    TEST_METHOD(XtgettcapMalformedOddHex)
+    {
+        // T4: odd-length hex name ("544") cannot decode; spec requires a
+        // miss reply with the request's hex echoed verbatim, no crash.
+        _testGetSet->PrepData();
+        const auto h = _pDispatch->RequestTermcap();
+        for (auto ch : std::wstring_view{ L"544" })
+            h(ch);
+        h(L'\033');
+        _testGetSet->ValidateInputEvent(L"\033P0+r544\033\\");
+    }
+
+    TEST_METHOD(XtgettcapMalformedNonHex)
+    {
+        // T5: non-hex byte mid-name ("5G") poisons the cap; reply is a miss
+        // with empty echoed name (we do not echo attacker-supplied bytes).
+        _testGetSet->PrepData();
+        const auto h = _pDispatch->RequestTermcap();
+        for (auto ch : std::wstring_view{ L"5G" })
+            h(ch);
+        h(L'\033');
+        _testGetSet->ValidateInputEvent(L"\033P0+r\033\\");
+    }
+
+    TEST_METHOD(XtgettcapCrossRequestNoLeak)
+    {
+        // S3: request A is aborted mid-payload via ESC; request B is fresh.
+        // B's reply must contain only B's bytes — no residual state from A.
+        _testGetSet->PrepData();
+        {
+            const auto hA = _pDispatch->RequestTermcap();
+            // Begin "5463" (Tc) then abort mid-payload after the first nibble.
+            hA(L'5');
+            hA(L'\033');
+        }
+        // After ESC, A produced a miss reply for "5"; clear it before B.
+        _testGetSet->PrepData();
+
+        const auto hB = _pDispatch->RequestTermcap();
+        for (auto ch : std::wstring_view{ L"5463" })
+            hB(ch);
+        hB(L'\033');
+        // B's reply must be exactly the Tc hit — no "5" prefix from A.
+        _testGetSet->ValidateInputEvent(L"\033P1+r5463=\033\\");
+    }
+
+    TEST_METHOD(XtgettcapDECCKMOnRoundtrip)
+    {
+        // Mirrors XtgettcapDECCKMTogglesKcuu1 for the remaining arrow caps.
+        // DECCKM off: kcud1/kcuf1/kcub1 -> "\E[B" / "\E[C" / "\E[D".
+        // DECCKM on : kcud1/kcuf1/kcub1 -> "\EOB" / "\EOC" / "\EOD".
+        struct Case
+        {
+            std::wstring_view hexName;
+            std::wstring_view offResp;
+            std::wstring_view onResp;
+        };
+        const Case cases[] = {
+            // kcud1 = 6b63756431
+            { L"6b63756431",
+              L"\033P1+r6b63756431=5c" L"455b42\033\\",
+              L"\033P1+r6b63756431=5c" L"454f42\033\\" },
+            // kcuf1 = 6b63756631
+            { L"6b63756631",
+              L"\033P1+r6b63756631=5c" L"455b43\033\\",
+              L"\033P1+r6b63756631=5c" L"454f43\033\\" },
+            // kcub1 = 6b63756231
+            { L"6b63756231",
+              L"\033P1+r6b63756231=5c" L"455b44\033\\",
+              L"\033P1+r6b63756231=5c" L"454f44\033\\" },
+        };
+
+        for (const auto& c : cases)
+        {
+            _testGetSet->PrepData();
+            _terminalInput.SetInputMode(TerminalInput::Mode::CursorKey, false);
+            {
+                const auto h = _pDispatch->RequestTermcap();
+                for (auto ch : c.hexName)
+                    h(ch);
+                h(L'\033');
+            }
+            Log::Comment(c.hexName.data());
+            _testGetSet->ValidateInputEvent(c.offResp.data());
+
+            _testGetSet->PrepData();
+            _terminalInput.SetInputMode(TerminalInput::Mode::CursorKey, true);
+            {
+                const auto h = _pDispatch->RequestTermcap();
+                for (auto ch : c.hexName)
+                    h(ch);
+                h(L'\033');
+            }
+            _testGetSet->ValidateInputEvent(c.onResp.data());
+        }
+        _terminalInput.SetInputMode(TerminalInput::Mode::CursorKey, false);
     }
 
     TEST_METHOD(RequestStandardModeTests)
