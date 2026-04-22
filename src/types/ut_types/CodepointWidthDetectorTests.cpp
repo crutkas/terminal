@@ -1538,7 +1538,7 @@ class CodepointWidthDetectorTests
         VERIFY_IS_LESS_THAN_OR_EQUAL(w, 2);
         VERIFY_IS_GREATER_THAN(l, 0);
 
-        // Combining diaeresis + FE0E must not underflow either.
+        // Combining acute accent + FE0E must not underflow either.
         const auto [w2, l2] = MeasureGraphemesForward(L"\u0301\uFE0E");
         VERIFY_IS_GREATER_THAN_OR_EQUAL(w2, 0);
         VERIFY_IS_LESS_THAN_OR_EQUAL(w2, 2);
@@ -1596,7 +1596,8 @@ class CodepointWidthDetectorTests
     TEST_METHOD(VS15PropertyCannotEnlarge)
     {
         // For every base codepoint with width >= 1, appending VS15 must never increase the width
-        // and must never yield a negative width.
+        // and must never yield a negative width. Also asserts forward/reverse parity per sample,
+        // which is the regression catcher for the cluster-base tracking parity bug.
         CodepointWidthDetector cwdPlain;
         cwdPlain.Reset(TextMeasurementMode::Graphemes);
         CodepointWidthDetector cwdVS;
@@ -1604,7 +1605,7 @@ class CodepointWidthDetectorTests
 
         std::wstring buf;
         std::wstring bufVS;
-        for (char32_t cp = 0x20; cp <= 0x1FFFF; ++cp)
+        for (char32_t cp = 0x20; cp <= 0x10FFFF; ++cp)
         {
             // Skip surrogate halves.
             if (cp >= 0xD800 && cp <= 0xDFFF)
@@ -1642,6 +1643,155 @@ class CodepointWidthDetectorTests
                     VERIFY_IS_TRUE(ok);
                 }
             }
+
+            // Forward/reverse parity must hold for the VS15-suffixed sample, but only when
+            // bufVS forms a single grapheme cluster (otherwise MeasureGraphemes{Forward,Reverse}
+            // return the rightmost vs leftmost cluster's width respectively, which is not a
+            // meaningful parity comparison). This is the property assertion that catches the
+            // parity bug for clusters where the emoji base is not the cluster head (rainbow
+            // flag + FE0E + ZWJ + emoji, Prepend + emoji + FE0E, etc.).
+            if (sVS.len == static_cast<int>(bufVS.size()))
+            {
+                const auto fwd = MeasureGraphemesForward(bufVS);
+                const auto rev = MeasureGraphemesReverse(bufVS);
+                if (fwd.first != rev.first)
+                {
+                    WEX::Logging::Log::Error(
+                        WEX::Common::String().Format(L"parity broken: cp=U+%04X fwd=%d rev=%d",
+                                                     static_cast<unsigned>(cp), fwd.first, rev.first));
+                    VERIFY_ARE_EQUAL(fwd.first, rev.first);
+                }
+            }
         }
     }
+
+    TEST_METHOD(VS15ForwardReverseParityZwjEmoji)
+    {
+        // Rainbow flag with text-presentation request: WAVING WHITE FLAG (1F3F3, EPres=Y, wide)
+        // + VS15 + ZWJ + RAINBOW (1F308, EPres=Y, wide). All four codepoints form a single
+        // grapheme cluster (UAX#29 GB9/GB11). The VS15 requests text presentation for the
+        // cluster's emoji base, so the entire cluster must collapse to width 1.
+        //
+        // Reasoning (independent of the production code direction):
+        //   - The cluster contains an emoji-presentation base (the flag) targeted by FE0E.
+        //   - Per the locked spec decision, FE0E never enlarges and caps at <= 1 when the
+        //     cluster contains an emoji base.
+        //   - Therefore the final cluster width must be 1, and forward must equal reverse.
+        constexpr std::wstring_view input = L"\U0001F3F3\uFE0E\u200D\U0001F308";
+        const auto fwd = MeasureGraphemesForward(input);
+        const auto rev = MeasureGraphemesReverse(input);
+        VERIFY_ARE_EQUAL(1, fwd.first);
+        VERIFY_ARE_EQUAL(1, rev.first);
+        VERIFY_ARE_EQUAL(fwd.first, rev.first);
+        VERIFY_ARE_EQUAL(fwd.second, rev.second);
+    }
+
+    TEST_METHOD(VS15PrependBeforeEmojiBase)
+    {
+        // U+0600 ARABIC NUMBER SIGN (Prepend, narrow) + U+231A WATCH (EPres=Y, wide) + VS15.
+        // UAX#29 GB9b joins the Prepend with what follows; GB9 joins the watch with VS15.
+        // The cluster's emoji base is the watch (not the leftmost codepoint), so the FE0E cap
+        // must still apply, and forward/reverse must agree.
+        //
+        // Reasoning: cluster contains an emoji-presentation base (231A) targeted by FE0E,
+        // therefore width caps at 1 (overall narrow cluster).
+        constexpr std::wstring_view input = L"\u0600\u231A\uFE0E";
+        const auto fwd = MeasureGraphemesForward(input);
+        const auto rev = MeasureGraphemesReverse(input);
+        VERIFY_ARE_EQUAL(1, fwd.first);
+        VERIFY_ARE_EQUAL(1, rev.first);
+        VERIFY_ARE_EQUAL(fwd.first, rev.first);
+        VERIFY_ARE_EQUAL(fwd.second, rev.second);
+    }
+
+    TEST_METHOD(VS15ZwjFlagSequence)
+    {
+        // Pin the rainbow-flag sequence's per-direction outcome explicitly. Same input as
+        // VS15ForwardReverseParityZwjEmoji but the assertion focus is on each direction's
+        // measured width independently, not just parity. The VS15 must narrow the entire
+        // single-cluster ZWJ sequence to width 1.
+        constexpr std::wstring_view input = L"\U0001F3F3\uFE0E\u200D\U0001F308";
+
+        CodepointWidthDetector cwd;
+        cwd.Reset(TextMeasurementMode::Graphemes);
+        GraphemeState sFwd;
+        bool more = true;
+        int finalFwd = 0;
+        while (more)
+        {
+            more = cwd.GraphemeNext(sFwd, input);
+            finalFwd = sFwd.width;
+        }
+        VERIFY_ARE_EQUAL(1, finalFwd);
+
+        CodepointWidthDetector cwd2;
+        cwd2.Reset(TextMeasurementMode::Graphemes);
+        GraphemeState sRev;
+        more = true;
+        int finalRev = 0;
+        while (more)
+        {
+            more = cwd2.GraphemePrev(sRev, input);
+            finalRev = sRev.width;
+        }
+        VERIFY_ARE_EQUAL(1, finalRev);
+    }
+
+    TEST_METHOD(VS15Keycap)
+    {
+        // Digit keycap with explicit text-presentation request:
+        // '3' (Emoji=Y, default text, narrow) + VS15 + U+20E3 COMBINING ENCLOSING KEYCAP (Extend).
+        // The cluster contains an emoji base targeted by FE0E, so it must collapse to width 1
+        // in both directions.
+        constexpr std::wstring_view input = L"3\uFE0E\u20E3";
+        const auto fwd = MeasureGraphemesForward(input);
+        const auto rev = MeasureGraphemesReverse(input);
+        VERIFY_ARE_EQUAL(1, fwd.first);
+        VERIFY_ARE_EQUAL(1, rev.first);
+        VERIFY_ARE_EQUAL(fwd.first, rev.first);
+    }
+
+    TEST_METHOD(VS15ConsoleModeUnchanged)
+    {
+        // Console mode must be byte-for-byte identical with and without a trailing VS15.
+        // VS15 only affects Graphemes-mode width; under Console the codepoint contributes
+        // its trie width (0) and the per-call byte counts must match.
+        const auto bytesFor = [](std::wstring_view s) {
+            CodepointWidthDetector cwd;
+            cwd.Reset(TextMeasurementMode::Console);
+            GraphemeState state;
+            int total = 0;
+            for (;;)
+            {
+                const auto ok = cwd.GraphemeNext(state, s);
+                total += state.len;
+                if (!ok)
+                {
+                    break;
+                }
+            }
+            return total;
+        };
+        const auto baseline = bytesFor(L"\u231A");
+        const auto withVS15 = bytesFor(L"\u231A\uFE0E");
+        // The base codepoint count is the same; FE0E adds one wchar of consumed input but the
+        // width contribution is a no-op in Console mode (FE0E has trie width 0).
+        VERIFY_ARE_EQUAL(baseline + 1, withVS15);
+
+        // Verify width path: the per-cluster widths reported by Console mode are the trie widths
+        // of the individual codepoints; FE0E's width is 0 and ⌚'s is unchanged.
+        CodepointWidthDetector cwdNo;
+        cwdNo.Reset(TextMeasurementMode::Console);
+        GraphemeState sNo;
+        cwdNo.GraphemeNext(sNo, std::wstring_view{ L"\u231A" });
+        const auto noVSWatchWidth = sNo.width;
+
+        CodepointWidthDetector cwdYes;
+        cwdYes.Reset(TextMeasurementMode::Console);
+        GraphemeState sYes;
+        cwdYes.GraphemeNext(sYes, std::wstring_view{ L"\u231A\uFE0E" });
+        const auto withVSWatchWidth = sYes.width;
+        VERIFY_ARE_EQUAL(noVSWatchWidth, withVSWatchWidth);
+    }
+
 };
