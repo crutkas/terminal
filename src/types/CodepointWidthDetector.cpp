@@ -831,6 +831,7 @@ bool CodepointWidthDetector::_graphemeNext(GraphemeState& s, const std::wstring_
     auto state = s._state;
     auto lead = s._last;
     auto baseLead = s._baseLead;
+    auto pendingVS15 = s._pendingVS15;
 
     // If it's a new string argument, we'll restart at the new string's beginning.
     clusterBeg = resetIfOutOfRange(beg, end, beg, clusterBeg);
@@ -858,9 +859,11 @@ bool CodepointWidthDetector::_graphemeNext(GraphemeState& s, const std::wstring_
         lead = ucdLookup(cp);
         width = 0;
         state = 0;
-        // Remember the cluster's base trie value so the VS15 handling below can decide whether
-        // the base has Emoji_Presentation=Yes (UTS #51) and therefore may be narrowed by U+FE0E.
-        baseLead = lead;
+        // Track the latest emoji base seen in the cluster (not just the cluster head) so that VS15
+        // narrowing applies correctly even when the head is a Prepend or other non-emoji codepoint
+        // and so that an emoji base appearing later in the cluster (e.g. ZWJ-joined) is still seen.
+        baseLead = 0;
+        pendingVS15 = false;
 
         for (;;)
         {
@@ -871,6 +874,13 @@ bool CodepointWidthDetector::_graphemeNext(GraphemeState& s, const std::wstring_
                     w = _ambiguousWidth;
                 }
 
+                // Track the latest emoji base in the cluster. Variation selectors themselves are
+                // skipped so that FE0E/FE0F never overwrite the actual base they target.
+                if (cp != 0xFE0F && cp != 0xFE0E && ucdIsEmoji(lead))
+                {
+                    baseLead = lead;
+                }
+
                 // U+FE0F Variation Selector-16 is used to turn unqualified Emojis into qualified ones.
                 // By convention, this turns them from being ambiguous width (= narrow) into wide ones.
                 // We achieve this here by explicitly giving this codepoint a wide width.
@@ -878,20 +888,20 @@ bool CodepointWidthDetector::_graphemeNext(GraphemeState& s, const std::wstring_
                 if (cp == 0xFE0F)
                 {
                     w = 2;
+                    // FE0F overrides any previously-pending VS15 cap (last-selector-wins).
+                    pendingVS15 = false;
                 }
                 // U+FE0E Variation Selector-15 requests the text (narrow) presentation for the
                 // preceding base codepoint (UTS #51). We only narrow when the base has
                 // Emoji_Presentation=Yes so intrinsically-wide CJK ideographs are unaffected.
                 // Cap semantics: never enlarge, never go below the already-accumulated width for
-                // narrow bases. The running `width` may subsequently be brought back up by a
-                // trailing U+FE0F (last-selector-wins, bounded by the `<= 2` clamp below).
+                // narrow bases. We defer the actual cap to the end of the cluster so that any
+                // subsequent emoji codepoints joined to this cluster (e.g. via ZWJ) cannot
+                // re-widen the result and break forward/reverse parity.
                 // This overrides an ambiguous-wide base per the locked spec decision.
                 else if (cp == 0xFE0E)
                 {
-                    if (ucdIsEmoji(baseLead))
-                    {
-                        width = width > 1 ? 1 : width;
-                    }
+                    pendingVS15 = true;
                     w = 0;
                 }
 
@@ -923,6 +933,14 @@ bool CodepointWidthDetector::_graphemeNext(GraphemeState& s, const std::wstring_
         }
 
         state = ~state;
+        // Apply the deferred VS15 (FE0E) cap once at the end of the cluster, gated on whether the
+        // cluster actually contained an emoji base. This is the symmetric forward-side fix for the
+        // forward/reverse parity bug for clusters where the emoji base is not the cluster head
+        // (e.g. Prepend + emoji + FE0E, or flag + FE0E + ZWJ + emoji).
+        if (pendingVS15 && ucdIsEmoji(baseLead))
+        {
+            width = width > 1 ? 1 : width;
+        }
         width = width > 2 ? 2 : width;
         width = width < 0 ? 0 : width;
 
@@ -932,6 +950,7 @@ bool CodepointWidthDetector::_graphemeNext(GraphemeState& s, const std::wstring_
         s._state = state;
         s._last = lead;
         s._baseLead = baseLead;
+        s._pendingVS15 = pendingVS15;
     }
 
     return clusterEnd < end;
@@ -948,6 +967,7 @@ bool CodepointWidthDetector::_graphemePrev(GraphemeState& s, const std::wstring_
     auto width = s.width;
     auto state = s._state;
     auto trail = s._last;
+    auto baseLead = s._baseLead;
     auto pendingVS15 = s._pendingVS15;
     auto vsDecided = s._vsSelectorDecided;
 
@@ -977,6 +997,7 @@ bool CodepointWidthDetector::_graphemePrev(GraphemeState& s, const std::wstring_
         trail = ucdLookup(cp);
         width = 0;
         state = 0;
+        baseLead = 0;
         pendingVS15 = false;
         vsDecided = false;
 
@@ -987,6 +1008,16 @@ bool CodepointWidthDetector::_graphemePrev(GraphemeState& s, const std::wstring_
                 if (w == 3)
                 {
                     w = _ambiguousWidth;
+                }
+
+                // Track the latest emoji base seen during reverse iteration. Variation selectors
+                // are skipped so they never overwrite the actual base they target. At loop exit
+                // this holds an emoji codepoint from the cluster (if any), regardless of whether
+                // the cluster head (leftmost CP) is itself an emoji — which is required for
+                // forward/reverse parity on Prepend + emoji + FE0E and flag + FE0E + ZWJ + emoji.
+                if (cp != 0xFE0F && cp != 0xFE0E && ucdIsEmoji(trail))
+                {
+                    baseLead = trail;
                 }
 
                 // U+FE0F Variation Selector-16 is used to turn unqualified Emojis into qualified ones.
@@ -1006,9 +1037,10 @@ bool CodepointWidthDetector::_graphemePrev(GraphemeState& s, const std::wstring_
                 }
                 // U+FE0E Variation Selector-15 requests the text (narrow) presentation for the base
                 // codepoint (UTS #51). In reverse iteration the base hasn't been seen yet; mark a
-                // pending cap and apply it when we later encounter an emoji-presentation codepoint
-                // (the cluster base). Only the first selector in reverse iteration takes effect so
-                // that last-selector-wins parity with forward iteration is preserved.
+                // pending cap and apply it after the cluster has been fully scanned (deferred to
+                // immediately before the post-loop clamp below). Only the first selector in
+                // reverse iteration takes effect so that last-selector-wins parity with forward
+                // iteration is preserved.
                 else if (cp == 0xFE0E)
                 {
                     w = 0;
@@ -1020,15 +1052,6 @@ bool CodepointWidthDetector::_graphemePrev(GraphemeState& s, const std::wstring_
                 }
 
                 width += w;
-
-                // Consume the pending VS15 cap the moment we see an emoji-presentation base in the
-                // reverse iteration. This overrides an ambiguous-wide base per the locked spec
-                // decision and never enlarges the running width.
-                if (pendingVS15 && ucdIsEmoji(trail))
-                {
-                    width = width > 1 ? 1 : width;
-                    pendingVS15 = false;
-                }
             }
 
             // If we're at the end of the string, we'll break out of the loop, but leave
@@ -1055,6 +1078,15 @@ bool CodepointWidthDetector::_graphemePrev(GraphemeState& s, const std::wstring_
             trail = lead;
         }
 
+        // Apply the deferred VS15 cap once, on the actual cluster's emoji base (tracked in
+        // `baseLead` across the reverse iteration). This is the symmetric reverse-side fix for
+        // the forward/reverse parity bug; gating on the tracked base — rather than the leftmost
+        // codepoint — handles Prepend + emoji + FE0E correctly.
+        if (pendingVS15 && ucdIsEmoji(baseLead))
+        {
+            width = width > 1 ? 1 : width;
+        }
+
         state = ~state;
         width = width > 2 ? 2 : width;
         width = width < 0 ? 0 : width;
@@ -1064,6 +1096,7 @@ bool CodepointWidthDetector::_graphemePrev(GraphemeState& s, const std::wstring_
         s.width = width;
         s._state = state;
         s._last = trail;
+        s._baseLead = baseLead;
         s._pendingVS15 = pendingVS15;
         s._vsSelectorDecided = vsDecided;
     }

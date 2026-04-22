@@ -47,10 +47,14 @@ struct GraphemeState
     int _last = 0;
 
     // Cluster-scoped VS15 (U+FE0E text-presentation selector) bookkeeping (Graphemes mode only).
-    // _baseLead holds the trie value of the cluster's base codepoint, used by GraphemeNext to decide
-    // whether the base has Emoji_Presentation=Yes (UTS #51).
-    // _pendingVS15 / _vsSelectorDecided implement last-selector-wins semantics for GraphemePrev,
-    // where we observe codepoints in reverse and the first variation selector seen is the winner.
+    // _baseLead holds the trie value of the latest emoji base codepoint seen in the cluster
+    // (used by both GraphemeNext and GraphemePrev to decide whether the cluster contains an
+    // Emoji_Presentation=Yes base targeted by FE0E (UTS #51), regardless of whether that base
+    // is the cluster's leftmost codepoint).
+    // _pendingVS15 / _vsSelectorDecided implement last-selector-wins semantics. The cap is
+    // applied once at end-of-cluster (deferred from inline) so that emoji codepoints joined
+    // after the FE0E (e.g. via ZWJ) cannot re-widen the cluster, preserving forward/reverse
+    // parity (R6 / AC-V1).
     int _baseLead = 0;
     bool _pendingVS15 = false;
     bool _vsSelectorDecided = false;
