@@ -6,6 +6,10 @@
 
 #include "../types/inc/CodepointWidthDetector.hpp"
 
+#ifdef UNIT_TESTING
+extern "C" int CodepointWidthDetectorTest_ucdLookup(char32_t cp) noexcept;
+#endif
+
 // FYI at the time of writing you may have to generate this table in cmd with
 //   go run CodepointWidthDetectorTests_gen.go > temp.txt
 // because PowerShell garbles Unicode text between piped commands.
@@ -1354,5 +1358,289 @@ class CodepointWidthDetectorTests
             cwd.SetAmbiguousWidth(2);
             VERIFY_ARE_EQUAL(2, measureWidth(cwd, L"→"));
         }
+    }
+
+    // ---------------------------------------------------------------------
+    // WIDE/CJK (PR #3) standalone tests
+    // ---------------------------------------------------------------------
+
+    // Helper: plain-width of a single-codepoint grapheme under Graphemes mode.
+    static int PlainWidth(char32_t cp)
+    {
+        wchar_t buf[2];
+        size_t len = 1;
+        if (cp <= 0xFFFF)
+        {
+            buf[0] = static_cast<wchar_t>(cp);
+        }
+        else
+        {
+            const auto c = cp - 0x10000;
+            buf[0] = static_cast<wchar_t>(0xD800 | (c >> 10));
+            buf[1] = static_cast<wchar_t>(0xDC00 | (c & 0x3FF));
+            len = 2;
+        }
+        auto& cwd = CodepointWidthDetector::Singleton();
+        cwd.Reset(TextMeasurementMode::Graphemes);
+        GraphemeState s{};
+        cwd.GraphemeNext(s, std::wstring_view{ buf, len });
+        return s.width;
+    }
+
+    // Spec §6.4 W1: CJK Unified Ideographs Extension A (U+3400..U+4DBF).
+    TEST_METHOD(CjkExtAIsWide)
+    {
+        VERIFY_ARE_EQUAL(2, PlainWidth(0x3400));
+        VERIFY_ARE_EQUAL(2, PlainWidth(0x3401));
+        VERIFY_ARE_EQUAL(2, PlainWidth(0x4DBE));
+        VERIFY_ARE_EQUAL(2, PlainWidth(0x4DBF));
+    }
+
+    // W2: Extension B (U+20000..U+2A6DF).
+    TEST_METHOD(CjkExtBIsWide)
+    {
+        VERIFY_ARE_EQUAL(2, PlainWidth(0x20000));
+        VERIFY_ARE_EQUAL(2, PlainWidth(0x20001));
+        VERIFY_ARE_EQUAL(2, PlainWidth(0x2A6DE));
+        VERIFY_ARE_EQUAL(2, PlainWidth(0x2A6DF));
+    }
+
+    // W3..W7: Extensions C, D, E, F, G.
+    TEST_METHOD(CjkExtCThroughGIsWide)
+    {
+        VERIFY_ARE_EQUAL(2, PlainWidth(0x2A700));
+        VERIFY_ARE_EQUAL(2, PlainWidth(0x2B734));
+        VERIFY_ARE_EQUAL(2, PlainWidth(0x2B73F));
+        VERIFY_ARE_EQUAL(2, PlainWidth(0x2B740));
+        VERIFY_ARE_EQUAL(2, PlainWidth(0x2B81D));
+        VERIFY_ARE_EQUAL(2, PlainWidth(0x2B81F));
+        VERIFY_ARE_EQUAL(2, PlainWidth(0x2B820));
+        VERIFY_ARE_EQUAL(2, PlainWidth(0x2CEA1));
+        VERIFY_ARE_EQUAL(2, PlainWidth(0x2CEAF));
+        VERIFY_ARE_EQUAL(2, PlainWidth(0x2CEB0));
+        VERIFY_ARE_EQUAL(2, PlainWidth(0x2EBE0));
+        VERIFY_ARE_EQUAL(2, PlainWidth(0x2EBEF));
+        VERIFY_ARE_EQUAL(2, PlainWidth(0x30000));
+        VERIFY_ARE_EQUAL(2, PlainWidth(0x31340));
+        VERIFY_ARE_EQUAL(2, PlainWidth(0x3134F));
+    }
+
+    // W8: CJK Unified Ideographs Extension H (U+31350..U+323AF).
+    TEST_METHOD(CjkExtHIsWide)
+    {
+        VERIFY_ARE_EQUAL(2, PlainWidth(0x31350));
+        VERIFY_ARE_EQUAL(2, PlainWidth(0x31351));
+        VERIFY_ARE_EQUAL(2, PlainWidth(0x32000));
+        VERIFY_ARE_EQUAL(2, PlainWidth(0x323AE));
+        VERIFY_ARE_EQUAL(2, PlainWidth(0x323AF));
+    }
+
+    // W9: CJK Unified Ideographs Extension I (U+2EBF0..U+2EE5F).
+    TEST_METHOD(CjkExtIIsWide)
+    {
+        VERIFY_ARE_EQUAL(2, PlainWidth(0x2EBF0));
+        VERIFY_ARE_EQUAL(2, PlainWidth(0x2EBF1));
+        VERIFY_ARE_EQUAL(2, PlainWidth(0x2ED00));
+        VERIFY_ARE_EQUAL(2, PlainWidth(0x2EE5E));
+        VERIFY_ARE_EQUAL(2, PlainWidth(0x2EE5F));
+    }
+
+    // W10: CJK Compatibility Ideographs (U+F900..U+FAFF).
+    TEST_METHOD(CjkCompatibilityIsWide)
+    {
+        VERIFY_ARE_EQUAL(2, PlainWidth(0xF900));
+        VERIFY_ARE_EQUAL(2, PlainWidth(0xF901));
+        VERIFY_ARE_EQUAL(2, PlainWidth(0xF9A0));
+        VERIFY_ARE_EQUAL(2, PlainWidth(0xFAFE));
+        VERIFY_ARE_EQUAL(2, PlainWidth(0xFAFF));
+    }
+
+    // W11..W16: EPres regression — the core "87→100" fix.
+    TEST_METHOD(EmojiPresentationDefaultsWide)
+    {
+        struct Case
+        {
+            char32_t cp;
+            const wchar_t* name;
+        };
+        const std::array cases{
+            Case{ 0x231A, L"WATCH" },
+            Case{ 0x23F0, L"ALARM CLOCK" },
+            Case{ 0x23F3, L"HOURGLASS WITH FLOWING SAND" },
+            Case{ 0x1F004, L"MAHJONG TILE RED DRAGON" },
+            Case{ 0x1F0CF, L"PLAYING CARD BLACK JOKER" },
+            Case{ 0x1F3F4, L"BLACK FLAG" },
+            Case{ 0x1F5FB, L"MOUNT FUJI" },
+        };
+        for (const auto& c : cases)
+        {
+            const int w = PlainWidth(c.cp);
+            VERIFY_ARE_EQUAL(2, w, WEX::Common::String().Format(L"%s U+%04X", c.name, static_cast<unsigned>(c.cp)));
+        }
+    }
+
+    // W17: Data-driven walk of the full Unicode 16.0 EPres=Yes corpus.
+    TEST_METHOD(EmojiPresentationCorpusWide)
+    {
+#include "EPresCorpus.inc"
+        size_t failures = 0;
+        for (const auto cp : s_epresCorpus)
+        {
+            const int w = PlainWidth(cp);
+            if (w != 2)
+            {
+                ++failures;
+                WEX::Logging::Log::Error(WEX::Common::String().Format(
+                    L"Emoji_Presentation=Yes U+%05X reported width %d (expected 2)",
+                    static_cast<unsigned>(cp), w));
+            }
+        }
+        VERIFY_ARE_EQUAL(0u, static_cast<unsigned>(failures));
+    }
+
+    // W18: Box-drawing override (U+2500..U+259F) stays narrow.
+    TEST_METHOD(BoxDrawingStaysNarrow)
+    {
+        VERIFY_ARE_EQUAL(1, PlainWidth(0x2500));
+        VERIFY_ARE_EQUAL(1, PlainWidth(0x2502));
+        VERIFY_ARE_EQUAL(1, PlainWidth(0x257F));
+        VERIFY_ARE_EQUAL(1, PlainWidth(0x2580));
+        VERIFY_ARE_EQUAL(1, PlainWidth(0x259F));
+    }
+
+    // W19: Yijing Hexagram Symbols override.
+    TEST_METHOD(YijingStaysNarrow)
+    {
+        VERIFY_ARE_EQUAL(1, PlainWidth(0x4DC0));
+        VERIFY_ARE_EQUAL(1, PlainWidth(0x4DD0));
+        VERIFY_ARE_EQUAL(1, PlainWidth(0x4DFF));
+    }
+
+    // W20: Combining Half Marks override.
+    TEST_METHOD(CombiningHalfMarksStayNarrow)
+    {
+        VERIFY_ARE_EQUAL(1, PlainWidth(0xFE20));
+        VERIFY_ARE_EQUAL(1, PlainWidth(0xFE27));
+        VERIFY_ARE_EQUAL(1, PlainWidth(0xFE2F));
+    }
+
+    // W21: Surrogate-pair correctness — U+30000 must decode to one wide cluster.
+    TEST_METHOD(SurrogatePairDecodesToWide)
+    {
+        static constexpr wchar_t kExtGFirst[] = { 0xD880, 0xDC00 };
+        auto& cwd = CodepointWidthDetector::Singleton();
+        cwd.Reset(TextMeasurementMode::Graphemes);
+        GraphemeState s{};
+        cwd.GraphemeNext(s, std::wstring_view{ kExtGFirst, 2 });
+        VERIFY_ARE_EQUAL(2, s.width);
+        VERIFY_ARE_EQUAL(2, s.len);
+    }
+
+    // W23: Ambiguous width policy still applies; not overridden by EPres or CJK fills.
+    TEST_METHOD(AmbiguousInvarianceAfterCjkRework)
+    {
+        auto& cwd = CodepointWidthDetector::Singleton();
+        cwd.Reset(TextMeasurementMode::Graphemes);
+
+        cwd.SetAmbiguousWidth(1);
+        GraphemeState s1{};
+        cwd.GraphemeNext(s1, std::wstring_view{ L"\u2192", 1 });
+        VERIFY_ARE_EQUAL(1, s1.width);
+
+        cwd.SetAmbiguousWidth(2);
+        GraphemeState s2{};
+        cwd.GraphemeNext(s2, std::wstring_view{ L"\u2192", 1 });
+        VERIFY_ARE_EQUAL(2, s2.width);
+
+        cwd.SetAmbiguousWidth(1);
+    }
+
+    // Regression: basic ASCII / Latin-1 widths were NOT perturbed by the rework.
+    TEST_METHOD(AsciiAndLatin1WidthsRegression)
+    {
+        for (char32_t cp = 0x0020; cp <= 0x007E; ++cp)
+        {
+            VERIFY_ARE_EQUAL(1, PlainWidth(cp), WEX::Common::String().Format(L"ASCII U+%04X", static_cast<unsigned>(cp)));
+        }
+        VERIFY_ARE_EQUAL(1, PlainWidth(0x00AD));
+        VERIFY_ARE_EQUAL(1, PlainWidth(0x00E9));
+        VERIFY_ARE_EQUAL(2, PlainWidth(0x4E00));
+        VERIFY_ARE_EQUAL(2, PlainWidth(0x4E01));
+        VERIFY_ARE_EQUAL(2, PlainWidth(0x9FFF));
+        VERIFY_ARE_EQUAL(2, PlainWidth(0xAC00));
+        VERIFY_ARE_EQUAL(2, PlainWidth(0xD7A3));
+        VERIFY_ARE_EQUAL(2, PlainWidth(0x3042));
+        VERIFY_ARE_EQUAL(2, PlainWidth(0x30A2));
+    }
+
+    // Fuzz-style property test with a deterministic seed over valid codepoints.
+    TEST_METHOD(FuzzPropertyOverValidCodepoints)
+    {
+        uint32_t rng = 0xC0FFEE42u;
+        auto next = [&rng]() {
+            rng = rng * 1664525u + 1013904223u;
+            return rng;
+        };
+
+        const int iterations = 4096;
+        int failures = 0;
+        for (int i = 0; i < iterations; ++i)
+        {
+            char32_t cp = next() % 0x110000u;
+            if (cp >= 0xD800 && cp <= 0xDFFF)
+            {
+                continue;
+            }
+            const int w = PlainWidth(cp);
+            if (w < 0 || w > 2)
+            {
+                ++failures;
+                WEX::Logging::Log::Error(WEX::Common::String().Format(
+                    L"cp=U+%06X gave width %d (out of 0..2)", static_cast<unsigned>(cp), w));
+            }
+        }
+        VERIFY_ARE_EQUAL(0, failures);
+
+        auto& cwd = CodepointWidthDetector::Singleton();
+        cwd.Reset(TextMeasurementMode::Graphemes);
+        for (wchar_t lone : { wchar_t{ 0xD83D }, wchar_t{ 0xDC00 } })
+        {
+            GraphemeState s{};
+            cwd.GraphemeNext(s, std::wstring_view{ &lone, 1 });
+            VERIFY_IS_GREATER_THAN_OR_EQUAL(s.width, 0);
+            VERIFY_IS_LESS_THAN_OR_EQUAL(s.width, 2);
+        }
+    }
+
+    // R7: directly exercise the OOB guard inside ucdLookup.
+    TEST_METHOD(UcdLookupOutOfBoundsReturnsZero)
+    {
+        VERIFY_ARE_EQUAL(0, CodepointWidthDetectorTest_ucdLookup(0x110000u));
+        VERIFY_ARE_EQUAL(0, CodepointWidthDetectorTest_ucdLookup(0x110001u));
+        VERIFY_ARE_EQUAL(0, CodepointWidthDetectorTest_ucdLookup(0x1FFFFFu));
+        VERIFY_ARE_EQUAL(0, CodepointWidthDetectorTest_ucdLookup(0xFFFFFFFFu));
+        const int wAscii = CodepointWidthDetectorTest_ucdLookup(U'A');
+        VERIFY_IS_GREATER_THAN_OR_EQUAL(wAscii, 0);
+    }
+
+    // R8: bound the fallback cache even under adversarial input.
+    TEST_METHOD(FallbackCacheIsBounded)
+    {
+        CodepointWidthDetector cwd;
+        cwd.Reset(TextMeasurementMode::Console);
+        cwd.SetFallbackMethod([](const std::wstring_view&) { return false; });
+
+        const size_t cap = 4096;
+        const size_t pushes = cap + 1;
+        size_t maxObserved = 0;
+        for (size_t i = 0; i < pushes; ++i)
+        {
+            const char32_t cp = static_cast<char32_t>(0x20000u + i);
+            (void)cwd.TestHookCheckFallbackViaCache(cp);
+            maxObserved = std::max(maxObserved, cwd.TestHookFallbackCacheSize());
+        }
+
+        VERIFY_IS_LESS_THAN_OR_EQUAL(maxObserved, cap);
+        VERIFY_IS_LESS_THAN_OR_EQUAL(cwd.TestHookFallbackCacheSize(), cap);
     }
 };

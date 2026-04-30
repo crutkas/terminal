@@ -228,6 +228,7 @@ static Ucd ExtractValuesFromUcd(string path)
         var groupIndicConjunctBreak = group.Attribute("InCB")?.Value;
         var groupExtendedPictographic = group.Attribute("ExtPict")?.Value;
         var groupEastAsian = group.Attribute("ea")?.Value;
+        var groupEmojiPresentation = group.Attribute("EPres")?.Value;
 
         foreach (var ch in group.Elements())
         {
@@ -250,6 +251,8 @@ static Ucd ExtractValuesFromUcd(string path)
             var indicConjunctBreak = ch.Attribute("InCB")?.Value ?? groupIndicConjunctBreak ?? "";
             var extendedPictographic = ch.Attribute("ExtPict")?.Value ?? groupExtendedPictographic ?? "";
             var eastAsian = ch.Attribute("ea")?.Value ?? groupEastAsian ?? "";
+            var emojiPresentation = ch.Attribute("EPres")?.Value ?? groupEmojiPresentation ?? "";
+            var isEmojiPresentation = emojiPresentation == "Y";
 
             var cb = graphemeClusterBreak switch
             {
@@ -319,6 +322,15 @@ static Ucd ExtractValuesFromUcd(string path)
                     break;
             }
 
+            // Emoji_Presentation=Yes forces wide rendering. This closes the
+            // "87→100" widecharwidth gap: bases like U+231A WATCH (ea=N, EPres=Y)
+            // or U+1F004 MAHJONG TILE RED DRAGON (ea=N, EPres=Y) are default-emoji
+            // and must occupy 2 cells even though their East Asian Width is "N".
+            if (isEmojiPresentation)
+            {
+                width = CharacterWidth.Wide;
+            }
+
             Fill(firstCp, lastCp, TrieValue(cb, width));
         }
     }
@@ -335,6 +347,15 @@ static Ucd ExtractValuesFromUcd(string path)
     // U+2580 to U+259F: Block Elements block
     // By default, CharacterWidth.Ambiguous, but by convention .Narrow in terminals.
     Fill(0x2500, 0x259F, TrieValue(ClusterBreak.Other, CharacterWidth.Narrow));
+
+    // U+4DC0..U+4DFF: Yijing Hexagram Symbols — narrow by convention
+    // (ported from legacy unicode_width_overrides.xml, D6).
+    Fill(0x4DC0, 0x4DFF, TrieValue(ClusterBreak.Other, CharacterWidth.Narrow));
+
+    // U+FE20..U+FE2F: Combining Half Marks — narrow
+    // (formally zero-width combiners, but treated as narrow in terminal tradition
+    // to preserve cell math; ported from legacy unicode_width_overrides.xml, D6).
+    Fill(0xFE20, 0xFE2F, TrieValue(ClusterBreak.Extend, CharacterWidth.Narrow));
 
     return new Ucd
     {

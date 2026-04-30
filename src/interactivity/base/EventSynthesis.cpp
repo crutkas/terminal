@@ -3,6 +3,7 @@
 
 #include "precomp.h"
 #include "../inc/EventSynthesis.hpp"
+#include "../../types/inc/CodepointWidthDetector.hpp"
 
 // TODO: MSFT 14150722 - can these const values be generated at
 // runtime without breaking compatibility?
@@ -10,26 +11,20 @@ static constexpr WORD altScanCode = 0x38;
 static constexpr WORD leftShiftScanCode = 0x2A;
 
 // Routine Description:
-// - naively determines the width of a UCS2 encoded wchar (with caveats noted above)
+// - Determines the width of a single UCS-2 wchar by routing through the
+//   canonical CodepointWidthDetector. Previously this carried a hand-rolled
+//   Unicode 9.0 fullwidth table that drifted from the renderer's view of
+//   width and produced split-brain results for any Emoji_Presentation=Yes
+//   codepoint not on the legacy list (e.g. U+231A WATCH). Going through the
+//   singleton guarantees the input-event-synthesis path agrees with the
+//   rendering / measurement path under whatever TextMeasurementMode the
+//   detector is currently configured for. (See AC-W9 in the WIDE/CJK plan.)
 #pragma warning(suppress : 4505) // this function will be deleted if numpad events are disabled
 static bool IsCharFullWidth(const wchar_t wch) noexcept
 {
-    return (0x1100 <= wch && wch <= 0x115f) || // From Unicode 9.0, Hangul Choseong is wide
-           (0x2e80 <= wch && wch <= 0x303e) || // From Unicode 9.0, this range is wide (assorted languages)
-           (0x3041 <= wch && wch <= 0x3094) || // Hiragana
-           (0x30a1 <= wch && wch <= 0x30f6) || // Katakana
-           (0x3105 <= wch && wch <= 0x312c) || // Bopomofo
-           (0x3131 <= wch && wch <= 0x318e) || // Hangul Elements
-           (0x3190 <= wch && wch <= 0x3247) || // From Unicode 9.0, this range is wide
-           (0x3251 <= wch && wch <= 0x4dbf) || // Unicode 9.0 CJK Unified Ideographs, Yi, Reserved, Han Ideograph (hexagrams from 4DC0..4DFF are ignored
-           (0x4e00 <= wch && wch <= 0xa4c6) || // Unicode 9.0 CJK Unified Ideographs, Yi, Reserved, Han Ideograph (hexagrams from 4DC0..4DFF are ignored
-           (0xa960 <= wch && wch <= 0xa97c) || // Wide Hangul Choseong
-           (0xac00 <= wch && wch <= 0xd7a3) || // Korean Hangul Syllables
-           (0xf900 <= wch && wch <= 0xfaff) || // From Unicode 9.0, this range is wide [CJK Compatibility Ideographs, Includes Han Compatibility Ideographs]
-           (0xfe10 <= wch && wch <= 0xfe1f) || // From Unicode 9.0, this range is wide [Presentation forms]
-           (0xfe30 <= wch && wch <= 0xfe6b) || // From Unicode 9.0, this range is wide [Presentation forms]
-           (0xff01 <= wch && wch <= 0xff5e) || // Fullwidth ASCII variants
-           (0xffe0 <= wch && wch <= 0xffe6); // Fullwidth symbol variants
+    GraphemeState state;
+    CodepointWidthDetector::Singleton().GraphemeNext(state, std::wstring_view{ &wch, 1 });
+    return state.width >= 2;
 }
 
 void Microsoft::Console::Interactivity::CharToKeyEvents(const wchar_t wch, const unsigned int codepage, InputEventQueue& keyEvents)

@@ -61,6 +61,14 @@ struct CodepointWidthDetector
     void SetFallbackMethod(std::function<bool(const std::wstring_view&)> pfnFallback) noexcept;
     void Reset(TextMeasurementMode mode) noexcept;
 
+#ifdef UNIT_TESTING
+    // Test-only accessors for the bounded fallback cache (R8). Lets the unit
+    // test assert that the cache never exceeds its hard cap (4096 entries)
+    // even when more distinct codepoints are routed through it.
+    size_t TestHookFallbackCacheSize() const noexcept { return _fallbackCache.size(); }
+    int TestHookCheckFallbackViaCache(char32_t cp) noexcept { return _checkFallbackViaCache(cp); }
+#endif
+
 private:
     bool _graphemeNext(GraphemeState& s, const std::wstring_view& str) const noexcept;
     bool _graphemePrev(GraphemeState& s, const std::wstring_view& str) const noexcept;
