@@ -2125,18 +2125,21 @@ public:
         _testGetSet->ValidateInputEvent(L"\033P1+r636F6C6F7273=323536\033\\");
     }
 
-    TEST_METHOD(XtgettcapAllTwelveCaps)
+    TEST_METHOD(XtgettcapAllCapabilities)
     {
-        // Drive each of the 12 MVP capabilities and assert exact response bytes.
-        // Values mirror the spec section 4.2 golden table; we recompute them
-        // here by hand (not via production helpers) so the test catches any
-        // silent value drift.
+        // Drive each MVP and shifted-nav capability and assert exact response bytes.
+        //
+        // Wire-format note (xterm): the value side of a +r reply is the
+        // RAW BYTES the terminal would send, hex-encoded. So ESC encodes as
+        // 0x1b (one byte = "1b"), NOT the two-byte terminfo source form
+        // "\E" (0x5c 0x45 = "5c45"). The golden hex below uses raw-byte
+        // encoding; a regression that flips back to source-format encoding
+        // would emit double the ESC bytes per cap and fail this test.
         struct Case
         {
             std::wstring_view hexName; // request case is echoed
             std::wstring_view expectedResponse;
         };
-        // All values pre-hexed from the canonical value strings in the spec.
         const Case cases[] = {
             // TN = "xterm-256color"
             { L"544e", L"\033P1+r544e=78" L"7465726d2d323536636f6c6f72\033\\" },
@@ -2150,21 +2153,40 @@ public:
             { L"626365", L"\033P1+r626365=\033\\" },
             // Tc = "" (boolean)
             { L"5463", L"\033P1+r5463=\033\\" },
-            // Smulx = "\E[4:%p1%dm" -> 11 chars: 5c 45 5b 34 3a 25 70 31 25 64 6d
-            { L"536d756c78", L"\033P1+r536d756c78=5c" L"455b343a2570312564" L"6d\033\\" },
-            // Ms = "\E]52;%p1%s;%p2%s\E\\" -> 21 chars
-            //   5c 45 5d 35 32 3b 25 70 31 25 73 3b 25 70 32 25 73 5c 45 5c 5c
-            { L"4d73", L"\033P1+r4d73=5c" L"455d35323b25703125733b25703225735c" L"455c5c\033\\" },
-            // kdch1 = "\E[3~" -> 5c 45 5b 33 7e  (hex of "kdch1" = 6b64636831)
-            { L"6b64636831", L"\033P1+r6b64636831=5c" L"455b337e\033\\" },
+            // Smulx = ESC [ 4 : % p 1 % d m -> 10 bytes: 1b 5b 34 3a 25 70 31 25 64 6d
+            { L"536d756c78", L"\033P1+r536d756c78=1b" L"5b343a2570312564" L"6d\033\\" },
+            // Ms = ESC ] 5 2 ; % p 1 % s ; % p 2 % s ESC \ -> 18 bytes:
+            //   1b 5d 35 32 3b 25 70 31 25 73 3b 25 70 32 25 73 1b 5c
+            { L"4d73", L"\033P1+r4d73=1b5d35323b25703125733b25703225731b5c\033\\" },
+            // kdch1 = ESC [ 3 ~ -> 4 bytes: 1b 5b 33 7e
+            { L"6b64636831", L"\033P1+r6b64636831=1b" L"5b337e\033\\" },
             // kbs (default: BackarrowKey OFF) -> 0x7f -> "7f"
             { L"6b6273", L"\033P1+r6b6273=7f\033\\" },
-            // kcuu1 (default: DECCKM OFF / normal) -> "\E[A" -> 5c 45 5b 41
-            { L"6b63757531", L"\033P1+r6b63757531=5c" L"455b41\033\\" },
-            // kcud1 / kcuf1 / kcub1
-            { L"6b63756431", L"\033P1+r6b63756431=5c" L"455b42\033\\" },
-            { L"6b63756631", L"\033P1+r6b63756631=5c" L"455b43\033\\" },
-            { L"6b63756231", L"\033P1+r6b63756231=5c" L"455b44\033\\" },
+            // kcuu1 (default: DECCKM OFF / normal) -> ESC [ A -> 1b 5b 41
+            { L"6b63757531", L"\033P1+r6b63757531=1b" L"5b41\033\\" },
+            // kcud1 / kcuf1 / kcub1 (DECCKM off)
+            { L"6b63756431", L"\033P1+r6b63756431=1b" L"5b42\033\\" },
+            { L"6b63756631", L"\033P1+r6b63756631=1b" L"5b43\033\\" },
+            { L"6b63756231", L"\033P1+r6b63756231=1b" L"5b44\033\\" },
+            // I1: new caps — DECSCUSR (Ss/Se) and shifted nav keys.
+            // Ss = ESC [ % p 1 % d SPACE q -> 9 bytes: 1b 5b 25 70 31 25 64 20 71
+            { L"5373", L"\033P1+r5373=1b" L"5b2570312564" L"2071\033\\" },
+            // Se = ESC [ 2 SPACE q -> 5 bytes: 1b 5b 32 20 71
+            { L"5365", L"\033P1+r5365=1b" L"5b322071\033\\" },
+            // kDC (Shift+Delete) = ESC [ 3 ; 2 ~ -> 1b 5b 33 3b 32 7e ; hex("kDC") = 6b4443
+            { L"6b4443", L"\033P1+r6b4443=1b" L"5b333b327e\033\\" },
+            // kUP (Shift+Up)    = ESC [ 1 ; 2 A -> 1b 5b 31 3b 32 41 ; hex("kUP") = 6b5550
+            { L"6b5550", L"\033P1+r6b5550=1b" L"5b313b3241\033\\" },
+            // kDN (Shift+Down)  = ESC [ 1 ; 2 B ; hex("kDN") = 6b444e
+            { L"6b444e", L"\033P1+r6b444e=1b" L"5b313b3242\033\\" },
+            // kRIT (Shift+Right)= ESC [ 1 ; 2 C ; hex("kRIT") = 6b524954
+            { L"6b524954", L"\033P1+r6b524954=1b" L"5b313b3243\033\\" },
+            // kLFT (Shift+Left) = ESC [ 1 ; 2 D ; hex("kLFT") = 6b4c4654
+            { L"6b4c4654", L"\033P1+r6b4c4654=1b" L"5b313b3244\033\\" },
+            // kHOM (Shift+Home) = ESC [ 1 ; 2 H ; hex("kHOM") = 6b484f4d
+            { L"6b484f4d", L"\033P1+r6b484f4d=1b" L"5b313b3248\033\\" },
+            // kEND (Shift+End)  = ESC [ 1 ; 2 F ; hex("kEND") = 6b454e44
+            { L"6b454e44", L"\033P1+r6b454e44=1b" L"5b313b3246\033\\" },
         };
 
         for (const auto& c : cases)
@@ -2179,6 +2201,52 @@ public:
             Log::Comment(c.hexName.data());
             _testGetSet->ValidateInputEvent(c.expectedResponse.data());
         }
+    }
+
+    TEST_METHOD(XtgettcapExplicitEmptyCapRejected)
+    {
+        // I2: well-formed-but-empty cap-name requests must not blow up and
+        // must not emit a stale or attacker-controlled reply.
+        //
+        // Case A — truly empty payload (`DCS +q ST`): no cap names at all.
+        // Per the handler's design, _ReportTermcap is only called when a name
+        // separator (';') or terminator (ESC) is reached AND a name was
+        // accumulated (or the parse was poisoned). With zero bytes between
+        // `+q` and ST there is nothing to report, so we emit zero replies.
+        _testGetSet->PrepData();
+        const auto h = _pDispatch->RequestTermcap();
+        h(L'\033');
+        VERIFY_ARE_EQUAL(std::wstring{}, _testGetSet->_response);
+
+        // Case B — explicit empty between separators (`;;`): each `;` is a
+        // boundary, so the parser sees two empty names. For an empty name we
+        // emit a miss reply with no echoed hex (the handler treats empty
+        // hex as "malformed" — !decodeOk falls through to the unknown
+        // branch which writes `0+r` with the empty name).
+        _testGetSet->PrepData();
+        auto retainScope = _testGetSet->EnableInputRetentionInScope();
+        const auto h2 = _pDispatch->RequestTermcap();
+        for (auto ch : std::wstring_view{ L";;" })
+            h2(ch);
+        h2(L'\033');
+        // First `;` -> miss with empty echoed name. Second `;` -> miss with
+        // empty echoed name. ESC after empty name -> no further reply
+        // (matches Case A: ESC with empty name + !poisoned == no-op).
+        _testGetSet->ValidateInputEvent(L"\033P0+r\033\\\033P0+r\033\\");
+
+        // Case C — non-empty;empty (`5463;`): the known cap reports a hit;
+        // the trailing empty (after `;`, before ESC) is dropped because the
+        // ESC branch only emits a reply when `!name.empty() || poisoned`,
+        // and the `;` already cleared name. This documents the current
+        // (xterm-compatible) behavior; any future change to emit a trailing
+        // miss must update this golden.
+        _testGetSet->PrepData();
+        auto retainScope2 = _testGetSet->EnableInputRetentionInScope();
+        const auto h3 = _pDispatch->RequestTermcap();
+        for (auto ch : std::wstring_view{ L"5463;" })
+            h3(ch);
+        h3(L'\033');
+        _testGetSet->ValidateInputEvent(L"\033P1+r5463=\033\\");
     }
 
     TEST_METHOD(XtgettcapUnknownCap)
@@ -2258,7 +2326,8 @@ public:
 
     TEST_METHOD(XtgettcapDECCKMTogglesKcuu1)
     {
-        // DECCKM off (default) -> \E[A ; DECCKM on -> \EOA.
+        // DECCKM off (default) -> raw ESC [ A ; DECCKM on -> raw ESC O A.
+        // Wire format uses raw ESC (0x1b), not source-form "\E" (0x5c45).
         _testGetSet->PrepData();
         _terminalInput.SetInputMode(TerminalInput::Mode::CursorKey, false);
         {
@@ -2267,7 +2336,7 @@ public:
                 h(ch);
             h(L'\033');
         }
-        _testGetSet->ValidateInputEvent(L"\033P1+r6b63757531=5c" L"455b41\033\\");
+        _testGetSet->ValidateInputEvent(L"\033P1+r6b63757531=1b" L"5b41\033\\");
 
         _testGetSet->PrepData();
         _terminalInput.SetInputMode(TerminalInput::Mode::CursorKey, true);
@@ -2277,8 +2346,8 @@ public:
                 h(ch);
             h(L'\033');
         }
-        // hex("\EOA") = 5c 45 4f 41
-        _testGetSet->ValidateInputEvent(L"\033P1+r6b63757531=5c" L"454f41\033\\");
+        // hex(ESC O A) = 1b 4f 41
+        _testGetSet->ValidateInputEvent(L"\033P1+r6b63757531=1b" L"4f41\033\\");
         _terminalInput.SetInputMode(TerminalInput::Mode::CursorKey, false);
     }
 
@@ -2382,8 +2451,8 @@ public:
     TEST_METHOD(XtgettcapDECCKMOnRoundtrip)
     {
         // Mirrors XtgettcapDECCKMTogglesKcuu1 for the remaining arrow caps.
-        // DECCKM off: kcud1/kcuf1/kcub1 -> "\E[B" / "\E[C" / "\E[D".
-        // DECCKM on : kcud1/kcuf1/kcub1 -> "\EOB" / "\EOC" / "\EOD".
+        // DECCKM off: kcud1/kcuf1/kcub1 -> ESC [ B / ESC [ C / ESC [ D (raw bytes).
+        // DECCKM on : kcud1/kcuf1/kcub1 -> ESC O B / ESC O C / ESC O D (raw bytes).
         struct Case
         {
             std::wstring_view hexName;
@@ -2393,16 +2462,16 @@ public:
         const Case cases[] = {
             // kcud1 = 6b63756431
             { L"6b63756431",
-              L"\033P1+r6b63756431=5c" L"455b42\033\\",
-              L"\033P1+r6b63756431=5c" L"454f42\033\\" },
+              L"\033P1+r6b63756431=1b" L"5b42\033\\",
+              L"\033P1+r6b63756431=1b" L"4f42\033\\" },
             // kcuf1 = 6b63756631
             { L"6b63756631",
-              L"\033P1+r6b63756631=5c" L"455b43\033\\",
-              L"\033P1+r6b63756631=5c" L"454f43\033\\" },
+              L"\033P1+r6b63756631=1b" L"5b43\033\\",
+              L"\033P1+r6b63756631=1b" L"4f43\033\\" },
             // kcub1 = 6b63756231
             { L"6b63756231",
-              L"\033P1+r6b63756231=5c" L"455b44\033\\",
-              L"\033P1+r6b63756231=5c" L"454f44\033\\" },
+              L"\033P1+r6b63756231=1b" L"5b44\033\\",
+              L"\033P1+r6b63756231=1b" L"4f44\033\\" },
         };
 
         for (const auto& c : cases)

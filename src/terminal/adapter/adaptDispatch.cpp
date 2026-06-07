@@ -4389,6 +4389,12 @@ void AdaptDispatch::_ReportTermcap(const std::wstring_view hexName)
     // Resolve the capability value. Dynamic caps consult the live TerminalInput
     // state (DECCKM for cursor keys, BackarrowKey for kbs). Never duplicate
     // string tables — we must stay in sync with the input encoder.
+    //
+    // Wire format note (xterm-compatible): per xterm ctlseqs, the response
+    // value is "the value of the corresponding string that xterm would send"
+    // — i.e. the RAW BYTES the terminal would transmit, hex-encoded. So ESC is
+    // 0x1b (one byte), NOT the two-byte sequence "\E" (0x5c 0x45). Parameterized
+    // caps preserve their literal terminfo placeholder bytes (%p1, %d, %s, %?).
     std::string_view value;
     auto known = false;
 
@@ -4418,17 +4424,32 @@ void AdaptDispatch::_ReportTermcap(const std::wstring_view hexName)
         }
         else if (decoded == "Smulx")
         {
-            value = "\\E[4:%p1%dm"sv;
+            // \E[4:%p1%dm  (parameterized colon-separated underline style)
+            value = "\x1b[4:%p1%dm"sv;
             known = true;
         }
         else if (decoded == "Ms")
         {
-            value = "\\E]52;%p1%s;%p2%s\\E\\\\"sv;
+            // \E]52;%p1%s;%p2%s\E\\  (OSC 52 set-clipboard, terminated by ST)
+            value = "\x1b]52;%p1%s;%p2%s\x1b\\"sv;
+            known = true;
+        }
+        else if (decoded == "Ss")
+        {
+            // DECSCUSR set cursor shape: \E[%p1%d q
+            value = "\x1b[%p1%d q"sv;
+            known = true;
+        }
+        else if (decoded == "Se")
+        {
+            // DECSCUSR reset cursor shape to default: \E[2 q
+            value = "\x1b[2 q"sv;
             known = true;
         }
         else if (decoded == "kdch1")
         {
-            value = "\\E[3~"sv;
+            // Plain Delete key: \E[3~
+            value = "\x1b[3~"sv;
             known = true;
         }
         else if (decoded == "kbs")
@@ -4440,16 +4461,41 @@ void AdaptDispatch::_ReportTermcap(const std::wstring_view hexName)
         }
         else if (decoded == "kcuu1" || decoded == "kcud1" || decoded == "kcuf1" || decoded == "kcub1")
         {
-            // CursorKey mode (DECCKM) selects between CSI (\E[) and SS3 (\EO).
+            // CursorKey mode (DECCKM) selects between CSI (ESC[) and SS3 (ESCO).
             const auto app = _terminalInput.GetInputMode(TerminalInput::Mode::CursorKey);
             if (decoded == "kcuu1")
-                value = app ? "\\EOA"sv : "\\E[A"sv;
+                value = app ? "\x1bOA"sv : "\x1b[A"sv;
             else if (decoded == "kcud1")
-                value = app ? "\\EOB"sv : "\\E[B"sv;
+                value = app ? "\x1bOB"sv : "\x1b[B"sv;
             else if (decoded == "kcuf1")
-                value = app ? "\\EOC"sv : "\\E[C"sv;
+                value = app ? "\x1bOC"sv : "\x1b[C"sv;
             else // kcub1
-                value = app ? "\\EOD"sv : "\\E[D"sv;
+                value = app ? "\x1bOD"sv : "\x1b[D"sv;
+            known = true;
+        }
+        else if (decoded == "kDC" || decoded == "kUP" || decoded == "kDN" ||
+                 decoded == "kRIT" || decoded == "kLFT" || decoded == "kHOM" ||
+                 decoded == "kEND")
+        {
+            // Shift-modified navigation keys. Standard xterm-256color form is
+            // CSI <key>;2 <final>, matching what TerminalInput emits via
+            // _formatEncodingHelper (terminalInput.cpp ~line 1117) when only
+            // the SHIFT modifier flag is set: keycode=1 (or 3 for Delete),
+            // modifier=1+CSI_SHIFT=2.
+            if (decoded == "kDC")
+                value = "\x1b[3;2~"sv;
+            else if (decoded == "kUP")
+                value = "\x1b[1;2A"sv;
+            else if (decoded == "kDN")
+                value = "\x1b[1;2B"sv;
+            else if (decoded == "kRIT")
+                value = "\x1b[1;2C"sv;
+            else if (decoded == "kLFT")
+                value = "\x1b[1;2D"sv;
+            else if (decoded == "kHOM")
+                value = "\x1b[1;2H"sv;
+            else // kEND
+                value = "\x1b[1;2F"sv;
             known = true;
         }
     }
