@@ -695,18 +695,18 @@ constexpr int ucdToCharacterWidth(const int val) noexcept
 }
 // clang-format on
 
-#ifdef UNIT_TESTING
 // Test hook for the R7 OOB guard in ucdLookup. The constexpr function above
 // has internal linkage and is unreachable from the public detector API
 // (UTF-16 decode normalizes any invalid input through utf16NextOrFFFD, so the
 // trie itself never sees a scalar > U+10FFFF). This wrapper lets the unit
-// test exercise the boundary directly. Gated on UNIT_TESTING so the symbol
-// never leaks into release binaries.
+// test exercise the boundary directly. The cost is one small extern function
+// in production binaries; gating on UNIT_TESTING is not viable because the
+// test DLL links against the production types.lib (which is not compiled
+// with UNIT_TESTING defined).
 extern "C" int CodepointWidthDetectorTest_ucdLookup(char32_t cp) noexcept
 {
     return ucdLookup(cp);
 }
-#endif
 
 // Decodes the next codepoint from the given UTF-16 string.
 // Returns the start of the next codepoint. Assumes `it < end`.
