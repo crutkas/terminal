@@ -695,15 +695,18 @@ constexpr int ucdToCharacterWidth(const int val) noexcept
 }
 // clang-format on
 
+#ifdef UNIT_TESTING
 // Test hook for the R7 OOB guard in ucdLookup. The constexpr function above
 // has internal linkage and is unreachable from the public detector API
 // (UTF-16 decode normalizes any invalid input through utf16NextOrFFFD, so the
 // trie itself never sees a scalar > U+10FFFF). This wrapper lets the unit
-// test exercise the boundary directly.
+// test exercise the boundary directly. Gated on UNIT_TESTING so the symbol
+// never leaks into release binaries.
 extern "C" int CodepointWidthDetectorTest_ucdLookup(char32_t cp) noexcept
 {
     return ucdLookup(cp);
 }
+#endif
 
 // Decodes the next codepoint from the given UTF-16 string.
 // Returns the start of the next codepoint. Assumes `it < end`.
@@ -1242,9 +1245,15 @@ try
         return 1;
     }
 
-    if (const auto it = _fallbackCache.find(codepoint); it != _fallbackCache.end())
+    // Read path: locked only across the lookup. Release before potentially calling
+    // the (expensive) fallback method to avoid serializing renderer/input threads
+    // on font queries.
     {
-        return it->second;
+        std::scoped_lock lock{ _fallbackCacheMutex };
+        if (const auto it = _fallbackCache.find(codepoint); it != _fallbackCache.end())
+        {
+            return it->second;
+        }
     }
 
     wchar_t buf[2];
@@ -1262,16 +1271,20 @@ try
     }
 
     const int width = _pfnFallbackMethod({ &buf[0], len }) ? 2 : 1;
-    // Bound the cache (R8): font fallback can be called with adversarial input
-    // (e.g. a stream of distinct high-planes codepoints) that would otherwise
-    // grow the cache without limit. Clear when we reach the ceiling; the
-    // typical working set is far smaller than 4096 entries and a flush
-    // on overflow costs only the next re-queries, not correctness.
-    if (_fallbackCache.size() >= 4096)
+
+    // Write path: re-lock to mutate the cache. Bound the cache (R8): font fallback
+    // can be called with adversarial input (e.g. a stream of distinct high-planes
+    // codepoints) that would otherwise grow the cache without limit. Clear when we
+    // reach the ceiling; the typical working set is far smaller than 4096 entries
+    // and a flush on overflow costs only the next re-queries, not correctness.
     {
-        _fallbackCache.clear();
+        std::scoped_lock lock{ _fallbackCacheMutex };
+        if (_fallbackCache.size() >= 4096)
+        {
+            _fallbackCache.clear();
+        }
+        _fallbackCache.insert_or_assign(codepoint, width);
     }
-    _fallbackCache.insert_or_assign(codepoint, width);
     return width;
 }
 catch (...)
@@ -1313,5 +1326,6 @@ void CodepointWidthDetector::SetFallbackMethod(std::function<bool(const std::wst
 void CodepointWidthDetector::Reset(const TextMeasurementMode mode) noexcept
 {
     _mode = mode;
+    std::scoped_lock lock{ _fallbackCacheMutex };
     _fallbackCache.clear();
 }

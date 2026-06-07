@@ -65,7 +65,11 @@ struct CodepointWidthDetector
     // Test-only accessors for the bounded fallback cache (R8). Lets the unit
     // test assert that the cache never exceeds its hard cap (4096 entries)
     // even when more distinct codepoints are routed through it.
-    size_t TestHookFallbackCacheSize() const noexcept { return _fallbackCache.size(); }
+    size_t TestHookFallbackCacheSize() const noexcept
+    {
+        std::scoped_lock lock{ _fallbackCacheMutex };
+        return _fallbackCache.size();
+    }
     int TestHookCheckFallbackViaCache(char32_t cp) noexcept { return _checkFallbackViaCache(cp); }
 #endif
 
@@ -78,6 +82,13 @@ private:
     bool _graphemePrevConsole(GraphemeState& s, const std::wstring_view& str) noexcept;
     __declspec(noinline) int _checkFallbackViaCache(char32_t codepoint) noexcept;
 
+    // Cross-thread invariant (R-thread): the singleton detector can be called
+    // concurrently from the renderer thread *and* from the console input thread
+    // (the latter via EventSynthesis::IsCharFullWidth). Guard the fallback cache
+    // with a mutex so concurrent insert_or_assign/clear from those threads is
+    // not UB. The lock is held only across cache operations — the (potentially
+    // expensive) _pfnFallbackMethod callback runs unlocked.
+    mutable std::mutex _fallbackCacheMutex;
     std::unordered_map<char32_t, int> _fallbackCache;
     std::function<bool(const std::wstring_view&)> _pfnFallbackMethod;
     TextMeasurementMode _mode = TextMeasurementMode::Graphemes;
