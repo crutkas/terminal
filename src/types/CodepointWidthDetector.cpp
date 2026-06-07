@@ -942,7 +942,6 @@ bool CodepointWidthDetector::_graphemeNext(GraphemeState& s, const std::wstring_
             width = width > 1 ? 1 : width;
         }
         width = width > 2 ? 2 : width;
-        width = width < 0 ? 0 : width;
 
         s.beg = clusterBeg;
         s.len = static_cast<int>(clusterEnd - clusterBeg);
@@ -1089,7 +1088,6 @@ bool CodepointWidthDetector::_graphemePrev(GraphemeState& s, const std::wstring_
 
         state = ~state;
         width = width > 2 ? 2 : width;
-        width = width < 0 ? 0 : width;
 
         s.beg = clusterBeg;
         s.len = static_cast<int>(clusterEnd - clusterBeg);
