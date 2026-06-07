@@ -1643,4 +1643,94 @@ class CodepointWidthDetectorTests
         VERIFY_IS_LESS_THAN_OR_EQUAL(maxObserved, cap);
         VERIFY_IS_LESS_THAN_OR_EQUAL(cwd.TestHookFallbackCacheSize(), cap);
     }
+
+    // I8 regression — EventSynthesis::IsCharFullWidth invariant.
+    //
+    // EventSynthesis.cpp now routes `IsCharFullWidth(wch)` through the singleton's
+    // GraphemeNext and tests `state.width >= 2`. The motivating defect was that the
+    // legacy hand-rolled BMP table missed Emoji_Presentation=Yes codepoints like
+    // U+231A WATCH, causing CharToKeyEvents to take the SynthesizeNumpadEvents path
+    // (treating the char as DBCS-narrow) for what is actually a wide emoji. This
+    // test pins the invariant EventSynthesis depends on: for every BMP code point
+    // with EPres=Yes, GraphemeNext on a single-wchar input must report width >= 2.
+    // A regression here would directly re-introduce the split-brain numpad routing.
+    TEST_METHOD(EventSynthesisIsCharFullWidthInvariantForEpresBmp)
+    {
+        // EPres=Yes spot checks chosen to span the BMP ranges that the legacy
+        // table missed: watch / alarm / hourglass, plus a default-emoji symbol
+        // (U+2615 HOT BEVERAGE) and the heart (U+2764, EPres=No) as a control.
+        struct Case
+        {
+            wchar_t wch;
+            bool expectedFullWidth;
+            const wchar_t* name;
+        };
+        const std::array cases{
+            Case{ L'\u231A', true, L"WATCH" },
+            Case{ L'\u23F0', true, L"ALARM CLOCK" },
+            Case{ L'\u23F3', true, L"HOURGLASS WITH FLOWING SAND" },
+            Case{ L'\u2615', true, L"HOT BEVERAGE" },
+            Case{ L'\u26A1', true, L"HIGH VOLTAGE SIGN" },
+            // Default-text emoji: EPres=No, must NOT be treated as full-width.
+            Case{ L'\u2764', false, L"HEAVY BLACK HEART (text-default)" },
+            // Plain ASCII narrow control.
+            Case{ L'A', false, L"LATIN CAPITAL A" },
+        };
+        for (const auto& c : cases)
+        {
+            CodepointWidthDetector cwd;
+            cwd.Reset(TextMeasurementMode::Graphemes);
+            GraphemeState s{};
+            cwd.GraphemeNext(s, std::wstring_view{ &c.wch, 1 });
+            const bool isFullWidth = s.width >= 2;
+            VERIFY_ARE_EQUAL(c.expectedFullWidth, isFullWidth,
+                             WEX::Common::String().Format(L"%s U+%04X width=%d", c.name, static_cast<unsigned>(c.wch), s.width));
+        }
+    }
+
+    // I6 regression — _fallbackCache must be safe under concurrent renderer-vs-input
+    // access. EventSynthesis::IsCharFullWidth now drives the singleton from the
+    // console input thread; without the mutex, racing insert_or_assign / clear with
+    // the renderer thread is undefined behavior (heap corruption). This stress test
+    // hammers TestHookCheckFallbackViaCache from N threads. Pre-mutex this would
+    // crash or trip ASan; post-mutex it completes cleanly and the bounded-cache
+    // invariant still holds.
+    TEST_METHOD(FallbackCacheIsThreadSafe)
+    {
+        CodepointWidthDetector cwd;
+        cwd.Reset(TextMeasurementMode::Console);
+        cwd.SetFallbackMethod([](const std::wstring_view& s) {
+            // Deterministic: report "wide" for codepoints whose low bit is set so
+            // we exercise both branches of the cached path.
+            return s.size() > 0 && (s[0] & 1) != 0;
+        });
+
+        constexpr int kThreads = 8;
+        constexpr int kIters = 4000;
+        std::vector<std::thread> workers;
+        workers.reserve(kThreads);
+        std::atomic<int> failures{ 0 };
+        for (int t = 0; t < kThreads; ++t)
+        {
+            workers.emplace_back([&cwd, &failures, t]() {
+                // Each thread cycles through an overlapping range so writers race.
+                for (int i = 0; i < kIters; ++i)
+                {
+                    const char32_t cp = static_cast<char32_t>(0x4000u + ((t * 13 + i) % 8192));
+                    const int w = cwd.TestHookCheckFallbackViaCache(cp);
+                    if (w != 1 && w != 2)
+                    {
+                        failures.fetch_add(1, std::memory_order_relaxed);
+                    }
+                }
+            });
+        }
+        for (auto& th : workers)
+        {
+            th.join();
+        }
+        VERIFY_ARE_EQUAL(0, failures.load());
+        // Cache bound still holds after concurrent writers.
+        VERIFY_IS_LESS_THAN_OR_EQUAL(cwd.TestHookFallbackCacheSize(), static_cast<size_t>(4096));
+    }
 };

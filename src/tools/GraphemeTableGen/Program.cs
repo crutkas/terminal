@@ -173,6 +173,14 @@ buf.Append("};\n");
 
 buf.Append("constexpr int ucdLookup(const char32_t cp) noexcept\n");
 buf.Append("{\n");
+// Defensive guard (R7): any caller passing an out-of-range scalar value
+// (e.g. a sentinel U+FFFFFFFF used to represent lone surrogates or
+// decoder errors) must not index past s_stage0. The trie below is sized
+// to cover exactly the Unicode range U+0..U+10FFFF.
+buf.Append("    if (cp > 0x10FFFF)\n");
+buf.Append("    {\n");
+buf.Append("        return 0;\n");
+buf.Append("    }\n");
 foreach (var stage in trie.Stages)
 {
     buf.Append($"    const auto s{stage.Index} = s_stage{stage.Index}[");
