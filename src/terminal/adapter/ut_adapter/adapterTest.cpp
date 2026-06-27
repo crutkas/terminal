@@ -4530,12 +4530,37 @@ public:
         VERIFY_IS_TRUE(BufferContainsColor(buffer, 0, 0, 255), L"Bare #1 must select the blue register.");
     }
 
-    // Kitty graphics protocol (APC G ... ST) reaches the handler and is acked.
+    // Kitty graphics protocol (APC G ... ST): the control block is parsed and the
+    // image id is echoed in the acknowledgement.
     TEST_METHOD(KittyGraphicsApcAcknowledged)
     {
         _testGetSet->PrepData();
         _stateMachine->ProcessString(L"\x1b_Gi=1,a=q;\x1b\\");
-        _testGetSet->ValidateInputEvent(L"\x1b_G;OK\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=1;OK\x1b\\");
+    }
+
+    // A larger image id is parsed and echoed (as decimal) in the acknowledgement.
+    TEST_METHOD(KittyGraphicsEchoesImageId)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1b_Ga=q,i=42;\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=42;OK\x1b\\");
+    }
+
+    // An image number (I=) is echoed when no image id is given.
+    TEST_METHOD(KittyGraphicsEchoesImageNumber)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1b_GI=7,a=q;\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_GI=7;OK\x1b\\");
+    }
+
+    // Quiet mode (q=1) suppresses the success acknowledgement.
+    TEST_METHOD(KittyGraphicsQuietModeSuppressesAck)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1b_Gi=1,a=q,q=1;\x1b\\");
+        VERIFY_IS_TRUE(_testGetSet->_response.empty(), L"q=1 should suppress the success acknowledgement.");
     }
 
     // An APC string with a non-'G' identifier is not Kitty graphics and is ignored.
