@@ -4869,6 +4869,55 @@ void AdaptDispatch::_ReturnDcsResponse(const std::wstring_view response) const
     _api.ReturnResponse(fmt::format(FMT_COMPILE(L"{}{}{}"), dcs, response, st));
 }
 
+void AdaptDispatch::_ReturnApcResponse(const std::wstring_view response) const
+{
+    const auto apc = _terminalInput.GetInputMode(TerminalInput::Mode::SendC1) ? L"\x9F" : L"\x1B_";
+    const auto st = _terminalInput.GetInputMode(TerminalInput::Mode::SendC1) ? L"\x9C" : L"\x1B\\";
+    _api.ReturnResponse(fmt::format(FMT_COMPILE(L"{}{}{}"), apc, response, st));
+}
+
+// Routine Description:
+// - Handles the Kitty graphics protocol (APC G <control>;<payload> ST). This is
+//   the MVP skeleton: it validates the leading 'G' identifier (anything else is
+//   a non-Kitty APC and is ignored), bounds the control block, and emits a
+//   minimal acknowledgement on the terminating ESC. Full control-key/payload
+//   parsing, an image/placement store, and rendering are added in later phases.
+// Return Value:
+// - a data string handler for the APC body, never null
+ITermDispatch::StringHandler AdaptDispatch::KittyGraphics()
+{
+    return [this, sawIdentifier = false, isKitty = false, length = size_t{ 0 }](const auto ch) mutable -> bool {
+        // The first byte is the APC identifier. Only 'G' is the Kitty graphics
+        // protocol; any other APC (tmux, iTerm2, ConEmu, FinalTerm, ...) is
+        // declined so the parser ignores the remainder.
+        if (!sawIdentifier)
+        {
+            sawIdentifier = true;
+            isKitty = (ch == L'G');
+            return isKitty;
+        }
+
+        // ESC is delivered by the parser to signal the end of the APC string.
+        if (ch == AsciiChars::ESC)
+        {
+            if (isKitty)
+            {
+                // MVP skeleton acknowledgement. Real handling echoes the image
+                // id and an OK/error code derived from the parsed control keys.
+                _ReturnApcResponse(L"G;OK");
+            }
+            return false;
+        }
+
+        // Bound the control block to defeat an unbounded-payload DoS.
+        if (++length > 4096)
+        {
+            return false;
+        }
+        return true;
+    };
+}
+
 void AdaptDispatch::_ReturnOscResponse(const std::wstring_view response) const
 {
     const auto osc = _terminalInput.GetInputMode(TerminalInput::Mode::SendC1) ? L"\x9D" : L"\x1B]";

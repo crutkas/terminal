@@ -169,6 +169,8 @@ namespace Microsoft::Console::VirtualTerminal
                                        const DispatchTypes::SixelBackground backgroundSelect,
                                        const VTParameter backgroundColor) override; // SIXEL
 
+        StringHandler KittyGraphics() override; // Kitty graphics protocol (APC G)
+
         StringHandler DownloadDRCS(const VTInt fontNumber,
                                    const VTParameter startChar,
                                    const DispatchTypes::DrcsEraseControl eraseControl,
@@ -304,6 +306,7 @@ namespace Microsoft::Console::VirtualTerminal
 
         void _ReturnCsiResponse(const std::wstring_view response) const;
         void _ReturnDcsResponse(const std::wstring_view response) const;
+        void _ReturnApcResponse(const std::wstring_view response) const;
         void _ReturnOscResponse(const std::wstring_view response) const;
 
         std::vector<uint8_t> _tabStopColumns;

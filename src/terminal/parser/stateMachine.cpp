@@ -628,6 +628,7 @@ void StateMachine::_ActionClear() noexcept
     _oscParameter = 0;
 
     _dcsStringHandler = nullptr;
+    _apcStringHandler = nullptr;
 }
 
 // Routine Description:
@@ -648,15 +649,25 @@ void StateMachine::_ActionIgnore() noexcept
 // - <none>
 // Return Value:
 // - <none>
-void StateMachine::_ActionInterrupt()
+void StateMachine::_ActionInterrupt(const bool wasEscape)
 {
-    // This is only applicable for DCS strings. OSC strings require a full
-    // ST sequence to be received before they can be dispatched.
+    // This is only applicable for DCS and APC strings. OSC strings require a
+    // full ST sequence to be received before they can be dispatched.
     if (_state == VTStates::DcsPassThrough)
     {
         // The ESC signals the end of the data string.
         _dcsStringHandler(AsciiChars::ESC);
         _dcsStringHandler = nullptr;
+    }
+    else if (_state == VTStates::ApcString && _apcStringHandler)
+    {
+        // ESC terminates the APC string and finalizes the handler; CAN/SUB
+        // cancel it without finalizing (per ECMA-48).
+        if (wasEscape)
+        {
+            _apcStringHandler(AsciiChars::ESC);
+        }
+        _apcStringHandler = nullptr;
     }
 }
 
@@ -1049,6 +1060,23 @@ void StateMachine::_EnterSosPmApcString() noexcept
 }
 
 // Routine Description:
+// - Moves the state machine into the ApcString state. Unlike SOS/PM (which are
+//   always ignored), APC is dispatched to an engine handler so the Kitty
+//   graphics protocol (APC G) can be processed. The handler validates the
+//   leading identifier byte itself, since APC has no parameter/identifier phase.
+// Arguments:
+// - <none>
+// Return Value:
+// - <none>
+void StateMachine::_EnterApcString()
+{
+    _state = VTStates::ApcString;
+    _cachedSequence.reset();
+    _apcStringHandler = _engine->ActionApcDispatch();
+    _trace.TraceStateChange(L"ApcString");
+}
+
+// Routine Description:
 // - Processes a character event into an Action that occurs while in the Ground state.
 //   Events in this state will:
 //   1. Execute C0 control characters
@@ -1140,9 +1168,13 @@ void StateMachine::_EventEscape(const wchar_t wch)
         {
             _EnterDcsEntry();
         }
-        else if (_isSosIndicator(wch) || _isPmIndicator(wch) || _isApcIndicator(wch))
+        else if (_isSosIndicator(wch) || _isPmIndicator(wch))
         {
             _EnterSosPmApcString();
+        }
+        else if (_isApcIndicator(wch))
+        {
+            _EnterApcString();
         }
         else
         {
@@ -1831,6 +1863,34 @@ void StateMachine::_EventSosPmApcString(const wchar_t /*wch*/) noexcept
 }
 
 // Routine Description:
+// - Handle the APC string. Characters are fed to the APC string handler (if the
+//   engine provided one); a handler that declines (returns false) causes the
+//   remainder of the string to be ignored. The terminating ESC is delivered to
+//   the handler via _ActionInterrupt.
+// Arguments:
+// - wch - Character that triggered the event
+// Return Value:
+// - <none>
+void StateMachine::_EventApcString(const wchar_t wch)
+{
+    _trace.TraceOnEvent(L"ApcString");
+    if (_apcStringHandler)
+    {
+        if (!_apcStringHandler(wch))
+        {
+            // The handler declined (a non-Kitty APC, or a bound was exceeded);
+            // ignore the rest of the string like an ordinary SOS/PM/APC string.
+            _apcStringHandler = nullptr;
+            _state = VTStates::SosPmApcString;
+        }
+    }
+    else
+    {
+        _ActionIgnore();
+    }
+}
+
+// Routine Description:
 // - Entry to the state machine. Takes characters one by one and processes them according to the state machine rules.
 // Arguments:
 // - wch - New character to operate upon
@@ -1849,7 +1909,7 @@ void StateMachine::ProcessCharacter(const wchar_t wch)
     // these from any state.
     if (isFromAnywhereChar && !(_state == VTStates::Escape && _isEngineForInput))
     {
-        _ActionInterrupt();
+        _ActionInterrupt(false);
         _ActionExecute(wch);
         _EnterGround();
     }
@@ -1918,6 +1978,8 @@ void StateMachine::ProcessCharacter(const wchar_t wch)
             return _EventDcsPassThrough(wch);
         case VTStates::SosPmApcString:
             return _EventSosPmApcString(wch);
+        case VTStates::ApcString:
+            return _EventApcString(wch);
         default:
             return;
         }
@@ -2073,7 +2135,7 @@ void StateMachine::ProcessString(const std::wstring_view string)
                 cacheUnusedRun = false;
             }
         }
-        else if (_state == VTStates::SosPmApcString || _state == VTStates::DcsPassThrough || _state == VTStates::DcsIgnore)
+        else if (_state == VTStates::SosPmApcString || _state == VTStates::ApcString || _state == VTStates::DcsPassThrough || _state == VTStates::DcsIgnore)
         {
             // There is no need to cache the run if we've reached one of the
             // string processing states in the output engine, since that data
