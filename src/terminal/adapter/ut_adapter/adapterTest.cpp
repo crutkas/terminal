@@ -4530,12 +4530,11 @@ public:
         VERIFY_IS_TRUE(BufferContainsColor(buffer, 0, 0, 255), L"Bare #1 must select the blue register.");
     }
 
-    // Kitty graphics protocol (APC G ... ST): the control block is parsed and the
-    // image id is echoed in the acknowledgement.
+    // Kitty graphics transmit (a=t) registers the image and echoes its id.
     TEST_METHOD(KittyGraphicsApcAcknowledged)
     {
         _testGetSet->PrepData();
-        _stateMachine->ProcessString(L"\x1b_Gi=1,a=q;\x1b\\");
+        _stateMachine->ProcessString(L"\x1b_Gi=1,a=t;\x1b\\");
         _testGetSet->ValidateInputEvent(L"\x1b_Gi=1;OK\x1b\\");
     }
 
@@ -4543,7 +4542,7 @@ public:
     TEST_METHOD(KittyGraphicsEchoesImageId)
     {
         _testGetSet->PrepData();
-        _stateMachine->ProcessString(L"\x1b_Ga=q,i=42;\x1b\\");
+        _stateMachine->ProcessString(L"\x1b_Ga=t,i=42;\x1b\\");
         _testGetSet->ValidateInputEvent(L"\x1b_Gi=42;OK\x1b\\");
     }
 
@@ -4551,7 +4550,7 @@ public:
     TEST_METHOD(KittyGraphicsEchoesImageNumber)
     {
         _testGetSet->PrepData();
-        _stateMachine->ProcessString(L"\x1b_GI=7,a=q;\x1b\\");
+        _stateMachine->ProcessString(L"\x1b_GI=7,a=t;\x1b\\");
         _testGetSet->ValidateInputEvent(L"\x1b_GI=7;OK\x1b\\");
     }
 
@@ -4559,8 +4558,37 @@ public:
     TEST_METHOD(KittyGraphicsQuietModeSuppressesAck)
     {
         _testGetSet->PrepData();
-        _stateMachine->ProcessString(L"\x1b_Gi=1,a=q,q=1;\x1b\\");
+        _stateMachine->ProcessString(L"\x1b_Gi=1,a=t,q=1;\x1b\\");
         VERIFY_IS_TRUE(_testGetSet->_response.empty(), L"q=1 should suppress the success acknowledgement.");
+    }
+
+    // Querying an image that was never transmitted reports ENOENT.
+    TEST_METHOD(KittyGraphicsQueryUnknownIsEnoent)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1b_Ga=q,i=99;\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=99;ENOENT:image not found\x1b\\");
+    }
+
+    // After transmitting an image, querying its id reports OK (found).
+    TEST_METHOD(KittyGraphicsTransmitThenQueryOk)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1b_Ga=t,i=5;\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=5;OK\x1b\\");
+        _stateMachine->ProcessString(L"\x1b_Ga=q,i=5;\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=5;OK\x1b\\");
+    }
+
+    // Deleting an image removes it from the registry (a later query is ENOENT).
+    TEST_METHOD(KittyGraphicsDeleteRemovesImage)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1b_Ga=t,i=8;\x1b\\");
+        _stateMachine->ProcessString(L"\x1b_Ga=d,i=8;\x1b\\");
+        _testGetSet->_response.clear();
+        _stateMachine->ProcessString(L"\x1b_Ga=q,i=8;\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=8;ENOENT:image not found\x1b\\");
     }
 
     // An APC string with a non-'G' identifier is not Kitty graphics and is ignored.

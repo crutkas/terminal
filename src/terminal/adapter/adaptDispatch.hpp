@@ -20,6 +20,8 @@ Author(s):
 #include "MacroBuffer.hpp"
 #include "PageManager.hpp"
 #include "terminalOutput.hpp"
+
+#include <unordered_set>
 #include "../input/terminalInput.hpp"
 #include "../../types/inc/sgrStack.hpp"
 
@@ -326,6 +328,12 @@ namespace Microsoft::Console::VirtualTerminal
         std::shared_ptr<MacroBuffer> _macroBuffer;
         std::optional<unsigned int> _initialCodePage;
         til::enumset<OptionalFeature> _optionalFeatures = { OptionalFeature::ClipboardWrite };
+
+        // Kitty graphics protocol image registry (MVP): tracks transmitted image
+        // ids and numbers so queries can report OK/ENOENT. Pixel storage and
+        // placements are added in later phases.
+        std::unordered_set<uint32_t> _kittyImageIds;
+        std::unordered_set<uint32_t> _kittyImageNumbers;
 
         // We have two instances of the saved cursor state, because we need
         // one for the main buffer (at index 0), and another for the alt buffer
