@@ -4937,6 +4937,7 @@ ITermDispatch::StringHandler AdaptDispatch::KittyGraphics()
 // - None
 void AdaptDispatch::_HandleKittyGraphics(const std::wstring_view control)
 {
+    auto action = L't'; // the default action is transmit
     uint32_t imageId = 0;
     uint32_t imageNumber = 0;
     auto quiet = 0;
@@ -4956,6 +4957,12 @@ void AdaptDispatch::_HandleKittyGraphics(const std::wstring_view control)
             const auto value = pair.substr(eq + 1);
             switch (key)
             {
+            case L'a':
+                if (!value.empty())
+                {
+                    action = value.front();
+                }
+                break;
             case L'i':
                 imageId = _ParseKittyUint(value);
                 haveId = true;
@@ -4968,7 +4975,7 @@ void AdaptDispatch::_HandleKittyGraphics(const std::wstring_view control)
                 quiet = static_cast<int>(_ParseKittyUint(value));
                 break;
             default:
-                // Other keys (a, f, t, s, v, m, ...) are not handled in this MVP chunk.
+                // Other keys (f, t, s, v, m, ...) are not handled in this MVP chunk.
                 break;
             }
         }
@@ -4979,9 +4986,56 @@ void AdaptDispatch::_HandleKittyGraphics(const std::wstring_view control)
         pos = comma + 1;
     }
 
+    // Apply the action against the image registry and determine the result code.
+    auto success = true;
+    std::wstring_view code = L"OK";
+    switch (action)
+    {
+    case L't': // transmit
+    case L'T': // transmit and display
+        // Registering an existing id replaces it (retransmit-deletes-old).
+        if (haveId)
+        {
+            _kittyImageIds.insert(imageId);
+        }
+        else if (haveNumber)
+        {
+            _kittyImageNumbers.insert(imageNumber);
+        }
+        break;
+    case L'q': // query whether the image is present
+    case L'p': // put (display) an existing image
+        if (haveId && _kittyImageIds.find(imageId) == _kittyImageIds.end())
+        {
+            success = false;
+            code = L"ENOENT:image not found";
+        }
+        else if (!haveId && haveNumber && _kittyImageNumbers.find(imageNumber) == _kittyImageNumbers.end())
+        {
+            success = false;
+            code = L"ENOENT:image not found";
+        }
+        break;
+    case L'd': // delete
+        if (haveId)
+        {
+            _kittyImageIds.erase(imageId);
+        }
+        else if (haveNumber)
+        {
+            _kittyImageNumbers.erase(imageNumber);
+        }
+        break;
+    default:
+        break;
+    }
+
     // Quiet mode: q=1 suppresses success replies; q>=2 suppresses everything.
-    // This MVP chunk only produces success ("OK") replies.
-    if (quiet >= 1)
+    if (success && quiet >= 1)
+    {
+        return;
+    }
+    if (!success && quiet >= 2)
     {
         return;
     }
@@ -4996,7 +5050,8 @@ void AdaptDispatch::_HandleKittyGraphics(const std::wstring_view control)
     {
         response += fmt::format(FMT_COMPILE(L"I={}"), imageNumber);
     }
-    response += L";OK";
+    response.push_back(L';');
+    response.append(code);
     _ReturnApcResponse(response);
 }
 
