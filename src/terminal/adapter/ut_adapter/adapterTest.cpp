@@ -4530,6 +4530,31 @@ public:
         VERIFY_IS_TRUE(BufferContainsColor(buffer, 0, 0, 255), L"Bare #1 must select the blue register.");
     }
 
+    // Kitty graphics protocol (APC G ... ST) reaches the handler and is acked.
+    TEST_METHOD(KittyGraphicsApcAcknowledged)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1b_Gi=1,a=q;\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_G;OK\x1b\\");
+    }
+
+    // An APC string with a non-'G' identifier is not Kitty graphics and is ignored.
+    TEST_METHOD(NonKittyApcIgnored)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1b_Zhello\x1b\\");
+        VERIFY_IS_TRUE(_testGetSet->_response.empty(), L"A non-Kitty APC should produce no response.");
+    }
+
+    // SOS and PM strings remain ignored (only APC is now dispatched).
+    TEST_METHOD(SosPmStringsStillIgnored)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1bXsos data\x1b\\");
+        _stateMachine->ProcessString(L"\x1b^pm data\x1b\\");
+        VERIFY_IS_TRUE(_testGetSet->_response.empty(), L"SOS/PM strings should be ignored.");
+    }
+
 private:
     TerminalInput _terminalInput;
     std::unique_ptr<TestGetSet> _testGetSet;

@@ -1022,11 +1022,11 @@ class Microsoft::Console::VirtualTerminal::OutputEngineTest final
         mach.ProcessCharacter(AsciiChars::ESC);
         VERIFY_ARE_EQUAL(mach._state, StateMachine::VTStates::Escape);
         mach.ProcessCharacter(L'_');
-        VERIFY_ARE_EQUAL(mach._state, StateMachine::VTStates::SosPmApcString);
+        VERIFY_ARE_EQUAL(mach._state, StateMachine::VTStates::ApcString);
         mach.ProcessCharacter(L'5');
-        VERIFY_ARE_EQUAL(mach._state, StateMachine::VTStates::SosPmApcString);
+        VERIFY_ARE_EQUAL(mach._state, StateMachine::VTStates::ApcString);
         mach.ProcessCharacter(L'6');
-        VERIFY_ARE_EQUAL(mach._state, StateMachine::VTStates::SosPmApcString);
+        VERIFY_ARE_EQUAL(mach._state, StateMachine::VTStates::ApcString);
         mach.ProcessCharacter(AsciiChars::ESC);
         VERIFY_ARE_EQUAL(mach._state, StateMachine::VTStates::Escape);
         mach.ProcessCharacter(L'\\');
@@ -1092,9 +1092,9 @@ class Microsoft::Console::VirtualTerminal::OutputEngineTest final
         mach.ProcessCharacter(AsciiChars::ESC);
         VERIFY_ARE_EQUAL(mach._state, StateMachine::VTStates::Escape);
         mach.ProcessCharacter(L'_');
-        VERIFY_ARE_EQUAL(mach._state, StateMachine::VTStates::SosPmApcString);
+        VERIFY_ARE_EQUAL(mach._state, StateMachine::VTStates::ApcString);
         mach.ProcessCharacter(L'3');
-        VERIFY_ARE_EQUAL(mach._state, StateMachine::VTStates::SosPmApcString);
+        VERIFY_ARE_EQUAL(mach._state, StateMachine::VTStates::ApcString);
         mach.ProcessCharacter(L'\x9c');
         VERIFY_ARE_EQUAL(mach._state, StateMachine::VTStates::Ground);
     }

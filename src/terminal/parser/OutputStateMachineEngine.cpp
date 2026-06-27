@@ -187,6 +187,17 @@ bool OutputStateMachineEngine::ActionPassThroughString(const std::wstring_view /
 }
 
 // Routine Description:
+// - Returns the handler for an APC string. APC has no identifier/parameter phase
+//   in the parser, so a single handler is returned that validates the leading
+//   identifier byte itself. The Kitty graphics protocol uses 'G'.
+// Return Value:
+// - the data string handler function or nullptr if APC is not handled
+IStateMachineEngine::StringHandler OutputStateMachineEngine::ActionApcDispatch()
+{
+    return _dispatch->KittyGraphics();
+}
+
+// Routine Description:
 // - Triggers the EscDispatch action to indicate that the listener should handle
 //      a simple escape sequence. These sequences traditionally start with ESC
 //      and a simple letter. No complicated parameters.
