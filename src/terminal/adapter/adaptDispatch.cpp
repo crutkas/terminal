@@ -4877,19 +4877,18 @@ void AdaptDispatch::_ReturnApcResponse(const std::wstring_view response) const
 }
 
 // Routine Description:
-// - Handles the Kitty graphics protocol (APC G <control>;<payload> ST). This is
-//   the MVP skeleton: it validates the leading 'G' identifier (anything else is
-//   a non-Kitty APC and is ignored), bounds the control block, and emits a
-//   minimal acknowledgement on the terminating ESC. Full control-key/payload
-//   parsing, an image/placement store, and rendering are added in later phases.
+// - Handles the Kitty graphics protocol (APC G <control>;<payload> ST). The
+//   leading 'G' identifier is validated first (any other APC is ignored). The
+//   control block (comma-separated key=value pairs up to the ';') is accumulated
+//   and parsed on the terminating ESC; the base64 payload after ';' is consumed
+//   but not yet decoded (image transmission/rendering arrives in a later phase).
 // Return Value:
-// - a data string handler for the APC body, never null
+// - a data string handler for the APC body
 ITermDispatch::StringHandler AdaptDispatch::KittyGraphics()
 {
-    return [this, sawIdentifier = false, isKitty = false, length = size_t{ 0 }](const auto ch) mutable -> bool {
-        // The first byte is the APC identifier. Only 'G' is the Kitty graphics
-        // protocol; any other APC (tmux, iTerm2, ConEmu, FinalTerm, ...) is
-        // declined so the parser ignores the remainder.
+    return [this, control = std::wstring{}, sawIdentifier = false, isKitty = false, inControl = true, total = size_t{ 0 }](const auto ch) mutable -> bool {
+        // The first byte is the APC identifier; only 'G' is Kitty graphics. Any
+        // other APC (tmux, iTerm2, ConEmu, FinalTerm, ...) is declined.
         if (!sawIdentifier)
         {
             sawIdentifier = true;
@@ -4897,25 +4896,134 @@ ITermDispatch::StringHandler AdaptDispatch::KittyGraphics()
             return isKitty;
         }
 
-        // ESC is delivered by the parser to signal the end of the APC string.
+        // ESC terminates the APC string; parse the control block and acknowledge.
         if (ch == AsciiChars::ESC)
         {
-            if (isKitty)
-            {
-                // MVP skeleton acknowledgement. Real handling echoes the image
-                // id and an OK/error code derived from the parsed control keys.
-                _ReturnApcResponse(L"G;OK");
-            }
+            _HandleKittyGraphics(control);
             return false;
         }
 
-        // Bound the control block to defeat an unbounded-payload DoS.
-        if (++length > 4096)
+        // Bound the total payload to defeat an unbounded-payload DoS.
+        if (++total > 4096)
         {
             return false;
         }
+
+        // ';' separates the control block from the (base64) payload.
+        if (ch == L';')
+        {
+            inControl = false;
+            return true;
+        }
+
+        // Accumulate the control block; the payload is consumed but ignored here.
+        if (inControl && control.size() < 1024)
+        {
+            control.push_back(ch);
+        }
         return true;
     };
+}
+
+// Routine Description:
+// - Parses a Kitty graphics control block (comma-separated key=value pairs) and
+//   emits the acknowledgement. This MVP chunk recognizes the image id (i), image
+//   number (I), and quiet mode (q) keys; unknown keys are ignored for forward
+//   compatibility. Ids are re-emitted as decimal only (never raw request bytes),
+//   and quiet mode suppresses the reply.
+// Arguments:
+// - control - the key=value control block (without the leading 'G' or payload)
+// Return Value:
+// - None
+void AdaptDispatch::_HandleKittyGraphics(const std::wstring_view control)
+{
+    uint32_t imageId = 0;
+    uint32_t imageNumber = 0;
+    auto quiet = 0;
+    auto haveId = false;
+    auto haveNumber = false;
+
+    size_t pos = 0;
+    while (pos <= control.size())
+    {
+        const auto comma = control.find(L',', pos);
+        const auto end = (comma == std::wstring_view::npos) ? control.size() : comma;
+        const auto pair = control.substr(pos, end - pos);
+        const auto eq = pair.find(L'=');
+        if (eq != std::wstring_view::npos && eq > 0)
+        {
+            const auto key = pair.front();
+            const auto value = pair.substr(eq + 1);
+            switch (key)
+            {
+            case L'i':
+                imageId = _ParseKittyUint(value);
+                haveId = true;
+                break;
+            case L'I':
+                imageNumber = _ParseKittyUint(value);
+                haveNumber = true;
+                break;
+            case L'q':
+                quiet = static_cast<int>(_ParseKittyUint(value));
+                break;
+            default:
+                // Other keys (a, f, t, s, v, m, ...) are not handled in this MVP chunk.
+                break;
+            }
+        }
+        if (comma == std::wstring_view::npos)
+        {
+            break;
+        }
+        pos = comma + 1;
+    }
+
+    // Quiet mode: q=1 suppresses success replies; q>=2 suppresses everything.
+    // This MVP chunk only produces success ("OK") replies.
+    if (quiet >= 1)
+    {
+        return;
+    }
+
+    // Build the acknowledgement, echoing the id/number as decimal only.
+    std::wstring response = L"G";
+    if (haveId)
+    {
+        response += fmt::format(FMT_COMPILE(L"i={}"), imageId);
+    }
+    else if (haveNumber)
+    {
+        response += fmt::format(FMT_COMPILE(L"I={}"), imageNumber);
+    }
+    response += L";OK";
+    _ReturnApcResponse(response);
+}
+
+// Routine Description:
+// - Parses a non-negative decimal integer from a Kitty control value, clamped to
+//   the uint32 range. Parsing stops at the first non-digit. Always noexcept.
+// Arguments:
+// - value - the textual value
+// Return Value:
+// - the parsed value, clamped to [0, 0xFFFFFFFF]
+uint32_t AdaptDispatch::_ParseKittyUint(const std::wstring_view value) noexcept
+{
+    uint64_t result = 0;
+    for (const auto ch : value)
+    {
+        if (ch < L'0' || ch > L'9')
+        {
+            break;
+        }
+        result = result * 10 + static_cast<uint64_t>(ch - L'0');
+        if (result > 0xFFFFFFFF)
+        {
+            result = 0xFFFFFFFF;
+            break;
+        }
+    }
+    return static_cast<uint32_t>(result);
 }
 
 void AdaptDispatch::_ReturnOscResponse(const std::wstring_view response) const

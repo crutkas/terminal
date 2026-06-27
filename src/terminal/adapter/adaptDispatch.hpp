@@ -307,6 +307,8 @@ namespace Microsoft::Console::VirtualTerminal
         void _ReturnCsiResponse(const std::wstring_view response) const;
         void _ReturnDcsResponse(const std::wstring_view response) const;
         void _ReturnApcResponse(const std::wstring_view response) const;
+        void _HandleKittyGraphics(const std::wstring_view control);
+        static uint32_t _ParseKittyUint(const std::wstring_view value) noexcept;
         void _ReturnOscResponse(const std::wstring_view response) const;
 
         std::vector<uint8_t> _tabStopColumns;
