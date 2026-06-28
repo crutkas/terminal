@@ -4882,11 +4882,11 @@ void AdaptDispatch::_ReturnApcResponse(const std::wstring_view response) const
 
 // Handles the Kitty graphics protocol (APC G <control>;<payload> ST). The leading
 // 'G' identifier is validated first; the control block (key=value pairs up to ';')
-// is accumulated and parsed on ESC. Payload bytes after ';' are consumed but not
-// yet decoded. The handler is exception-safe: any failure declines the rest.
+// is accumulated, and the base64 payload after ';' is collected (bounded). Both are
+// parsed on ESC. The handler is exception-safe: any failure declines the rest.
 ITermDispatch::StringHandler AdaptDispatch::KittyGraphics()
 {
-    return [this, control = std::wstring{}, sawIdentifier = false, inControl = true](const auto ch) mutable noexcept -> bool {
+    return [this, control = std::wstring{}, payload = std::string{}, sawIdentifier = false, inControl = true, payloadValid = true](const auto ch) mutable noexcept -> bool {
         try
         {
             if (!sawIdentifier)
@@ -4896,7 +4896,7 @@ ITermDispatch::StringHandler AdaptDispatch::KittyGraphics()
             }
             if (ch == AsciiChars::ESC)
             {
-                _HandleKittyGraphics(control);
+                _HandleKittyGraphics(control, payload, payloadValid);
                 return false;
             }
             if (ch == L';')
@@ -4904,10 +4904,26 @@ ITermDispatch::StringHandler AdaptDispatch::KittyGraphics()
                 inControl = false;
                 return true;
             }
-            // Bound the stored control block; payload bytes are consumed and discarded.
-            if (inControl && control.size() < 1024)
+            if (inControl)
             {
-                control.push_back(ch);
+                // Bound the stored control block; excess is ignored.
+                if (control.size() < 1024)
+                {
+                    control.push_back(ch);
+                }
+            }
+            else if (ch > 0x7F)
+            {
+                // The payload is base64 (ASCII only); anything else is invalid.
+                payloadValid = false;
+            }
+            else if (payload.size() < MaxKittyPayload)
+            {
+                payload.push_back(static_cast<char>(ch));
+            }
+            else
+            {
+                payloadValid = false;
             }
             return true;
         }
@@ -4918,17 +4934,23 @@ ITermDispatch::StringHandler AdaptDispatch::KittyGraphics()
     };
 }
 
-// Parses a Kitty graphics control block (comma-separated key=value pairs) and
-// emits the acknowledgement. Recognizes action (a), image id (i)/number (I),
-// quiet mode (q), and delete target (d); unknown keys are ignored. Ids are
+// Parses a Kitty graphics control block (comma-separated key=value pairs) and the
+// base64 payload, then emits the acknowledgement. Recognizes action (a), image
+// id (i)/number (I), quiet mode (q), delete target (d), and the transmit format
+// (f), dimensions (s,v), compression (o) and continuation (m) keys. Ids are
 // re-emitted as decimal only.
-void AdaptDispatch::_HandleKittyGraphics(const std::wstring_view control)
+void AdaptDispatch::_HandleKittyGraphics(const std::wstring_view control, const std::string_view payload, const bool payloadValid)
 {
     auto action = L't';
     auto deleteTarget = L'a';
     uint32_t imageId = 0;
     uint32_t imageNumber = 0;
     uint32_t quiet = 0;
+    uint32_t format = 32; // default pixel format is RGBA
+    uint32_t width = 0;
+    uint32_t height = 0;
+    wchar_t compression = 0; // 'z' = zlib; 0 = none
+    auto moreChunks = false;
     auto haveId = false;
     auto haveNumber = false;
 
@@ -4963,6 +4985,21 @@ void AdaptDispatch::_HandleKittyGraphics(const std::wstring_view control)
             case L'q':
                 quiet = _ParseKittyUint(value);
                 break;
+            case L'f':
+                format = _ParseKittyUint(value);
+                break;
+            case L's':
+                width = _ParseKittyUint(value);
+                break;
+            case L'v':
+                height = _ParseKittyUint(value);
+                break;
+            case L'o':
+                compression = value.front();
+                break;
+            case L'm':
+                moreChunks = _ParseKittyUint(value) != 0;
+                break;
             default:
                 break;
             }
@@ -4995,6 +5032,26 @@ void AdaptDispatch::_HandleKittyGraphics(const std::wstring_view control)
         case L't': // transmit
         case L'T': // transmit and display
         {
+            // Decode and validate the payload before registering anything.
+            std::vector<uint8_t> bytes;
+            if (!payloadValid || !_DecodeKittyBase64(payload, bytes))
+            {
+                success = false;
+                code = L"EINVAL:bad payload";
+                break;
+            }
+            // For an uncompressed, single-chunk, direct-pixel transmit with known
+            // dimensions, the payload size must match width * height * depth.
+            const auto depth = format == 24 ? 3u : (format == 32 ? 4u : 0u);
+            if (depth != 0 && compression == 0 && !moreChunks && width != 0 && height != 0)
+            {
+                if (bytes.size() != static_cast<uint64_t>(width) * height * depth)
+                {
+                    success = false;
+                    code = L"EINVAL:payload size mismatch";
+                    break;
+                }
+            }
             if (haveId)
             {
                 assignedId = imageId;
@@ -5162,6 +5219,98 @@ void AdaptDispatch::_clearKittyImages() noexcept
     _kittyImages.clear();
     _kittyImageNumbers.clear();
     _kittyImageOrder.clear();
+}
+
+// Decodes a standard base64 string (RFC 4648, '+'/'/' alphabet, '=' padding) into
+// bytes. Returns false on any invalid character, misplaced padding, or a length
+// that is not a multiple of four. An empty input decodes to zero bytes (success).
+bool AdaptDispatch::_DecodeKittyBase64(const std::string_view input, std::vector<uint8_t>& output) noexcept
+{
+    output.clear();
+    if (input.size() % 4 != 0)
+    {
+        return false;
+    }
+
+    const auto sextet = [](const char c) noexcept -> int {
+        if (c >= 'A' && c <= 'Z')
+        {
+            return c - 'A';
+        }
+        if (c >= 'a' && c <= 'z')
+        {
+            return c - 'a' + 26;
+        }
+        if (c >= '0' && c <= '9')
+        {
+            return c - '0' + 52;
+        }
+        if (c == '+')
+        {
+            return 62;
+        }
+        if (c == '/')
+        {
+            return 63;
+        }
+        return -1;
+    };
+
+    try
+    {
+        output.reserve(input.size() / 4 * 3);
+    }
+    catch (...)
+    {
+        return false;
+    }
+
+    for (size_t i = 0; i < input.size(); i += 4)
+    {
+        const auto c2 = input[i + 2];
+        const auto c3 = input[i + 3];
+        const auto v0 = sextet(input[i]);
+        const auto v1 = sextet(input[i + 1]);
+        if (v0 < 0 || v1 < 0)
+        {
+            return false;
+        }
+        // Padding ('=') is only valid in the final group, at position 3 or 2-3.
+        if (c2 == '=')
+        {
+            if (c3 != '=' || i + 4 != input.size())
+            {
+                return false;
+            }
+            output.push_back(static_cast<uint8_t>((v0 << 2) | (v1 >> 4)));
+            break;
+        }
+        const auto v2 = sextet(c2);
+        if (v2 < 0)
+        {
+            return false;
+        }
+        if (c3 == '=')
+        {
+            if (i + 4 != input.size())
+            {
+                return false;
+            }
+            output.push_back(static_cast<uint8_t>((v0 << 2) | (v1 >> 4)));
+            output.push_back(static_cast<uint8_t>((v1 << 4) | (v2 >> 2)));
+            break;
+        }
+        const auto v3 = sextet(c3);
+        if (v3 < 0)
+        {
+            return false;
+        }
+        output.push_back(static_cast<uint8_t>((v0 << 2) | (v1 >> 4)));
+        output.push_back(static_cast<uint8_t>((v1 << 4) | (v2 >> 2)));
+        output.push_back(static_cast<uint8_t>((v2 << 6) | v3));
+    }
+
+    return true;
 }
 
 void AdaptDispatch::_ReturnOscResponse(const std::wstring_view response) const

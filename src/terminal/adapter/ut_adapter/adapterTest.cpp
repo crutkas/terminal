@@ -4661,6 +4661,75 @@ public:
         VERIFY_IS_TRUE(_testGetSet->_response.empty(), L"CAN should abort the APC without an acknowledgement.");
     }
 
+    // An RGB (f=24) transmit whose base64 payload matches s*v*3 bytes is accepted.
+    TEST_METHOD(KittyGraphicsRgbPayloadSizeMatches)
+    {
+        _testGetSet->PrepData();
+        // "AAAAAAAAAAAAAAAA" decodes to 12 zero bytes == 2*2*3.
+        _stateMachine->ProcessString(L"\x1b_Ga=t,i=2,f=24,s=2,v=2;AAAAAAAAAAAAAAAA\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=2;OK\x1b\\");
+    }
+
+    // An RGBA (f=32) transmit whose base64 payload matches s*v*4 bytes is accepted.
+    TEST_METHOD(KittyGraphicsRgbaPayloadSizeMatches)
+    {
+        _testGetSet->PrepData();
+        // "AQIDBA==" decodes to 4 bytes == 1*1*4.
+        _stateMachine->ProcessString(L"\x1b_Ga=t,i=1,f=32,s=1,v=1;AQIDBA==\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=1;OK\x1b\\");
+    }
+
+    // A direct-pixel transmit whose payload size does not match the dimensions is EINVAL.
+    TEST_METHOD(KittyGraphicsPayloadSizeMismatchIsEinval)
+    {
+        _testGetSet->PrepData();
+        // 4 decoded bytes != 2*2*3 = 12.
+        _stateMachine->ProcessString(L"\x1b_Ga=t,i=3,f=24,s=2,v=2;AQIDBA==\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=3;EINVAL:payload size mismatch\x1b\\");
+    }
+
+    // A transmit with a malformed base64 payload is EINVAL.
+    TEST_METHOD(KittyGraphicsBadBase64IsEinval)
+    {
+        _testGetSet->PrepData();
+        // "AAA" is not a multiple of four base64 characters.
+        _stateMachine->ProcessString(L"\x1b_Ga=t,i=4,f=32,s=1,v=1;AAA\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=4;EINVAL:bad payload\x1b\\");
+    }
+
+    // A PNG (f=100) transmit skips the direct-pixel size check (only base64 is validated).
+    TEST_METHOD(KittyGraphicsPngTransmitSkipsSizeCheck)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1b_Ga=t,i=5,f=100,s=1,v=1;AQIDBA==\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=5;OK\x1b\\");
+    }
+
+    // A chunked transmit (m=1) defers the size check (only base64 is validated).
+    TEST_METHOD(KittyGraphicsChunkedTransmitSkipsSizeCheck)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1b_Ga=t,i=6,f=24,s=2,v=2,m=1;AQIDBA==\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=6;OK\x1b\\");
+    }
+
+    // A base64 payload containing a character outside the alphabet is EINVAL.
+    TEST_METHOD(KittyGraphicsInvalidBase64CharIsEinval)
+    {
+        _testGetSet->PrepData();
+        // '@' is not part of the base64 alphabet.
+        _stateMachine->ProcessString(L"\x1b_Ga=t,i=7,f=100;A@==\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=7;EINVAL:bad payload\x1b\\");
+    }
+
+    // A non-ASCII byte in the payload (invalid for base64) is EINVAL.
+    TEST_METHOD(KittyGraphicsNonAsciiPayloadIsEinval)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1b_Ga=t,i=8,f=100;\u00FF\u00FF\u00FF\u00FF\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=8;EINVAL:bad payload\x1b\\");
+    }
+
     // An APC string with a non-'G' identifier is not Kitty graphics and is ignored.
     TEST_METHOD(NonKittyApcIgnored)
     {
