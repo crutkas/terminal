@@ -21,7 +21,9 @@ Author(s):
 #include "PageManager.hpp"
 #include "terminalOutput.hpp"
 
-#include <unordered_set>
+#include <unordered_map>
+#include <deque>
+#include <algorithm>
 #include "../input/terminalInput.hpp"
 #include "../../types/inc/sgrStack.hpp"
 
@@ -311,6 +313,10 @@ namespace Microsoft::Console::VirtualTerminal
         void _ReturnApcResponse(const std::wstring_view response) const;
         void _HandleKittyGraphics(const std::wstring_view control);
         static uint32_t _ParseKittyUint(const std::wstring_view value) noexcept;
+        uint32_t _kittyAssignImageId();
+        void _registerKittyImage(const uint32_t id, const uint32_t number);
+        void _eraseKittyImage(const uint32_t id);
+        void _clearKittyImages() noexcept;
         void _ReturnOscResponse(const std::wstring_view response) const;
 
         std::vector<uint8_t> _tabStopColumns;
@@ -329,11 +335,13 @@ namespace Microsoft::Console::VirtualTerminal
         std::optional<unsigned int> _initialCodePage;
         til::enumset<OptionalFeature> _optionalFeatures = { OptionalFeature::ClipboardWrite };
 
-        // Kitty graphics protocol image registry (MVP): tracks transmitted image
-        // ids and numbers so queries can report OK/ENOENT. Pixel storage and
-        // placements are added in later phases.
-        std::unordered_set<uint32_t> _kittyImageIds;
-        std::unordered_set<uint32_t> _kittyImageNumbers;
+        // Kitty graphics image registry: id -> number (0 = none), with a reverse
+        // number -> id map and FIFO eviction bounded by MaxKittyImages.
+        static constexpr size_t MaxKittyImages = 4096;
+        uint32_t _kittyNextImageId = 1;
+        std::unordered_map<uint32_t, uint32_t> _kittyImages;
+        std::unordered_map<uint32_t, uint32_t> _kittyImageNumbers;
+        std::deque<uint32_t> _kittyImageOrder;
 
         // We have two instances of the saved cursor state, because we need
         // one for the main buffer (at index 0), and another for the alt buffer

@@ -3054,6 +3054,9 @@ void AdaptDispatch::HardReset(bool erase)
     // Reset the Sixel parser.
     _sixelParser = nullptr;
 
+    // Reset the Kitty graphics image registry.
+    _clearKittyImages();
+
     // Completely reset the TerminalOutput state.
     _termOutput = {};
     // Reset the code page to the default value.
@@ -4871,76 +4874,61 @@ void AdaptDispatch::_ReturnDcsResponse(const std::wstring_view response) const
 
 void AdaptDispatch::_ReturnApcResponse(const std::wstring_view response) const
 {
-    const auto apc = _terminalInput.GetInputMode(TerminalInput::Mode::SendC1) ? L"\x9F" : L"\x1B_";
-    const auto st = _terminalInput.GetInputMode(TerminalInput::Mode::SendC1) ? L"\x9C" : L"\x1B\\";
+    const auto c1 = _terminalInput.GetInputMode(TerminalInput::Mode::SendC1);
+    const auto apc = c1 ? L"\x9F" : L"\x1B_";
+    const auto st = c1 ? L"\x9C" : L"\x1B\\";
     _api.ReturnResponse(fmt::format(FMT_COMPILE(L"{}{}{}"), apc, response, st));
 }
 
-// Routine Description:
-// - Handles the Kitty graphics protocol (APC G <control>;<payload> ST). The
-//   leading 'G' identifier is validated first (any other APC is ignored). The
-//   control block (comma-separated key=value pairs up to the ';') is accumulated
-//   and parsed on the terminating ESC; the base64 payload after ';' is consumed
-//   but not yet decoded (image transmission/rendering arrives in a later phase).
-// Return Value:
-// - a data string handler for the APC body
+// Handles the Kitty graphics protocol (APC G <control>;<payload> ST). The leading
+// 'G' identifier is validated first; the control block (key=value pairs up to ';')
+// is accumulated and parsed on ESC. Payload bytes after ';' are consumed but not
+// yet decoded. The handler is exception-safe: any failure declines the rest.
 ITermDispatch::StringHandler AdaptDispatch::KittyGraphics()
 {
-    return [this, control = std::wstring{}, sawIdentifier = false, isKitty = false, inControl = true, total = size_t{ 0 }](const auto ch) mutable -> bool {
-        // The first byte is the APC identifier; only 'G' is Kitty graphics. Any
-        // other APC (tmux, iTerm2, ConEmu, FinalTerm, ...) is declined.
-        if (!sawIdentifier)
+    return [this, control = std::wstring{}, sawIdentifier = false, inControl = true](const auto ch) mutable noexcept -> bool {
+        try
         {
-            sawIdentifier = true;
-            isKitty = (ch == L'G');
-            return isKitty;
-        }
-
-        // ESC terminates the APC string; parse the control block and acknowledge.
-        if (ch == AsciiChars::ESC)
-        {
-            _HandleKittyGraphics(control);
-            return false;
-        }
-
-        // Bound the total payload to defeat an unbounded-payload DoS.
-        if (++total > 4096)
-        {
-            return false;
-        }
-
-        // ';' separates the control block from the (base64) payload.
-        if (ch == L';')
-        {
-            inControl = false;
+            if (!sawIdentifier)
+            {
+                sawIdentifier = true;
+                return ch == L'G';
+            }
+            if (ch == AsciiChars::ESC)
+            {
+                _HandleKittyGraphics(control);
+                return false;
+            }
+            if (ch == L';')
+            {
+                inControl = false;
+                return true;
+            }
+            // Bound the stored control block; payload bytes are consumed and discarded.
+            if (inControl && control.size() < 1024)
+            {
+                control.push_back(ch);
+            }
             return true;
         }
-
-        // Accumulate the control block; the payload is consumed but ignored here.
-        if (inControl && control.size() < 1024)
+        catch (...)
         {
-            control.push_back(ch);
+            return false;
         }
-        return true;
     };
 }
 
-// Routine Description:
-// - Parses a Kitty graphics control block (comma-separated key=value pairs) and
-//   emits the acknowledgement. This MVP chunk recognizes the image id (i), image
-//   number (I), and quiet mode (q) keys; unknown keys are ignored for forward
-//   compatibility. Ids are re-emitted as decimal only (never raw request bytes),
-//   and quiet mode suppresses the reply.
-// Arguments:
-// - control - the key=value control block (without the leading 'G' or payload)
-// Return Value:
-// - None
+// Parses a Kitty graphics control block (comma-separated key=value pairs) and
+// emits the acknowledgement. Recognizes action (a), image id (i)/number (I),
+// quiet mode (q), and delete target (d); unknown keys are ignored. Ids are
+// re-emitted as decimal only.
 void AdaptDispatch::_HandleKittyGraphics(const std::wstring_view control)
 {
-    auto action = L't'; // the default action is transmit
+    auto action = L't';
+    auto deleteTarget = L'a';
     uint32_t imageId = 0;
     uint32_t imageNumber = 0;
-    auto quiet = 0;
+    uint32_t quiet = 0;
     auto haveId = false;
     auto haveNumber = false;
 
@@ -4951,17 +4939,18 @@ void AdaptDispatch::_HandleKittyGraphics(const std::wstring_view control)
         const auto end = (comma == std::wstring_view::npos) ? control.size() : comma;
         const auto pair = control.substr(pos, end - pos);
         const auto eq = pair.find(L'=');
-        if (eq != std::wstring_view::npos && eq > 0)
+        // Keys are single characters with a non-empty value (e.g. "i=5").
+        if (eq == 1 && pair.size() > 2)
         {
             const auto key = pair.front();
             const auto value = pair.substr(eq + 1);
             switch (key)
             {
             case L'a':
-                if (!value.empty())
-                {
-                    action = value.front();
-                }
+                action = value.front();
+                break;
+            case L'd':
+                deleteTarget = value.front();
                 break;
             case L'i':
                 imageId = _ParseKittyUint(value);
@@ -4972,10 +4961,9 @@ void AdaptDispatch::_HandleKittyGraphics(const std::wstring_view control)
                 haveNumber = true;
                 break;
             case L'q':
-                quiet = static_cast<int>(_ParseKittyUint(value));
+                quiet = _ParseKittyUint(value);
                 break;
             default:
-                // Other keys (f, t, s, v, m, ...) are not handled in this MVP chunk.
                 break;
             }
         }
@@ -4986,48 +4974,75 @@ void AdaptDispatch::_HandleKittyGraphics(const std::wstring_view control)
         pos = comma + 1;
     }
 
-    // Apply the action against the image registry and determine the result code.
+    // A zero (or empty) id/number means "unspecified" in the kitty protocol.
+    haveId = haveId && imageId != 0;
+    haveNumber = haveNumber && imageNumber != 0;
+
     auto success = true;
     std::wstring_view code = L"OK";
-    switch (action)
+    auto assignedId = imageId; // id to report back (auto-assigned for transmit-by-number)
+
+    if (haveId && haveNumber)
     {
-    case L't': // transmit
-    case L'T': // transmit and display
-        // Registering an existing id replaces it (retransmit-deletes-old).
-        if (haveId)
+        // An image id and an image number are mutually exclusive.
+        success = false;
+        code = L"EINVAL:i and I are mutually exclusive";
+    }
+    else
+    {
+        switch (action)
         {
-            _kittyImageIds.insert(imageId);
+        case L't': // transmit
+        case L'T': // transmit and display
+        {
+            if (haveId)
+            {
+                assignedId = imageId;
+            }
+            else if (haveNumber)
+            {
+                const auto existing = _kittyImageNumbers.find(imageNumber);
+                assignedId = existing != _kittyImageNumbers.end() ? existing->second : _kittyAssignImageId();
+            }
+            else
+            {
+                assignedId = _kittyAssignImageId();
+            }
+            _registerKittyImage(assignedId, haveNumber ? imageNumber : 0);
+            break;
         }
-        else if (haveNumber)
-        {
-            _kittyImageNumbers.insert(imageNumber);
-        }
-        break;
-    case L'q': // query whether the image is present
-    case L'p': // put (display) an existing image
-        if (haveId && _kittyImageIds.find(imageId) == _kittyImageIds.end())
-        {
+        case L'q': // query: validate the request without storing -> OK
+            break;
+        case L'p': // put: the referenced image must exist
+            if (haveId ? _kittyImages.find(imageId) == _kittyImages.end() : !(haveNumber && _kittyImageNumbers.find(imageNumber) != _kittyImageNumbers.end()))
+            {
+                success = false;
+                code = L"ENOENT:image not found";
+            }
+            break;
+        case L'd': // delete
+            if (deleteTarget == L'a' || deleteTarget == L'A')
+            {
+                _clearKittyImages();
+            }
+            else if (haveId)
+            {
+                _eraseKittyImage(imageId);
+            }
+            else if (haveNumber)
+            {
+                const auto it = _kittyImageNumbers.find(imageNumber);
+                if (it != _kittyImageNumbers.end())
+                {
+                    _eraseKittyImage(it->second);
+                }
+            }
+            break;
+        default: // unrecognized action
             success = false;
-            code = L"ENOENT:image not found";
+            code = L"EINVAL:unknown action";
+            break;
         }
-        else if (!haveId && haveNumber && _kittyImageNumbers.find(imageNumber) == _kittyImageNumbers.end())
-        {
-            success = false;
-            code = L"ENOENT:image not found";
-        }
-        break;
-    case L'd': // delete
-        if (haveId)
-        {
-            _kittyImageIds.erase(imageId);
-        }
-        else if (haveNumber)
-        {
-            _kittyImageNumbers.erase(imageNumber);
-        }
-        break;
-    default:
-        break;
     }
 
     // Quiet mode: q=1 suppresses success replies; q>=2 suppresses everything.
@@ -5040,7 +5055,15 @@ void AdaptDispatch::_HandleKittyGraphics(const std::wstring_view control)
         return;
     }
 
-    // Build the acknowledgement, echoing the id/number as decimal only.
+    // Success replies are only sent when the client referenced the image by id or
+    // number; an anonymous success is silent. Errors are always reported.
+    if (success && !haveId && !haveNumber)
+    {
+        return;
+    }
+
+    // Echo the id and/or number. When only a number was given, the (possibly
+    // auto-assigned) id is reported so the client can reference the image later.
     std::wstring response = L"G";
     if (haveId)
     {
@@ -5048,7 +5071,14 @@ void AdaptDispatch::_HandleKittyGraphics(const std::wstring_view control)
     }
     else if (haveNumber)
     {
-        response += fmt::format(FMT_COMPILE(L"I={}"), imageNumber);
+        if (assignedId != 0)
+        {
+            response += fmt::format(FMT_COMPILE(L"i={},I={}"), assignedId, imageNumber);
+        }
+        else
+        {
+            response += fmt::format(FMT_COMPILE(L"I={}"), imageNumber);
+        }
     }
     response.push_back(L';');
     response.append(code);
@@ -5079,6 +5109,59 @@ uint32_t AdaptDispatch::_ParseKittyUint(const std::wstring_view value) noexcept
         }
     }
     return static_cast<uint32_t>(result);
+}
+
+// Returns an unused image id, skipping ids that are already registered.
+uint32_t AdaptDispatch::_kittyAssignImageId()
+{
+    while (_kittyImages.find(_kittyNextImageId) != _kittyImages.end() || _kittyNextImageId == 0)
+    {
+        ++_kittyNextImageId;
+    }
+    return _kittyNextImageId++;
+}
+
+// Registers (or replaces) an image id, optionally cross-referenced by number.
+// The registry is bounded; the oldest entry is evicted past MaxKittyImages.
+void AdaptDispatch::_registerKittyImage(const uint32_t id, const uint32_t number)
+{
+    if (_kittyImages.find(id) == _kittyImages.end())
+    {
+        _kittyImageOrder.push_back(id);
+        if (_kittyImageOrder.size() > MaxKittyImages)
+        {
+            _eraseKittyImage(_kittyImageOrder.front());
+        }
+    }
+    _kittyImages[id] = number;
+    if (number != 0)
+    {
+        _kittyImageNumbers[number] = id;
+    }
+}
+
+// Removes an image id and any number/order references to it.
+void AdaptDispatch::_eraseKittyImage(const uint32_t id)
+{
+    const auto it = _kittyImages.find(id);
+    if (it == _kittyImages.end())
+    {
+        return;
+    }
+    if (it->second != 0)
+    {
+        _kittyImageNumbers.erase(it->second);
+    }
+    _kittyImages.erase(it);
+    _kittyImageOrder.erase(std::remove(_kittyImageOrder.begin(), _kittyImageOrder.end(), id), _kittyImageOrder.end());
+}
+
+// Clears the entire image registry.
+void AdaptDispatch::_clearKittyImages() noexcept
+{
+    _kittyImages.clear();
+    _kittyImageNumbers.clear();
+    _kittyImageOrder.clear();
 }
 
 void AdaptDispatch::_ReturnOscResponse(const std::wstring_view response) const

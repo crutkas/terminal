@@ -4530,7 +4530,7 @@ public:
         VERIFY_IS_TRUE(BufferContainsColor(buffer, 0, 0, 255), L"Bare #1 must select the blue register.");
     }
 
-    // Kitty graphics transmit (a=t) registers the image and echoes its id.
+    // Kitty graphics transmit (a=t) with an explicit id registers the image and echoes its id.
     TEST_METHOD(KittyGraphicsApcAcknowledged)
     {
         _testGetSet->PrepData();
@@ -4546,12 +4546,20 @@ public:
         _testGetSet->ValidateInputEvent(L"\x1b_Gi=42;OK\x1b\\");
     }
 
-    // An image number (I=) is echoed when no image id is given.
-    TEST_METHOD(KittyGraphicsEchoesImageNumber)
+    // Transmitting by image number (I=) auto-assigns an id, echoed alongside the number.
+    TEST_METHOD(KittyGraphicsTransmitByNumberAssignsId)
     {
         _testGetSet->PrepData();
         _stateMachine->ProcessString(L"\x1b_GI=7,a=t;\x1b\\");
-        _testGetSet->ValidateInputEvent(L"\x1b_GI=7;OK\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=1,I=7;OK\x1b\\");
+    }
+
+    // An anonymous transmit (no id and no number) succeeds silently (no response).
+    TEST_METHOD(KittyGraphicsAnonymousTransmitIsSilent)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1b_Ga=t;\x1b\\");
+        VERIFY_IS_TRUE(_testGetSet->_response.empty(), L"An anonymous transmit should not produce a response.");
     }
 
     // Quiet mode (q=1) suppresses the success acknowledgement.
@@ -4562,33 +4570,95 @@ public:
         VERIFY_IS_TRUE(_testGetSet->_response.empty(), L"q=1 should suppress the success acknowledgement.");
     }
 
-    // Querying an image that was never transmitted reports ENOENT.
-    TEST_METHOD(KittyGraphicsQueryUnknownIsEnoent)
+    // A query (a=q) validates the request and reports OK without checking presence.
+    TEST_METHOD(KittyGraphicsQueryValidatesOk)
     {
         _testGetSet->PrepData();
         _stateMachine->ProcessString(L"\x1b_Ga=q,i=99;\x1b\\");
-        _testGetSet->ValidateInputEvent(L"\x1b_Gi=99;ENOENT:image not found\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=99;OK\x1b\\");
     }
 
-    // After transmitting an image, querying its id reports OK (found).
-    TEST_METHOD(KittyGraphicsTransmitThenQueryOk)
+    // Putting (a=p) an image that was never transmitted reports ENOENT.
+    TEST_METHOD(KittyGraphicsPutUnknownIsEnoent)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1b_Ga=p,i=50;\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=50;ENOENT:image not found\x1b\\");
+    }
+
+    // After transmitting an image, putting it reports OK (found).
+    TEST_METHOD(KittyGraphicsTransmitThenPutOk)
     {
         _testGetSet->PrepData();
         _stateMachine->ProcessString(L"\x1b_Ga=t,i=5;\x1b\\");
         _testGetSet->ValidateInputEvent(L"\x1b_Gi=5;OK\x1b\\");
-        _stateMachine->ProcessString(L"\x1b_Ga=q,i=5;\x1b\\");
+        _stateMachine->ProcessString(L"\x1b_Ga=p,i=5;\x1b\\");
         _testGetSet->ValidateInputEvent(L"\x1b_Gi=5;OK\x1b\\");
     }
 
-    // Deleting an image removes it from the registry (a later query is ENOENT).
+    // Deleting an image removes it from the registry (a later put is ENOENT).
     TEST_METHOD(KittyGraphicsDeleteRemovesImage)
     {
         _testGetSet->PrepData();
         _stateMachine->ProcessString(L"\x1b_Ga=t,i=8;\x1b\\");
         _stateMachine->ProcessString(L"\x1b_Ga=d,i=8;\x1b\\");
         _testGetSet->_response.clear();
-        _stateMachine->ProcessString(L"\x1b_Ga=q,i=8;\x1b\\");
+        _stateMachine->ProcessString(L"\x1b_Ga=p,i=8;\x1b\\");
         _testGetSet->ValidateInputEvent(L"\x1b_Gi=8;ENOENT:image not found\x1b\\");
+    }
+
+    // Delete-all (a=d,d=a) clears every registered image.
+    TEST_METHOD(KittyGraphicsDeleteAllClearsRegistry)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1b_Ga=t,i=8;\x1b\\");
+        _stateMachine->ProcessString(L"\x1b_Ga=t,i=9;\x1b\\");
+        _stateMachine->ProcessString(L"\x1b_Ga=d,d=a;\x1b\\");
+        _testGetSet->_response.clear();
+        _stateMachine->ProcessString(L"\x1b_Ga=p,i=8;\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=8;ENOENT:image not found\x1b\\");
+        _stateMachine->ProcessString(L"\x1b_Ga=p,i=9;\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=9;ENOENT:image not found\x1b\\");
+    }
+
+    // Specifying both an id and a number is invalid (EINVAL).
+    TEST_METHOD(KittyGraphicsIdAndNumberIsEinval)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1b_Ga=t,i=2,I=3;\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=2;EINVAL:i and I are mutually exclusive\x1b\\");
+    }
+
+    // An unrecognized action reports EINVAL.
+    TEST_METHOD(KittyGraphicsUnknownActionIsEinval)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1b_Ga=z,i=4;\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=4;EINVAL:unknown action\x1b\\");
+    }
+
+    // q=1 does not suppress error responses (only successes).
+    TEST_METHOD(KittyGraphicsQuietOneKeepsErrors)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1b_Ga=p,i=77,q=1;\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=77;ENOENT:image not found\x1b\\");
+    }
+
+    // q=2 suppresses error responses as well as successes.
+    TEST_METHOD(KittyGraphicsQuietTwoSuppressesErrors)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1b_Ga=p,i=77,q=2;\x1b\\");
+        VERIFY_IS_TRUE(_testGetSet->_response.empty(), L"q=2 should suppress error responses.");
+    }
+
+    // Aborting the APC string with CAN does not finalize or acknowledge it.
+    TEST_METHOD(KittyGraphicsCanAbortsWithoutAck)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1b_Gi=1,a=t\x18");
+        VERIFY_IS_TRUE(_testGetSet->_response.empty(), L"CAN should abort the APC without an acknowledgement.");
     }
 
     // An APC string with a non-'G' identifier is not Kitty graphics and is ignored.
