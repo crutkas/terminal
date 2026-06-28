@@ -311,8 +311,9 @@ namespace Microsoft::Console::VirtualTerminal
         void _ReturnCsiResponse(const std::wstring_view response) const;
         void _ReturnDcsResponse(const std::wstring_view response) const;
         void _ReturnApcResponse(const std::wstring_view response) const;
-        void _HandleKittyGraphics(const std::wstring_view control);
+        void _HandleKittyGraphics(const std::wstring_view control, const std::string_view payload, const bool payloadValid);
         static uint32_t _ParseKittyUint(const std::wstring_view value) noexcept;
+        static bool _DecodeKittyBase64(const std::string_view input, std::vector<uint8_t>& output) noexcept;
         uint32_t _kittyAssignImageId();
         void _registerKittyImage(const uint32_t id, const uint32_t number);
         void _eraseKittyImage(const uint32_t id);
@@ -338,6 +339,7 @@ namespace Microsoft::Console::VirtualTerminal
         // Kitty graphics image registry: id -> number (0 = none), with a reverse
         // number -> id map and FIFO eviction bounded by MaxKittyImages.
         static constexpr size_t MaxKittyImages = 4096;
+        static constexpr size_t MaxKittyPayload = 32 * 1024 * 1024;
         uint32_t _kittyNextImageId = 1;
         std::unordered_map<uint32_t, uint32_t> _kittyImages;
         std::unordered_map<uint32_t, uint32_t> _kittyImageNumbers;
