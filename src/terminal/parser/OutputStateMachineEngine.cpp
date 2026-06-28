@@ -187,9 +187,8 @@ bool OutputStateMachineEngine::ActionPassThroughString(const std::wstring_view /
 }
 
 // Routine Description:
-// - Returns the handler for an APC string. APC has no identifier/parameter phase
-//   in the parser, so a single handler is returned that validates the leading
-//   identifier byte itself. The Kitty graphics protocol uses 'G'.
+// - Returns the handler for an APC string. The handler validates the leading
+//   identifier byte itself (the Kitty graphics protocol uses 'G').
 // Return Value:
 // - the data string handler function or nullptr if APC is not handled
 IStateMachineEngine::StringHandler OutputStateMachineEngine::ActionApcDispatch()
