@@ -255,6 +255,11 @@ public:
         return true;
     }
 
+    til::size GetCellSize() const noexcept override
+    {
+        return _cellSize;
+    }
+
     void PrepData()
     {
         PrepData(CursorDirection::UP); // if called like this, the cursor direction doesn't matter.
@@ -417,6 +422,7 @@ public:
     bool _decodeImageSucceeds = true;
     bool _decodeImageMismatched = false;
     int _decodeImageCallCount = 0;
+    til::size _cellSize{ 10, 20 };
 
     til::enumset<Mode> _systemMode{ Mode::AutoWrap };
 
@@ -5113,6 +5119,19 @@ public:
         const auto slice = FindFirstImageSlice(*_testGetSet->_textBuffer, imageRow);
         VERIFY_IS_NOT_NULL(slice);
         VERIFY_IS_TRUE(SliceContainsColor(slice, 0, 0, 255));
+    }
+
+    // The image is laid out using the host's pixel cell size, not a hardcoded one.
+    TEST_METHOD(KittyGraphicsUsesHostCellSize)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 5, 10 };
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,f=32,s=1,v=1;/wAA/w==\x1b\\");
+        til::CoordType imageRow = -1;
+        const auto slice = FindFirstImageSlice(*_testGetSet->_textBuffer, imageRow);
+        VERIFY_IS_NOT_NULL(slice);
+        VERIFY_ARE_EQUAL((til::size{ 5, 10 }), slice->CellSize()); // host cell, not {10,20}
+        VERIFY_ARE_EQUAL(5, slice->PixelWidth()); // 1 cell * 5px
     }
 
     // A base64 payload containing a character outside the alphabet is EINVAL.

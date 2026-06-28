@@ -369,11 +369,10 @@ namespace Microsoft::Console::VirtualTerminal
         // Kitty graphics image registry. Each id maps to a KittyImage (number +
         // decoded BGRA pixels); a reverse number -> id map and FIFO/LRU eviction
         // bound the registry to MaxKittyImages entries and MaxKittyTotalBytes of
-        // decoded pixels. KittyCellSize is the assumed pixel cell.
+        // decoded pixels. The pixel cell size comes from the host (ITerminalApi).
         static constexpr size_t MaxKittyImages = 4096;
         static constexpr size_t MaxKittyPayload = 32 * 1024 * 1024;
         static constexpr size_t MaxKittyTotalBytes = 320 * 1024 * 1024;
-        static constexpr til::size KittyCellSize{ 10, 20 };
         uint32_t _kittyNextImageId = 1;
         size_t _kittyTotalPixelBytes = 0;
         std::unordered_map<uint32_t, KittyImage> _kittyImages;
