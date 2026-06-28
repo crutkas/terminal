@@ -5142,6 +5142,21 @@ void AdaptDispatch::_ProcessKittyCommand(const KittyControl& command, const std:
                     image.height = height;
                     image.pixels = _decodeKittyPixels(format, bytes);
                 }
+                else if (format == 100 && compression == 0 && !bytes.empty())
+                {
+                    // PNG: the host decodes it to premultiplied BGRA. Only store the
+                    // result if its dimensions and pixel count agree.
+                    std::vector<RGBQUAD> decoded;
+                    til::size decodedSize;
+                    if (_api.DecodeImageToBgra(bytes, decoded, decodedSize) &&
+                        decodedSize.width > 0 && decodedSize.height > 0 &&
+                        decoded.size() == static_cast<size_t>(decodedSize.width) * decodedSize.height)
+                    {
+                        image.width = static_cast<uint32_t>(decodedSize.width);
+                        image.height = static_cast<uint32_t>(decodedSize.height);
+                        image.pixels = std::move(decoded);
+                    }
+                }
                 _registerKittyImage(assignedId, std::move(image));
                 if (action == L'T')
                 {
