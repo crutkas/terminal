@@ -103,5 +103,12 @@ namespace Microsoft::Console::VirtualTerminal
         {
             return false;
         }
+
+        // Returns the pixel size of a text cell, used to lay out graphics images.
+        // The default is a reasonable fallback; hosts with real font metrics override.
+        virtual til::size GetCellSize() const noexcept
+        {
+            return { 10, 20 };
+        }
     };
 }

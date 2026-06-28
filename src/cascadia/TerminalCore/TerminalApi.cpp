@@ -461,6 +461,13 @@ catch (...)
     return false;
 }
 
+til::size Terminal::GetCellSize() const noexcept
+{
+    const auto size = _fontInfo.GetSize();
+    // Guard against a degenerate font size so image layout never divides by zero.
+    return { std::max(1, size.width), std::max(1, size.height) };
+}
+
 void Terminal::NotifyBufferRotation(const int delta)
 {
     // Update our selection, so it doesn't move as the buffer is cycled

@@ -5437,8 +5437,9 @@ void AdaptDispatch::_placeKittyImage(const KittyImage& image)
     auto page = _pages.ActivePage();
     auto& buffer = page.Buffer();
     const auto origin = page.Cursor().GetPosition();
-    const auto cellWidth = KittyCellSize.width;
-    const auto cellHeight = KittyCellSize.height;
+    const auto cellSize = _api.GetCellSize();
+    const auto cellWidth = std::max(1, cellSize.width);
+    const auto cellHeight = std::max(1, cellSize.height);
     const auto imageWidth = static_cast<til::CoordType>(image.width);
     const auto imageHeight = static_cast<til::CoordType>(image.height);
 
@@ -5464,9 +5465,9 @@ void AdaptDispatch::_placeKittyImage(const KittyImage& image)
         // Reuse an existing slice only if it shares our cell size; otherwise the
         // write stride (the slice's cell size) and extent (ours) would disagree and
         // overflow the slice buffer.
-        if (!dstSlice || dstSlice->CellSize() != KittyCellSize)
+        if (!dstSlice || dstSlice->CellSize() != cellSize)
         {
-            dstSlice = dstRow.SetImageSlice(std::make_unique<ImageSlice>(KittyCellSize));
+            dstSlice = dstRow.SetImageSlice(std::make_unique<ImageSlice>(cellSize));
         }
         auto dstIterator = dstSlice->MutablePixels(columnBegin, columnEnd);
         for (auto pixelRow = 0; pixelRow < cellHeight; ++pixelRow)
