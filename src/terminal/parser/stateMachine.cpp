@@ -1060,10 +1060,9 @@ void StateMachine::_EnterSosPmApcString() noexcept
 }
 
 // Routine Description:
-// - Moves the state machine into the ApcString state. Unlike SOS/PM (which are
-//   always ignored), APC is dispatched to an engine handler so the Kitty
-//   graphics protocol (APC G) can be processed. The handler validates the
-//   leading identifier byte itself, since APC has no parameter/identifier phase.
+// - Moves the state machine into the ApcString state. Unlike SOS/PM (always
+//   ignored), APC is dispatched to an engine handler so the Kitty graphics
+//   protocol (APC G) can be processed.
 // Arguments:
 // - <none>
 // Return Value:
