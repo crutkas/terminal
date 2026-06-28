@@ -5128,12 +5128,11 @@ void AdaptDispatch::_ProcessKittyCommand(const KittyControl& command, const std:
                     break;
                 }
             }
-            // Query validates only. Transmit assigns a fresh id (an image number
-            // always yields a new id), decodes and stores the pixels, and (a=T)
-            // displays the image.
+            // Query validates only. Transmit decodes and stores the pixels, then
+            // assigns a fresh id (an image number always yields a new id) and (a=T)
+            // displays the image. The id is assigned only after a successful decode.
             if (action != L'q')
             {
-                assignedId = haveId ? imageId : _kittyAssignImageId();
                 KittyImage image;
                 image.number = haveNumber ? imageNumber : 0;
                 if (directPixels)
@@ -5142,13 +5141,15 @@ void AdaptDispatch::_ProcessKittyCommand(const KittyControl& command, const std:
                     image.height = height;
                     image.pixels = _decodeKittyPixels(format, bytes);
                 }
-                else if (format == 100 && compression == 0 && !bytes.empty())
+                else if (format == 100)
                 {
-                    // PNG: the host decodes it to premultiplied BGRA. Only store the
-                    // result if its dimensions and pixel count agree.
+                    // f=100 is PNG; the host decodes it to premultiplied BGRA. A
+                    // compressed (o=z), empty, or undecodable payload is reported as
+                    // an error rather than silently stored as an empty image.
                     std::vector<RGBQUAD> decoded;
                     til::size decodedSize;
-                    if (_api.DecodeImageToBgra(bytes, decoded, decodedSize) &&
+                    if (compression == 0 && !bytes.empty() &&
+                        _api.DecodeImageToBgra(bytes, decoded, decodedSize) &&
                         decodedSize.width > 0 && decodedSize.height > 0 &&
                         decoded.size() == static_cast<size_t>(decodedSize.width) * decodedSize.height)
                     {
@@ -5156,7 +5157,14 @@ void AdaptDispatch::_ProcessKittyCommand(const KittyControl& command, const std:
                         image.height = static_cast<uint32_t>(decodedSize.height);
                         image.pixels = std::move(decoded);
                     }
+                    else
+                    {
+                        success = false;
+                        code = L"EBADPNG:could not decode image";
+                        break;
+                    }
                 }
+                assignedId = haveId ? imageId : _kittyAssignImageId();
                 _registerKittyImage(assignedId, std::move(image));
                 if (action == L'T')
                 {
@@ -5305,28 +5313,37 @@ uint32_t AdaptDispatch::_kittyAssignImageId()
 void AdaptDispatch::_registerKittyImage(const uint32_t id, KittyImage&& image)
 {
     const auto number = image.number;
+    const auto newBytes = image.pixels.size() * sizeof(RGBQUAD);
     const auto existing = _kittyImages.find(id);
-    if (existing == _kittyImages.end())
+    if (existing != _kittyImages.end())
     {
-        _kittyImageOrder.push_back(id);
-        if (_kittyImageOrder.size() > MaxKittyImages)
+        // Replacing an existing id: account for its old pixels, drop any stale
+        // reverse mapping, and move it to the most-recent position in the order.
+        _kittyTotalPixelBytes -= existing->second.pixels.size() * sizeof(RGBQUAD);
+        if (existing->second.number != 0 && existing->second.number != number)
         {
-            _eraseKittyImage(_kittyImageOrder.front());
+            const auto rev = _kittyImageNumbers.find(existing->second.number);
+            if (rev != _kittyImageNumbers.end() && rev->second == id)
+            {
+                _kittyImageNumbers.erase(rev);
+            }
         }
+        _kittyImageOrder.erase(std::remove(_kittyImageOrder.begin(), _kittyImageOrder.end(), id), _kittyImageOrder.end());
     }
-    else if (existing->second.number != 0 && existing->second.number != number)
-    {
-        // This id previously had a different number; drop its stale reverse entry.
-        const auto rev = _kittyImageNumbers.find(existing->second.number);
-        if (rev != _kittyImageNumbers.end() && rev->second == id)
-        {
-            _kittyImageNumbers.erase(rev);
-        }
-    }
+    _kittyImageOrder.push_back(id);
     _kittyImages[id] = std::move(image);
+    _kittyTotalPixelBytes += newBytes;
     if (number != 0)
     {
         _kittyImageNumbers[number] = id;
+    }
+
+    // Evict the oldest images until within both the count and memory budgets,
+    // always keeping the image we just added.
+    while (_kittyImageOrder.size() > 1 &&
+           (_kittyImageOrder.size() > MaxKittyImages || _kittyTotalPixelBytes > MaxKittyTotalBytes))
+    {
+        _eraseKittyImage(_kittyImageOrder.front());
     }
 }
 
@@ -5338,6 +5355,7 @@ void AdaptDispatch::_eraseKittyImage(const uint32_t id)
     {
         return;
     }
+    _kittyTotalPixelBytes -= it->second.pixels.size() * sizeof(RGBQUAD);
     // Only drop the reverse entry if it still points at this id (a newer image
     // may have taken over the number).
     if (it->second.number != 0)
@@ -5358,6 +5376,7 @@ void AdaptDispatch::_clearKittyImages() noexcept
     _kittyImages.clear();
     _kittyImageNumbers.clear();
     _kittyImageOrder.clear();
+    _kittyTotalPixelBytes = 0;
 }
 
 // Discards any in-progress chunked transmission, releasing its payload buffer.

@@ -242,13 +242,16 @@ public:
     bool DecodeImageToBgra(const std::span<const uint8_t> data, std::vector<RGBQUAD>& pixels, til::size& size) noexcept override
     {
         Log::Comment(L"DecodeImageToBgra MOCK called...");
+        _decodeImageCallCount++;
         if (!_decodeImageSucceeds || data.empty())
         {
             return false;
         }
         // Return a fixed 2x2 opaque blue image so tests can verify the PNG path.
         size = { 2, 2 };
-        pixels.assign(4, RGBQUAD{ 255, 0, 0, 255 });
+        // When asked, return an inconsistent pixel count (3 != 2*2) to exercise the
+        // adapter's host-contract guard.
+        pixels.assign(_decodeImageMismatched ? 3 : 4, RGBQUAD{ 255, 0, 0, 255 });
         return true;
     }
 
@@ -412,6 +415,8 @@ public:
     bool _returnResponseResult = false;
 
     bool _decodeImageSucceeds = true;
+    bool _decodeImageMismatched = false;
+    int _decodeImageCallCount = 0;
 
     til::enumset<Mode> _systemMode{ Mode::AutoWrap };
 
@@ -5017,14 +5022,97 @@ public:
         VERIFY_ARE_EQUAL(1, CountImageRows(buffer)); // 2px tall => 1 row
     }
 
-    // When the host cannot decode a PNG, the transmit still succeeds but nothing shows.
-    TEST_METHOD(KittyGraphicsPngDecodeFailureNoDisplay)
+    // When the host cannot decode a PNG, the transmit reports EBADPNG and stores nothing.
+    TEST_METHOD(KittyGraphicsPngDecodeFailureIsError)
     {
         _testGetSet->PrepData();
         _testGetSet->_decodeImageSucceeds = false;
         _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,f=100;iVBORw0K\x1b\\");
-        _testGetSet->ValidateInputEvent(L"\x1b_Gi=1;OK\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=1;EBADPNG:could not decode image\x1b\\");
         VERIFY_ARE_EQUAL(0, CountImageRows(*_testGetSet->_textBuffer));
+        // The failed image must not be registered (no phantom entry).
+        _stateMachine->ProcessString(L"\x1b_Ga=p,i=1;\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=1;ENOENT:image not found\x1b\\");
+    }
+
+    // For PNG the host's decoded dimensions are authoritative; client s/v are ignored.
+    TEST_METHOD(KittyGraphicsPngIgnoresClientSizeUsesHostDims)
+    {
+        _testGetSet->PrepData();
+        // Client claims 25x40 (would be 3 columns, 2 rows); host decodes 2x2
+        // (1 column, 1 row). The render must reflect the host's 2x2.
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,f=100,s=25,v=40;iVBORw0K\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=1;OK\x1b\\");
+        const auto& buffer = *_testGetSet->_textBuffer;
+        til::CoordType imageRow = -1;
+        const auto slice = FindFirstImageSlice(buffer, imageRow);
+        VERIFY_IS_NOT_NULL(slice);
+        VERIFY_ARE_EQUAL(10, slice->PixelWidth()); // 1 cell (host 2px), not 30 (client 25px)
+        VERIFY_ARE_EQUAL(1, CountImageRows(buffer)); // host 2px => 1 row, not client 40px => 2
+    }
+
+    // A host decode whose pixel count disagrees with its dimensions is rejected.
+    TEST_METHOD(KittyGraphicsPngInconsistentDecodeRejected)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_decodeImageMismatched = true; // returns 3 pixels for a 2x2 size
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,f=100;iVBORw0K\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=1;EBADPNG:could not decode image\x1b\\");
+        VERIFY_ARE_EQUAL(0, CountImageRows(*_testGetSet->_textBuffer));
+    }
+
+    // A query (a=q) never invokes the host decoder.
+    TEST_METHOD(KittyGraphicsPngQueryDoesNotDecode)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1b_Ga=q,i=1,f=100;iVBORw0K\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=1;OK\x1b\\");
+        VERIFY_ARE_EQUAL(0, _testGetSet->_decodeImageCallCount);
+    }
+
+    // A compressed (o=z) PNG is rejected until zlib support exists.
+    TEST_METHOD(KittyGraphicsPngZlibRejected)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,f=100,o=z;iVBORw0K\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=1;EBADPNG:could not decode image\x1b\\");
+    }
+
+    // PNG transmit-by-number assigns a fresh id and displays the decoded image.
+    TEST_METHOD(KittyGraphicsPngTransmitByNumberDisplays)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1b_Ga=T,I=5,f=100;iVBORw0K\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=1,I=5;OK\x1b\\");
+        til::CoordType imageRow = -1;
+        const auto slice = FindFirstImageSlice(*_testGetSet->_textBuffer, imageRow);
+        VERIFY_IS_NOT_NULL(slice);
+        VERIFY_IS_TRUE(SliceContainsColor(slice, 0, 0, 255));
+    }
+
+    // A stored PNG (a=t) is displayed later by a=p.
+    TEST_METHOD(KittyGraphicsPngPutDisplaysStored)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1b_Ga=t,i=2,f=100;iVBORw0K\x1b\\");
+        VERIFY_ARE_EQUAL(0, CountImageRows(*_testGetSet->_textBuffer));
+        _stateMachine->ProcessString(L"\x1b_Ga=p,i=2;\x1b\\");
+        til::CoordType imageRow = -1;
+        const auto slice = FindFirstImageSlice(*_testGetSet->_textBuffer, imageRow);
+        VERIFY_IS_NOT_NULL(slice);
+        VERIFY_IS_TRUE(SliceContainsColor(slice, 0, 0, 255));
+    }
+
+    // A PNG transmitted in chunks is assembled, decoded, and displayed.
+    TEST_METHOD(KittyGraphicsPngChunkedTransmitDisplays)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,f=100,m=1;iVBO\x1b\\");
+        _stateMachine->ProcessString(L"\x1b_Gm=0;Rw0K\x1b\\");
+        til::CoordType imageRow = -1;
+        const auto slice = FindFirstImageSlice(*_testGetSet->_textBuffer, imageRow);
+        VERIFY_IS_NOT_NULL(slice);
+        VERIFY_IS_TRUE(SliceContainsColor(slice, 0, 0, 255));
     }
 
     // A base64 payload containing a character outside the alphabet is EINVAL.
@@ -5177,6 +5265,24 @@ public:
         _testGetSet->ValidateInputEvent(L"\x1b_Gi=1;ENOENT:image not found\x1b\\");
         _stateMachine->ProcessString(L"\x1b_Ga=p,i=4097;\x1b\\");
         _testGetSet->ValidateInputEvent(L"\x1b_Gi=4097;OK\x1b\\");
+    }
+
+    // Re-transmitting an image moves it to the most-recent position, so it survives
+    // eviction while the next-oldest image is evicted instead.
+    TEST_METHOD(KittyGraphicsRetransmitMovesToBackOfEviction)
+    {
+        _testGetSet->PrepData();
+        for (auto i = 1; i <= 4096; ++i)
+        {
+            _stateMachine->ProcessString(L"\x1b_Ga=t,i=" + std::to_wstring(i) + L";\x1b\\");
+        }
+        _stateMachine->ProcessString(L"\x1b_Ga=t,i=1;\x1b\\"); // re-transmit -> moves id 1 to back
+        _stateMachine->ProcessString(L"\x1b_Ga=t,i=4097;\x1b\\"); // over cap -> evicts the new front (id 2)
+        _testGetSet->_response.clear();
+        _stateMachine->ProcessString(L"\x1b_Ga=p,i=1;\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=1;OK\x1b\\"); // survived
+        _stateMachine->ProcessString(L"\x1b_Ga=p,i=2;\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=2;ENOENT:image not found\x1b\\"); // evicted
     }
 
     // An APC string with a non-'G' identifier is not Kitty graphics and is ignored.

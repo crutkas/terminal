@@ -422,6 +422,14 @@ try
     wil::com_ptr<IWICBitmapDecoder> decoder;
     THROW_IF_FAILED(factory->CreateDecoderFromStream(stream.get(), nullptr, WICDecodeMetadataCacheOnDemand, decoder.addressof()));
 
+    // Kitty's f=100 means PNG specifically; reject any other container WIC accepts.
+    GUID container{};
+    THROW_IF_FAILED(decoder->GetContainerFormat(&container));
+    if (container != GUID_ContainerFormatPng)
+    {
+        return false;
+    }
+
     wil::com_ptr<IWICBitmapFrameDecode> frame;
     THROW_IF_FAILED(decoder->GetFrame(0, frame.addressof()));
 
