@@ -39,6 +39,8 @@ namespace TerminalCoreUnitTests
 
         TEST_METHOD(SetTaskbarProgress);
         TEST_METHOD(SetWorkingDirectory);
+
+        TEST_METHOD(GetCellSizeFallsBackWhenFontUnset);
     };
 };
 
@@ -390,4 +392,18 @@ void TerminalCoreUnitTests::TerminalApiTest::SetWorkingDirectory()
 
     stateMachine.ProcessString(L"\x1b]9;9;D:\\中文\x1b\\");
     VERIFY_ARE_EQUAL(term.GetWorkingDirectory(), L"D:\\中文");
+}
+
+void TerminalApiTest::GetCellSizeFallsBackWhenFontUnset()
+{
+    Terminal term{ Terminal::TestDummyMarker{} };
+    DummyRenderer renderer{ &term };
+    term.Create({ 100, 100 }, 0, renderer);
+
+    // Before the renderer reports the real font, _fontInfo is a placeholder whose
+    // width is 0. GetCellSize must fall back to a real grid, not a degenerate 1px
+    // cell that would stretch Kitty/Sixel images ~cell-width times horizontally.
+    const auto cellSize = term.GetCellSize();
+    VERIFY_IS_GREATER_THAN(cellSize.width, 1, L"cell width must not be a degenerate 1px");
+    VERIFY_IS_GREATER_THAN(cellSize.height, 1, L"cell height must not be a degenerate 1px");
 }
