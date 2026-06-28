@@ -4954,6 +4954,10 @@ AdaptDispatch::KittyControl AdaptDispatch::_ParseKittyControl(const std::wstring
         {
             const auto key = pair.front();
             const auto value = pair.substr(eq + 1);
+            if (key != L'm')
+            {
+                c.hasNonChunkKey = true; // distinguishes a fresh command from an 'm=' continuation
+            }
             switch (key)
             {
             case L'a':
@@ -4985,6 +4989,12 @@ AdaptDispatch::KittyControl AdaptDispatch::_ParseKittyControl(const std::wstring
             case L'o':
                 c.compression = value.front();
                 break;
+            case L't':
+                c.medium = value.front();
+                break;
+            case L'C':
+                c.noCursorMovement = _ParseKittyUint(value) != 0;
+                break;
             case L'm':
                 c.moreChunks = _ParseKittyUint(value) != 0;
                 c.mPresent = true;
@@ -5013,9 +5023,11 @@ void AdaptDispatch::_HandleKittyGraphics(const std::wstring_view control, const 
 {
     const auto command = _ParseKittyControl(control);
 
-    // A command with no 'm' key is not a continuation chunk; if a transfer is in
-    // progress it has been abandoned, so drop it and process this command normally.
-    if (_kittyChunkActive && !command.mPresent)
+    // Only a bare 'm='-prefixed sequence continues an in-progress transfer. Any other
+    // command starts fresh, so if a transfer is already active it was orphaned (e.g.
+    // its APC was aborted mid-stream) and its stale state must be discarded first.
+    const auto isContinuation = command.mPresent && !command.hasNonChunkKey;
+    if (_kittyChunkActive && !isContinuation)
     {
         _clearKittyChunk();
     }
@@ -5074,6 +5086,8 @@ void AdaptDispatch::_ProcessKittyCommand(const KittyControl& command, const std:
     const auto compression = command.compression;
     const auto haveId = command.haveId;
     const auto haveNumber = command.haveNumber;
+    const auto medium = command.medium;
+    const auto moveCursor = !command.noCursorMovement;
 
     auto success = true;
     std::wstring_view code = L"OK";
@@ -5100,8 +5114,17 @@ void AdaptDispatch::_ProcessKittyCommand(const KittyControl& command, const std:
                 code = L"EINVAL:unsupported format";
                 break;
             }
-            if (compression != 0 && compression != L'z')
+            if (medium != L'd')
             {
+                // Only direct (t=d) transmission is supported; file/temp/shared-memory
+                // media are deferred and rejected (no file-access code is linked).
+                success = false;
+                code = L"EINVAL:unsupported transmission medium";
+                break;
+            }
+            if (compression != 0)
+            {
+                // o=z (zlib) is deferred; reject it rather than store an empty image.
                 success = false;
                 code = L"EINVAL:unsupported compression";
                 break;
@@ -5112,14 +5135,19 @@ void AdaptDispatch::_ProcessKittyCommand(const KittyControl& command, const std:
                 code = L"EINVAL:bad payload";
                 break;
             }
-            // For an uncompressed, direct-pixel transmit with known dimensions, the
-            // payload must be exactly width * height * depth bytes (reaching here
-            // implies the command is fully assembled, so m is no longer relevant).
-            // Compare via division so hostile dimensions cannot overflow.
+            // Raw pixel formats (f=24/32) require positive dimensions and an exact
+            // payload of width * height * depth bytes; compare via division so hostile
+            // dimensions cannot overflow. (o=z was already rejected, so depth==direct.)
             const auto depth = format == 24 ? 3u : (format == 32 ? 4u : 0u);
-            const auto directPixels = depth != 0 && compression == 0 && width != 0 && height != 0;
+            const auto directPixels = depth != 0;
             if (directPixels)
             {
+                if (width == 0 || height == 0)
+                {
+                    success = false;
+                    code = L"EINVAL:missing dimensions";
+                    break;
+                }
                 const auto area = static_cast<uint64_t>(width) * height;
                 if (area > bytes.size() / depth || area * depth != bytes.size())
                 {
@@ -5128,9 +5156,8 @@ void AdaptDispatch::_ProcessKittyCommand(const KittyControl& command, const std:
                     break;
                 }
             }
-            // Query validates only. Transmit decodes and stores the pixels, then
-            // assigns a fresh id (an image number always yields a new id) and (a=T)
-            // displays the image. The id is assigned only after a successful decode.
+            // Query (a=q) validates only; transmit decodes and stores the pixels, assigns
+            // a fresh id (a number always yields a new id), and for a=T displays the image.
             if (action != L'q')
             {
                 KittyImage image;
@@ -5143,12 +5170,11 @@ void AdaptDispatch::_ProcessKittyCommand(const KittyControl& command, const std:
                 }
                 else if (format == 100)
                 {
-                    // f=100 is PNG; the host decodes it to premultiplied BGRA. A
-                    // compressed (o=z), empty, or undecodable payload is reported as
-                    // an error rather than silently stored as an empty image.
+                    // f=100 is PNG; the host decodes it to premultiplied BGRA. An empty
+                    // or undecodable payload is an error, not a silently-empty image.
                     std::vector<RGBQUAD> decoded;
                     til::size decodedSize;
-                    if (compression == 0 && !bytes.empty() &&
+                    if (!bytes.empty() &&
                         _api.DecodeImageToBgra(bytes, decoded, decodedSize) &&
                         decodedSize.width > 0 && decodedSize.height > 0 &&
                         decoded.size() == static_cast<size_t>(decodedSize.width) * decodedSize.height)
@@ -5171,7 +5197,7 @@ void AdaptDispatch::_ProcessKittyCommand(const KittyControl& command, const std:
                     const auto stored = _kittyImages.find(assignedId);
                     if (stored != _kittyImages.end())
                     {
-                        _placeKittyImage(stored->second);
+                        _placeKittyImage(stored->second, moveCursor);
                     }
                 }
             }
@@ -5207,26 +5233,49 @@ void AdaptDispatch::_ProcessKittyCommand(const KittyControl& command, const std:
             }
             else
             {
-                _placeKittyImage(*target);
+                _placeKittyImage(*target, moveCursor);
             }
             break;
         }
         case L'd': // delete
-            if (deleteTarget == L'a' || deleteTarget == L'A')
+            switch (deleteTarget)
             {
+            case L'a': // all images (the default when d= is omitted)
+            case L'A':
                 _clearKittyImages();
-            }
-            else if (haveId)
-            {
-                _eraseKittyImage(imageId);
-            }
-            else if (haveNumber)
-            {
-                const auto it = _kittyImageNumbers.find(imageNumber);
-                if (it != _kittyImageNumbers.end())
+                break;
+            case L'i': // by image id
+            case L'I':
+                if (haveId)
                 {
-                    _eraseKittyImage(it->second);
+                    _eraseKittyImage(imageId);
                 }
+                else
+                {
+                    success = false;
+                    code = L"EINVAL:delete by id requires i";
+                }
+                break;
+            case L'n': // by image number
+            case L'N':
+                if (haveNumber)
+                {
+                    const auto it = _kittyImageNumbers.find(imageNumber);
+                    if (it != _kittyImageNumbers.end())
+                    {
+                        _eraseKittyImage(it->second);
+                    }
+                }
+                else
+                {
+                    success = false;
+                    code = L"EINVAL:delete by number requires I";
+                }
+                break;
+            default: // positional (d=p) and other selectors are not in this MVP
+                success = false;
+                code = L"EINVAL:unsupported delete target";
+                break;
             }
             break;
         default: // unrecognized action
@@ -5247,8 +5296,9 @@ void AdaptDispatch::_ProcessKittyCommand(const KittyControl& command, const std:
     }
 
     // Success replies are only sent when the client referenced the image by id or
-    // number; an anonymous success is silent. Errors are always reported.
-    if (success && !haveId && !haveNumber)
+    // number; an anonymous success is silent, except a query, which always answers.
+    // Errors are always reported.
+    if (success && !haveId && !haveNumber && action != L'q')
     {
         return;
     }
@@ -5314,22 +5364,9 @@ void AdaptDispatch::_registerKittyImage(const uint32_t id, KittyImage&& image)
 {
     const auto number = image.number;
     const auto newBytes = image.pixels.size() * sizeof(RGBQUAD);
-    const auto existing = _kittyImages.find(id);
-    if (existing != _kittyImages.end())
-    {
-        // Replacing an existing id: account for its old pixels, drop any stale
-        // reverse mapping, and move it to the most-recent position in the order.
-        _kittyTotalPixelBytes -= existing->second.pixels.size() * sizeof(RGBQUAD);
-        if (existing->second.number != 0 && existing->second.number != number)
-        {
-            const auto rev = _kittyImageNumbers.find(existing->second.number);
-            if (rev != _kittyImageNumbers.end() && rev->second == id)
-            {
-                _kittyImageNumbers.erase(rev);
-            }
-        }
-        _kittyImageOrder.erase(std::remove(_kittyImageOrder.begin(), _kittyImageOrder.end(), id), _kittyImageOrder.end());
-    }
+    // Replacing an existing id: erase it first so the byte total, reverse number map,
+    // and LRU order stay consistent, then re-add it at the most-recent position.
+    _eraseKittyImage(id);
     _kittyImageOrder.push_back(id);
     _kittyImages[id] = std::move(image);
     _kittyTotalPixelBytes += newBytes;
@@ -5367,7 +5404,15 @@ void AdaptDispatch::_eraseKittyImage(const uint32_t id)
         }
     }
     _kittyImages.erase(it);
-    _kittyImageOrder.erase(std::remove(_kittyImageOrder.begin(), _kittyImageOrder.end(), id), _kittyImageOrder.end());
+    // The eviction path always removes the front, so keep that common case O(1).
+    if (!_kittyImageOrder.empty() && _kittyImageOrder.front() == id)
+    {
+        _kittyImageOrder.pop_front();
+    }
+    else
+    {
+        _kittyImageOrder.erase(std::remove(_kittyImageOrder.begin(), _kittyImageOrder.end(), id), _kittyImageOrder.end());
+    }
 }
 
 // Clears the entire image registry.
@@ -5425,9 +5470,10 @@ std::vector<RGBQUAD> AdaptDispatch::_decodeKittyPixels(const uint32_t format, co
     return pixels;
 }
 
-// Draws a stored image at the cursor, one ImageSlice per text row (reusing the same
-// row-based image mechanism as Sixel), then moves the cursor below the image.
-void AdaptDispatch::_placeKittyImage(const KittyImage& image)
+// Draws a stored image at the cursor as one ImageSlice per text row (the same row
+// image mechanism as Sixel). Unless moveCursor is false (C=1), the cursor then
+// advances right by the column span and down by the row span, per the kitty spec.
+void AdaptDispatch::_placeKittyImage(const KittyImage& image, const bool moveCursor)
 {
     if (image.pixels.empty() || image.width == 0 || image.height == 0)
     {
@@ -5440,6 +5486,9 @@ void AdaptDispatch::_placeKittyImage(const KittyImage& image)
     const auto cellSize = _api.GetCellSize();
     const auto cellWidth = std::max(1, cellSize.width);
     const auto cellHeight = std::max(1, cellSize.height);
+    // Use the clamped cell size for the slice so its stride always matches the write
+    // loop below, even if the host ever reported a zero/negative cell dimension.
+    const til::size clampedCellSize{ cellWidth, cellHeight };
     const auto imageWidth = static_cast<til::CoordType>(image.width);
     const auto imageHeight = static_cast<til::CoordType>(image.height);
 
@@ -5462,12 +5511,11 @@ void AdaptDispatch::_placeKittyImage(const KittyImage& image)
         }
         auto& dstRow = buffer.GetMutableRowByOffset(rowOffset);
         auto dstSlice = dstRow.GetMutableImageSlice();
-        // Reuse an existing slice only if it shares our cell size; otherwise the
-        // write stride (the slice's cell size) and extent (ours) would disagree and
-        // overflow the slice buffer.
-        if (!dstSlice || dstSlice->CellSize() != cellSize)
+        // Reuse an existing slice only if it shares our (clamped) cell size; a stride
+        // vs. extent mismatch would otherwise overflow the slice buffer.
+        if (!dstSlice || dstSlice->CellSize() != clampedCellSize)
         {
-            dstSlice = dstRow.SetImageSlice(std::make_unique<ImageSlice>(cellSize));
+            dstSlice = dstRow.SetImageSlice(std::make_unique<ImageSlice>(clampedCellSize));
         }
         auto dstIterator = dstSlice->MutablePixels(columnBegin, columnEnd);
         for (auto pixelRow = 0; pixelRow < cellHeight; ++pixelRow)
@@ -5488,15 +5536,23 @@ void AdaptDispatch::_placeKittyImage(const KittyImage& image)
             {
                 til::at(dstIterator, pixelColumn) = image.pixels[srcRowStart + pixelColumn];
             }
-            std::advance(dstIterator, dstSlice->PixelWidth());
+            // Advance to the next pixel row, but not past the end of the final row
+            // (forming a past-the-end iterator would be undefined behavior).
+            if (pixelRow + 1 < cellHeight)
+            {
+                std::advance(dstIterator, dstSlice->PixelWidth());
+            }
         }
     }
 
     const auto bottomRow = std::min(origin.y + rows, page.Bottom());
     buffer.TriggerRedraw(Viewport::FromExclusive({ 0, origin.y, page.Width(), bottomRow }));
-    // Per the kitty spec, the cursor moves right by the column span and down by the
-    // row span of the placement (clamped to the page).
-    page.Cursor().SetPosition({ std::min(columnEnd, page.Width() - 1), std::min(origin.y + rows, page.Bottom() - 1) });
+    if (moveCursor)
+    {
+        // Per the kitty spec, the cursor moves right by the column span and down by
+        // the row span of the placement (clamped to the page).
+        page.Cursor().SetPosition({ std::min(columnEnd, page.Width() - 1), std::min(origin.y + rows, page.Bottom() - 1) });
+    }
 }
 
 // Decodes a standard base64 string (RFC 4648, '+'/'/' alphabet, '=' padding) into

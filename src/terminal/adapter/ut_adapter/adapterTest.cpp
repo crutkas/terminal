@@ -4560,7 +4560,7 @@ public:
     TEST_METHOD(KittyGraphicsApcAcknowledged)
     {
         _testGetSet->PrepData();
-        _stateMachine->ProcessString(L"\x1b_Gi=1,a=t;\x1b\\");
+        _stateMachine->ProcessString(L"\x1b_Gi=1,a=t,f=24,s=1,v=1;AAAA\x1b\\");
         _testGetSet->ValidateInputEvent(L"\x1b_Gi=1;OK\x1b\\");
     }
 
@@ -4568,7 +4568,7 @@ public:
     TEST_METHOD(KittyGraphicsEchoesImageId)
     {
         _testGetSet->PrepData();
-        _stateMachine->ProcessString(L"\x1b_Ga=t,i=42;\x1b\\");
+        _stateMachine->ProcessString(L"\x1b_Ga=t,i=42,f=24,s=1,v=1;AAAA\x1b\\");
         _testGetSet->ValidateInputEvent(L"\x1b_Gi=42;OK\x1b\\");
     }
 
@@ -4576,7 +4576,7 @@ public:
     TEST_METHOD(KittyGraphicsTransmitByNumberAssignsId)
     {
         _testGetSet->PrepData();
-        _stateMachine->ProcessString(L"\x1b_GI=7,a=t;\x1b\\");
+        _stateMachine->ProcessString(L"\x1b_GI=7,a=t,f=24,s=1,v=1;AAAA\x1b\\");
         _testGetSet->ValidateInputEvent(L"\x1b_Gi=1,I=7;OK\x1b\\");
     }
 
@@ -4584,7 +4584,7 @@ public:
     TEST_METHOD(KittyGraphicsAnonymousTransmitIsSilent)
     {
         _testGetSet->PrepData();
-        _stateMachine->ProcessString(L"\x1b_Ga=t;\x1b\\");
+        _stateMachine->ProcessString(L"\x1b_Ga=t,f=24,s=1,v=1;AAAA\x1b\\");
         VERIFY_IS_TRUE(_testGetSet->_response.empty(), L"An anonymous transmit should not produce a response.");
     }
 
@@ -4592,7 +4592,7 @@ public:
     TEST_METHOD(KittyGraphicsQuietModeSuppressesAck)
     {
         _testGetSet->PrepData();
-        _stateMachine->ProcessString(L"\x1b_Gi=1,a=t,q=1;\x1b\\");
+        _stateMachine->ProcessString(L"\x1b_Gi=1,a=t,q=1,f=24,s=1,v=1;AAAA\x1b\\");
         VERIFY_IS_TRUE(_testGetSet->_response.empty(), L"q=1 should suppress the success acknowledgement.");
     }
 
@@ -4600,7 +4600,7 @@ public:
     TEST_METHOD(KittyGraphicsQueryValidatesOk)
     {
         _testGetSet->PrepData();
-        _stateMachine->ProcessString(L"\x1b_Ga=q,i=99;\x1b\\");
+        _stateMachine->ProcessString(L"\x1b_Ga=q,i=99,f=24,s=1,v=1;AAAA\x1b\\");
         _testGetSet->ValidateInputEvent(L"\x1b_Gi=99;OK\x1b\\");
     }
 
@@ -4616,7 +4616,7 @@ public:
     TEST_METHOD(KittyGraphicsTransmitThenPutOk)
     {
         _testGetSet->PrepData();
-        _stateMachine->ProcessString(L"\x1b_Ga=t,i=5;\x1b\\");
+        _stateMachine->ProcessString(L"\x1b_Ga=t,i=5,f=24,s=1,v=1;AAAA\x1b\\");
         _testGetSet->ValidateInputEvent(L"\x1b_Gi=5;OK\x1b\\");
         _stateMachine->ProcessString(L"\x1b_Ga=p,i=5;\x1b\\");
         _testGetSet->ValidateInputEvent(L"\x1b_Gi=5;OK\x1b\\");
@@ -4626,8 +4626,8 @@ public:
     TEST_METHOD(KittyGraphicsDeleteByIdPreservesOthers)
     {
         _testGetSet->PrepData();
-        _stateMachine->ProcessString(L"\x1b_Ga=t,i=8;\x1b\\");
-        _stateMachine->ProcessString(L"\x1b_Ga=t,i=9;\x1b\\");
+        _stateMachine->ProcessString(L"\x1b_Ga=t,i=8,f=24,s=1,v=1;AAAA\x1b\\");
+        _stateMachine->ProcessString(L"\x1b_Ga=t,i=9,f=24,s=1,v=1;AAAA\x1b\\");
         _stateMachine->ProcessString(L"\x1b_Ga=d,d=i,i=8;\x1b\\");
         _testGetSet->_response.clear();
         _stateMachine->ProcessString(L"\x1b_Ga=p,i=8;\x1b\\");
@@ -4640,8 +4640,8 @@ public:
     TEST_METHOD(KittyGraphicsDeleteAllClearsRegistry)
     {
         _testGetSet->PrepData();
-        _stateMachine->ProcessString(L"\x1b_Ga=t,i=8;\x1b\\");
-        _stateMachine->ProcessString(L"\x1b_Ga=t,i=9;\x1b\\");
+        _stateMachine->ProcessString(L"\x1b_Ga=t,i=8,f=24,s=1,v=1;AAAA\x1b\\");
+        _stateMachine->ProcessString(L"\x1b_Ga=t,i=9,f=24,s=1,v=1;AAAA\x1b\\");
         _stateMachine->ProcessString(L"\x1b_Ga=d,d=a;\x1b\\");
         _testGetSet->_response.clear();
         _stateMachine->ProcessString(L"\x1b_Ga=p,i=8;\x1b\\");
@@ -4999,7 +4999,7 @@ public:
     {
         _testGetSet->PrepData();
         _stateMachine->ProcessString(L"\x1b_Ga=t,i=1,f=24,m=1;/wAA\x1b\\"); // start a transfer
-        _stateMachine->ProcessString(L"\x1b_Ga=q,i=5;\x1b\\"); // no m -> discard + run
+        _stateMachine->ProcessString(L"\x1b_Ga=q,i=5,f=24,s=1,v=1;AAAA\x1b\\"); // no m -> discard + run
         _testGetSet->ValidateInputEvent(L"\x1b_Gi=5;OK\x1b\\");
     }
 
@@ -5081,7 +5081,7 @@ public:
     {
         _testGetSet->PrepData();
         _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,f=100,o=z;iVBORw0K\x1b\\");
-        _testGetSet->ValidateInputEvent(L"\x1b_Gi=1;EBADPNG:could not decode image\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=1;EINVAL:unsupported compression\x1b\\");
     }
 
     // PNG transmit-by-number assigns a fresh id and displays the decoded image.
@@ -5155,9 +5155,9 @@ public:
     TEST_METHOD(KittyGraphicsTransmitByNumberNewIdEachTime)
     {
         _testGetSet->PrepData();
-        _stateMachine->ProcessString(L"\x1b_Ga=t,I=7;\x1b\\");
+        _stateMachine->ProcessString(L"\x1b_Ga=t,I=7,f=24,s=1,v=1;AAAA\x1b\\");
         _testGetSet->ValidateInputEvent(L"\x1b_Gi=1,I=7;OK\x1b\\");
-        _stateMachine->ProcessString(L"\x1b_Ga=t,I=7;\x1b\\");
+        _stateMachine->ProcessString(L"\x1b_Ga=t,I=7,f=24,s=1,v=1;AAAA\x1b\\");
         _testGetSet->ValidateInputEvent(L"\x1b_Gi=2,I=7;OK\x1b\\");
     }
 
@@ -5165,8 +5165,8 @@ public:
     TEST_METHOD(KittyGraphicsDeleteByNumber)
     {
         _testGetSet->PrepData();
-        _stateMachine->ProcessString(L"\x1b_Ga=t,I=7;\x1b\\");
-        _stateMachine->ProcessString(L"\x1b_Ga=t,I=8;\x1b\\");
+        _stateMachine->ProcessString(L"\x1b_Ga=t,I=7,f=24,s=1,v=1;AAAA\x1b\\");
+        _stateMachine->ProcessString(L"\x1b_Ga=t,I=8,f=24,s=1,v=1;AAAA\x1b\\");
         _stateMachine->ProcessString(L"\x1b_Ga=d,d=n,I=7;\x1b\\");
         _testGetSet->_response.clear();
         _stateMachine->ProcessString(L"\x1b_Ga=p,I=7;\x1b\\");
@@ -5179,7 +5179,7 @@ public:
     TEST_METHOD(KittyGraphicsHardResetClearsRegistry)
     {
         _testGetSet->PrepData();
-        _stateMachine->ProcessString(L"\x1b_Ga=t,i=5;\x1b\\");
+        _stateMachine->ProcessString(L"\x1b_Ga=t,i=5,f=24,s=1,v=1;AAAA\x1b\\");
         _testGetSet->ValidateInputEvent(L"\x1b_Gi=5;OK\x1b\\");
         _pDispatch->HardReset(true);
         _testGetSet->_response.clear();
@@ -5193,7 +5193,7 @@ public:
         _testGetSet->PrepData();
         _testGetSet->_expectedCodePage = CP_UTF8; // required to enable C1 output
         _stateMachine->ProcessString(L"\x1b G"); // S8C1T: select 8-bit C1 controls
-        _stateMachine->ProcessString(L"\x1b_Gi=1,a=t;\x1b\\");
+        _stateMachine->ProcessString(L"\x1b_Gi=1,a=t,f=24,s=1,v=1;AAAA\x1b\\");
         _testGetSet->ValidateInputEvent(L"\x9fGi=1;OK\x9c");
     }
 
@@ -5201,7 +5201,7 @@ public:
     TEST_METHOD(KittyGraphicsParseUintClamps)
     {
         _testGetSet->PrepData();
-        _stateMachine->ProcessString(L"\x1b_Ga=t,i=99999999999999999999;\x1b\\");
+        _stateMachine->ProcessString(L"\x1b_Ga=t,i=99999999999999999999,f=24,s=1,v=1;AAAA\x1b\\");
         _testGetSet->ValidateInputEvent(L"\x1b_Gi=4294967295;OK\x1b\\");
     }
 
@@ -5214,12 +5214,12 @@ public:
         _testGetSet->ValidateInputEvent(L"\x1b_Gi=12;OK\x1b\\");
     }
 
-    // Compression (o=z) defers the direct-pixel size check.
-    TEST_METHOD(KittyGraphicsCompressionDefersSizeCheck)
+    // Compression (o=z, zlib) is deferred and rejected with EINVAL until implemented.
+    TEST_METHOD(KittyGraphicsZlibCompressionIsEinval)
     {
         _testGetSet->PrepData();
         _stateMachine->ProcessString(L"\x1b_Ga=t,i=13,f=24,s=2,v=2,o=z;AQIDBA==\x1b\\");
-        _testGetSet->ValidateInputEvent(L"\x1b_Gi=13;OK\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=13;EINVAL:unsupported compression\x1b\\");
     }
 
     // A query (a=q) validates the payload like a transmit; malformed base64 is EINVAL.
@@ -5258,7 +5258,7 @@ public:
     TEST_METHOD(KittyGraphicsMultiCharKeyIgnored)
     {
         _testGetSet->PrepData();
-        _stateMachine->ProcessString(L"\x1b_Ga=t,ab=5,zz,i=1;\x1b\\");
+        _stateMachine->ProcessString(L"\x1b_Ga=t,ab=5,zz,i=1,f=24,s=1,v=1;AAAA\x1b\\");
         _testGetSet->ValidateInputEvent(L"\x1b_Gi=1;OK\x1b\\");
     }
 
@@ -5277,7 +5277,7 @@ public:
         _testGetSet->PrepData();
         for (auto i = 1; i <= 4097; ++i)
         {
-            _stateMachine->ProcessString(L"\x1b_Ga=t,i=" + std::to_wstring(i) + L";\x1b\\");
+            _stateMachine->ProcessString(L"\x1b_Ga=t,i=" + std::to_wstring(i) + L",f=24,s=1,v=1;AAAA\x1b\\");
         }
         _testGetSet->_response.clear();
         _stateMachine->ProcessString(L"\x1b_Ga=p,i=1;\x1b\\");
@@ -5293,15 +5293,139 @@ public:
         _testGetSet->PrepData();
         for (auto i = 1; i <= 4096; ++i)
         {
-            _stateMachine->ProcessString(L"\x1b_Ga=t,i=" + std::to_wstring(i) + L";\x1b\\");
+            _stateMachine->ProcessString(L"\x1b_Ga=t,i=" + std::to_wstring(i) + L",f=24,s=1,v=1;AAAA\x1b\\");
         }
-        _stateMachine->ProcessString(L"\x1b_Ga=t,i=1;\x1b\\"); // re-transmit -> moves id 1 to back
-        _stateMachine->ProcessString(L"\x1b_Ga=t,i=4097;\x1b\\"); // over cap -> evicts the new front (id 2)
+        _stateMachine->ProcessString(L"\x1b_Ga=t,i=1,f=24,s=1,v=1;AAAA\x1b\\"); // re-transmit -> moves id 1 to back
+        _stateMachine->ProcessString(L"\x1b_Ga=t,i=4097,f=24,s=1,v=1;AAAA\x1b\\"); // over cap -> evicts the new front (id 2)
         _testGetSet->_response.clear();
         _stateMachine->ProcessString(L"\x1b_Ga=p,i=1;\x1b\\");
         _testGetSet->ValidateInputEvent(L"\x1b_Gi=1;OK\x1b\\"); // survived
         _stateMachine->ProcessString(L"\x1b_Ga=p,i=2;\x1b\\");
         _testGetSet->ValidateInputEvent(L"\x1b_Gi=2;ENOENT:image not found\x1b\\"); // evicted
+    }
+
+    // A raw (f=24/32) transmit without dimensions is rejected, not stored empty.
+    TEST_METHOD(KittyGraphicsMissingDimensionsIsEinval)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1b_Ga=t,i=1,f=24;AAAA\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=1;EINVAL:missing dimensions\x1b\\");
+    }
+
+    // Only direct (t=d) transmission is supported; file/temp/shm media are rejected.
+    TEST_METHOD(KittyGraphicsUnsupportedMediumIsEinval)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1b_Ga=t,i=1,f=24,s=1,v=1,t=f;AAAA\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=1;EINVAL:unsupported transmission medium\x1b\\");
+    }
+
+    // An unsupported delete target (e.g. positional d=p) is rejected, not acted on.
+    TEST_METHOD(KittyGraphicsDeleteUnsupportedTargetIsEinval)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1b_Ga=d,d=p,i=5;\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=5;EINVAL:unsupported delete target\x1b\\");
+    }
+
+    // Delete-by-id (d=i) without an id is rejected.
+    TEST_METHOD(KittyGraphicsDeleteByIdRequiresId)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1b_Ga=d,d=i;\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_G;EINVAL:delete by id requires i\x1b\\");
+    }
+
+    // With C=1 the cursor stays put after a placement, but the image still renders.
+    TEST_METHOD(KittyGraphicsCursorPolicyNoMove)
+    {
+        _testGetSet->PrepData();
+        _pDispatch->CursorPosition(1, 4);
+        const auto before = _testGetSet->_textBuffer->GetCursor().GetPosition();
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,f=24,s=1,v=1,C=1;/wAA\x1b\\");
+        const auto after = _testGetSet->_textBuffer->GetCursor().GetPosition();
+        VERIFY_ARE_EQUAL(before.x, after.x);
+        VERIFY_ARE_EQUAL(before.y, after.y);
+        VERIFY_IS_TRUE(BufferContainsColor(*_testGetSet->_textBuffer, 255, 0, 0));
+    }
+
+    // Placing over a row whose slice has a different cell size replaces the slice
+    // (the stride must match the write extent, or the slice buffer would overflow).
+    TEST_METHOD(KittyGraphicsCellSizeMismatchReplacesSlice)
+    {
+        _testGetSet->PrepData();
+        _pDispatch->CursorPosition(2, 1);
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,f=24,s=1,v=1,C=1;/wAA\x1b\\"); // cell {10,20}
+        _testGetSet->_cellSize = { 5, 10 };
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=2,f=24,s=1,v=1,C=1;AP8A\x1b\\"); // same row, new size
+        const auto& buffer = *_testGetSet->_textBuffer;
+        til::CoordType row = -1;
+        const auto slice = FindFirstImageSlice(buffer, row);
+        VERIFY_IS_NOT_NULL(slice);
+        VERIFY_ARE_EQUAL(5, slice->CellSize().width);
+        VERIFY_ARE_EQUAL(10, slice->CellSize().height);
+    }
+
+    // An image wider than the remaining columns is clipped to the page, not overflowed.
+    TEST_METHOD(KittyGraphicsClipsAtRightEdge)
+    {
+        _testGetSet->PrepData();
+        const auto width = _testGetSet->_textBuffer->GetSize().Width();
+        _pDispatch->CursorPosition(1, width); // last column
+        std::wstring payload;
+        for (auto i = 0; i < 30; ++i)
+        {
+            payload += L"/wAA"; // 30px-wide red image (3 cells at cellWidth 10)
+        }
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,f=24,s=30,v=1;" + payload + L"\x1b\\");
+        const auto& buffer = *_testGetSet->_textBuffer;
+        til::CoordType row = -1;
+        const auto slice = FindFirstImageSlice(buffer, row);
+        VERIFY_IS_NOT_NULL(slice);
+        VERIFY_ARE_EQUAL(width - 1, buffer.GetCursor().GetPosition().x); // clamped to last column
+    }
+
+    // An image taller than the remaining rows is clipped at the bottom of the page.
+    TEST_METHOD(KittyGraphicsClipsAtBottomEdge)
+    {
+        _testGetSet->PrepData();
+        _pDispatch->CursorPosition(9999, 1); // clamps to the last page row
+        std::wstring payload;
+        for (auto i = 0; i < 40; ++i)
+        {
+            payload += L"/wAA"; // 1px wide x 40px tall => 2 rows
+        }
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,f=24,s=1,v=40;" + payload + L"\x1b\\");
+        VERIFY_ARE_EQUAL(1, CountImageRows(*_testGetSet->_textBuffer)); // clipped to one row
+    }
+
+    // The decoded-byte total tracks transmit, replace, and delete, so the memory
+    // budget cannot be silently bypassed (e.g. by re-transmitting the same id).
+    TEST_METHOD(KittyGraphicsByteAccounting)
+    {
+        _testGetSet->PrepData();
+        VERIFY_ARE_EQUAL(static_cast<size_t>(0), _pDispatch->_kittyTotalPixelBytes);
+        // 2x2 RGBA = 4 px stored as 4 RGBQUAD = 16 bytes.
+        _stateMachine->ProcessString(L"\x1b_Ga=t,i=1,f=32,s=2,v=2;AAAAAAAAAAAAAAAAAAAAAA==\x1b\\");
+        VERIFY_ARE_EQUAL(static_cast<size_t>(16), _pDispatch->_kittyTotalPixelBytes);
+        _stateMachine->ProcessString(L"\x1b_Ga=t,i=1,f=32,s=2,v=2;AAAAAAAAAAAAAAAAAAAAAA==\x1b\\"); // replace
+        VERIFY_ARE_EQUAL(static_cast<size_t>(16), _pDispatch->_kittyTotalPixelBytes);
+        _stateMachine->ProcessString(L"\x1b_Ga=d,d=i,i=1;\x1b\\"); // delete frees bytes
+        VERIFY_ARE_EQUAL(static_cast<size_t>(0), _pDispatch->_kittyTotalPixelBytes);
+    }
+
+    // A new self-describing transfer discards an orphaned chunked transfer (e.g. one
+    // whose APC was aborted) rather than concatenating into its stale buffer.
+    TEST_METHOD(KittyGraphicsNewTransferResetsOrphanedChunk)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1b_Ga=t,i=1,f=24,s=2,v=2,m=1;/wAA\x1b\\"); // orphaned (no m=0)
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=2,f=24,s=1,v=1;AP8A\x1b\\");      // fresh transfer
+        _testGetSet->_response.clear();
+        _stateMachine->ProcessString(L"\x1b_Ga=p,i=2;\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=2;OK\x1b\\");          // id 2 registered cleanly
+        _stateMachine->ProcessString(L"\x1b_Ga=p,i=1;\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=1;ENOENT:image not found\x1b\\"); // id 1 discarded
     }
 
     // An APC string with a non-'G' identifier is not Kitty graphics and is ignored.
