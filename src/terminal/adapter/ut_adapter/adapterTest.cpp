@@ -4754,6 +4754,74 @@ public:
         _testGetSet->ValidateInputEvent(L"\x1b_Gi=10;OK\x1b\\");
     }
 
+    // Transmit-and-display (a=T) of a 1x1 RGBA red image renders a red pixel.
+    TEST_METHOD(KittyGraphicsTransmitAndDisplayRendersPixels)
+    {
+        _testGetSet->PrepData();
+        // "/wAA/w==" decodes to RGBA {255,0,0,255} (opaque red).
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,f=32,s=1,v=1;/wAA/w==\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=1;OK\x1b\\");
+        const auto& buffer = *_testGetSet->_textBuffer;
+        til::CoordType imageRow = -1;
+        const auto slice = FindFirstImageSlice(buffer, imageRow);
+        VERIFY_IS_NOT_NULL(slice, L"a=T should place an image slice in the buffer.");
+        VERIFY_IS_TRUE(SliceContainsColor(slice, 255, 0, 0), L"The placed image should contain the red pixel.");
+        VERIFY_ARE_EQUAL(1, CountImageRows(buffer));
+    }
+
+    // A plain transmit (a=t) stores but does not display; a=p then displays it.
+    TEST_METHOD(KittyGraphicsPutDisplaysStoredImage)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1b_Ga=t,i=2,f=32,s=1,v=1;/wAA/w==\x1b\\");
+        VERIFY_ARE_EQUAL(0, CountImageRows(*_testGetSet->_textBuffer)); // a=t must not display
+        _stateMachine->ProcessString(L"\x1b_Ga=p,i=2;\x1b\\");
+        const auto& buffer = *_testGetSet->_textBuffer;
+        til::CoordType imageRow = -1;
+        const auto slice = FindFirstImageSlice(buffer, imageRow);
+        VERIFY_IS_NOT_NULL(slice, L"a=p should display the stored image.");
+        VERIFY_IS_TRUE(SliceContainsColor(slice, 255, 0, 0));
+    }
+
+    // An RGB (f=24) image renders the same red pixel (alpha implied opaque).
+    TEST_METHOD(KittyGraphicsRgbImageDisplays)
+    {
+        _testGetSet->PrepData();
+        // "/wAA" decodes to RGB {255,0,0}.
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=3,f=24,s=1,v=1;/wAA\x1b\\");
+        const auto& buffer = *_testGetSet->_textBuffer;
+        til::CoordType imageRow = -1;
+        const auto slice = FindFirstImageSlice(buffer, imageRow);
+        VERIFY_IS_NOT_NULL(slice);
+        VERIFY_IS_TRUE(SliceContainsColor(slice, 255, 0, 0));
+    }
+
+    // A 40px-tall image (cell height 20) spans two text rows.
+    TEST_METHOD(KittyGraphicsTallImageSpansRows)
+    {
+        _testGetSet->PrepData();
+        std::wstring payload;
+        for (auto i = 0; i < 40; ++i)
+        {
+            payload += L"/wAA"; // 40 red RGB pixels arranged 1 wide x 40 tall
+        }
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=4,f=24,s=1,v=40;" + payload + L"\x1b\\");
+        VERIFY_ARE_EQUAL(2, CountImageRows(*_testGetSet->_textBuffer));
+    }
+
+    // The image is placed starting at the cursor's column.
+    TEST_METHOD(KittyGraphicsImagePlacedAtCursorColumn)
+    {
+        _testGetSet->PrepData();
+        _pDispatch->CursorPosition(1, 6); // row 1, column 6 (1-based) => column 5
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=5,f=32,s=1,v=1;/wAA/w==\x1b\\");
+        const auto& buffer = *_testGetSet->_textBuffer;
+        til::CoordType imageRow = -1;
+        const auto slice = FindFirstImageSlice(buffer, imageRow);
+        VERIFY_IS_NOT_NULL(slice);
+        VERIFY_ARE_EQUAL(5, slice->ColumnOffset());
+    }
+
     // A base64 payload containing a character outside the alphabet is EINVAL.
     TEST_METHOD(KittyGraphicsInvalidBase64CharIsEinval)
     {
