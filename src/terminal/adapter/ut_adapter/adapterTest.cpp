@@ -4596,15 +4596,18 @@ public:
         _testGetSet->ValidateInputEvent(L"\x1b_Gi=5;OK\x1b\\");
     }
 
-    // Deleting an image removes it from the registry (a later put is ENOENT).
-    TEST_METHOD(KittyGraphicsDeleteRemovesImage)
+    // Deleting by id (d=i) removes only the targeted image; others survive.
+    TEST_METHOD(KittyGraphicsDeleteByIdPreservesOthers)
     {
         _testGetSet->PrepData();
         _stateMachine->ProcessString(L"\x1b_Ga=t,i=8;\x1b\\");
-        _stateMachine->ProcessString(L"\x1b_Ga=d,i=8;\x1b\\");
+        _stateMachine->ProcessString(L"\x1b_Ga=t,i=9;\x1b\\");
+        _stateMachine->ProcessString(L"\x1b_Ga=d,d=i,i=8;\x1b\\");
         _testGetSet->_response.clear();
         _stateMachine->ProcessString(L"\x1b_Ga=p,i=8;\x1b\\");
         _testGetSet->ValidateInputEvent(L"\x1b_Gi=8;ENOENT:image not found\x1b\\");
+        _stateMachine->ProcessString(L"\x1b_Ga=p,i=9;\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=9;OK\x1b\\");
     }
 
     // Delete-all (a=d,d=a) clears every registered image.
@@ -4728,6 +4731,141 @@ public:
         _testGetSet->PrepData();
         _stateMachine->ProcessString(L"\x1b_Ga=t,i=8,f=100;\u00FF\u00FF\u00FF\u00FF\x1b\\");
         _testGetSet->ValidateInputEvent(L"\x1b_Gi=8;EINVAL:bad payload\x1b\\");
+    }
+
+    // Each transmit by image number assigns a fresh id; the number tracks the newest.
+    TEST_METHOD(KittyGraphicsTransmitByNumberNewIdEachTime)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1b_Ga=t,I=7;\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=1,I=7;OK\x1b\\");
+        _stateMachine->ProcessString(L"\x1b_Ga=t,I=7;\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=2,I=7;OK\x1b\\");
+    }
+
+    // Delete by number (d=n) removes only the targeted image; others survive.
+    TEST_METHOD(KittyGraphicsDeleteByNumber)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1b_Ga=t,I=7;\x1b\\");
+        _stateMachine->ProcessString(L"\x1b_Ga=t,I=8;\x1b\\");
+        _stateMachine->ProcessString(L"\x1b_Ga=d,d=n,I=7;\x1b\\");
+        _testGetSet->_response.clear();
+        _stateMachine->ProcessString(L"\x1b_Ga=p,I=7;\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_GI=7;ENOENT:image not found\x1b\\");
+        _stateMachine->ProcessString(L"\x1b_Ga=p,I=8;\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_GI=8;OK\x1b\\");
+    }
+
+    // A hard reset (RIS) clears the image registry.
+    TEST_METHOD(KittyGraphicsHardResetClearsRegistry)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1b_Ga=t,i=5;\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=5;OK\x1b\\");
+        _pDispatch->HardReset(true);
+        _testGetSet->_response.clear();
+        _stateMachine->ProcessString(L"\x1b_Ga=p,i=5;\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=5;ENOENT:image not found\x1b\\");
+    }
+
+    // In 8-bit C1 mode the acknowledgement is framed with APC (0x9F) and ST (0x9C).
+    TEST_METHOD(KittyGraphicsSendC1Framing)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_expectedCodePage = CP_UTF8; // required to enable C1 output
+        _stateMachine->ProcessString(L"\x1b G"); // S8C1T: select 8-bit C1 controls
+        _stateMachine->ProcessString(L"\x1b_Gi=1,a=t;\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x9fGi=1;OK\x9c");
+    }
+
+    // An out-of-range image id is clamped to the uint32 maximum.
+    TEST_METHOD(KittyGraphicsParseUintClamps)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1b_Ga=t,i=99999999999999999999;\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=4294967295;OK\x1b\\");
+    }
+
+    // A single-pad (one '=') base64 group decodes to a two-byte final group.
+    TEST_METHOD(KittyGraphicsSinglePadBase64)
+    {
+        _testGetSet->PrepData();
+        // "AAAAAAAAAAA=" decodes to 8 bytes == 2*1*4.
+        _stateMachine->ProcessString(L"\x1b_Ga=t,i=12,f=32,s=2,v=1;AAAAAAAAAAA=\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=12;OK\x1b\\");
+    }
+
+    // Compression (o=z) defers the direct-pixel size check.
+    TEST_METHOD(KittyGraphicsCompressionDefersSizeCheck)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1b_Ga=t,i=13,f=24,s=2,v=2,o=z;AQIDBA==\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=13;OK\x1b\\");
+    }
+
+    // A query (a=q) validates the payload like a transmit; malformed base64 is EINVAL.
+    TEST_METHOD(KittyGraphicsQueryInvalidPayloadIsEinval)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1b_Ga=q,i=5,f=100;AAA\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=5;EINVAL:bad payload\x1b\\");
+    }
+
+    // An unsupported pixel format is EINVAL.
+    TEST_METHOD(KittyGraphicsUnsupportedFormatIsEinval)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1b_Ga=t,i=6,f=99;\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=6;EINVAL:unsupported format\x1b\\");
+    }
+
+    // An unsupported compression value is EINVAL.
+    TEST_METHOD(KittyGraphicsUnsupportedCompressionIsEinval)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1b_Ga=t,i=7,o=x;\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=7;EINVAL:unsupported compression\x1b\\");
+    }
+
+    // Hostile dimensions cannot overflow the size check; they report a mismatch.
+    TEST_METHOD(KittyGraphicsOverflowDimsIsMismatch)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1b_Ga=t,i=14,f=32,s=2147483648,v=2147483648;AQIDBA==\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=14;EINVAL:payload size mismatch\x1b\\");
+    }
+
+    // Multi-character keys and tokens without '=' are ignored.
+    TEST_METHOD(KittyGraphicsMultiCharKeyIgnored)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1b_Ga=t,ab=5,zz,i=1;\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=1;OK\x1b\\");
+    }
+
+    // Only the first ';' separates control from payload; a later ';' is part of the
+    // (now invalid) payload rather than being silently stripped.
+    TEST_METHOD(KittyGraphicsSemicolonInPayloadIsBad)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1b_Ga=t,i=1,f=100;AAAA;BBBB\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=1;EINVAL:bad payload\x1b\\");
+    }
+
+    // The registry is bounded; transmitting past MaxKittyImages evicts the oldest.
+    TEST_METHOD(KittyGraphicsRegistryEvictsOldest)
+    {
+        _testGetSet->PrepData();
+        for (auto i = 1; i <= 4097; ++i)
+        {
+            _stateMachine->ProcessString(L"\x1b_Ga=t,i=" + std::to_wstring(i) + L";\x1b\\");
+        }
+        _testGetSet->_response.clear();
+        _stateMachine->ProcessString(L"\x1b_Ga=p,i=1;\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=1;ENOENT:image not found\x1b\\");
+        _stateMachine->ProcessString(L"\x1b_Ga=p,i=4097;\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=4097;OK\x1b\\");
     }
 
     // An APC string with a non-'G' identifier is not Kitty graphics and is ignored.

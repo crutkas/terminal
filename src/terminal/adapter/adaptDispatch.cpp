@@ -4899,7 +4899,7 @@ ITermDispatch::StringHandler AdaptDispatch::KittyGraphics()
                 _HandleKittyGraphics(control, payload, payloadValid);
                 return false;
             }
-            if (ch == L';')
+            if (inControl && ch == L';')
             {
                 inControl = false;
                 return true;
@@ -5031,9 +5031,21 @@ void AdaptDispatch::_HandleKittyGraphics(const std::wstring_view control, const 
         {
         case L't': // transmit
         case L'T': // transmit and display
+        case L'q': // query: validate the request the same way but do not store
         {
-            // Decode and validate the payload before registering anything.
             std::vector<uint8_t> bytes;
+            if (format != 24 && format != 32 && format != 100)
+            {
+                success = false;
+                code = L"EINVAL:unsupported format";
+                break;
+            }
+            if (compression != 0 && compression != L'z')
+            {
+                success = false;
+                code = L"EINVAL:unsupported compression";
+                break;
+            }
             if (!payloadValid || !_DecodeKittyBase64(payload, bytes))
             {
                 success = false;
@@ -5041,35 +5053,28 @@ void AdaptDispatch::_HandleKittyGraphics(const std::wstring_view control, const 
                 break;
             }
             // For an uncompressed, single-chunk, direct-pixel transmit with known
-            // dimensions, the payload size must match width * height * depth.
+            // dimensions, the payload must be exactly width * height * depth bytes.
+            // Compare via division so hostile dimensions cannot overflow.
             const auto depth = format == 24 ? 3u : (format == 32 ? 4u : 0u);
             if (depth != 0 && compression == 0 && !moreChunks && width != 0 && height != 0)
             {
-                if (bytes.size() != static_cast<uint64_t>(width) * height * depth)
+                const auto area = static_cast<uint64_t>(width) * height;
+                if (area > bytes.size() / depth || area * depth != bytes.size())
                 {
                     success = false;
                     code = L"EINVAL:payload size mismatch";
                     break;
                 }
             }
-            if (haveId)
+            // Query validates only; transmit assigns a fresh id (an image number
+            // always yields a new id) and stores the image.
+            if (action != L'q')
             {
-                assignedId = imageId;
+                assignedId = haveId ? imageId : _kittyAssignImageId();
+                _registerKittyImage(assignedId, haveNumber ? imageNumber : 0);
             }
-            else if (haveNumber)
-            {
-                const auto existing = _kittyImageNumbers.find(imageNumber);
-                assignedId = existing != _kittyImageNumbers.end() ? existing->second : _kittyAssignImageId();
-            }
-            else
-            {
-                assignedId = _kittyAssignImageId();
-            }
-            _registerKittyImage(assignedId, haveNumber ? imageNumber : 0);
             break;
         }
-        case L'q': // query: validate the request without storing -> OK
-            break;
         case L'p': // put: the referenced image must exist
             if (haveId ? _kittyImages.find(imageId) == _kittyImages.end() : !(haveNumber && _kittyImageNumbers.find(imageNumber) != _kittyImageNumbers.end()))
             {
@@ -5142,13 +5147,8 @@ void AdaptDispatch::_HandleKittyGraphics(const std::wstring_view control, const 
     _ReturnApcResponse(response);
 }
 
-// Routine Description:
-// - Parses a non-negative decimal integer from a Kitty control value, clamped to
-//   the uint32 range. Parsing stops at the first non-digit. Always noexcept.
-// Arguments:
-// - value - the textual value
-// Return Value:
-// - the parsed value, clamped to [0, 0xFFFFFFFF]
+// Parses a non-negative decimal integer from a Kitty control value, clamped to the
+// uint32 range. Parsing stops at the first non-digit. Always noexcept.
 uint32_t AdaptDispatch::_ParseKittyUint(const std::wstring_view value) noexcept
 {
     uint64_t result = 0;
@@ -5179,15 +5179,26 @@ uint32_t AdaptDispatch::_kittyAssignImageId()
 }
 
 // Registers (or replaces) an image id, optionally cross-referenced by number.
-// The registry is bounded; the oldest entry is evicted past MaxKittyImages.
+// The registry is bounded; the oldest entry is evicted past MaxKittyImages. The
+// reverse number->id map is kept consistent when an id's number changes.
 void AdaptDispatch::_registerKittyImage(const uint32_t id, const uint32_t number)
 {
-    if (_kittyImages.find(id) == _kittyImages.end())
+    const auto existing = _kittyImages.find(id);
+    if (existing == _kittyImages.end())
     {
         _kittyImageOrder.push_back(id);
         if (_kittyImageOrder.size() > MaxKittyImages)
         {
             _eraseKittyImage(_kittyImageOrder.front());
+        }
+    }
+    else if (existing->second != 0 && existing->second != number)
+    {
+        // This id previously had a different number; drop its stale reverse entry.
+        const auto rev = _kittyImageNumbers.find(existing->second);
+        if (rev != _kittyImageNumbers.end() && rev->second == id)
+        {
+            _kittyImageNumbers.erase(rev);
         }
     }
     _kittyImages[id] = number;
@@ -5205,9 +5216,15 @@ void AdaptDispatch::_eraseKittyImage(const uint32_t id)
     {
         return;
     }
+    // Only drop the reverse entry if it still points at this id (a newer image
+    // may have taken over the number).
     if (it->second != 0)
     {
-        _kittyImageNumbers.erase(it->second);
+        const auto rev = _kittyImageNumbers.find(it->second);
+        if (rev != _kittyImageNumbers.end() && rev->second == id)
+        {
+            _kittyImageNumbers.erase(rev);
+        }
     }
     _kittyImages.erase(it);
     _kittyImageOrder.erase(std::remove(_kittyImageOrder.begin(), _kittyImageOrder.end(), id), _kittyImageOrder.end());
