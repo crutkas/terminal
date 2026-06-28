@@ -464,8 +464,16 @@ catch (...)
 til::size Terminal::GetCellSize() const noexcept
 {
     const auto size = _fontInfo.GetSize();
-    // Guard against a degenerate font size so image layout never divides by zero.
-    return { std::max(1, size.width), std::max(1, size.height) };
+    // Before the renderer reports the real font (via SetFontInfo), _fontInfo is a
+    // placeholder whose width is 0. Clamping that to 1 would lay images out on a
+    // degenerate 1px-per-cell grid, stretching them ~cell-width times horizontally.
+    // Fall back to a sane default cell (matching conhost/Sixel) until the real font
+    // is known, so images render at a correct grid rather than badly stretched.
+    if (size.width < 2 || size.height < 2)
+    {
+        return { 10, 20 };
+    }
+    return size;
 }
 
 void Terminal::NotifyBufferRotation(const int delta)
