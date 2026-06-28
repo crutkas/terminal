@@ -323,6 +323,7 @@ namespace Microsoft::Console::VirtualTerminal
             uint32_t width = 0;
             uint32_t height = 0;
             bool moreChunks = false;
+            bool mPresent = false;
             bool haveId = false;
             bool haveNumber = false;
         };
