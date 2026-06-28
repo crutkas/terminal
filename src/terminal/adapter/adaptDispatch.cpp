@@ -3056,6 +3056,7 @@ void AdaptDispatch::HardReset(bool erase)
 
     // Reset the Kitty graphics image registry.
     _clearKittyImages();
+    _clearKittyChunk();
 
     // Completely reset the TerminalOutput state.
     _termOutput = {};
@@ -4934,26 +4935,12 @@ ITermDispatch::StringHandler AdaptDispatch::KittyGraphics()
     };
 }
 
-// Parses a Kitty graphics control block (comma-separated key=value pairs) and the
-// base64 payload, then emits the acknowledgement. Recognizes action (a), image
-// id (i)/number (I), quiet mode (q), delete target (d), and the transmit format
-// (f), dimensions (s,v), compression (o) and continuation (m) keys. Ids are
-// re-emitted as decimal only.
-void AdaptDispatch::_HandleKittyGraphics(const std::wstring_view control, const std::string_view payload, const bool payloadValid)
+// Parses a Kitty graphics control block (comma-separated key=value pairs) into a
+// KittyControl. Keys are single characters with a non-empty value; a zero or empty
+// id/number is treated as unspecified.
+AdaptDispatch::KittyControl AdaptDispatch::_ParseKittyControl(const std::wstring_view control) noexcept
 {
-    auto action = L't';
-    auto deleteTarget = L'a';
-    uint32_t imageId = 0;
-    uint32_t imageNumber = 0;
-    uint32_t quiet = 0;
-    uint32_t format = 32; // default pixel format is RGBA
-    uint32_t width = 0;
-    uint32_t height = 0;
-    wchar_t compression = 0; // 'z' = zlib; 0 = none
-    auto moreChunks = false;
-    auto haveId = false;
-    auto haveNumber = false;
-
+    KittyControl c;
     size_t pos = 0;
     while (pos <= control.size())
     {
@@ -4969,36 +4956,36 @@ void AdaptDispatch::_HandleKittyGraphics(const std::wstring_view control, const 
             switch (key)
             {
             case L'a':
-                action = value.front();
+                c.action = value.front();
                 break;
             case L'd':
-                deleteTarget = value.front();
+                c.deleteTarget = value.front();
                 break;
             case L'i':
-                imageId = _ParseKittyUint(value);
-                haveId = true;
+                c.imageId = _ParseKittyUint(value);
+                c.haveId = true;
                 break;
             case L'I':
-                imageNumber = _ParseKittyUint(value);
-                haveNumber = true;
+                c.imageNumber = _ParseKittyUint(value);
+                c.haveNumber = true;
                 break;
             case L'q':
-                quiet = _ParseKittyUint(value);
+                c.quiet = _ParseKittyUint(value);
                 break;
             case L'f':
-                format = _ParseKittyUint(value);
+                c.format = _ParseKittyUint(value);
                 break;
             case L's':
-                width = _ParseKittyUint(value);
+                c.width = _ParseKittyUint(value);
                 break;
             case L'v':
-                height = _ParseKittyUint(value);
+                c.height = _ParseKittyUint(value);
                 break;
             case L'o':
-                compression = value.front();
+                c.compression = value.front();
                 break;
             case L'm':
-                moreChunks = _ParseKittyUint(value) != 0;
+                c.moreChunks = _ParseKittyUint(value) != 0;
                 break;
             default:
                 break;
@@ -5012,8 +4999,73 @@ void AdaptDispatch::_HandleKittyGraphics(const std::wstring_view control, const 
     }
 
     // A zero (or empty) id/number means "unspecified" in the kitty protocol.
-    haveId = haveId && imageId != 0;
-    haveNumber = haveNumber && imageNumber != 0;
+    c.haveId = c.haveId && c.imageId != 0;
+    c.haveNumber = c.haveNumber && c.imageNumber != 0;
+    return c;
+}
+
+// Dispatches a Kitty graphics command. A chunked transmission (m=1) accumulates its
+// base64 payload across sequences and is processed only when the final chunk (m=0)
+// arrives, using the control from the first chunk. Only one transfer runs at a time.
+void AdaptDispatch::_HandleKittyGraphics(const std::wstring_view control, const std::string_view payload, const bool payloadValid)
+{
+    const auto command = _ParseKittyControl(control);
+
+    if (_kittyChunkActive || command.moreChunks)
+    {
+        if (!_kittyChunkActive)
+        {
+            _kittyChunkActive = true;
+            _kittyChunkControl = command;
+            _kittyChunkPayload.clear();
+            _kittyChunkPayloadValid = true;
+        }
+
+        // Accumulate this chunk's payload, bounded in total by MaxKittyPayload.
+        _kittyChunkPayloadValid = _kittyChunkPayloadValid && payloadValid;
+        if (_kittyChunkPayload.size() + payload.size() > MaxKittyPayload)
+        {
+            _kittyChunkPayloadValid = false;
+        }
+        else
+        {
+            _kittyChunkPayload.append(payload);
+        }
+
+        if (command.moreChunks)
+        {
+            return; // more chunks to come; no response until completion
+        }
+
+        // Final chunk: assemble and process using the first chunk's control.
+        auto finalControl = _kittyChunkControl;
+        finalControl.moreChunks = false;
+        const auto finalPayload = std::move(_kittyChunkPayload);
+        const auto finalValid = _kittyChunkPayloadValid;
+        _clearKittyChunk();
+        _ProcessKittyCommand(finalControl, finalPayload, finalValid);
+        return;
+    }
+
+    _ProcessKittyCommand(command, payload, payloadValid);
+}
+
+// Validates and applies a fully-assembled Kitty graphics command, then emits the
+// acknowledgement. Ids are re-emitted as decimal only.
+void AdaptDispatch::_ProcessKittyCommand(const KittyControl& command, const std::string_view payload, const bool payloadValid)
+{
+    const auto action = command.action;
+    const auto deleteTarget = command.deleteTarget;
+    const auto imageId = command.imageId;
+    const auto imageNumber = command.imageNumber;
+    const auto quiet = command.quiet;
+    const auto format = command.format;
+    const auto width = command.width;
+    const auto height = command.height;
+    const auto compression = command.compression;
+    const auto moreChunks = command.moreChunks;
+    const auto haveId = command.haveId;
+    const auto haveNumber = command.haveNumber;
 
     auto success = true;
     std::wstring_view code = L"OK";
@@ -5236,6 +5288,15 @@ void AdaptDispatch::_clearKittyImages() noexcept
     _kittyImages.clear();
     _kittyImageNumbers.clear();
     _kittyImageOrder.clear();
+}
+
+// Discards any in-progress chunked transmission.
+void AdaptDispatch::_clearKittyChunk() noexcept
+{
+    _kittyChunkActive = false;
+    _kittyChunkPayloadValid = true;
+    _kittyChunkControl = {};
+    _kittyChunkPayload.clear();
 }
 
 // Decodes a standard base64 string (RFC 4648, '+'/'/' alphabet, '=' padding) into
