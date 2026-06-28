@@ -326,6 +326,9 @@ namespace Microsoft::Console::VirtualTerminal
             bool mPresent = false;
             bool haveId = false;
             bool haveNumber = false;
+            wchar_t medium = L'd';          // t=: transmission medium (only d=direct in MVP)
+            bool noCursorMovement = false;  // C=1: leave the cursor in place after a placement
+            bool hasNonChunkKey = false;    // true if any key other than 'm' was present
         };
         // A stored Kitty image: the client image number (0 = none), the pixel
         // dimensions, and the decoded BGRA pixels (empty if not yet decodable).
@@ -347,7 +350,7 @@ namespace Microsoft::Console::VirtualTerminal
         void _registerKittyImage(const uint32_t id, KittyImage&& image);
         void _eraseKittyImage(const uint32_t id);
         void _clearKittyImages() noexcept;
-        void _placeKittyImage(const KittyImage& image);
+        void _placeKittyImage(const KittyImage& image, const bool moveCursor);
         void _ReturnOscResponse(const std::wstring_view response) const;
 
         std::vector<uint8_t> _tabStopColumns;
