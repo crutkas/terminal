@@ -5,6 +5,7 @@
 
 #include "adaptDispatch.hpp"
 #include "SixelParser.hpp"
+#include "../buffer/out/ImageSlice.hpp"
 #include "../../inc/unicode.hpp"
 #include "../../renderer/base/renderer.hpp"
 #include "../../types/inc/CodepointWidthDetector.hpp"
@@ -5118,22 +5119,66 @@ void AdaptDispatch::_ProcessKittyCommand(const KittyControl& command, const std:
                     break;
                 }
             }
-            // Query validates only; transmit assigns a fresh id (an image number
-            // always yields a new id) and stores the image.
+            // Query validates only. Transmit assigns a fresh id (an image number
+            // always yields a new id), decodes and stores the pixels, and (a=T)
+            // displays the image.
             if (action != L'q')
             {
                 assignedId = haveId ? imageId : _kittyAssignImageId();
-                _registerKittyImage(assignedId, haveNumber ? imageNumber : 0);
+                KittyImage image;
+                image.number = haveNumber ? imageNumber : 0;
+                if (depth != 0 && compression == 0 && !moreChunks && width != 0 && height != 0 && !bytes.empty())
+                {
+                    image.width = width;
+                    image.height = height;
+                    image.pixels = _decodeKittyPixels(format, bytes);
+                }
+                _registerKittyImage(assignedId, std::move(image));
+                if (action == L'T')
+                {
+                    const auto stored = _kittyImages.find(assignedId);
+                    if (stored != _kittyImages.end())
+                    {
+                        _placeKittyImage(stored->second);
+                    }
+                }
             }
             break;
         }
-        case L'p': // put: the referenced image must exist
-            if (haveId ? _kittyImages.find(imageId) == _kittyImages.end() : !(haveNumber && _kittyImageNumbers.find(imageNumber) != _kittyImageNumbers.end()))
+        case L'p': // put: display the referenced image
+        {
+            const KittyImage* target = nullptr;
+            if (haveId)
+            {
+                const auto it = _kittyImages.find(imageId);
+                if (it != _kittyImages.end())
+                {
+                    target = &it->second;
+                }
+            }
+            else if (haveNumber)
+            {
+                const auto rev = _kittyImageNumbers.find(imageNumber);
+                if (rev != _kittyImageNumbers.end())
+                {
+                    const auto it = _kittyImages.find(rev->second);
+                    if (it != _kittyImages.end())
+                    {
+                        target = &it->second;
+                    }
+                }
+            }
+            if (!target)
             {
                 success = false;
                 code = L"ENOENT:image not found";
             }
+            else
+            {
+                _placeKittyImage(*target);
+            }
             break;
+        }
         case L'd': // delete
             if (deleteTarget == L'a' || deleteTarget == L'A')
             {
@@ -5233,8 +5278,9 @@ uint32_t AdaptDispatch::_kittyAssignImageId()
 // Registers (or replaces) an image id, optionally cross-referenced by number.
 // The registry is bounded; the oldest entry is evicted past MaxKittyImages. The
 // reverse number->id map is kept consistent when an id's number changes.
-void AdaptDispatch::_registerKittyImage(const uint32_t id, const uint32_t number)
+void AdaptDispatch::_registerKittyImage(const uint32_t id, KittyImage&& image)
 {
+    const auto number = image.number;
     const auto existing = _kittyImages.find(id);
     if (existing == _kittyImages.end())
     {
@@ -5244,16 +5290,16 @@ void AdaptDispatch::_registerKittyImage(const uint32_t id, const uint32_t number
             _eraseKittyImage(_kittyImageOrder.front());
         }
     }
-    else if (existing->second != 0 && existing->second != number)
+    else if (existing->second.number != 0 && existing->second.number != number)
     {
         // This id previously had a different number; drop its stale reverse entry.
-        const auto rev = _kittyImageNumbers.find(existing->second);
+        const auto rev = _kittyImageNumbers.find(existing->second.number);
         if (rev != _kittyImageNumbers.end() && rev->second == id)
         {
             _kittyImageNumbers.erase(rev);
         }
     }
-    _kittyImages[id] = number;
+    _kittyImages[id] = std::move(image);
     if (number != 0)
     {
         _kittyImageNumbers[number] = id;
@@ -5270,9 +5316,9 @@ void AdaptDispatch::_eraseKittyImage(const uint32_t id)
     }
     // Only drop the reverse entry if it still points at this id (a newer image
     // may have taken over the number).
-    if (it->second != 0)
+    if (it->second.number != 0)
     {
-        const auto rev = _kittyImageNumbers.find(it->second);
+        const auto rev = _kittyImageNumbers.find(it->second.number);
         if (rev != _kittyImageNumbers.end() && rev->second == id)
         {
             _kittyImageNumbers.erase(rev);
@@ -5297,6 +5343,93 @@ void AdaptDispatch::_clearKittyChunk() noexcept
     _kittyChunkPayloadValid = true;
     _kittyChunkControl = {};
     _kittyChunkPayload.clear();
+}
+
+// Converts a direct-pixel payload (f=24 RGB or f=32 RGBA) into BGRA RGBQUADs. PNG
+// (f=100) is not decoded here yet and yields an empty buffer.
+std::vector<RGBQUAD> AdaptDispatch::_decodeKittyPixels(const uint32_t format, const std::vector<uint8_t>& bytes)
+{
+    std::vector<RGBQUAD> pixels;
+    const auto depth = format == 24 ? 3u : (format == 32 ? 4u : 0u);
+    if (depth == 0 || bytes.empty())
+    {
+        return pixels;
+    }
+    const auto count = bytes.size() / depth;
+    pixels.reserve(count);
+    for (size_t i = 0; i < count; ++i)
+    {
+        const auto base = i * depth;
+        RGBQUAD px{};
+        px.rgbRed = bytes[base + 0];
+        px.rgbGreen = bytes[base + 1];
+        px.rgbBlue = bytes[base + 2];
+        px.rgbReserved = depth == 4 ? bytes[base + 3] : 255;
+        pixels.push_back(px);
+    }
+    return pixels;
+}
+
+// Draws a stored image at the cursor, one ImageSlice per text row (reusing the same
+// row-based image mechanism as Sixel), then moves the cursor below the image.
+void AdaptDispatch::_placeKittyImage(const KittyImage& image)
+{
+    if (image.pixels.empty() || image.width == 0 || image.height == 0)
+    {
+        return;
+    }
+
+    auto page = _pages.ActivePage();
+    auto& buffer = page.Buffer();
+    const auto origin = page.Cursor().GetPosition();
+    const auto cellWidth = KittyCellSize.width;
+    const auto cellHeight = KittyCellSize.height;
+    const auto imageWidth = static_cast<til::CoordType>(image.width);
+    const auto imageHeight = static_cast<til::CoordType>(image.height);
+
+    const auto columnBegin = origin.x;
+    const auto columns = (imageWidth + cellWidth - 1) / cellWidth;
+    const auto columnEnd = std::min(columnBegin + columns, page.Width());
+    if (columnEnd <= columnBegin)
+    {
+        return;
+    }
+    const auto drawWidth = std::min(imageWidth, (columnEnd - columnBegin) * cellWidth);
+    const auto rows = (imageHeight + cellHeight - 1) / cellHeight;
+
+    for (auto row = 0; row < rows; ++row)
+    {
+        const auto rowOffset = origin.y + row;
+        if (rowOffset < 0 || rowOffset >= page.Bottom())
+        {
+            break;
+        }
+        auto& dstRow = buffer.GetMutableRowByOffset(rowOffset);
+        auto dstSlice = dstRow.GetMutableImageSlice();
+        if (!dstSlice)
+        {
+            dstSlice = dstRow.SetImageSlice(std::make_unique<ImageSlice>(KittyCellSize));
+        }
+        auto dstIterator = dstSlice->MutablePixels(columnBegin, columnEnd);
+        for (auto pixelRow = 0; pixelRow < cellHeight; ++pixelRow)
+        {
+            const auto srcY = row * cellHeight + pixelRow;
+            if (srcY >= imageHeight)
+            {
+                break;
+            }
+            const auto srcRowStart = static_cast<size_t>(srcY) * image.width;
+            for (auto pixelColumn = 0; pixelColumn < drawWidth; ++pixelColumn)
+            {
+                til::at(dstIterator, pixelColumn) = image.pixels[srcRowStart + pixelColumn];
+            }
+            std::advance(dstIterator, dstSlice->PixelWidth());
+        }
+    }
+
+    const auto bottomRow = std::min(origin.y + rows, page.Bottom());
+    buffer.TriggerRedraw(Viewport::FromExclusive({ 0, origin.y, page.Width(), bottomRow }));
+    page.Cursor().SetPosition({ origin.x, std::min(origin.y + rows, page.Bottom() - 1) });
 }
 
 // Decodes a standard base64 string (RFC 4648, '+'/'/' alphabet, '=' padding) into

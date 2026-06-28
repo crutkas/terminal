@@ -326,16 +326,27 @@ namespace Microsoft::Console::VirtualTerminal
             bool haveId = false;
             bool haveNumber = false;
         };
+        // A stored Kitty image: the client image number (0 = none), the pixel
+        // dimensions, and the decoded BGRA pixels (empty if not yet decodable).
+        struct KittyImage
+        {
+            uint32_t number = 0;
+            uint32_t width = 0;
+            uint32_t height = 0;
+            std::vector<RGBQUAD> pixels;
+        };
         static KittyControl _ParseKittyControl(const std::wstring_view control) noexcept;
         void _HandleKittyGraphics(const std::wstring_view control, const std::string_view payload, const bool payloadValid);
         void _ProcessKittyCommand(const KittyControl& command, const std::string_view payload, const bool payloadValid);
         void _clearKittyChunk() noexcept;
         static uint32_t _ParseKittyUint(const std::wstring_view value) noexcept;
         static bool _DecodeKittyBase64(const std::string_view input, std::vector<uint8_t>& output) noexcept;
+        static std::vector<RGBQUAD> _decodeKittyPixels(const uint32_t format, const std::vector<uint8_t>& bytes);
         uint32_t _kittyAssignImageId();
-        void _registerKittyImage(const uint32_t id, const uint32_t number);
+        void _registerKittyImage(const uint32_t id, KittyImage&& image);
         void _eraseKittyImage(const uint32_t id);
         void _clearKittyImages() noexcept;
+        void _placeKittyImage(const KittyImage& image);
         void _ReturnOscResponse(const std::wstring_view response) const;
 
         std::vector<uint8_t> _tabStopColumns;
@@ -354,12 +365,14 @@ namespace Microsoft::Console::VirtualTerminal
         std::optional<unsigned int> _initialCodePage;
         til::enumset<OptionalFeature> _optionalFeatures = { OptionalFeature::ClipboardWrite };
 
-        // Kitty graphics image registry: id -> number (0 = none), with a reverse
-        // number -> id map and FIFO eviction bounded by MaxKittyImages.
+        // Kitty graphics image registry. Each id maps to a KittyImage (number +
+        // decoded BGRA pixels); a reverse number -> id map and FIFO eviction bound
+        // the registry to MaxKittyImages. KittyCellSize is the assumed pixel cell.
         static constexpr size_t MaxKittyImages = 4096;
         static constexpr size_t MaxKittyPayload = 32 * 1024 * 1024;
+        static constexpr til::size KittyCellSize{ 10, 20 };
         uint32_t _kittyNextImageId = 1;
-        std::unordered_map<uint32_t, uint32_t> _kittyImages;
+        std::unordered_map<uint32_t, KittyImage> _kittyImages;
         std::unordered_map<uint32_t, uint32_t> _kittyImageNumbers;
         std::deque<uint32_t> _kittyImageOrder;
 
