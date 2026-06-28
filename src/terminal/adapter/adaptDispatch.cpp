@@ -4987,6 +4987,7 @@ AdaptDispatch::KittyControl AdaptDispatch::_ParseKittyControl(const std::wstring
                 break;
             case L'm':
                 c.moreChunks = _ParseKittyUint(value) != 0;
+                c.mPresent = true;
                 break;
             default:
                 break;
@@ -5011,6 +5012,13 @@ AdaptDispatch::KittyControl AdaptDispatch::_ParseKittyControl(const std::wstring
 void AdaptDispatch::_HandleKittyGraphics(const std::wstring_view control, const std::string_view payload, const bool payloadValid)
 {
     const auto command = _ParseKittyControl(control);
+
+    // A command with no 'm' key is not a continuation chunk; if a transfer is in
+    // progress it has been abandoned, so drop it and process this command normally.
+    if (_kittyChunkActive && !command.mPresent)
+    {
+        _clearKittyChunk();
+    }
 
     if (_kittyChunkActive || command.moreChunks)
     {
@@ -5064,7 +5072,6 @@ void AdaptDispatch::_ProcessKittyCommand(const KittyControl& command, const std:
     const auto width = command.width;
     const auto height = command.height;
     const auto compression = command.compression;
-    const auto moreChunks = command.moreChunks;
     const auto haveId = command.haveId;
     const auto haveNumber = command.haveNumber;
 
@@ -5105,11 +5112,13 @@ void AdaptDispatch::_ProcessKittyCommand(const KittyControl& command, const std:
                 code = L"EINVAL:bad payload";
                 break;
             }
-            // For an uncompressed, single-chunk, direct-pixel transmit with known
-            // dimensions, the payload must be exactly width * height * depth bytes.
+            // For an uncompressed, direct-pixel transmit with known dimensions, the
+            // payload must be exactly width * height * depth bytes (reaching here
+            // implies the command is fully assembled, so m is no longer relevant).
             // Compare via division so hostile dimensions cannot overflow.
             const auto depth = format == 24 ? 3u : (format == 32 ? 4u : 0u);
-            if (depth != 0 && compression == 0 && !moreChunks && width != 0 && height != 0)
+            const auto directPixels = depth != 0 && compression == 0 && width != 0 && height != 0;
+            if (directPixels)
             {
                 const auto area = static_cast<uint64_t>(width) * height;
                 if (area > bytes.size() / depth || area * depth != bytes.size())
@@ -5127,7 +5136,7 @@ void AdaptDispatch::_ProcessKittyCommand(const KittyControl& command, const std:
                 assignedId = haveId ? imageId : _kittyAssignImageId();
                 KittyImage image;
                 image.number = haveNumber ? imageNumber : 0;
-                if (depth != 0 && compression == 0 && !moreChunks && width != 0 && height != 0 && !bytes.empty())
+                if (directPixels)
                 {
                     image.width = width;
                     image.height = height;
@@ -5336,17 +5345,17 @@ void AdaptDispatch::_clearKittyImages() noexcept
     _kittyImageOrder.clear();
 }
 
-// Discards any in-progress chunked transmission.
+// Discards any in-progress chunked transmission, releasing its payload buffer.
 void AdaptDispatch::_clearKittyChunk() noexcept
 {
     _kittyChunkActive = false;
     _kittyChunkPayloadValid = true;
     _kittyChunkControl = {};
-    _kittyChunkPayload.clear();
+    _kittyChunkPayload = {};
 }
 
-// Converts a direct-pixel payload (f=24 RGB or f=32 RGBA) into BGRA RGBQUADs. PNG
-// (f=100) is not decoded here yet and yields an empty buffer.
+// Converts a direct-pixel payload (f=24 RGB or f=32 RGBA) into premultiplied BGRA
+// RGBQUADs (the format the renderer expects). PNG (f=100) is not decoded here yet.
 std::vector<RGBQUAD> AdaptDispatch::_decodeKittyPixels(const uint32_t format, const std::vector<uint8_t>& bytes)
 {
     std::vector<RGBQUAD> pixels;
@@ -5361,10 +5370,22 @@ std::vector<RGBQUAD> AdaptDispatch::_decodeKittyPixels(const uint32_t format, co
     {
         const auto base = i * depth;
         RGBQUAD px{};
-        px.rgbRed = bytes[base + 0];
-        px.rgbGreen = bytes[base + 1];
-        px.rgbBlue = bytes[base + 2];
-        px.rgbReserved = depth == 4 ? bytes[base + 3] : 255;
+        if (depth == 4)
+        {
+            // Premultiply RGB by alpha (no-op when alpha is 255).
+            const uint32_t a = bytes[base + 3];
+            px.rgbRed = static_cast<BYTE>(bytes[base + 0] * a / 255);
+            px.rgbGreen = static_cast<BYTE>(bytes[base + 1] * a / 255);
+            px.rgbBlue = static_cast<BYTE>(bytes[base + 2] * a / 255);
+            px.rgbReserved = static_cast<BYTE>(a);
+        }
+        else
+        {
+            px.rgbRed = bytes[base + 0];
+            px.rgbGreen = bytes[base + 1];
+            px.rgbBlue = bytes[base + 2];
+            px.rgbReserved = 255;
+        }
         pixels.push_back(px);
     }
     return pixels;
@@ -5406,7 +5427,10 @@ void AdaptDispatch::_placeKittyImage(const KittyImage& image)
         }
         auto& dstRow = buffer.GetMutableRowByOffset(rowOffset);
         auto dstSlice = dstRow.GetMutableImageSlice();
-        if (!dstSlice)
+        // Reuse an existing slice only if it shares our cell size; otherwise the
+        // write stride (the slice's cell size) and extent (ours) would disagree and
+        // overflow the slice buffer.
+        if (!dstSlice || dstSlice->CellSize() != KittyCellSize)
         {
             dstSlice = dstRow.SetImageSlice(std::make_unique<ImageSlice>(KittyCellSize));
         }
@@ -5419,6 +5443,12 @@ void AdaptDispatch::_placeKittyImage(const KittyImage& image)
                 break;
             }
             const auto srcRowStart = static_cast<size_t>(srcY) * image.width;
+            // Defensive: never read past the decoded pixels (the dimensions and
+            // pixel count always agree today, but a future decoder might differ).
+            if (srcRowStart + static_cast<size_t>(drawWidth) > image.pixels.size())
+            {
+                break;
+            }
             for (auto pixelColumn = 0; pixelColumn < drawWidth; ++pixelColumn)
             {
                 til::at(dstIterator, pixelColumn) = image.pixels[srcRowStart + pixelColumn];
@@ -5429,7 +5459,9 @@ void AdaptDispatch::_placeKittyImage(const KittyImage& image)
 
     const auto bottomRow = std::min(origin.y + rows, page.Bottom());
     buffer.TriggerRedraw(Viewport::FromExclusive({ 0, origin.y, page.Width(), bottomRow }));
-    page.Cursor().SetPosition({ origin.x, std::min(origin.y + rows, page.Bottom() - 1) });
+    // Per the kitty spec, the cursor moves right by the column span and down by the
+    // row span of the placement (clamped to the page).
+    page.Cursor().SetPosition({ std::min(columnEnd, page.Width() - 1), std::min(origin.y + rows, page.Bottom() - 1) });
 }
 
 // Decodes a standard base64 string (RFC 4648, '+'/'/' alphabet, '=' padding) into

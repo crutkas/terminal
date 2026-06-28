@@ -4822,6 +4822,171 @@ public:
         VERIFY_ARE_EQUAL(5, slice->ColumnOffset());
     }
 
+    // Channel order: RGBA {10,20,30,255} must land in the right RGBQUAD fields.
+    TEST_METHOD(KittyGraphicsRgbaChannelOrderExact)
+    {
+        _testGetSet->PrepData();
+        // "ChQe/w==" decodes to RGBA {10,20,30,255}.
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,f=32,s=1,v=1;ChQe/w==\x1b\\");
+        const auto& buffer = *_testGetSet->_textBuffer;
+        til::CoordType imageRow = -1;
+        const auto slice = FindFirstImageSlice(buffer, imageRow);
+        VERIFY_IS_NOT_NULL(slice);
+        const auto px = slice->Pixels()[0];
+        VERIFY_ARE_EQUAL(10, static_cast<int>(px.rgbRed));
+        VERIFY_ARE_EQUAL(20, static_cast<int>(px.rgbGreen));
+        VERIFY_ARE_EQUAL(30, static_cast<int>(px.rgbBlue));
+        VERIFY_ARE_EQUAL(255, static_cast<int>(px.rgbReserved));
+    }
+
+    // A translucent RGBA pixel is stored premultiplied (255,0,0,128 -> 128,0,0,128).
+    TEST_METHOD(KittyGraphicsPremultipliedAlpha)
+    {
+        _testGetSet->PrepData();
+        // "/wAAgA==" decodes to RGBA {255,0,0,128}.
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,f=32,s=1,v=1;/wAAgA==\x1b\\");
+        const auto& buffer = *_testGetSet->_textBuffer;
+        til::CoordType imageRow = -1;
+        const auto slice = FindFirstImageSlice(buffer, imageRow);
+        VERIFY_IS_NOT_NULL(slice);
+        const auto px = slice->Pixels()[0];
+        VERIFY_ARE_EQUAL(128, static_cast<int>(px.rgbRed));
+        VERIFY_ARE_EQUAL(0, static_cast<int>(px.rgbGreen));
+        VERIFY_ARE_EQUAL(0, static_cast<int>(px.rgbBlue));
+        VERIFY_ARE_EQUAL(128, static_cast<int>(px.rgbReserved));
+    }
+
+    // A 20px-wide image spans two cells (PixelWidth 20).
+    TEST_METHOD(KittyGraphicsWideImageSpansColumns)
+    {
+        _testGetSet->PrepData();
+        std::wstring payload;
+        for (auto i = 0; i < 20; ++i)
+        {
+            payload += L"AP8A"; // 20 green RGB pixels, 20 wide x 1 tall
+        }
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,f=24,s=20,v=1;" + payload + L"\x1b\\");
+        const auto& buffer = *_testGetSet->_textBuffer;
+        til::CoordType imageRow = -1;
+        const auto slice = FindFirstImageSlice(buffer, imageRow);
+        VERIFY_IS_NOT_NULL(slice);
+        VERIFY_ARE_EQUAL(20, slice->PixelWidth());
+        VERIFY_IS_TRUE(SliceContainsColor(slice, 0, 255, 0));
+    }
+
+    // After placement the cursor moves right by the column span and down by the rows.
+    TEST_METHOD(KittyGraphicsCursorAdvancesBelowImage)
+    {
+        _testGetSet->PrepData();
+        _pDispatch->CursorPosition(1, 4); // row 1, column 4 (1-based) => column 3
+        const auto before = _testGetSet->_textBuffer->GetCursor().GetPosition();
+        std::wstring payload;
+        for (auto i = 0; i < 40; ++i)
+        {
+            payload += L"/wAA"; // 1 wide x 40 tall => 1 column, 2 rows
+        }
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,f=24,s=1,v=40;" + payload + L"\x1b\\");
+        const auto after = _testGetSet->_textBuffer->GetCursor().GetPosition();
+        VERIFY_ARE_EQUAL(before.x + 1, after.x); // right by the 1-column span
+        VERIFY_ARE_EQUAL(before.y + 2, after.y); // down by the 2-row span
+    }
+
+    // Displaying by image number (a=p,I=) resolves and renders the stored image.
+    TEST_METHOD(KittyGraphicsPutByNumberDisplays)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1b_Ga=t,I=7,f=32,s=1,v=1;/wAA/w==\x1b\\");
+        _stateMachine->ProcessString(L"\x1b_Ga=p,I=7;\x1b\\");
+        const auto& buffer = *_testGetSet->_textBuffer;
+        til::CoordType imageRow = -1;
+        const auto slice = FindFirstImageSlice(buffer, imageRow);
+        VERIFY_IS_NOT_NULL(slice);
+        VERIFY_IS_TRUE(SliceContainsColor(slice, 255, 0, 0));
+    }
+
+    // A chunked transmit-and-display (a=T) renders the assembled image.
+    TEST_METHOD(KittyGraphicsChunkedTransmitDisplays)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,f=24,s=2,v=2,m=1;/wAA/wAA\x1b\\");
+        _stateMachine->ProcessString(L"\x1b_Gm=0;/wAA/wAA\x1b\\");
+        const auto& buffer = *_testGetSet->_textBuffer;
+        til::CoordType imageRow = -1;
+        const auto slice = FindFirstImageSlice(buffer, imageRow);
+        VERIFY_IS_NOT_NULL(slice);
+        VERIFY_IS_TRUE(SliceContainsColor(slice, 255, 0, 0));
+        VERIFY_ARE_EQUAL(1, CountImageRows(buffer)); // 2px tall => 1 row
+    }
+
+    // Each row of a multi-row image actually contains the image color.
+    TEST_METHOD(KittyGraphicsTallImageEachRowHasColor)
+    {
+        _testGetSet->PrepData();
+        std::wstring payload;
+        for (auto i = 0; i < 40; ++i)
+        {
+            payload += L"AP8A"; // green, 1 wide x 40 tall => 2 rows
+        }
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,f=24,s=1,v=40;" + payload + L"\x1b\\");
+        const auto& buffer = *_testGetSet->_textBuffer;
+        auto greenRows = 0;
+        for (til::CoordType y = 0; y < buffer.GetSize().Height(); ++y)
+        {
+            const auto slice = buffer.GetRowByOffset(y).GetImageSlice();
+            if (slice && SliceContainsColor(slice, 0, 255, 0))
+            {
+                ++greenRows;
+            }
+        }
+        VERIFY_ARE_EQUAL(2, greenRows);
+    }
+
+    // Re-transmitting the same id replaces its pixels.
+    TEST_METHOD(KittyGraphicsRetransmitReplacesPixels)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1b_Ga=t,i=1,f=32,s=1,v=1;/wAA/w==\x1b\\"); // red
+        _stateMachine->ProcessString(L"\x1b_Ga=t,i=1,f=32,s=1,v=1;AP8A/w==\x1b\\"); // green
+        _stateMachine->ProcessString(L"\x1b_Ga=p,i=1;\x1b\\");
+        const auto& buffer = *_testGetSet->_textBuffer;
+        til::CoordType imageRow = -1;
+        const auto slice = FindFirstImageSlice(buffer, imageRow);
+        VERIFY_IS_NOT_NULL(slice);
+        VERIFY_IS_TRUE(SliceContainsColor(slice, 0, 255, 0));
+        VERIFY_IS_FALSE(SliceContainsColor(slice, 255, 0, 0));
+    }
+
+    // Deleting an image removes it from the display path (a later put is ENOENT).
+    TEST_METHOD(KittyGraphicsDeleteThenPutIsEnoent)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1b_Ga=t,i=5,f=32,s=1,v=1;/wAA/w==\x1b\\");
+        _stateMachine->ProcessString(L"\x1b_Ga=d,d=i,i=5;\x1b\\");
+        _testGetSet->_response.clear();
+        _stateMachine->ProcessString(L"\x1b_Ga=p,i=5;\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=5;ENOENT:image not found\x1b\\");
+        VERIFY_ARE_EQUAL(0, CountImageRows(*_testGetSet->_textBuffer));
+    }
+
+    // A standalone command (no m key) during a transfer discards it and runs alone.
+    TEST_METHOD(KittyGraphicsMidTransferDiscardsChunk)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1b_Ga=t,i=1,f=24,m=1;/wAA\x1b\\"); // start a transfer
+        _stateMachine->ProcessString(L"\x1b_Ga=q,i=5;\x1b\\"); // no m -> discard + run
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=5;OK\x1b\\");
+    }
+
+    // A bad base64 character in a middle chunk fails the assembled transfer.
+    TEST_METHOD(KittyGraphicsChunkedBadBase64)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1b_Ga=t,i=9,f=24,s=2,v=2,m=1;/wAA\x1b\\");
+        _stateMachine->ProcessString(L"\x1b_Gm=1;@@@@\x1b\\");
+        _stateMachine->ProcessString(L"\x1b_Gm=0;/wAA\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=9;EINVAL:bad payload\x1b\\");
+    }
+
     // A base64 payload containing a character outside the alphabet is EINVAL.
     TEST_METHOD(KittyGraphicsInvalidBase64CharIsEinval)
     {
