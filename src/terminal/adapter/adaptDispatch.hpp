@@ -311,7 +311,25 @@ namespace Microsoft::Console::VirtualTerminal
         void _ReturnCsiResponse(const std::wstring_view response) const;
         void _ReturnDcsResponse(const std::wstring_view response) const;
         void _ReturnApcResponse(const std::wstring_view response) const;
+        struct KittyControl
+        {
+            wchar_t action = L't';
+            wchar_t deleteTarget = L'a';
+            wchar_t compression = 0;
+            uint32_t imageId = 0;
+            uint32_t imageNumber = 0;
+            uint32_t quiet = 0;
+            uint32_t format = 32;
+            uint32_t width = 0;
+            uint32_t height = 0;
+            bool moreChunks = false;
+            bool haveId = false;
+            bool haveNumber = false;
+        };
+        static KittyControl _ParseKittyControl(const std::wstring_view control) noexcept;
         void _HandleKittyGraphics(const std::wstring_view control, const std::string_view payload, const bool payloadValid);
+        void _ProcessKittyCommand(const KittyControl& command, const std::string_view payload, const bool payloadValid);
+        void _clearKittyChunk() noexcept;
         static uint32_t _ParseKittyUint(const std::wstring_view value) noexcept;
         static bool _DecodeKittyBase64(const std::string_view input, std::vector<uint8_t>& output) noexcept;
         uint32_t _kittyAssignImageId();
@@ -344,6 +362,13 @@ namespace Microsoft::Console::VirtualTerminal
         std::unordered_map<uint32_t, uint32_t> _kittyImages;
         std::unordered_map<uint32_t, uint32_t> _kittyImageNumbers;
         std::deque<uint32_t> _kittyImageOrder;
+
+        // Chunked transmission (m=): accumulates the base64 payload across sequences;
+        // only one transfer runs at a time, processed on the final chunk (m=0).
+        bool _kittyChunkActive = false;
+        bool _kittyChunkPayloadValid = true;
+        KittyControl _kittyChunkControl;
+        std::string _kittyChunkPayload;
 
         // We have two instances of the saved cursor state, because we need
         // one for the main buffer (at index 0), and another for the alt buffer

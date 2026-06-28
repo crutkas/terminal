@@ -4708,12 +4708,50 @@ public:
         _testGetSet->ValidateInputEvent(L"\x1b_Gi=5;OK\x1b\\");
     }
 
-    // A chunked transmit (m=1) defers the size check (only base64 is validated).
-    TEST_METHOD(KittyGraphicsChunkedTransmitSkipsSizeCheck)
+    // A chunked transmission (m=1 ... m=0) assembles the payload across sequences;
+    // intermediate chunks produce no response and the size check runs on the whole.
+    TEST_METHOD(KittyGraphicsChunkedTransmitAssembles)
     {
         _testGetSet->PrepData();
-        _stateMachine->ProcessString(L"\x1b_Ga=t,i=6,f=24,s=2,v=2,m=1;AQIDBA==\x1b\\");
+        // First chunk carries the control + half the base64; it must not respond.
+        _stateMachine->ProcessString(L"\x1b_Ga=t,i=6,f=24,s=2,v=2,m=1;AAAAAAAA\x1b\\");
+        VERIFY_IS_TRUE(_testGetSet->_response.empty(), L"An intermediate chunk should not respond.");
+        // Final chunk (m=0) completes 12 bytes == 2*2*3 and is acknowledged.
+        _stateMachine->ProcessString(L"\x1b_Gm=0;AAAAAAAA\x1b\\");
         _testGetSet->ValidateInputEvent(L"\x1b_Gi=6;OK\x1b\\");
+    }
+
+    // A chunked transmission validates the size of the assembled payload.
+    TEST_METHOD(KittyGraphicsChunkedSizeMismatch)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1b_Ga=t,i=7,f=24,s=2,v=2,m=1;AAAA\x1b\\");
+        _stateMachine->ProcessString(L"\x1b_Gm=0;AAAA\x1b\\");
+        // Assembles to 6 bytes, but 2*2*3 = 12 -> mismatch.
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=7;EINVAL:payload size mismatch\x1b\\");
+    }
+
+    // A chunked transmission can span three or more sequences.
+    TEST_METHOD(KittyGraphicsChunkedThreeParts)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1b_Ga=t,i=8,f=100,m=1;AAAA\x1b\\");
+        _stateMachine->ProcessString(L"\x1b_Gm=1;AAAA\x1b\\");
+        VERIFY_IS_TRUE(_testGetSet->_response.empty(), L"Intermediate chunks should not respond.");
+        _stateMachine->ProcessString(L"\x1b_Gm=0;AAAA\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=8;OK\x1b\\");
+    }
+
+    // A hard reset discards an in-progress chunked transmission.
+    TEST_METHOD(KittyGraphicsHardResetClearsChunk)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1b_Ga=t,i=9,f=100,m=1;AAAA\x1b\\");
+        _pDispatch->HardReset(true);
+        _testGetSet->_response.clear();
+        // After RIS the pending transfer is gone, so this is a fresh single command.
+        _stateMachine->ProcessString(L"\x1b_Ga=t,i=10,f=100;AAAA\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=10;OK\x1b\\");
     }
 
     // A base64 payload containing a character outside the alphabet is EINVAL.
