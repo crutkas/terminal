@@ -22,6 +22,7 @@ Author(s):
 
 #include <deque>
 #include <memory>
+#include <span>
 
 namespace Microsoft::Console::VirtualTerminal
 {
@@ -94,5 +95,13 @@ namespace Microsoft::Console::VirtualTerminal
         virtual void SearchMissingCommand(const std::wstring_view command) = 0;
 
         virtual void ShowNotification(const std::wstring_view title, const std::wstring_view body) = 0;
+
+        // Decodes an encoded image (e.g. PNG) into premultiplied BGRA pixels. Hosts
+        // without an image decoder (conhost) leave this unimplemented and return
+        // false; the Kitty graphics handler then skips display of that image.
+        virtual bool DecodeImageToBgra(const std::span<const uint8_t> /*data*/, std::vector<RGBQUAD>& /*pixels*/, til::size& /*size*/) noexcept
+        {
+            return false;
+        }
     };
 }

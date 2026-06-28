@@ -239,6 +239,19 @@ public:
         Log::Comment(L"ShowNotification MOCK called...");
     }
 
+    bool DecodeImageToBgra(const std::span<const uint8_t> data, std::vector<RGBQUAD>& pixels, til::size& size) noexcept override
+    {
+        Log::Comment(L"DecodeImageToBgra MOCK called...");
+        if (!_decodeImageSucceeds || data.empty())
+        {
+            return false;
+        }
+        // Return a fixed 2x2 opaque blue image so tests can verify the PNG path.
+        size = { 2, 2 };
+        pixels.assign(4, RGBQUAD{ 255, 0, 0, 255 });
+        return true;
+    }
+
     void PrepData()
     {
         PrepData(CursorDirection::UP); // if called like this, the cursor direction doesn't matter.
@@ -397,6 +410,8 @@ public:
     bool _isPty = false;
 
     bool _returnResponseResult = false;
+
+    bool _decodeImageSucceeds = true;
 
     til::enumset<Mode> _systemMode{ Mode::AutoWrap };
 
@@ -4985,6 +5000,31 @@ public:
         _stateMachine->ProcessString(L"\x1b_Gm=1;@@@@\x1b\\");
         _stateMachine->ProcessString(L"\x1b_Gm=0;/wAA\x1b\\");
         _testGetSet->ValidateInputEvent(L"\x1b_Gi=9;EINVAL:bad payload\x1b\\");
+    }
+
+    // A PNG (f=100) transmit-and-display decodes via the host and renders.
+    TEST_METHOD(KittyGraphicsPngTransmitAndDisplay)
+    {
+        _testGetSet->PrepData();
+        // The mock host decodes any non-empty data to a 2x2 opaque blue image.
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,f=100;iVBORw0K\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=1;OK\x1b\\");
+        const auto& buffer = *_testGetSet->_textBuffer;
+        til::CoordType imageRow = -1;
+        const auto slice = FindFirstImageSlice(buffer, imageRow);
+        VERIFY_IS_NOT_NULL(slice, L"a PNG a=T should render the host-decoded image.");
+        VERIFY_IS_TRUE(SliceContainsColor(slice, 0, 0, 255)); // blue
+        VERIFY_ARE_EQUAL(1, CountImageRows(buffer)); // 2px tall => 1 row
+    }
+
+    // When the host cannot decode a PNG, the transmit still succeeds but nothing shows.
+    TEST_METHOD(KittyGraphicsPngDecodeFailureNoDisplay)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_decodeImageSucceeds = false;
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,f=100;iVBORw0K\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=1;OK\x1b\\");
+        VERIFY_ARE_EQUAL(0, CountImageRows(*_testGetSet->_textBuffer));
     }
 
     // A base64 payload containing a character outside the alphabet is EINVAL.
