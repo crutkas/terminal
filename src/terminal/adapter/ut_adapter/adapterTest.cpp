@@ -5803,6 +5803,56 @@ public:
         VERIFY_IS_FALSE(BufferContainsColor(*_testGetSet->_textBuffer, 255, 0, 0), L"scaled placement must be fully erased");
     }
 
+    // An oversized c clips off-screen, not squashes: a 2px red|green at c=200 on a
+    // <200-col page shows only the left (red) source, never green.
+    TEST_METHOD(KittyGraphicsOversizeClipsNotSquash)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,f=24,s=2,v=1,c=200;/wAAAP8A\x1b\\"); // red|green, huge c
+        VERIFY_IS_TRUE(BufferContainsColor(*_testGetSet->_textBuffer, 255, 0, 0), L"left source clips into view");
+        VERIFY_IS_FALSE(BufferContainsColor(*_testGetSet->_textBuffer, 0, 255, 0), L"right source must clip off-screen, not squash in");
+    }
+
+    // r alone scales height and preserves aspect on width.
+    TEST_METHOD(KittyGraphicsRowsOnlyPreservesAspect)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,f=24,s=2,v=2,r=4;/wAA/wAA/wAA/wAA\x1b\\"); // 2x2, r=4
+        VERIFY_ARE_EQUAL(4, CountImageRows(*_testGetSet->_textBuffer));
+    }
+
+    // x/y/w/h crop then c/r scale compose: bottom-right green quadrant scaled up.
+    TEST_METHOD(KittyGraphicsCropThenScale)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,f=24,s=2,v=1,x=1,w=1,c=3,r=2;/wAAAP8A\x1b\\"); // crop right green, scale 3x2
+        VERIFY_IS_TRUE(BufferContainsColor(*_testGetSet->_textBuffer, 0, 255, 0));
+        VERIFY_IS_FALSE(BufferContainsColor(*_testGetSet->_textBuffer, 255, 0, 0), L"cropped-out red absent");
+        VERIFY_ARE_EQUAL(2, CountImageRows(*_testGetSet->_textBuffer));
+    }
+
+    // a=p put applies geometry from the put command, not just transmit.
+    TEST_METHOD(KittyGraphicsPutAppliesGeometry)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1b_Ga=t,i=2,f=24,s=1,v=1;/wAA\x1b\\"); // store only
+        _stateMachine->ProcessString(L"\x1b_Ga=p,i=2,c=3,r=2;\x1b\\"); // put scaled
+        VERIFY_ARE_EQUAL(2, CountImageRows(*_testGetSet->_textBuffer));
+        til::CoordType r=-1; const auto s=FindFirstImageSlice(*_testGetSet->_textBuffer,r);
+        VERIFY_IS_NOT_NULL(s); VERIFY_ARE_EQUAL(30, s->PixelWidth());
+    }
+
+    // Ownership tag covers the full scaled width so delete-by-number erases it all.
+    TEST_METHOD(KittyGraphicsScaledOwnershipSpansAllCols)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1b_Ga=T,I=9,f=24,s=1,v=1,c=3,r=2;/wAA\x1b\\");
+        VERIFY_IS_TRUE(BufferContainsColor(*_testGetSet->_textBuffer, 255, 0, 0));
+        _stateMachine->ProcessString(L"\x1b_Ga=d,d=n,I=9;\x1b\\");
+        VERIFY_ARE_EQUAL(0, CountImageRows(*_testGetSet->_textBuffer));
+        VERIFY_IS_FALSE(BufferContainsColor(*_testGetSet->_textBuffer, 255, 0, 0));
+    }
+
     // An APC string with a non-'G' identifier is not Kitty graphics and is ignored.
     TEST_METHOD(NonKittyApcIgnored)
     {
