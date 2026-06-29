@@ -5864,6 +5864,14 @@ public:
         VERIFY_IS_TRUE(_testGetSet->_textBuffer->GetCursor().GetPosition().y < bottom, L"row span stays page-bounded");
     }
 
+    // A hostile w near UINT32_MAX must clamp to the image edge, not wrap negative.
+    TEST_METHOD(KittyGraphicsHugeCropWidthClampsToEdge)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,f=24,s=2,v=1,w=4294967295;/wAAAP8A\x1b\\"); // w=UINT32_MAX
+        VERIFY_IS_TRUE(BufferContainsColor(*_testGetSet->_textBuffer, 255, 0, 0), L"huge w clamps to edge, image still renders");
+    }
+
     // An APC string with a non-'G' identifier is not Kitty graphics and is ignored.
     TEST_METHOD(NonKittyApcIgnored)
     {
