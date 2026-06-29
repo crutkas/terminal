@@ -270,6 +270,33 @@ class ::Microsoft::Console::VirtualTerminal::VtIoTests
         VERIFY_ARE_EQUAL(expected, actual);
     }
 
+    // Proves that graphics sequences (Kitty APC, Sixel DCS) emitted by a shell are
+    // forwarded verbatim through the ConPTY to the connected terminal, rather than being
+    // consumed by conhost. This is what lets a real terminal render shell graphics.
+    TEST_METHOD(GraphicsSequencesArePassedThroughToConpty)
+    {
+        resetContents();
+
+        size_t written;
+
+        // A Kitty graphics transmit-and-display APC must appear verbatim downstream.
+        const auto kitty = L"\x1b_Ga=T,i=1,f=24,s=1,v=1;/wAA\x1b\\";
+        THROW_IF_FAILED(routines.WriteConsoleWImpl(*screenInfo, kitty, written, nullptr));
+        const auto kittyOut = std::string{ readOutput() };
+        VERIFY_IS_TRUE(kittyOut.find("\x1b_Ga=T,i=1,f=24,s=1,v=1;/wAA\x1b\\") != std::string::npos,
+                       L"the Kitty APC must be forwarded verbatim through ConPTY");
+
+        resetContents();
+        std::ignore = readOutput();
+
+        // A Sixel image DCS must likewise pass through untouched.
+        const auto sixel = L"\x1bPq#0;2;100;0;0~\x1b\\";
+        THROW_IF_FAILED(routines.WriteConsoleWImpl(*screenInfo, sixel, written, nullptr));
+        const auto sixelOut = std::string{ readOutput() };
+        VERIFY_IS_TRUE(sixelOut.find("\x1bPq#0;2;100;0;0~") != std::string::npos,
+                       L"the Sixel DCS must be forwarded verbatim through ConPTY");
+    }
+
     TEST_METHOD(WriteConsoleOutputW)
     {
         resetContents();
