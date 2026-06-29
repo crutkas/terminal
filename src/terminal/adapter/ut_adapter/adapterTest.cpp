@@ -5506,6 +5506,29 @@ public:
         VERIFY_ARE_EQUAL(static_cast<size_t>(1), _pDispatch->_kittyImages.count(92), L"A normal chunked transfer must still work.");
     }
 
+    // Deleting an image now erases its on-screen pixels (placement-store recompose),
+    // and deleting one image preserves another's.
+    TEST_METHOD(KittyGraphicsDeleteErasesPixels)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,f=24,s=1,v=1;/wAA\x1b\\");
+        VERIFY_IS_TRUE(CountImageRows(*_testGetSet->_textBuffer) >= 1, L"image should render");
+        _stateMachine->ProcessString(L"\x1b_Ga=d,d=i,i=1;\x1b\\");
+        VERIFY_ARE_EQUAL(0, CountImageRows(*_testGetSet->_textBuffer), L"delete must erase on-screen pixels");
+    }
+
+    TEST_METHOD(KittyGraphicsDeleteOnePreservesOther)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,f=24,s=1,v=1;/wAA\x1b\\"); // red
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=2,f=24,s=1,v=1;AP8A\x1b\\"); // green
+        VERIFY_IS_TRUE(BufferContainsColor(*_testGetSet->_textBuffer, 255, 0, 0));
+        VERIFY_IS_TRUE(BufferContainsColor(*_testGetSet->_textBuffer, 0, 255, 0));
+        _stateMachine->ProcessString(L"\x1b_Ga=d,d=i,i=1;\x1b\\");
+        VERIFY_IS_FALSE(BufferContainsColor(*_testGetSet->_textBuffer, 255, 0, 0), L"deleted image must be erased");
+        VERIFY_IS_TRUE(BufferContainsColor(*_testGetSet->_textBuffer, 0, 255, 0), L"other image must survive");
+    }
+
     // An APC string with a non-'G' identifier is not Kitty graphics and is ignored.
     TEST_METHOD(NonKittyApcIgnored)
     {
