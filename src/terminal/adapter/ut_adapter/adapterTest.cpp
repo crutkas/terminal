@@ -4148,6 +4148,18 @@ public:
         return count;
     }
 
+    // True if the slice pixel at (px, py) is exactly (r, g, b). Lets a test assert WHICH
+    // grid tile landed in WHICH cell, not just that a color appears somewhere in the row.
+    static bool SlicePixelIs(const ImageSlice* slice, til::CoordType px, til::CoordType py, BYTE r, BYTE g, BYTE b)
+    {
+        if (!slice)
+        {
+            return false;
+        }
+        const auto p = SlicePixelAt(slice, px, py);
+        return p.rgbRed == r && p.rgbGreen == g && p.rgbBlue == b;
+    }
+
     // Baseline smoke test: the simplest valid sixel (one color, one full column) must produce a
     // rendered image slice whose pixels contain the declared color. The other tests assume this
     // fundamental path works, so this is the canary if the Sixel pipeline breaks entirely.
@@ -5582,16 +5594,21 @@ public:
         VERIFY_IS_FALSE(BufferContainsColor(*_testGetSet->_textBuffer, 255, 0, 0), L"id 1 must not be drawn");
     }
 
-    // A run of placeholders forms a grid; a 2px-wide red|green image splits into two
-    // cells, the left red and the right green.
+    // A run of placeholders forms a grid; a 2px-wide red|green image with a host cell size of
+    // 1px spans a 2x1 grid, so the left cell is red ONLY and the right cell is green ONLY.
+    // Positional pixel checks (not a whole-row color scan) prove the two tiles are distinct.
     TEST_METHOD(KittyPlaceholderBlockFormsGrid)
     {
         _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        const auto origin = _testGetSet->_textBuffer->GetCursor().GetPosition();
         _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,f=24,s=2,v=1;/wAAAP8A\x1b\\"); // 2px: red,green
         _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m");
         _stateMachine->ProcessString(Placeholder() + Placeholder());
-        VERIFY_IS_TRUE(BufferContainsColor(*_testGetSet->_textBuffer, 255, 0, 0), L"left tile = red");
-        VERIFY_IS_TRUE(BufferContainsColor(*_testGetSet->_textBuffer, 0, 255, 0), L"right tile = green");
+        const auto* slice = _testGetSet->_textBuffer->GetRowByOffset(origin.y).GetImageSlice();
+        VERIFY_IS_NOT_NULL(slice);
+        VERIFY_IS_TRUE(SlicePixelIs(slice, 0, 0, 255, 0, 0), L"grid col 0 (left cell) = red only");
+        VERIFY_IS_TRUE(SlicePixelIs(slice, 1, 0, 0, 255, 0), L"grid col 1 (right cell) = green only");
     }
 
     // Deleting the image by id erases placeholder-rendered cells too.
@@ -5626,16 +5643,23 @@ public:
         VERIFY_ARE_EQUAL(0, CountImageRows(*_testGetSet->_textBuffer));
     }
 
-    // A multi-row grid splits vertically: a 1x2 (red-over-green) image with row
-    // diacritics 0 and 1 on one line shows red (top tile) and green (bottom tile).
+    // A multi-row grid splits vertically: a 1x2 (red-over-green) image with a 1px host cell
+    // spans a 1x2 grid. Two cells on one line tagged row 0 and row 1 show the top tile (red)
+    // in the first cell and the bottom tile (green) in the second. Positional checks confirm
+    // each cell holds ONLY its tile (the old default 1x1 grid let both cells show the whole
+    // image, so this passed without actually splitting).
     TEST_METHOD(KittyPlaceholderMultiRowSplitsVertically)
     {
         _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        const auto origin = _testGetSet->_textBuffer->GetCursor().GetPosition();
         _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,f=24,s=1,v=2;/wAAAP8A\x1b\\"); // top red, bottom green
         _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m");
         _stateMachine->ProcessString(Placeholder() + L"\x0305" + Placeholder() + L"\x030D"); // row 0, row 1
-        VERIFY_IS_TRUE(BufferContainsColor(*_testGetSet->_textBuffer, 255, 0, 0), L"top tile = red");
-        VERIFY_IS_TRUE(BufferContainsColor(*_testGetSet->_textBuffer, 0, 255, 0), L"bottom tile = green");
+        const auto* slice = _testGetSet->_textBuffer->GetRowByOffset(origin.y).GetImageSlice();
+        VERIFY_IS_NOT_NULL(slice);
+        VERIFY_IS_TRUE(SlicePixelIs(slice, 0, 0, 255, 0, 0), L"row-0 cell = top tile (red) only");
+        VERIFY_IS_TRUE(SlicePixelIs(slice, 1, 0, 0, 255, 0), L"row-1 cell = bottom tile (green) only");
     }
 
     // delete-all (d=a) erases placeholder-rendered cells too.
@@ -5713,15 +5737,20 @@ public:
         VERIFY_ARE_EQUAL(0, CountImageRows(*_testGetSet->_textBuffer), L"plain colored placeholder must not overlay a non-virtual image");
     }
 
-    // Non-divisible split keeps edge pixels: a 3px red/green/blue image in 2 cols shows
-    // the rightmost (blue) pixel in the second tile (2px then 1px, no drop).
+    // Non-divisible split keeps edge pixels: a 3px red/green/blue image forced to a 2-col grid
+    // (c=2) splits 1px | 2px, so the second tile keeps the rightmost (blue) pixel with no drop.
+    // Positional checks prove col 0 is red and the slice's rightmost pixel is blue.
     TEST_METHOD(KittyPlaceholderNonDivisibleKeepsRightPixel)
     {
         _testGetSet->PrepData();
-        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,f=24,s=3,v=1;/wAAAP8AAAD/\x1b\\"); // red,green,blue
+        const auto origin = _testGetSet->_textBuffer->GetCursor().GetPosition();
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,f=24,s=3,v=1,c=2,r=1;/wAAAP8AAAD/\x1b\\"); // red,green,blue; grid 2x1
         _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m");
         _stateMachine->ProcessString(Placeholder() + Placeholder());
-        VERIFY_IS_TRUE(BufferContainsColor(*_testGetSet->_textBuffer, 0, 0, 255), L"rightmost pixel (blue) must survive the 3px/2col split");
+        const auto* slice = _testGetSet->_textBuffer->GetRowByOffset(origin.y).GetImageSlice();
+        VERIFY_IS_NOT_NULL(slice);
+        VERIFY_IS_TRUE(SlicePixelIs(slice, 0, 0, 255, 0, 0), L"grid col 0 starts at the red pixel");
+        VERIFY_IS_TRUE(SlicePixelIs(slice, slice->PixelWidth() - 1, 0, 0, 0, 255), L"rightmost pixel (blue) must survive the 3px/2col split");
     }
 
     // The grid comes from the STORED geometry, so a multi-row placement printed one line
@@ -5781,6 +5810,152 @@ public:
         _stateMachine->ProcessString(Placeholder()); // ONE cell -> grid col 0 only
         VERIFY_IS_TRUE(BufferContainsColor(*_testGetSet->_textBuffer, 255, 0, 0), L"grid col 0 = left tile (red)");
         VERIFY_IS_FALSE(BufferContainsColor(*_testGetSet->_textBuffer, 0, 255, 0), L"stored cols=2 must keep the right tile (green) out of grid col 0");
+    }
+
+    // An explicit COLUMN diacritic (the 2nd recognized diacritic) selects the grid column
+    // independently of the row: a 2px red|green image in a 2-col grid addressed (row 0, col 1)
+    // shows ONLY green; the left tile (red) must be absent.
+    TEST_METHOD(KittyPlaceholderColDiacriticSelectsColumn)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,f=24,s=2,v=1,c=2,r=1;/wAAAP8A\x1b\\"); // red|green, grid 2x1
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m");
+        _stateMachine->ProcessString(Placeholder() + L"\x0305" + L"\x030D"); // row 0, col 1
+        VERIFY_IS_TRUE(BufferContainsColor(*_testGetSet->_textBuffer, 0, 255, 0), L"col diacritic 1 selects the right tile (green)");
+        VERIFY_IS_FALSE(BufferContainsColor(*_testGetSet->_textBuffer, 255, 0, 0), L"col 1 must not show the left tile (red)");
+    }
+
+    // Row + column diacritics address a 2D tile: a 2x2 image (red,green / blue,white) in a
+    // 2x2 grid addressed (row 1, col 1) shows ONLY white; the other three tiles are absent.
+    TEST_METHOD(KittyPlaceholderRowColAddressesTile)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,f=24,s=2,v=2,c=2,r=2;/wAAAP8AAAD/////\x1b\\"); // red,green / blue,white
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m");
+        _stateMachine->ProcessString(Placeholder() + L"\x030D" + L"\x030D"); // row 1, col 1
+        VERIFY_IS_TRUE(BufferContainsColor(*_testGetSet->_textBuffer, 255, 255, 255), L"(row 1, col 1) selects the bottom-right tile (white)");
+        VERIFY_IS_FALSE(BufferContainsColor(*_testGetSet->_textBuffer, 255, 0, 0), L"the red (0,0) tile must be absent");
+        VERIFY_IS_FALSE(BufferContainsColor(*_testGetSet->_textBuffer, 0, 255, 0), L"the green (1,0) tile must be absent");
+        VERIFY_IS_FALSE(BufferContainsColor(*_testGetSet->_textBuffer, 0, 0, 255), L"the blue (0,1) tile must be absent");
+    }
+
+    // With no c=/r=, the grid is inferred from the image's pixel size vs the host cell size:
+    // a 2px-wide image with a 1px cell gives a 2-col grid, so ONE placeholder shows only the
+    // left (red) tile. The old default 1x1 grid drew the whole image, leaking green.
+    TEST_METHOD(KittyPlaceholderDefaultGridFromPixels)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,f=24,s=2,v=1;/wAAAP8A\x1b\\"); // red|green, no c/r
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m");
+        _stateMachine->ProcessString(Placeholder()); // ONE cell -> grid col 0
+        VERIFY_IS_TRUE(BufferContainsColor(*_testGetSet->_textBuffer, 255, 0, 0), L"inferred grid col 0 = red");
+        VERIFY_IS_FALSE(BufferContainsColor(*_testGetSet->_textBuffer, 0, 255, 0), L"inferred 2-col grid keeps green out of col 0");
+    }
+
+    // The auto grid row must survive a bottom-of-buffer scroll. A 1x2 (red over green) image in
+    // a 1-col, 2-row grid with NO row diacritic: the first placeholder is grid row 0 (red).
+    // Printing another placeholder at the SAME screen row is the post-scroll signature (at the
+    // bottom of the buffer a new line keeps the same absolute row), so the auto row must advance
+    // to grid row 1 (green). An absolute anchor computed rowOffset 0 and repeated red forever.
+    TEST_METHOD(KittyPlaceholderAutoRowAfterScrollAdvances)
+    {
+        _testGetSet->PrepData();
+        const auto origin = _testGetSet->_textBuffer->GetCursor().GetPosition();
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,f=24,s=1,v=2,c=1,r=2;/wAAAP8A\x1b\\"); // top red, bottom green
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m");
+
+        // First render: auto row 0 -> top tile (red).
+        _stateMachine->ProcessString(Placeholder());
+        const auto* first = _testGetSet->_textBuffer->GetRowByOffset(origin.y).GetImageSlice();
+        VERIFY_IS_TRUE(SliceContainsColor(first, 255, 0, 0), L"auto row 0 = top tile (red)");
+
+        // A second render landing at the SAME screen row means the prior line scrolled off the
+        // bottom; the auto row must step to grid row 1 (bottom tile, green).
+        _testGetSet->_textBuffer->GetCursor().SetPosition({ origin.x, origin.y });
+        _stateMachine->ProcessString(Placeholder());
+        const auto* second = _testGetSet->_textBuffer->GetRowByOffset(origin.y).GetImageSlice();
+        VERIFY_IS_TRUE(SliceContainsColor(second, 0, 255, 0), L"auto row advanced to grid row 1 (green) after the scroll signature");
+        VERIFY_IS_FALSE(SliceContainsColor(second, 255, 0, 0), L"the advanced auto row must not repeat the top tile (red)");
+    }
+
+    // Re-storing a placement (re-transmit/put of the same virtual id) re-anchors the auto row,
+    // so the next placeholder starts again at grid row 0. Without the reset, the stale anchor
+    // would advance the row and show the wrong tile.
+    TEST_METHOD(KittyPlaceholderRestoreReanchors)
+    {
+        _testGetSet->PrepData();
+        const auto origin = _testGetSet->_textBuffer->GetCursor().GetPosition();
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,f=24,s=1,v=2,c=1,r=2;/wAAAP8A\x1b\\"); // top red, bottom green
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m");
+
+        // First placeholder anchors the auto row at this screen row (grid row 0 = red).
+        _stateMachine->ProcessString(Placeholder());
+        VERIFY_IS_TRUE(BufferContainsColor(*_testGetSet->_textBuffer, 255, 0, 0), L"initial auto row 0 = red");
+
+        // Re-transmit the same virtual id: the placement is re-stored, resetting the anchor.
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,f=24,s=1,v=2,c=1,r=2;/wAAAP8A\x1b\\");
+
+        // A placeholder five rows lower must re-anchor to grid row 0 (red), not advance to green.
+        _testGetSet->_textBuffer->GetCursor().SetPosition({ origin.x, origin.y + 5 });
+        _stateMachine->ProcessString(Placeholder());
+        const auto* slice = _testGetSet->_textBuffer->GetRowByOffset(origin.y + 5).GetImageSlice();
+        VERIFY_IS_TRUE(SliceContainsColor(slice, 255, 0, 0), L"re-anchored auto row 0 = red");
+        VERIFY_IS_FALSE(SliceContainsColor(slice, 0, 255, 0), L"a re-anchored placement must not jump to grid row 1 (green)");
+    }
+
+    // Re-transmitting a virtual id as a NON-virtual image cancels placeholder eligibility, so a
+    // later U+10EEEE cell no longer overlays it (and the prior overlay is erased by the new
+    // transmit). The placeholder becomes inert.
+    TEST_METHOD(KittyPlaceholderVirtualToNonVirtualStopsOverlay)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,f=24,s=1,v=1;/wAA\x1b\\"); // virtual red
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m");
+        _stateMachine->ProcessString(Placeholder());
+        VERIFY_IS_TRUE(BufferContainsColor(*_testGetSet->_textBuffer, 255, 0, 0), L"virtual id overlays red");
+
+        // Re-transmit the same id WITHOUT U=1: non-virtual, so the placeholder eligibility is
+        // dropped (a=t does not draw at the cursor).
+        _stateMachine->ProcessString(L"\x1b_Ga=t,i=1,f=24,s=1,v=1;/wAA\x1b\\");
+        _stateMachine->ProcessString(Placeholder());
+        VERIFY_ARE_EQUAL(0, CountImageRows(*_testGetSet->_textBuffer), L"a non-virtual id must not overlay via placeholders");
+    }
+
+    // A non-virtual PUT (a=p without U=1) of a previously-virtual id cancels placeholder
+    // eligibility through the put path, so a placeholder on a fresh row gains no image slice.
+    TEST_METHOD(KittyPlaceholderNonVirtualPutStopsOverlay)
+    {
+        _testGetSet->PrepData();
+        const auto origin = _testGetSet->_textBuffer->GetCursor().GetPosition();
+        _stateMachine->ProcessString(L"\x1b_Ga=t,U=1,i=1,f=24,s=1,v=1;/wAA\x1b\\"); // transmit + virtual, no draw
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m");
+        _stateMachine->ProcessString(Placeholder());
+        VERIFY_IS_TRUE(BufferContainsColor(*_testGetSet->_textBuffer, 255, 0, 0), L"virtual id overlays red before the put");
+
+        // Non-virtual put cancels eligibility (and draws once at the cursor).
+        _stateMachine->ProcessString(L"\x1b_Ga=p,i=1;\x1b\\");
+
+        // A placeholder on a fresh empty row must NOT gain an image slice.
+        const auto freshRow = origin.y + 10;
+        _testGetSet->_textBuffer->GetCursor().SetPosition({ 0, freshRow });
+        _stateMachine->ProcessString(Placeholder());
+        VERIFY_IS_NULL(_testGetSet->_textBuffer->GetRowByOffset(freshRow).GetImageSlice(), L"non-virtual put dropped placeholder eligibility");
+    }
+
+    // Delete-all (a=d, d=a) clears the virtual placement map, so a placeholder printed after a
+    // delete-all is inert even though the same fg id is still selected.
+    TEST_METHOD(KittyPlaceholderDeleteAllClearsVirtualMap)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,f=24,s=1,v=1;/wAA\x1b\\"); // virtual red
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m");
+        _stateMachine->ProcessString(Placeholder());
+        VERIFY_IS_TRUE(BufferContainsColor(*_testGetSet->_textBuffer, 255, 0, 0), L"virtual id overlays red");
+
+        _stateMachine->ProcessString(L"\x1b_Ga=d,d=a;\x1b\\"); // delete all
+        _stateMachine->ProcessString(Placeholder());
+        VERIFY_ARE_EQUAL(0, CountImageRows(*_testGetSet->_textBuffer), L"delete-all cleared the virtual map; re-print is inert");
     }
 
     // Delete-by-id is targeted: removing image 1 must erase only its pixels and leave a

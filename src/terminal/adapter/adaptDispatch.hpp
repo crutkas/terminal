@@ -22,7 +22,6 @@ Author(s):
 #include "terminalOutput.hpp"
 
 #include <unordered_map>
-#include <unordered_set>
 #include <deque>
 #include <algorithm>
 #include "../input/terminalInput.hpp"
@@ -347,17 +346,26 @@ namespace Microsoft::Console::VirtualTerminal
             uint32_t height = 0;
             std::vector<RGBQUAD> pixels;
         };
-        // A virtual (U=1) placement's fixed grid geometry. Recorded when the image is
-        // transmitted/put so Unicode-placeholder rendering slices the image by a STABLE
-        // rows x cols grid, independent of how the placeholder cells are chunked across
-        // writes (the StateMachine hands the dispatch one screen line per call). anchorRow
-        // is the screen row of the grid's top, latched on the first placeholder render so
-        // an absent row diacritic can derive its grid row from the cell's screen row.
+        // The target pixel size a c=/r= request maps to (one axis preserves aspect). Shared
+        // by the cursor-anchored and virtual paths so a U=1 grid matches an equivalent draw.
+        struct KittyTargetSize
+        {
+            int64_t width = 0;
+            int64_t height = 0;
+        };
+        // A virtual (U=1) placement's fixed grid geometry plus its auto-numbering cursor.
+        // The grid (cols x rows) is recorded at store time so placeholder rendering slices
+        // the image consistently no matter how the cells are chunked across writes. autoRow/
+        // autoCol track the grid cell a placeholder without explicit diacritics maps to;
+        // anchorRow is the last screen row rendered (-1 = none) and lets the auto row stay
+        // correct across newlines and bottom-of-buffer scrolls.
         struct KittyVirtualPlacement
         {
             uint32_t cols = 1;
             uint32_t rows = 1;
-            til::CoordType anchorRow = -1; // -1 = not yet anchored
+            til::CoordType anchorRow = -1;
+            uint32_t autoRow = 0;
+            uint32_t autoCol = 0;
         };
         static KittyControl _ParseKittyControl(const std::wstring_view control) noexcept;
         void _HandleKittyGraphics(const std::wstring_view control, const std::string_view payload, const bool payloadValid, const bool payloadTooLarge);
@@ -372,8 +380,9 @@ namespace Microsoft::Console::VirtualTerminal
         void _eraseKittyImageRows(const uint32_t imageId);
         void _clearKittyImages() noexcept;
         void _storeKittyVirtualPlacement(const uint32_t id, const KittyImage& image, const uint32_t cols, const uint32_t rows);
+        static KittyTargetSize _kittyTargetPixels(const int64_t cropW, const int64_t cropH, const uint32_t cols, const uint32_t rows, const int64_t cellWidth, const int64_t cellHeight) noexcept;
         void _placeKittyImage(const KittyImage& image, const bool moveCursor, const uint32_t imageId, const uint32_t cols = 0, const uint32_t rows = 0, const uint32_t srcX = 0, const uint32_t srcY = 0, const uint32_t srcW = 0, const uint32_t srcH = 0);
-        void _renderKittyPlaceholders(const std::wstring_view string, const til::point origin);
+        void _renderKittyPlaceholders(const std::wstring_view segment, const til::CoordType screenRow, const til::CoordType startColumn);
         void _placeKittyPlaceholderCell(const KittyImage& image, const uint32_t imageId, const til::CoordType column, const til::CoordType row, const uint32_t cellRow, const uint32_t cellCol, const uint32_t rows, const uint32_t cols);
         static int _KittyPlaceholderDiacriticIndex(const wchar_t ch) noexcept;
         void _ReturnOscResponse(const std::wstring_view response) const;
@@ -411,9 +420,9 @@ namespace Microsoft::Console::VirtualTerminal
         std::unordered_map<uint32_t, KittyImage> _kittyImages;
         std::unordered_map<uint32_t, uint32_t> _kittyImageNumbers;
         std::deque<uint32_t> _kittyImageOrder;
-        // Ids placed virtually (U=1): only these may be drawn by U+10EEEE placeholders,
-        // so a plain colored placeholder glyph can't false-overlay an ordinary image. The
-        // value is the placement's fixed grid geometry (see KittyVirtualPlacement).
+        // Ids placed virtually (U=1): only these may be drawn by U+10EEEE placeholders, so a
+        // plain colored placeholder glyph can't false-overlay an ordinary image. The value is
+        // the placement's fixed grid geometry and auto-numbering state (KittyVirtualPlacement).
         std::unordered_map<uint32_t, KittyVirtualPlacement> _kittyVirtualIds;
 
         // Chunked transmission (m=): accumulates the base64 payload across sequences;
