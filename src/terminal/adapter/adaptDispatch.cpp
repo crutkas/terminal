@@ -5133,6 +5133,15 @@ AdaptDispatch::KittyControl AdaptDispatch::_ParseKittyControl(const std::wstring
                 c.cellOffsetY = _ParseKittyUint(value);
                 c.upperY = c.cellOffsetY;
                 break;
+            case L'O':
+                // Uppercase O is the byte offset into a transmitted file (t=f / t=t);
+                // lowercase keys s/v are the pixel width/height, so case matters here.
+                c.fileOffset = _ParseKittyUint(value);
+                break;
+            case L'S':
+                // Uppercase S is the number of file bytes to read (0 = to EOF).
+                c.fileSize = _ParseKittyUint(value);
+                break;
             case L'o':
                 c.compression = value.front();
                 break;
@@ -5593,10 +5602,12 @@ void AdaptDispatch::_ProcessKittyCommand(const KittyControl& command, const std:
                 code = L"EINVAL:unsupported format";
                 break;
             }
-            if (medium != L'd')
+            if (medium != L'd' && medium != L'f' && medium != L't')
             {
-                // Only direct (t=d) transmission is supported; file/temp/shared-memory
-                // media are deferred and rejected (no file-access code is linked).
+                // t=d (direct), t=f (file) and t=t (temporary file) are supported.
+                // t=s (shared memory) is deferred and rejected here, as is any other
+                // unrecognized medium. (Shared-memory support would require mapping a
+                // named shm object, which is intentionally not linked yet.)
                 success = false;
                 code = L"EINVAL:unsupported transmission medium";
                 break;
@@ -5622,6 +5633,32 @@ void AdaptDispatch::_ProcessKittyCommand(const KittyControl& command, const std:
                     code = L"EINVAL:bad payload";
                 }
                 break;
+            }
+            if (medium == L'f' || medium == L't')
+            {
+                // For file/temporary transmission the decoded payload is not image
+                // data but the image FILE PATH (UTF-8 bytes). Read the file contents
+                // into `bytes` so the format-specific validation/decode below treats
+                // it exactly like a direct payload. The host bounds the read to a safe
+                // size (MaxKittyPayload), so a hostile S= cannot force a huge alloc.
+                // A temporary file (t=t) is deleted by the host after a successful
+                // read, but only when it resides under the system temp directory (the
+                // host enforces this; see ITerminalApi::ReadKittyImageFile).
+                std::wstring path;
+                const std::string pathUtf8(bytes.begin(), bytes.end());
+                if (FAILED(til::u8u16(pathUtf8, path)))
+                {
+                    path.clear(); // invalid UTF-8 path -> treated as unreadable below
+                }
+                std::vector<uint8_t> fileBytes;
+                if (path.empty() ||
+                    !_api.ReadKittyImageFile(path, command.fileOffset, command.fileSize, medium == L't', fileBytes))
+                {
+                    success = false;
+                    code = L"EBADF:could not read file";
+                    break;
+                }
+                bytes = std::move(fileBytes);
             }
             // Raw pixel formats (f=24/32) require positive dimensions and an exact
             // payload of width * height * depth bytes; compare via division so hostile

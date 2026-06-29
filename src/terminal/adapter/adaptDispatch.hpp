@@ -340,6 +340,8 @@ namespace Microsoft::Console::VirtualTerminal
             uint32_t cellOffsetY = 0; // Y=: y pixel offset of the image within the first cell
             uint32_t upperX = 0;  // X=: animation replacement mode or composition source x
             uint32_t upperY = 0;  // Y=: animation background RGBA or composition source y
+            uint32_t fileOffset = 0; // O=: byte offset into a transmitted file (t=f / t=t)
+            uint32_t fileSize = 0;   // S=: bytes to read from the file (0 = to EOF, host-bounded)
             bool moreChunks = false;
             bool mPresent = false;
             bool haveId = false;
