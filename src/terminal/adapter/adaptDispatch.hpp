@@ -22,6 +22,7 @@ Author(s):
 #include "terminalOutput.hpp"
 
 #include <unordered_map>
+#include <unordered_set>
 #include <deque>
 #include <algorithm>
 #include "../input/terminalInput.hpp"
@@ -397,6 +398,9 @@ namespace Microsoft::Console::VirtualTerminal
         std::unordered_map<uint32_t, KittyImage> _kittyImages;
         std::unordered_map<uint32_t, uint32_t> _kittyImageNumbers;
         std::deque<uint32_t> _kittyImageOrder;
+        // Ids placed virtually (U=1): only these may be drawn by U+10EEEE placeholders,
+        // so a plain colored placeholder glyph can't false-overlay an ordinary image.
+        std::unordered_set<uint32_t> _kittyVirtualIds;
 
         // Chunked transmission (m=): accumulates the base64 payload across sequences;
         // only one transfer runs at a time, processed on the final chunk (m=0).
