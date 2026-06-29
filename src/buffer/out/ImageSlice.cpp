@@ -33,14 +33,77 @@ til::size ImageSlice::CellSize() const noexcept
     return _cellSize;
 }
 
-uint32_t ImageSlice::ImageId() const noexcept
+uint32_t ImageSlice::ColumnOwner(const til::CoordType column) const noexcept
 {
-    return _imageId;
+    if (column < _columnBegin || column >= _columnEnd)
+    {
+        return 0;
+    }
+    const auto index = static_cast<size_t>(column - _columnBegin);
+    return index < _columnOwners.size() ? til::at(_columnOwners, index) : 0;
 }
 
-void ImageSlice::SetImageId(uint32_t id) noexcept
+void ImageSlice::SetColumnOwner(const til::CoordType columnBegin, const til::CoordType columnEnd, const uint32_t id)
 {
-    _imageId = id;
+    const auto setBegin = std::max(columnBegin, _columnBegin);
+    const auto setEnd = std::min(columnEnd, _columnEnd);
+    for (auto column = setBegin; column < setEnd; ++column)
+    {
+        const auto index = static_cast<size_t>(column - _columnBegin);
+        if (index < _columnOwners.size())
+        {
+            til::at(_columnOwners, index) = id;
+        }
+    }
+}
+
+bool ImageSlice::HasOwner(const uint32_t id) const noexcept
+{
+    return std::find(_columnOwners.begin(), _columnOwners.end(), id) != _columnOwners.end();
+}
+
+// Clears the pixels and owner tag for every column owned by id. Returns true if
+// nothing drawable remains (no owned columns and no opaque pixels), so the caller
+// can drop the slice. Co-resident content (e.g. Sixel, owner 0) keeps the slice.
+bool ImageSlice::EraseByOwner(const uint32_t id)
+{
+    if (id == 0 || _pixelBuffer.empty())
+    {
+        return false;
+    }
+    for (auto column = _columnBegin; column < _columnEnd; ++column)
+    {
+        const auto index = static_cast<size_t>(column - _columnBegin);
+        if (index >= _columnOwners.size() || til::at(_columnOwners, index) != id)
+        {
+            continue;
+        }
+        til::at(_columnOwners, index) = 0;
+        const auto eraseOffset = static_cast<til::CoordType>(index) * _cellSize.width;
+        auto eraseIterator = std::next(_pixelBuffer.data(), eraseOffset);
+        for (auto y = 0; y < _cellSize.height; y++)
+        {
+            std::memset(eraseIterator, 0, _cellSize.width * sizeof(RGBQUAD));
+            std::advance(eraseIterator, _pixelWidth);
+        }
+    }
+    // Anything left with an owner is another image, so the slice survives.
+    for (const auto owner : _columnOwners)
+    {
+        if (owner != 0)
+        {
+            return false;
+        }
+    }
+    // Otherwise keep the slice only if untagged (Sixel) pixels remain opaque.
+    for (const auto& px : _pixelBuffer)
+    {
+        if (px.rgbReserved != 0 || px.rgbRed != 0 || px.rgbGreen != 0 || px.rgbBlue != 0)
+        {
+            return false;
+        }
+    }
+    return true;
 }
 
 til::CoordType ImageSlice::ColumnOffset() const noexcept
@@ -76,6 +139,7 @@ RGBQUAD* ImageSlice::MutablePixels(const til::CoordType columnBegin, const til::
         _columnEnd = existingData ? std::max(_columnEnd, columnEnd) : columnEnd;
         _pixelWidth = (_columnEnd - _columnBegin) * _cellSize.width;
         const auto bufferSize = _pixelWidth * _cellSize.height;
+        const auto columnCount = _columnEnd - _columnBegin;
         if (existingData)
         {
             // If there is existing data in the buffer, we need to copy it
@@ -95,11 +159,21 @@ RGBQUAD* ImageSlice::MutablePixels(const til::CoordType columnBegin, const til::
                 std::advance(newIterator, _pixelWidth);
             }
             _pixelBuffer = std::move(newPixelBuffer);
+            // Keep the per-column owners aligned to the new column range.
+            auto newColumnOwners = std::vector<uint32_t>(columnCount);
+            const auto ownerOffset = oldColumnBegin - _columnBegin;
+            const auto ownerRange = std::min<til::CoordType>(static_cast<til::CoordType>(_columnOwners.size()), columnCount - ownerOffset);
+            for (auto i = 0; i < ownerRange; i++)
+            {
+                til::at(newColumnOwners, ownerOffset + i) = til::at(_columnOwners, i);
+            }
+            _columnOwners = std::move(newColumnOwners);
         }
         else
         {
             // Otherwise we just initialize the buffer to the correct size.
             _pixelBuffer.resize(bufferSize);
+            _columnOwners.assign(columnCount, 0);
         }
     }
     const auto pixelOffset = (columnBegin - _columnBegin) * _cellSize.width;
@@ -193,6 +267,13 @@ bool ImageSlice::_copyCells(const ImageSlice& srcSlice, const til::CoordType src
             std::advance(srcIterator, srcSlice._pixelWidth);
             std::advance(dstIterator, _pixelWidth);
         }
+        // Carry over per-column ownership so a moved/reflowed image keeps its tag.
+        for (auto i = 0; i < writeCellCount; i++)
+        {
+            const auto srcCol = srcUsedBegin + i;
+            const auto dstCol = dstWriteBegin + i;
+            SetColumnOwner(dstCol, dstCol + 1, srcSlice.ColumnOwner(srcCol));
+        }
     }
 
     // The used destination before and after the written area must be erased.
@@ -275,6 +356,8 @@ bool ImageSlice::_eraseCells(const til::CoordType columnBegin, const til::CoordT
                 std::memset(eraseIterator, 0, eraseLength * sizeof(RGBQUAD));
                 std::advance(eraseIterator, _pixelWidth);
             }
+            // Clear ownership of the erased columns so it doesn't outlive the pixels.
+            SetColumnOwner(eraseBegin, eraseEnd, 0);
         }
         return false;
     }

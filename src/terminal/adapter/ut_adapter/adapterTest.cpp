@@ -5506,8 +5506,21 @@ public:
         VERIFY_ARE_EQUAL(static_cast<size_t>(1), _pDispatch->_kittyImages.count(92), L"A normal chunked transfer must still work.");
     }
 
-    // Deleting an image now erases its on-screen pixels (placement-store recompose),
+    // Deleting an image erases its on-screen pixels (id-tagged slice clear),
     // and deleting one image preserves another's.
+    TEST_METHOD(KittyDeleteOnePreservesOtherOnSameRow)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,f=24,s=1,v=1,c=1,r=1,C=1;/wAA\x1b\\"); // red, C=1 don't move cursor
+        _stateMachine->ProcessString(L"\x1b[2C"); // move cursor right
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=2,f=24,s=1,v=1,c=1,r=1,C=1;AP8A\x1b\\"); // green, C=1 don't move cursor
+        VERIFY_IS_TRUE(BufferContainsColor(*_testGetSet->_textBuffer, 255, 0, 0));
+        VERIFY_IS_TRUE(BufferContainsColor(*_testGetSet->_textBuffer, 0, 255, 0));
+        _stateMachine->ProcessString(L"\x1b_Ga=d,d=i,i=1;\x1b\\");
+        VERIFY_IS_FALSE(BufferContainsColor(*_testGetSet->_textBuffer, 255, 0, 0), L"deleted image must be erased");
+        VERIFY_IS_TRUE(BufferContainsColor(*_testGetSet->_textBuffer, 0, 255, 0), L"other image must survive");
+    }
+
     TEST_METHOD(KittyGraphicsDeleteErasesPixels)
     {
         _testGetSet->PrepData();
@@ -5542,6 +5555,46 @@ public:
         _stateMachine->ProcessString(L"\x1b_Ga=d,d=a;\x1b\\");
         VERIFY_IS_FALSE(BufferContainsColor(*_testGetSet->_textBuffer, 0, 255, 0), L"Kitty image must be erased");
         VERIFY_IS_TRUE(BufferContainsColor(*_testGetSet->_textBuffer, 255, 0, 0), L"co-resident Sixel must survive a Kitty delete-all");
+    }
+
+    // Per-column ownership: a Sixel and a Kitty image sharing ONE row must delete
+    // independently. Deleting the Kitty image leaves the co-resident Sixel pixels.
+    TEST_METHOD(KittyDeleteSameRowPreservesSixel)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1bPq#0;2;100;0;0~~~~\x1b\\"); // Sixel red (id 0) at cols 0..
+        _stateMachine->ProcessString(L"\x1b[1;30H"); // back to the same row, further right
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,f=24,s=1,v=1,c=1,r=1,C=1;AP8A\x1b\\"); // Kitty green
+        VERIFY_IS_TRUE(BufferContainsColor(*_testGetSet->_textBuffer, 255, 0, 0));
+        VERIFY_IS_TRUE(BufferContainsColor(*_testGetSet->_textBuffer, 0, 255, 0));
+        _stateMachine->ProcessString(L"\x1b_Ga=d,d=i,i=1;\x1b\\");
+        VERIFY_IS_FALSE(BufferContainsColor(*_testGetSet->_textBuffer, 0, 255, 0), L"Kitty image must be erased");
+        VERIFY_IS_TRUE(BufferContainsColor(*_testGetSet->_textBuffer, 255, 0, 0), L"same-row Sixel must survive a Kitty delete");
+    }
+
+    // Pixels ride the row lifecycle, so scrolling the placement up then deleting it
+    // by id must still erase the on-screen pixels (no stale absolute anchor).
+    TEST_METHOD(KittyScrollThenDeleteErases)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,f=24,s=1,v=1;/wAA\x1b\\"); // red
+        VERIFY_IS_TRUE(BufferContainsColor(*_testGetSet->_textBuffer, 255, 0, 0));
+        _stateMachine->ProcessString(L"\r\n\r\n"); // scroll the placement up a couple rows
+        _stateMachine->ProcessString(L"\x1b_Ga=d,d=i,i=1;\x1b\\");
+        VERIFY_IS_FALSE(BufferContainsColor(*_testGetSet->_textBuffer, 255, 0, 0), L"delete must erase after scroll");
+    }
+
+    // delete-all clears only image cells; text written into the buffer survives.
+    TEST_METHOD(KittyDeleteAllPreservesText)
+    {
+        _testGetSet->PrepData();
+        const auto origin = _testGetSet->_textBuffer->GetCursor().GetPosition();
+        _stateMachine->ProcessString(L"hello");
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,f=24,s=1,v=1;/wAA\x1b\\"); // red image
+        VERIFY_IS_TRUE(BufferContainsColor(*_testGetSet->_textBuffer, 255, 0, 0));
+        _stateMachine->ProcessString(L"\x1b_Ga=d,d=a;\x1b\\");
+        VERIFY_IS_FALSE(BufferContainsColor(*_testGetSet->_textBuffer, 255, 0, 0), L"image must be erased");
+        VERIFY_ARE_EQUAL(L'h', _testGetSet->_textBuffer->GetRowByOffset(origin.y).GlyphAt(origin.x).front(), L"text must survive a Kitty delete-all");
     }
 
     // An APC string with a non-'G' identifier is not Kitty graphics and is ignored.
