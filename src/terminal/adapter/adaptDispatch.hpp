@@ -350,7 +350,8 @@ namespace Microsoft::Console::VirtualTerminal
         void _registerKittyImage(const uint32_t id, KittyImage&& image);
         void _eraseKittyImage(const uint32_t id);
         void _clearKittyImages() noexcept;
-        void _placeKittyImage(const KittyImage& image, const bool moveCursor);
+        void _placeKittyImage(const KittyImage& image, const bool moveCursor, const uint32_t imageId);
+        void _bakeKittyImage(const KittyImage& image, const til::CoordType top, const til::CoordType left);
         void _ReturnOscResponse(const std::wstring_view response) const;
 
         std::vector<uint8_t> _tabStopColumns;
@@ -381,6 +382,19 @@ namespace Microsoft::Console::VirtualTerminal
         std::unordered_map<uint32_t, KittyImage> _kittyImages;
         std::unordered_map<uint32_t, uint32_t> _kittyImageNumbers;
         std::deque<uint32_t> _kittyImageOrder;
+
+        // Placement store: the source of truth for which images are drawn where, keyed
+        // by buffer-row anchor. Image pixels are re-materialized from here into row
+        // ImageSlices, so a delete/retransmit can erase on-screen pixels (recompose).
+        struct KittyPlacement
+        {
+            uint32_t imageId = 0;
+            til::CoordType top = 0;  // anchor row (buffer offset)
+            til::CoordType left = 0; // anchor column
+        };
+        static constexpr size_t MaxKittyPlacements = 4096;
+        std::vector<KittyPlacement> _kittyPlacements;
+        void _recomposeKittyPlacements();
 
         // Chunked transmission (m=): accumulates the base64 payload across sequences;
         // only one transfer runs at a time, processed on the final chunk (m=0).
