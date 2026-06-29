@@ -5294,7 +5294,7 @@ void AdaptDispatch::_ProcessKittyCommand(const KittyControl& command, const std:
                 if (haveId)
                 {
                     _eraseKittyImage(imageId);
-                    _recomposeKittyPlacements();
+                    _eraseKittyImageRows(imageId);
                 }
                 else
                 {
@@ -5309,8 +5309,9 @@ void AdaptDispatch::_ProcessKittyCommand(const KittyControl& command, const std:
                     const auto it = _kittyImageNumbers.find(imageNumber);
                     if (it != _kittyImageNumbers.end())
                     {
-                        _eraseKittyImage(it->second);
-                        _recomposeKittyPlacements();
+                        const auto targetId = it->second;
+                        _eraseKittyImage(targetId);
+                        _eraseKittyImageRows(targetId);
                     }
                 }
                 else
@@ -5460,19 +5461,36 @@ void AdaptDispatch::_eraseKittyImage(const uint32_t id)
     {
         _kittyImageOrder.erase(std::remove(_kittyImageOrder.begin(), _kittyImageOrder.end(), id), _kittyImageOrder.end());
     }
-    // Drop any placements of this image so a later recompose erases them on screen.
-    _kittyPlacements.erase(std::remove_if(_kittyPlacements.begin(), _kittyPlacements.end(), [id](const KittyPlacement& p) { return p.imageId == id; }), _kittyPlacements.end());
 }
 
-// Clears the entire image registry and erases all drawn placements.
+// Clears the entire image registry and erases all drawn kitty placements, leaving any
+// co-resident Sixel slices (image id 0) untouched.
 void AdaptDispatch::_clearKittyImages() noexcept
+try
 {
     _kittyImages.clear();
     _kittyImageNumbers.clear();
     _kittyImageOrder.clear();
     _kittyTotalPixelBytes = 0;
-    _kittyPlacements.clear();
-    _recomposeKittyPlacements();
+    auto page = _pages.ActivePage();
+    auto& buffer = page.Buffer();
+    auto erased = false;
+    for (auto row = 0; row < page.Bottom(); ++row)
+    {
+        auto& dstRow = buffer.GetMutableRowByOffset(row);
+        if (const auto slice = dstRow.GetImageSlice(); slice && slice->ImageId() != 0)
+        {
+            dstRow.SetImageSlice(nullptr);
+            erased = true;
+        }
+    }
+    if (erased)
+    {
+        buffer.TriggerRedraw(Viewport::FromExclusive({ 0, 0, page.Width(), page.Bottom() }));
+    }
+}
+catch (...)
+{
 }
 
 // Discards any in-progress chunked transmission, releasing its payload buffer.
@@ -5524,8 +5542,9 @@ std::vector<RGBQUAD> AdaptDispatch::_decodeKittyPixels(const uint32_t format, co
 }
 
 // Draws a stored image at the cursor as one ImageSlice per text row (the same row
-// image mechanism as Sixel). Unless moveCursor is false (C=1), the cursor then
-// advances right by the column span and down by the row span, per the kitty spec.
+// image mechanism as Sixel), tagging each slice with imageId so it can be erased
+// later. Unless moveCursor is false (C=1), the cursor then advances right by the
+// column span and down by the row span, per the kitty spec.
 // Protocol: https://sw.kovidgoyal.net/kitty/graphics-protocol/#controlling-displayed-image-layout
 void AdaptDispatch::_placeKittyImage(const KittyImage& image, const bool moveCursor, const uint32_t imageId)
 {
@@ -5534,70 +5553,15 @@ void AdaptDispatch::_placeKittyImage(const KittyImage& image, const bool moveCur
         return;
     }
     auto page = _pages.ActivePage();
+    auto& buffer = page.Buffer();
     const auto origin = page.Cursor().GetPosition();
-    // Record this placement (bounded) so it can be re-materialized later and erased
-    // on delete/retransmit; then draw it into the row image slices.
-    if (_kittyPlacements.size() < MaxKittyPlacements)
-    {
-        _kittyPlacements.push_back({ imageId, origin.y, origin.x });
-    }
-    _bakeKittyImage(image, origin.y, origin.x);
-
-    const auto cellWidth = std::max(1, _api.GetCellSize().width);
-    const auto cellHeight = std::max(1, _api.GetCellSize().height);
-    const auto columns = (static_cast<til::CoordType>(image.width) + cellWidth - 1) / cellWidth;
-    const auto rows = (static_cast<til::CoordType>(image.height) + cellHeight - 1) / cellHeight;
-    if (moveCursor)
-    {
-        // Per the kitty spec, the cursor moves right by the column span and down by
-        // the row span of the placement (clamped to the page).
-        const auto columnEnd = std::min(origin.x + columns, page.Width());
-        page.Cursor().SetPosition({ std::min(columnEnd, page.Width() - 1), std::min(origin.y + rows, page.Bottom() - 1) });
-    }
-}
-
-// Re-materializes every placement from the placement store: clears all current image
-// slices, then re-bakes each surviving placement. Called after a delete/retransmit so
-// removed images are erased from the screen while others are preserved.
-void AdaptDispatch::_recomposeKittyPlacements()
-{
-    auto page = _pages.ActivePage();
-    auto& buffer = page.Buffer();
-    for (auto row = 0; row < page.Bottom(); ++row)
-    {
-        auto& dstRow = buffer.GetMutableRowByOffset(row);
-        if (dstRow.GetImageSlice())
-        {
-            dstRow.SetImageSlice(nullptr);
-        }
-    }
-    for (const auto& placement : _kittyPlacements)
-    {
-        const auto it = _kittyImages.find(placement.imageId);
-        if (it != _kittyImages.end())
-        {
-            _bakeKittyImage(it->second, placement.top, placement.left);
-        }
-    }
-    buffer.TriggerRedraw(Viewport::FromExclusive({ 0, 0, page.Width(), page.Bottom() }));
-}
-
-// Draws a stored image into row image slices anchored at (top,left). No cursor move.
-void AdaptDispatch::_bakeKittyImage(const KittyImage& image, const til::CoordType top, const til::CoordType left)
-{
-    if (image.pixels.empty() || image.width == 0 || image.height == 0)
-    {
-        return;
-    }
-    auto page = _pages.ActivePage();
-    auto& buffer = page.Buffer();
     const auto cellSize = _api.GetCellSize();
     const auto cellWidth = std::max(1, cellSize.width);
     const auto cellHeight = std::max(1, cellSize.height);
     const til::size clampedCellSize{ cellWidth, cellHeight };
     const auto imageWidth = static_cast<til::CoordType>(image.width);
     const auto imageHeight = static_cast<til::CoordType>(image.height);
-    const auto columnBegin = left;
+    const auto columnBegin = origin.x;
     const auto columns = (imageWidth + cellWidth - 1) / cellWidth;
     const auto columnEnd = std::min(columnBegin + columns, page.Width());
     if (columnEnd <= columnBegin)
@@ -5608,7 +5572,7 @@ void AdaptDispatch::_bakeKittyImage(const KittyImage& image, const til::CoordTyp
     const auto rows = (imageHeight + cellHeight - 1) / cellHeight;
     for (auto row = 0; row < rows; ++row)
     {
-        const auto rowOffset = top + row;
+        const auto rowOffset = origin.y + row;
         if (rowOffset < 0 || rowOffset >= page.Bottom())
         {
             break;
@@ -5619,6 +5583,7 @@ void AdaptDispatch::_bakeKittyImage(const KittyImage& image, const til::CoordTyp
         {
             dstSlice = dstRow.SetImageSlice(std::make_unique<ImageSlice>(clampedCellSize));
         }
+        dstSlice->SetImageId(imageId);
         auto dstIterator = dstSlice->MutablePixels(columnBegin, columnEnd);
         for (auto pixelRow = 0; pixelRow < cellHeight; ++pixelRow)
         {
@@ -5642,7 +5607,42 @@ void AdaptDispatch::_bakeKittyImage(const KittyImage& image, const til::CoordTyp
             }
         }
     }
-    buffer.TriggerRedraw(Viewport::FromExclusive({ 0, top, page.Width(), std::min(top + rows, page.Bottom()) }));
+    buffer.TriggerRedraw(Viewport::FromExclusive({ 0, origin.y, page.Width(), std::min(origin.y + rows, page.Bottom()) }));
+
+    if (moveCursor)
+    {
+        // Per the kitty spec, the cursor moves right by the column span and down by
+        // the row span of the placement (clamped to the page).
+        const auto columnAdvanceEnd = std::min(origin.x + columns, page.Width());
+        page.Cursor().SetPosition({ std::min(columnAdvanceEnd, page.Width() - 1), std::min(origin.y + rows, page.Bottom() - 1) });
+    }
+}
+
+// Erases on-screen pixels belonging to imageId by clearing only the row image slices
+// tagged with that id, leaving co-resident Sixel (id 0) and other images intact. Rides
+// the row lifecycle, so scroll/reflow keep slices aligned without absolute anchors.
+void AdaptDispatch::_eraseKittyImageRows(const uint32_t imageId)
+{
+    if (imageId == 0)
+    {
+        return;
+    }
+    auto page = _pages.ActivePage();
+    auto& buffer = page.Buffer();
+    auto erased = false;
+    for (auto row = 0; row < page.Bottom(); ++row)
+    {
+        auto& dstRow = buffer.GetMutableRowByOffset(row);
+        if (const auto slice = dstRow.GetImageSlice(); slice && slice->ImageId() == imageId)
+        {
+            dstRow.SetImageSlice(nullptr);
+            erased = true;
+        }
+    }
+    if (erased)
+    {
+        buffer.TriggerRedraw(Viewport::FromExclusive({ 0, 0, page.Width(), page.Bottom() }));
+    }
 }
 
 // Decodes a standard base64 string (RFC 4648, '+'/'/' alphabet, '=' padding) into

@@ -33,6 +33,11 @@ public:
     til::CoordType ColumnOffset() const noexcept;
     til::CoordType PixelWidth() const noexcept;
 
+    // Optional owner tag (0 = none/Sixel). Lets a protocol (e.g. Kitty) target only
+    // its own slices for deletion without disturbing other images on the same buffer.
+    uint32_t ImageId() const noexcept;
+    void SetImageId(uint32_t id) noexcept;
+
     std::span<const RGBQUAD> Pixels() const noexcept;
     const RGBQUAD* Pixels(const til::CoordType columnBegin) const noexcept;
     RGBQUAD* MutablePixels(const til::CoordType columnBegin, const til::CoordType columnEnd);
@@ -50,6 +55,7 @@ private:
 
     uint64_t _revision = 0;
     til::size _cellSize;
+    uint32_t _imageId = 0;
     std::vector<RGBQUAD> _pixelBuffer;
     til::CoordType _columnBegin = 0;
     til::CoordType _columnEnd = 0;
