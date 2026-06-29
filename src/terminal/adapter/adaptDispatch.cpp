@@ -5266,7 +5266,13 @@ void AdaptDispatch::_ProcessKittyCommand(const KittyControl& command, const std:
                 _registerKittyImage(assignedId, std::move(image));
                 if (command.virtualPlacement)
                 {
-                    _kittyVirtualIds.insert(assignedId); // eligible for placeholder rendering
+                    // Virtual (U=1): store the image and its grid geometry; the pixels are
+                    // drawn later by Unicode placeholders, not at the cursor.
+                    const auto stored = _kittyImages.find(assignedId);
+                    if (stored != _kittyImages.end())
+                    {
+                        _storeKittyVirtualPlacement(assignedId, stored->second, command.cols, command.rows);
+                    }
                 }
                 else
                 {
@@ -5316,7 +5322,8 @@ void AdaptDispatch::_ProcessKittyCommand(const KittyControl& command, const std:
             }
             else if (command.virtualPlacement)
             {
-                _kittyVirtualIds.insert(targetId); // virtual put: eligible for placeholders, no cursor draw
+                // Virtual put: eligible for placeholders with the requested grid, no cursor draw.
+                _storeKittyVirtualPlacement(targetId, *target, command.cols, command.rows);
             }
             else
             {
@@ -5743,6 +5750,27 @@ void AdaptDispatch::_placeKittyImage(const KittyImage& image, const bool moveCur
     }
 }
 
+// Records the fixed grid geometry of a virtual (U=1) placement so later Unicode-placeholder
+// rendering slices the image by a STABLE rows x cols grid. c=/r= give the grid directly; when
+// either is absent it's the number of cells the image spans at the host cell size
+// (ceil(pixels / cell)), matching how a cursor-anchored placement of the same image would size
+// itself. Re-storing resets the screen-row anchor so a fresh grid re-anchors on its next render.
+void AdaptDispatch::_storeKittyVirtualPlacement(const uint32_t id, const KittyImage& image, const uint32_t cols, const uint32_t rows)
+{
+    constexpr uint32_t maxCells = 8192;
+    const auto cellSize = _api.GetCellSize();
+    const auto cellWidth = static_cast<uint32_t>(std::max(1, cellSize.width));
+    const auto cellHeight = static_cast<uint32_t>(std::max(1, cellSize.height));
+    auto gridCols = cols != 0 ? cols : (std::max<uint32_t>(image.width, 1) + cellWidth - 1) / cellWidth;
+    auto gridRows = rows != 0 ? rows : (std::max<uint32_t>(image.height, 1) + cellHeight - 1) / cellHeight;
+    gridCols = std::clamp<uint32_t>(gridCols, 1, maxCells);
+    gridRows = std::clamp<uint32_t>(gridRows, 1, maxCells);
+    auto& placement = _kittyVirtualIds[id];
+    placement.cols = gridCols;
+    placement.rows = gridRows;
+    placement.anchorRow = -1;
+}
+
 // Maps a kitty row/column combining diacritic to its 0-based index, or -1 if the
 // glyph isn't a placeholder diacritic. The full kitty table is 297 entries; this
 // MVP keeps the first 16 (covers small grids) and falls back to auto-increment for
@@ -5823,11 +5851,15 @@ void AdaptDispatch::_placeKittyPlaceholderCell(const KittyImage& image, const ui
 }
 
 // Walks the cursor's just-written line, overlaying each U+10EEEE placeholder cell with
-// its sub-rect of the (virtual) image named by the cell's RGB foreground. The cells on
-// one line form a 1 x cols row of a rows x cols grid; row/col come from the kitty
-// combining diacritics (row then col), defaulting to left-to-right auto-increment. The
-// run is clamped to the first newline and to the page width; multi-row grids are split
-// vertically by the row diacritic (or driven by the app printing one line per row).
+// its sub-rect of the (virtual) image named by the cell's RGB foreground. The grid is the
+// rows x cols recorded when the image was stored virtually (NOT inferred from this run):
+// the StateMachine splits output on newlines, so a multi-row grid arrives one line per
+// _WriteToBuffer call and counting cells here would mis-size every slice. Each cell's grid
+// (row,col) comes from its kitty combining diacritics (row then col); when a diacritic is
+// absent the column auto-increments along the run and the row is the cell's screen row
+// relative to the grid's anchor (its first-rendered screen row). The screen column is
+// advanced by each just-written glyph's real cell width, so a wide (CJK) glyph before a
+// placeholder doesn't shift it. The run is clamped to the first newline and the page width.
 void AdaptDispatch::_renderKittyPlaceholders(const std::wstring_view string, const til::point origin)
 {
     auto page = _pages.ActivePage();
@@ -5840,7 +5872,8 @@ void AdaptDispatch::_renderKittyPlaceholders(const std::wstring_view string, con
     }
     const auto rgb = fg.GetRGB();
     const uint32_t imageId = (static_cast<uint32_t>(GetRValue(rgb)) << 16) | (static_cast<uint32_t>(GetGValue(rgb)) << 8) | GetBValue(rgb);
-    if (_kittyVirtualIds.find(imageId) == _kittyVirtualIds.end())
+    const auto placement = _kittyVirtualIds.find(imageId);
+    if (placement == _kittyVirtualIds.end())
     {
         return; // only U=1 (virtual) images draw via placeholders; ordinary text must not overlay
     }
@@ -5851,40 +5884,28 @@ void AdaptDispatch::_renderKittyPlaceholders(const std::wstring_view string, con
     }
     const auto& image = it->second;
 
-    // A placeholder grapheme (the surrogate pair plus any combining diacritics) occupies
-    // one cell; cols counts cells on THIS line only (cells-per-row), so a sub-rect is the
-    // C-th of cols, not 1/total. The largest row diacritic sets the vertical grid size.
-    const auto width = std::max<til::CoordType>(page.Width() - origin.x, 0);
-    uint32_t cols = 0;
-    uint32_t maxRow = 0;
-    auto count = origin.x;
-    for (size_t i = 0; i < string.size() && count < page.Width();)
-    {
-        if (string[i] == L'\n' || string[i] == L'\r')
-        {
-            break; // count cells up to the first newline only
-        }
-        const auto next = buffer.GraphemeNext(string, i);
-        if (i + 1 < next && string[i] == KittyPlaceholderCodePointHigh && string[i + 1] == KittyPlaceholderCodePointLow)
-        {
-            ++cols;
-            for (auto j = i + 2; j < next; ++j)
-            {
-                if (const auto idx = _KittyPlaceholderDiacriticIndex(string[j]); idx > 0)
-                {
-                    maxRow = std::max(maxRow, static_cast<uint32_t>(idx));
-                    break; // first diacritic is the row
-                }
-            }
-        }
-        i = next;
-        ++count;
-    }
-    const auto rows = maxRow + 1;
+    // Grid dimensions are fixed by the stored placement, so they stay constant no matter
+    // how the placeholder cells are chunked across writes.
+    const auto cols = std::max<uint32_t>(placement->second.cols, 1);
+    const auto rows = std::max<uint32_t>(placement->second.rows, 1);
 
+    // Latch the grid's top screen row on the first render; an absent row diacritic then
+    // derives its grid row from how far this line sits below that anchor (clamped to the
+    // grid). A re-store clears the anchor, so a fresh placement re-anchors here.
+    if (placement->second.anchorRow < 0)
+    {
+        placement->second.anchorRow = origin.y;
+    }
+    const auto rowOffset = std::max<til::CoordType>(origin.y - placement->second.anchorRow, 0);
+    const auto autoRow = std::min<uint32_t>(static_cast<uint32_t>(rowOffset), rows - 1);
+
+    // The just-written cells already carry the buffer's grapheme/width segmentation, so
+    // step the screen column with NavigateToNext rather than assuming one column per
+    // grapheme (which is wrong for wide glyphs).
+    const auto& row = buffer.GetRowByOffset(origin.y);
     uint32_t autoCol = 0;
     auto column = origin.x;
-    for (size_t i = 0; i < string.size() && column < page.Width() && (column - origin.x) < width;)
+    for (size_t i = 0; i < string.size() && column < page.Width();)
     {
         if (string[i] == L'\n' || string[i] == L'\r')
         {
@@ -5893,7 +5914,8 @@ void AdaptDispatch::_renderKittyPlaceholders(const std::wstring_view string, con
         const auto next = buffer.GraphemeNext(string, i);
         if (i + 1 < next && string[i] == KittyPlaceholderCodePointHigh && string[i + 1] == KittyPlaceholderCodePointLow)
         {
-            // First/second table diacritics in the cluster give row/col; auto-increment fills any gap.
+            // First/second table diacritics in the cluster give row/col; the screen-row
+            // anchor (row) and the running count (col) fill any absent diacritic.
             auto rowDiacritic = -1;
             auto colDiacritic = -1;
             for (auto j = i + 2; j < next; ++j)
@@ -5903,13 +5925,15 @@ void AdaptDispatch::_renderKittyPlaceholders(const std::wstring_view string, con
                     (rowDiacritic < 0 ? rowDiacritic : colDiacritic) = idx;
                 }
             }
-            const auto cellRow = rowDiacritic >= 0 ? static_cast<uint32_t>(rowDiacritic) : 0;
+            const auto cellRow = rowDiacritic >= 0 ? static_cast<uint32_t>(rowDiacritic) : autoRow;
             const auto cellCol = colDiacritic >= 0 ? static_cast<uint32_t>(colDiacritic) : autoCol;
             _placeKittyPlaceholderCell(image, imageId, column, origin.y, cellRow, cellCol, rows, cols);
             ++autoCol;
         }
+        // Advance by the glyph's real cell width; guard against a non-advancing step.
+        const auto nextColumn = row.NavigateToNext(column);
+        column = nextColumn > column ? nextColumn : column + 1;
         i = next;
-        ++column; // every grapheme is one cell; combining marks are part of the cluster
     }
 }
 

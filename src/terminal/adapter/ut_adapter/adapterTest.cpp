@@ -5724,6 +5724,65 @@ public:
         VERIFY_IS_TRUE(BufferContainsColor(*_testGetSet->_textBuffer, 0, 0, 255), L"rightmost pixel (blue) must survive the 3px/2col split");
     }
 
+    // The grid comes from the STORED geometry, so a multi-row placement printed one line
+    // per write (as the StateMachine splits output on newlines) slices correctly. A 1x2px
+    // image (top red, bottom green) stored as a 1col x 2row grid: writing grid row 0 then
+    // grid row 1 in TWO separate calls must show ONLY the top tile on the first screen row
+    // and ONLY the bottom tile on the next. The old per-run inference made the first write
+    // see rows=1 and draw the whole image (green leaking into the top row).
+    TEST_METHOD(KittyPlaceholderMultiRowAcrossWritesUsesStoredRows)
+    {
+        _testGetSet->PrepData();
+        const auto origin = _testGetSet->_textBuffer->GetCursor().GetPosition();
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,f=24,s=1,v=2,c=1,r=2;/wAAAP8A\x1b\\"); // 1x2: top red, bottom green
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m");
+
+        // Write 1: grid row 0 on the origin screen row -> top tile (red), no green.
+        _stateMachine->ProcessString(Placeholder() + L"\x0305");
+        const auto* row0 = _testGetSet->_textBuffer->GetRowByOffset(origin.y).GetImageSlice();
+        VERIFY_IS_TRUE(SliceContainsColor(row0, 255, 0, 0), L"grid row 0 = top tile (red)");
+        VERIFY_IS_FALSE(SliceContainsColor(row0, 0, 255, 0), L"stored rows=2 must keep the bottom tile (green) out of grid row 0");
+
+        // Write 2: a SEPARATE call on the next screen row, grid row 1 -> bottom tile (green).
+        _testGetSet->_textBuffer->GetCursor().SetPosition({ origin.x, origin.y + 1 });
+        _stateMachine->ProcessString(Placeholder() + L"\x030D");
+        const auto* row1 = _testGetSet->_textBuffer->GetRowByOffset(origin.y + 1).GetImageSlice();
+        VERIFY_IS_TRUE(SliceContainsColor(row1, 0, 255, 0), L"grid row 1 = bottom tile (green)");
+        VERIFY_IS_FALSE(SliceContainsColor(row1, 255, 0, 0), L"grid row 1 must not contain the top tile (red)");
+    }
+
+    // The screen column is tracked by real glyph width, so a wide (CJK = 2 cells) glyph
+    // before a placeholder doesn't shift it: the placeholder must land at origin.x+2, not
+    // origin.x+1 (the old one-column-per-grapheme walk).
+    TEST_METHOD(KittyPlaceholderWideGlyphKeepsColumn)
+    {
+        _testGetSet->PrepData();
+        const auto origin = _testGetSet->_textBuffer->GetCursor().GetPosition();
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,f=24,s=1,v=1;/wAA\x1b\\"); // red
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m");
+        _stateMachine->ProcessString(std::wstring{ L'\x4E00' } + Placeholder()); // U+4E00 is East Asian Wide
+        const auto& buffer = *_testGetSet->_textBuffer;
+        til::CoordType imageRow = -1;
+        const auto slice = FindFirstImageSlice(buffer, imageRow);
+        VERIFY_IS_NOT_NULL(slice);
+        VERIFY_ARE_EQUAL(origin.x + 2, slice->ColumnOffset(), L"a wide glyph before the placeholder must not shift its column");
+        VERIFY_ARE_EQUAL(1u, slice->ColumnOwner(origin.x + 2), L"the placeholder cell at origin.x+2 is owned by image id 1");
+    }
+
+    // The grid dimensions come from the stored c=/r=, NOT the number of placeholder cells
+    // printed: a 2px red|green image stored as a 2col x 1row grid, then ONE placeholder, is
+    // grid column 0 (left tile = red only). The old run-length inference made cols=1 and
+    // drew the whole image, so green appeared too.
+    TEST_METHOD(KittyPlaceholderGridUsesStoredColsNotRunLength)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,f=24,s=2,v=1,c=2,r=1;/wAAAP8A\x1b\\"); // 2px: red|green, grid 2x1
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m");
+        _stateMachine->ProcessString(Placeholder()); // ONE cell -> grid col 0 only
+        VERIFY_IS_TRUE(BufferContainsColor(*_testGetSet->_textBuffer, 255, 0, 0), L"grid col 0 = left tile (red)");
+        VERIFY_IS_FALSE(BufferContainsColor(*_testGetSet->_textBuffer, 0, 255, 0), L"stored cols=2 must keep the right tile (green) out of grid col 0");
+    }
+
     // Delete-by-id is targeted: removing image 1 must erase only its pixels and leave a
     // co-resident image (2) intact -- guards per-image cell ownership, not a blanket clear.
     TEST_METHOD(KittyGraphicsDeleteOnePreservesOther)

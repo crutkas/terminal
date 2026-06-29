@@ -347,6 +347,18 @@ namespace Microsoft::Console::VirtualTerminal
             uint32_t height = 0;
             std::vector<RGBQUAD> pixels;
         };
+        // A virtual (U=1) placement's fixed grid geometry. Recorded when the image is
+        // transmitted/put so Unicode-placeholder rendering slices the image by a STABLE
+        // rows x cols grid, independent of how the placeholder cells are chunked across
+        // writes (the StateMachine hands the dispatch one screen line per call). anchorRow
+        // is the screen row of the grid's top, latched on the first placeholder render so
+        // an absent row diacritic can derive its grid row from the cell's screen row.
+        struct KittyVirtualPlacement
+        {
+            uint32_t cols = 1;
+            uint32_t rows = 1;
+            til::CoordType anchorRow = -1; // -1 = not yet anchored
+        };
         static KittyControl _ParseKittyControl(const std::wstring_view control) noexcept;
         void _HandleKittyGraphics(const std::wstring_view control, const std::string_view payload, const bool payloadValid, const bool payloadTooLarge);
         void _ProcessKittyCommand(const KittyControl& command, const std::string_view payload, const bool payloadValid, const bool payloadTooLarge);
@@ -359,6 +371,7 @@ namespace Microsoft::Console::VirtualTerminal
         void _eraseKittyImage(const uint32_t id);
         void _eraseKittyImageRows(const uint32_t imageId);
         void _clearKittyImages() noexcept;
+        void _storeKittyVirtualPlacement(const uint32_t id, const KittyImage& image, const uint32_t cols, const uint32_t rows);
         void _placeKittyImage(const KittyImage& image, const bool moveCursor, const uint32_t imageId, const uint32_t cols = 0, const uint32_t rows = 0, const uint32_t srcX = 0, const uint32_t srcY = 0, const uint32_t srcW = 0, const uint32_t srcH = 0);
         void _renderKittyPlaceholders(const std::wstring_view string, const til::point origin);
         void _placeKittyPlaceholderCell(const KittyImage& image, const uint32_t imageId, const til::CoordType column, const til::CoordType row, const uint32_t cellRow, const uint32_t cellCol, const uint32_t rows, const uint32_t cols);
@@ -399,8 +412,9 @@ namespace Microsoft::Console::VirtualTerminal
         std::unordered_map<uint32_t, uint32_t> _kittyImageNumbers;
         std::deque<uint32_t> _kittyImageOrder;
         // Ids placed virtually (U=1): only these may be drawn by U+10EEEE placeholders,
-        // so a plain colored placeholder glyph can't false-overlay an ordinary image.
-        std::unordered_set<uint32_t> _kittyVirtualIds;
+        // so a plain colored placeholder glyph can't false-overlay an ordinary image. The
+        // value is the placement's fixed grid geometry (see KittyVirtualPlacement).
+        std::unordered_map<uint32_t, KittyVirtualPlacement> _kittyVirtualIds;
 
         // Chunked transmission (m=): accumulates the base64 payload across sequences;
         // only one transfer runs at a time, processed on the final chunk (m=0).
