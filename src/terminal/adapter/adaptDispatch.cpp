@@ -5606,8 +5606,8 @@ void AdaptDispatch::_placeKittyImage(const KittyImage& image, const bool moveCur
     // extends to the right/bottom edge.
     const auto cropX = static_cast<til::CoordType>(std::min<uint32_t>(srcX, image.width));
     const auto cropY = static_cast<til::CoordType>(std::min<uint32_t>(srcY, image.height));
-    const auto cropW = srcW == 0 ? imageWidth - cropX : std::min(static_cast<til::CoordType>(srcW), imageWidth - cropX);
-    const auto cropH = srcH == 0 ? imageHeight - cropY : std::min(static_cast<til::CoordType>(srcH), imageHeight - cropY);
+    const auto cropW = srcW == 0 ? imageWidth - cropX : std::min(static_cast<til::CoordType>(std::min<uint32_t>(srcW, image.width)), imageWidth - cropX);
+    const auto cropH = srcH == 0 ? imageHeight - cropY : std::min(static_cast<til::CoordType>(std::min<uint32_t>(srcH, image.height)), imageHeight - cropY);
     if (cropW <= 0 || cropH <= 0)
     {
         return;
