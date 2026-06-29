@@ -5425,16 +5425,85 @@ public:
         VERIFY_IS_TRUE(SliceContainsColor(slice, 0, 0, 255), L"the mock decoder returns a blue image.");
     }
 
-    // A hostile S= that overflows uint32 is clamped (to UINT32_MAX) by the control
-    // parser and forwarded as-is; the adapter never allocates based on S (the host
-    // bounds the actual read to 32 MiB), so the transfer still succeeds.
-    TEST_METHOD(KittyGraphicsFileTransmitOversizeSizeClampedByParser)
+    // O=/S= are 64-bit: a real >4 GiB size is preserved end-to-end, not truncated to
+    // 32 bits. The adapter never allocates from S (the host caps the actual read at
+    // 32 MiB), so the transfer still succeeds; only the value forwarded changes.
+    TEST_METHOD(KittyGraphicsFileTransmitLargeSizePassesThrough64Bit)
     {
         _testGetSet->PrepData();
         _testGetSet->_kittyFileBytes = { 255, 0, 0 };
         _stateMachine->ProcessString(L"\x1b_Ga=t,i=6,f=24,s=1,v=1,t=f,S=9999999999;L3RtcC94\x1b\\");
         _testGetSet->ValidateInputEvent(L"\x1b_Gi=6;OK\x1b\\");
-        VERIFY_ARE_EQUAL(static_cast<uint64_t>(UINT32_MAX), _testGetSet->_lastKittyFileSize, L"an overflowing S= must clamp to UINT32_MAX, not wrap.");
+        VERIFY_ARE_EQUAL(static_cast<uint64_t>(9999999999ull), _testGetSet->_lastKittyFileSize, L"a >4 GiB S= must pass through as 64-bit, not truncate to 32 bits.");
+    }
+
+    // A digit run that overflows even 64 bits clamps to UINT64_MAX rather than wrapping;
+    // the host rejects such an offset (past EOF) so it fails cleanly, never wraps to a
+    // small in-range value.
+    TEST_METHOD(KittyGraphicsFileOffsetOverflowClampsTo64Max)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_kittyFileBytes = { 255, 0, 0 };
+        _stateMachine->ProcessString(L"\x1b_Ga=t,i=7,f=24,s=1,v=1,t=f,O=99999999999999999999999;L3RtcC94\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=7;OK\x1b\\");
+        VERIFY_ARE_EQUAL(UINT64_MAX, _testGetSet->_lastKittyFileOffset, L"an O= that overflows 64 bits must clamp to UINT64_MAX, not wrap.");
+    }
+
+    // An empty (or non-UTF-8) payload yields an empty path: the adapter reports EBADF
+    // WITHOUT ever calling the host (no filesystem access for a path it cannot form).
+    TEST_METHOD(KittyGraphicsFileTransmitEmptyPathIsEbadf)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1b_Ga=t,i=8,f=24,s=1,v=1,t=f;\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=8;EBADF:could not read file\x1b\\");
+        VERIFY_ARE_EQUAL(0, _testGetSet->_readKittyFileCallCount, L"an empty path must not reach the host.");
+    }
+
+    // A payload that base64-decodes to invalid UTF-8 is rejected at conversion time
+    // (MB_ERR_INVALID_CHARS) -> empty path -> EBADF, again without any host call.
+    TEST_METHOD(KittyGraphicsFileTransmitInvalidUtf8PathIsEbadf)
+    {
+        _testGetSet->PrepData();
+        // "//79" is base64 of bytes {0xFF,0xFE,0xFD}, which is not valid UTF-8.
+        _stateMachine->ProcessString(L"\x1b_Ga=t,i=8,f=24,s=1,v=1,t=f;//79\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=8;EBADF:could not read file\x1b\\");
+        VERIFY_ARE_EQUAL(0, _testGetSet->_readKittyFileCallCount, L"an invalid-UTF-8 path must not reach the host.");
+    }
+
+    // The file's contents are validated exactly like a direct payload: a raw size that
+    // does not match s=*v=*depth is EINVAL, after the (successful) host read.
+    TEST_METHOD(KittyGraphicsFileTransmitSizeMismatchIsEinval)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_kittyFileBytes = { 255, 0, 0 }; // 3 bytes, but s=2,v=2,f=24 needs 12
+        _stateMachine->ProcessString(L"\x1b_Ga=t,i=9,f=24,s=2,v=2,t=f;L3RtcC94\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=9;EINVAL:payload size mismatch\x1b\\");
+    }
+
+    // a=q over t=f validates the request (the host IS asked to read) but stores nothing,
+    // so a later put of that id is ENOENT.
+    TEST_METHOD(KittyGraphicsFileTransmitQueryValidatesWithoutStoring)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_kittyFileBytes = { 255, 0, 0 };
+        _stateMachine->ProcessString(L"\x1b_Ga=q,i=10,f=24,s=1,v=1,t=f;L3RtcC94\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=10;OK\x1b\\");
+        VERIFY_IS_TRUE(_testGetSet->_readKittyFileCallCount > 0, L"a=q must still validate by reading the file.");
+        // The query must not have registered an image.
+        _stateMachine->ProcessString(L"\x1b_Ga=p,i=10;\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=10;ENOENT:image not found\x1b\\");
+    }
+
+    // a=q over t=t must NOT request deletion: a query is not a real transmit, so the
+    // temporary file is left intact (only a=t/a=T of a t=t file deletes).
+    TEST_METHOD(KittyGraphicsTempFileQueryDoesNotDelete)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_kittyFileBytes = { 255, 0, 0 };
+        _stateMachine->ProcessString(L"\x1b_Ga=q,i=11,f=24,s=1,v=1,t=t;L3RtcC94\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=11;OK\x1b\\");
+        VERIFY_IS_TRUE(_testGetSet->_readKittyFileCallCount > 0, L"a=q must still read the file to validate.");
+        VERIFY_IS_FALSE(_testGetSet->_lastKittyFileDeleteAfter, L"a=q,t=t must never request deletion.");
     }
 
     // An unsupported delete target (e.g. positional d=p) is rejected, not acted on.
