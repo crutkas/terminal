@@ -5004,6 +5004,24 @@ AdaptDispatch::KittyControl AdaptDispatch::_ParseKittyControl(const std::wstring
             case L'v':
                 c.height = _ParseKittyUint(value);
                 break;
+            case L'c':
+                c.cols = _ParseKittyUint(value);
+                break;
+            case L'r':
+                c.rows = _ParseKittyUint(value);
+                break;
+            case L'x':
+                c.srcX = _ParseKittyUint(value);
+                break;
+            case L'y':
+                c.srcY = _ParseKittyUint(value);
+                break;
+            case L'w':
+                c.srcW = _ParseKittyUint(value);
+                break;
+            case L'h':
+                c.srcH = _ParseKittyUint(value);
+                break;
             case L'o':
                 c.compression = value.front();
                 break;
@@ -5240,7 +5258,7 @@ void AdaptDispatch::_ProcessKittyCommand(const KittyControl& command, const std:
                     const auto stored = _kittyImages.find(assignedId);
                     if (stored != _kittyImages.end())
                     {
-                        _placeKittyImage(stored->second, moveCursor, assignedId);
+                        _placeKittyImage(stored->second, moveCursor, assignedId, command.cols, command.rows, command.srcX, command.srcY, command.srcW, command.srcH);
                     }
                 }
             }
@@ -5279,7 +5297,7 @@ void AdaptDispatch::_ProcessKittyCommand(const KittyControl& command, const std:
             }
             else
             {
-                _placeKittyImage(*target, moveCursor, targetId);
+                _placeKittyImage(*target, moveCursor, targetId, command.cols, command.rows, command.srcX, command.srcY, command.srcW, command.srcH);
             }
             break;
         }
@@ -5564,10 +5582,14 @@ std::vector<RGBQUAD> AdaptDispatch::_decodeKittyPixels(const uint32_t format, co
 
 // Draws a stored image at the cursor as one ImageSlice per text row (the same row
 // image mechanism as Sixel), tagging each covered column with imageId so it can be
-// erased later without disturbing co-resident cells. Unless moveCursor is false
-// (C=1), the cursor then advances right by the column span and down by the row span.
+// erased later without disturbing co-resident cells. Geometry follows the kitty
+// spec: x/y/w/h crop a source sub-rect in pixels (clamped to the image; w/h=0 means
+// to the edge) and c/r scale that crop to exactly cols x rows cells (a single axis
+// preserves aspect, neither keeps the native pixel size) via nearest-neighbour
+// sampling. Unless moveCursor is false (C=1), the cursor then advances right by the
+// column span and down by the row span.
 // Protocol: https://sw.kovidgoyal.net/kitty/graphics-protocol/#controlling-displayed-image-layout
-void AdaptDispatch::_placeKittyImage(const KittyImage& image, const bool moveCursor, const uint32_t imageId)
+void AdaptDispatch::_placeKittyImage(const KittyImage& image, const bool moveCursor, const uint32_t imageId, const uint32_t cols, const uint32_t rows, const uint32_t srcX, const uint32_t srcY, const uint32_t srcW, const uint32_t srcH)
 {
     if (image.pixels.empty() || image.width == 0 || image.height == 0)
     {
@@ -5582,16 +5604,56 @@ void AdaptDispatch::_placeKittyImage(const KittyImage& image, const bool moveCur
     const til::size clampedCellSize{ cellWidth, cellHeight };
     const auto imageWidth = static_cast<til::CoordType>(image.width);
     const auto imageHeight = static_cast<til::CoordType>(image.height);
+
+    // Source crop in pixels (x,y,w,h), clamped to the image; w/h=0 (or past the edge)
+    // extends to the right/bottom edge. The crop is the source rect sampled below.
+    const auto cropX = std::min(static_cast<til::CoordType>(std::min<uint32_t>(srcX, image.width)), imageWidth);
+    const auto cropY = std::min(static_cast<til::CoordType>(std::min<uint32_t>(srcY, image.height)), imageHeight);
+    const auto cropW = srcW == 0 ? imageWidth - cropX : std::min(static_cast<til::CoordType>(std::min<uint32_t>(srcW, image.width)), imageWidth - cropX);
+    const auto cropH = srcH == 0 ? imageHeight - cropY : std::min(static_cast<til::CoordType>(std::min<uint32_t>(srcH, image.height)), imageHeight - cropY);
+    if (cropW <= 0 || cropH <= 0)
+    {
+        return;
+    }
+
+    // Target pixel size: c/r request a cell span (c*cellWidth, r*cellHeight); one axis
+    // preserves the crop's aspect; neither keeps the native pixel size (current
+    // behaviour). Compute in 64-bit and clamp to the page so hostile values can't
+    // overflow or allocate unbounded spans.
+    int64_t targetW64, targetH64;
+    if (cols != 0 && rows != 0)
+    {
+        targetW64 = static_cast<int64_t>(cols) * cellWidth;
+        targetH64 = static_cast<int64_t>(rows) * cellHeight;
+    }
+    else if (cols != 0)
+    {
+        targetW64 = static_cast<int64_t>(cols) * cellWidth;
+        targetH64 = static_cast<int64_t>(cropH) * targetW64 / cropW;
+    }
+    else if (rows != 0)
+    {
+        targetH64 = static_cast<int64_t>(rows) * cellHeight;
+        targetW64 = static_cast<int64_t>(cropW) * targetH64 / cropH;
+    }
+    else
+    {
+        targetW64 = cropW;
+        targetH64 = cropH;
+    }
+    const auto targetW = static_cast<til::CoordType>(std::clamp<int64_t>(targetW64, 1, static_cast<int64_t>(page.Width()) * cellWidth));
+    const auto targetH = static_cast<til::CoordType>(std::clamp<int64_t>(targetH64, 1, static_cast<int64_t>(page.Bottom()) * cellHeight));
+
     const auto columnBegin = origin.x;
-    const auto columns = (imageWidth + cellWidth - 1) / cellWidth;
+    const auto columns = (targetW + cellWidth - 1) / cellWidth;
     const auto columnEnd = std::min(columnBegin + columns, page.Width());
     if (columnEnd <= columnBegin)
     {
         return;
     }
-    const auto drawWidth = std::min(imageWidth, (columnEnd - columnBegin) * cellWidth);
-    const auto rows = (imageHeight + cellHeight - 1) / cellHeight;
-    for (auto row = 0; row < rows; ++row)
+    const auto drawWidth = std::min(targetW, (columnEnd - columnBegin) * cellWidth);
+    const auto rowSpan = (targetH + cellHeight - 1) / cellHeight;
+    for (auto row = 0; row < rowSpan; ++row)
     {
         const auto rowOffset = origin.y + row;
         if (rowOffset < 0 || rowOffset >= page.Bottom())
@@ -5611,22 +5673,27 @@ void AdaptDispatch::_placeKittyImage(const KittyImage& image, const bool moveCur
         const til::CoordType ownedWidth = (columnEnd - columnBegin) * cellWidth;
         for (auto pixelRow = 0; pixelRow < cellHeight; ++pixelRow)
         {
-            const auto srcY = row * cellHeight + pixelRow;
+            const auto dstY = row * cellHeight + pixelRow;
             // Clear the full owned span first so padding (the last cell's pixels beyond
-            // the image, or rows past imageHeight) never retains a co-resident image's
+            // the scaled image, or rows past targetH) never retains a co-resident image's
             // stale pixels that this placement now owns.
             for (auto pixelColumn = 0; pixelColumn < ownedWidth; ++pixelColumn)
             {
                 til::at(dstIterator, pixelColumn) = RGBQUAD{};
             }
-            if (srcY < imageHeight)
+            if (dstY < targetH)
             {
-                const auto srcRowStart = static_cast<size_t>(srcY) * image.width;
-                if (srcRowStart + static_cast<size_t>(drawWidth) <= image.pixels.size())
+                // Nearest-neighbour: map this target row back into the crop, then offset
+                // by the crop origin to index the full image.
+                const auto sampleY = cropY + std::min(cropH - 1, static_cast<til::CoordType>(static_cast<int64_t>(dstY) * cropH / targetH));
+                const auto srcRowStart = static_cast<size_t>(sampleY) * image.width;
+                for (auto pixelColumn = 0; pixelColumn < drawWidth; ++pixelColumn)
                 {
-                    for (auto pixelColumn = 0; pixelColumn < drawWidth; ++pixelColumn)
+                    const auto sampleX = cropX + std::min(cropW - 1, static_cast<til::CoordType>(static_cast<int64_t>(pixelColumn) * cropW / targetW));
+                    const auto srcIndex = srcRowStart + static_cast<size_t>(sampleX);
+                    if (srcIndex < image.pixels.size())
                     {
-                        til::at(dstIterator, pixelColumn) = image.pixels[srcRowStart + pixelColumn];
+                        til::at(dstIterator, pixelColumn) = image.pixels[srcIndex];
                     }
                 }
             }
@@ -5636,13 +5703,13 @@ void AdaptDispatch::_placeKittyImage(const KittyImage& image, const bool moveCur
             }
         }
     }
-    buffer.TriggerRedraw(Viewport::FromExclusive({ 0, origin.y, page.Width(), std::min(origin.y + rows, page.Bottom()) }));
+    buffer.TriggerRedraw(Viewport::FromExclusive({ 0, origin.y, page.Width(), std::min(origin.y + rowSpan, page.Bottom()) }));
 
     if (moveCursor)
     {
         // Per the kitty spec, the cursor moves right by the column span and down by
         // the row span of the placement (clamped to the page).
-        page.Cursor().SetPosition({ std::min(columnEnd, page.Width() - 1), std::min(origin.y + rows, page.Bottom() - 1) });
+        page.Cursor().SetPosition({ std::min(columnEnd, page.Width() - 1), std::min(origin.y + rowSpan, page.Bottom() - 1) });
     }
 }
 
