@@ -319,6 +319,16 @@ namespace til // Terminal Implementation Library. Also: "Today I Learned"
             return false;
         }
 
+        // Defense in depth: reject a non-fixed drive letter BEFORE opening, so a mapped
+        // network drive (X: -> \\server\share) can't trigger an outbound SMB/NTLM auth
+        // inside CreateFileW. The post-open canonical check still catches junction/symlink
+        // redirects to other volumes; this closes the pre-handshake window for the common case.
+        const wchar_t driveRoot[]{ driveLetter, L':', L'\\', L'\0' };
+        if (GetDriveTypeW(driveRoot) != DRIVE_FIXED)
+        {
+            return false;
+        }
+
         std::wstring pathStr;
         try
         {
