@@ -5264,6 +5264,14 @@ void AdaptDispatch::_ProcessKittyCommand(const KittyControl& command, const std:
                 assignedId = haveId ? imageId : _kittyAssignImageId();
                 _eraseKittyImageRows(assignedId);
                 _registerKittyImage(assignedId, std::move(image));
+                if (command.virtualPlacement)
+                {
+                    _kittyVirtualIds.insert(assignedId); // eligible for placeholder rendering
+                }
+                else
+                {
+                    _kittyVirtualIds.erase(assignedId);
+                }
                 if (action == L'T' && !command.virtualPlacement)
                 {
                     const auto stored = _kittyImages.find(assignedId);
@@ -5306,7 +5314,11 @@ void AdaptDispatch::_ProcessKittyCommand(const KittyControl& command, const std:
                 success = false;
                 code = L"ENOENT:image not found";
             }
-            else if (!command.virtualPlacement)
+            else if (command.virtualPlacement)
+            {
+                _kittyVirtualIds.insert(targetId); // virtual put: eligible for placeholders, no cursor draw
+            }
+            else
             {
                 _placeKittyImage(*target, moveCursor, targetId, command.cols, command.rows, command.srcX, command.srcY, command.srcW, command.srcH);
             }
@@ -5484,6 +5496,7 @@ void AdaptDispatch::_eraseKittyImage(const uint32_t id)
         }
     }
     _kittyImages.erase(it);
+    _kittyVirtualIds.erase(id);
     // The eviction path always removes the front, so keep that common case O(1).
     if (!_kittyImageOrder.empty() && _kittyImageOrder.front() == id)
     {
@@ -5504,6 +5517,7 @@ try
     _kittyImages.clear();
     _kittyImageNumbers.clear();
     _kittyImageOrder.clear();
+    _kittyVirtualIds.clear();
     _kittyTotalPixelBytes = 0;
     auto page = _pages.ActivePage();
     auto& buffer = page.Buffer();
@@ -5732,7 +5746,8 @@ void AdaptDispatch::_placeKittyImage(const KittyImage& image, const bool moveCur
 // Maps a kitty row/column combining diacritic to its 0-based index, or -1 if the
 // glyph isn't a placeholder diacritic. The full kitty table is 297 entries; this
 // MVP keeps the first 16 (covers small grids) and falls back to auto-increment for
-// anything outside it. Source: kitty graphics protocol "rowcolumn-diacritics".
+// anything outside it. Source: kitty graphics protocol "rowcolumn-diacritics". The
+// optional 3rd diacritic (high byte of a >24-bit id) and 256-color ids are deferred.
 int AdaptDispatch::_KittyPlaceholderDiacriticIndex(const wchar_t ch) noexcept
 {
     static constexpr wchar_t table[] = {
@@ -5772,11 +5787,12 @@ void AdaptDispatch::_placeKittyPlaceholderCell(const KittyImage& image, const ui
     const auto gridRows = std::max<uint32_t>(rows, 1);
     const auto colIndex = std::min(cellCol, gridCols - 1);
     const auto rowIndex = std::min(cellRow, gridRows - 1);
-    // Source sub-rect for this tile (nearest-neighbour, full cell).
+    // Tile boundaries computed from the cumulative edges so a non-divisible image keeps
+    // its right/bottom pixels (e.g. 3px across 2 cols -> 2px tile then 1px tile, no drop).
     const auto srcX = static_cast<til::CoordType>(static_cast<uint64_t>(colIndex) * image.width / gridCols);
-    const auto srcW = std::max(1, static_cast<til::CoordType>(image.width / gridCols));
+    const auto srcW = std::max(1, static_cast<til::CoordType>(static_cast<uint64_t>(colIndex + 1) * image.width / gridCols) - srcX);
     const auto srcY = static_cast<til::CoordType>(static_cast<uint64_t>(rowIndex) * image.height / gridRows);
-    const auto srcH = std::max(1, static_cast<til::CoordType>(image.height / gridRows));
+    const auto srcH = std::max(1, static_cast<til::CoordType>(static_cast<uint64_t>(rowIndex + 1) * image.height / gridRows) - srcY);
     auto& dstRow = buffer.GetMutableRowByOffset(row);
     auto dstSlice = dstRow.GetMutableImageSlice();
     if (!dstSlice || dstSlice->CellSize() != clampedCellSize)
@@ -5824,6 +5840,10 @@ void AdaptDispatch::_renderKittyPlaceholders(const std::wstring_view string, con
     }
     const auto rgb = fg.GetRGB();
     const uint32_t imageId = (static_cast<uint32_t>(GetRValue(rgb)) << 16) | (static_cast<uint32_t>(GetGValue(rgb)) << 8) | GetBValue(rgb);
+    if (_kittyVirtualIds.find(imageId) == _kittyVirtualIds.end())
+    {
+        return; // only U=1 (virtual) images draw via placeholders; ordinary text must not overlay
+    }
     const auto it = _kittyImages.find(imageId);
     if (it == _kittyImages.end())
     {
