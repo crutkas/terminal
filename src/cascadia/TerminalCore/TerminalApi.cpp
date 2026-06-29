@@ -11,6 +11,8 @@
 #include <wil/com.h>
 #include <wil/resource.h>
 
+#include <til/io.h>
+
 using namespace Microsoft::Terminal::Core;
 using namespace Microsoft::Console::Render;
 using namespace Microsoft::Console::Types;
@@ -476,195 +478,13 @@ til::size Terminal::GetCellSize() const noexcept
     return size;
 }
 
-namespace
-{
-    // Kitty graphics file-transmission (t=f / t=t) helpers. NOTE: this logic is
-    // intentionally duplicated in ConhostInternalGetSet::ReadKittyImageFile
-    // (outputStream.cpp); keep the two copies in sync. Reads are bounded to the same
-    // 32 MiB cap the adapter applies to a direct (base64) payload, so a hostile S= can
-    // never force a large allocation regardless of the file's true size.
-    constexpr uint64_t MaxKittyFileBytes = 32ull * 1024 * 1024;
-
-    // Returns the fully-resolved on-disk path for an open handle (resolving symlinks,
-    // "..", and 8.3 short names) so the temp-directory containment check cannot be
-    // fooled, or an empty string on failure.
-    std::wstring _kittyFinalPath(HANDLE handle) noexcept
-    {
-        const auto needed = GetFinalPathNameByHandleW(handle, nullptr, 0, FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
-        if (needed == 0)
-        {
-            return {};
-        }
-        std::wstring path;
-        try
-        {
-            path.resize(needed);
-        }
-        catch (...)
-        {
-            return {};
-        }
-        const auto written = GetFinalPathNameByHandleW(handle, path.data(), needed, FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
-        if (written == 0 || written >= needed)
-        {
-            return {};
-        }
-        path.resize(written);
-        return path;
-    }
-
-    // Returns the canonical system temp directory (resolved through a handle so it is in
-    // the same normalized form as _kittyFinalPath) ending in a backslash, or empty on
-    // failure. Prefers GetTempPath2W (Win11, per-process) and falls back to GetTempPathW.
-    std::wstring _kittyTempDir() noexcept
-    {
-        wchar_t raw[MAX_PATH + 2]{};
-        using PfnGetTempPath2W = DWORD(WINAPI*)(DWORD, LPWSTR);
-        static const auto pfnGetTempPath2W = []() noexcept {
-            const auto k32 = GetModuleHandleW(L"kernel32.dll");
-            return k32 ? reinterpret_cast<PfnGetTempPath2W>(GetProcAddress(k32, "GetTempPath2W")) : nullptr;
-        }();
-        const auto len = pfnGetTempPath2W ? pfnGetTempPath2W(ARRAYSIZE(raw), raw) : GetTempPathW(ARRAYSIZE(raw), raw);
-        if (len == 0 || len >= ARRAYSIZE(raw))
-        {
-            return {};
-        }
-        wil::unique_hfile dir{ CreateFileW(raw, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr) };
-        if (!dir)
-        {
-            return {};
-        }
-        auto canonical = _kittyFinalPath(dir.get());
-        if (!canonical.empty() && canonical.back() != L'\\')
-        {
-            try
-            {
-                canonical.push_back(L'\\');
-            }
-            catch (...)
-            {
-                return {};
-            }
-        }
-        return canonical;
-    }
-
-    // True when the canonical file path is contained in the canonical temp directory.
-    // Both must be normalized via _kittyFinalPath so a case-insensitive ordinal prefix
-    // test is sufficient and safe.
-    bool _kittyPathUnderTemp(const std::wstring& canonicalFile) noexcept
-    {
-        const auto tempDir = _kittyTempDir();
-        if (tempDir.empty() || canonicalFile.size() < tempDir.size())
-        {
-            return false;
-        }
-        return CompareStringOrdinal(canonicalFile.c_str(), static_cast<int>(tempDir.size()), tempDir.c_str(), static_cast<int>(tempDir.size()), TRUE) == CSTR_EQUAL;
-    }
-
-    // Real-filesystem implementation of ITerminalApi::ReadKittyImageFile. Opens 'path',
-    // seeks to 'offset', reads up to min(size or EOF, 32 MiB) bytes into 'out', and—when
-    // 'deleteAfter' (t=t)—deletes the file afterward ONLY if it resolves to a location
-    // under the system temp directory, so the medium cannot delete arbitrary files.
-    // Never throws.
-    bool _readKittyImageFile(const std::wstring_view path, uint64_t offset, uint64_t size, bool deleteAfter, std::vector<uint8_t>& out) noexcept
-    {
-        out.clear();
-        if (path.empty())
-        {
-            return false;
-        }
-
-        std::wstring pathStr;
-        try
-        {
-            pathStr.assign(path);
-        }
-        catch (...)
-        {
-            return false;
-        }
-
-        // We only ever read; FILE_SHARE_DELETE lets the file be removed (by us or the
-        // client) while the handle is open.
-        wil::unique_hfile file{ CreateFileW(pathStr.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr) };
-        if (!file)
-        {
-            return false;
-        }
-
-        LARGE_INTEGER fileSize{};
-        if (!GetFileSizeEx(file.get(), &fileSize) || fileSize.QuadPart < 0)
-        {
-            return false;
-        }
-        const auto total = static_cast<uint64_t>(fileSize.QuadPart);
-        if (offset > total)
-        {
-            return false; // offset past end of file
-        }
-
-        // Bytes to read: what remains after the offset, clamped by the client's S= when
-        // nonzero, and always by the hard 32 MiB cap (fits in a single DWORD ReadFile).
-        uint64_t toRead = total - offset;
-        if (size != 0)
-        {
-            toRead = std::min(toRead, size);
-        }
-        toRead = std::min(toRead, MaxKittyFileBytes);
-
-        if (offset != 0)
-        {
-            LARGE_INTEGER move{};
-            move.QuadPart = static_cast<LONGLONG>(offset);
-            if (!SetFilePointerEx(file.get(), move, nullptr, FILE_BEGIN))
-            {
-                return false;
-            }
-        }
-
-        // Resolve the canonical path while the handle is open so the temp check (and the
-        // path we ultimately delete) reflects the real file, not the client's spelling.
-        std::wstring canonicalPath;
-        if (deleteAfter)
-        {
-            canonicalPath = _kittyFinalPath(file.get());
-        }
-
-        try
-        {
-            out.resize(static_cast<size_t>(toRead));
-        }
-        catch (...)
-        {
-            out.clear();
-            return false;
-        }
-
-        DWORD read = 0;
-        if (toRead != 0 && !ReadFile(file.get(), out.data(), static_cast<DWORD>(toRead), &read, nullptr))
-        {
-            out.clear();
-            return false;
-        }
-        out.resize(read);
-
-        file.reset(); // close before deleting
-
-        if (deleteAfter && !canonicalPath.empty() && _kittyPathUnderTemp(canonicalPath))
-        {
-            // Best-effort: a failed delete does not fail the (successful) read. Files
-            // outside the temp directory are deliberately left untouched.
-            std::ignore = DeleteFileW(canonicalPath.c_str());
-        }
-
-        return true;
-    }
-}
-
 bool Terminal::ReadKittyImageFile(const std::wstring_view path, uint64_t offset, uint64_t size, bool deleteAfter, std::vector<uint8_t>& out) noexcept
 {
-    return _readKittyImageFile(path, offset, size, deleteAfter, out);
+    // Windows Terminal is the final terminal in the chain, so it owns deletion of a t=t
+    // temporary file (conhost suppresses its own delete under ConPTY). The shared helper
+    // still enforces local fixed-drive reads and temp-dir + marker containment before it
+    // removes anything.
+    return til::read_image_file(path, offset, size, deleteAfter, out);
 }
 
 void Terminal::NotifyBufferRotation(const int delta)

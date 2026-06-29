@@ -328,8 +328,8 @@ namespace Microsoft::Console::VirtualTerminal
             uint32_t srcY = 0;    // y=: source crop top edge in pixels
             uint32_t srcW = 0;    // w=: source crop width in pixels (0 = to right edge)
             uint32_t srcH = 0;    // h=: source crop height in pixels (0 = to bottom edge)
-            uint32_t fileOffset = 0; // O=: byte offset into a transmitted file (t=f / t=t)
-            uint32_t fileSize = 0;   // S=: bytes to read from the file (0 = to EOF, host-bounded)
+            uint64_t fileOffset = 0; // O=: byte offset into a transmitted file (t=f / t=t)
+            uint64_t fileSize = 0;   // S=: bytes to read from the file (0 = to EOF, host-bounded)
             bool moreChunks = false;
             bool mPresent = false;
             bool haveId = false;
@@ -352,6 +352,7 @@ namespace Microsoft::Console::VirtualTerminal
         void _ProcessKittyCommand(const KittyControl& command, const std::string_view payload, const bool payloadValid, const bool payloadTooLarge);
         void _clearKittyChunk() noexcept;
         static uint32_t _ParseKittyUint(const std::wstring_view value) noexcept;
+        static uint64_t _ParseKittyUint64(const std::wstring_view value) noexcept;
         static bool _DecodeKittyBase64(const std::string_view input, std::vector<uint8_t>& output) noexcept;
         static std::vector<RGBQUAD> _decodeKittyPixels(const uint32_t format, const std::vector<uint8_t>& bytes);
         uint32_t _kittyAssignImageId();
