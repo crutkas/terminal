@@ -268,11 +268,16 @@ bool ImageSlice::_copyCells(const ImageSlice& srcSlice, const til::CoordType src
             std::advance(dstIterator, _pixelWidth);
         }
         // Carry over per-column ownership so a moved/reflowed image keeps its tag.
+        // Snapshot first because an in-place rightward move overlaps src and dst.
+        std::vector<uint32_t> movedOwners(writeCellCount);
         for (auto i = 0; i < writeCellCount; i++)
         {
-            const auto srcCol = srcUsedBegin + i;
+            til::at(movedOwners, i) = srcSlice.ColumnOwner(srcUsedBegin + i);
+        }
+        for (auto i = 0; i < writeCellCount; i++)
+        {
             const auto dstCol = dstWriteBegin + i;
-            SetColumnOwner(dstCol, dstCol + 1, srcSlice.ColumnOwner(srcCol));
+            SetColumnOwner(dstCol, dstCol + 1, til::at(movedOwners, i));
         }
     }
 

@@ -5597,6 +5597,30 @@ public:
         VERIFY_ARE_EQUAL(L'h', _testGetSet->_textBuffer->GetRowByOffset(origin.y).GlyphAt(origin.x).front(), L"text must survive a Kitty delete-all");
     }
 
+    // Retransmitting an existing id must erase the old placement's pixels before the
+    // replacement is drawn, so stale columns outside the new extent don't linger.
+    TEST_METHOD(KittyRetransmitErasesOldExtent)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,f=24,s=2,v=1;/wAA/wAA\x1b\\"); // 2px wide red
+        _stateMachine->ProcessString(L"\x1b[1;1H");
+        _stateMachine->ProcessString(L"\x1b_Ga=t,i=1,f=24,s=1,v=1;AP8A\x1b\\"); // replace: 1px green, store only
+        VERIFY_IS_FALSE(BufferContainsColor(*_testGetSet->_textBuffer, 255, 0, 0), L"old pixels must be erased on retransmit");
+        VERIFY_ARE_EQUAL(0, CountImageRows(*_testGetSet->_textBuffer)); // store-only: nothing drawn
+    }
+
+    // Sixel writing over Kitty-owned columns claims them (owner 0); a later Kitty
+    // delete-all must leave those Sixel pixels.
+    TEST_METHOD(KittySixelReclaimsColumnsSurvivesDelete)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,f=24,s=2,v=1,C=1;AP8AAP8A\x1b\\"); // Kitty green over cols
+        _stateMachine->ProcessString(L"\x1bPq#0;2;100;0;0~~~~\x1b\\"); // Sixel red same row reclaims cols
+        VERIFY_IS_TRUE(BufferContainsColor(*_testGetSet->_textBuffer, 255, 0, 0));
+        _stateMachine->ProcessString(L"\x1b_Ga=d,d=a;\x1b\\");
+        VERIFY_IS_TRUE(BufferContainsColor(*_testGetSet->_textBuffer, 255, 0, 0), L"Sixel-reclaimed cols must survive Kitty delete-all");
+    }
+
     // An APC string with a non-'G' identifier is not Kitty graphics and is ignored.
     TEST_METHOD(NonKittyApcIgnored)
     {
