@@ -929,10 +929,11 @@ void SixelParser::_maybeFlushImageBuffer(const bool endOfSequence)
                         dstSlice = dstRow.SetImageSlice(std::make_unique<ImageSlice>(_cellSize));
                         __assume(dstSlice != nullptr);
                     }
-                    // These columns are now Sixel content (no image id), so clear any
-                    // stale Kitty ownership; otherwise a later Kitty delete would scrub
-                    // these pixels.
-                    dstSlice->SetColumnOwner(columnBegin, columnEnd, 0);
+                    // These cells become Sixel content. Clear any foreign (Kitty)
+                    // pixels+ownership so a transparent Sixel hole can't leave ownerless
+                    // Kitty pixels that a later Kitty delete would skip. Existing Sixel
+                    // (owner 0) overlay is preserved.
+                    dstSlice->ClearForeignColumns(columnBegin, columnEnd);
                     auto dstIterator = dstSlice->MutablePixels(columnBegin, columnEnd);
                     for (auto pixelRow = 0; pixelRow < _cellSize.height; pixelRow++)
                     {

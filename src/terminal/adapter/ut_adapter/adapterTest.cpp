@@ -5621,6 +5621,20 @@ public:
         VERIFY_IS_TRUE(BufferContainsColor(*_testGetSet->_textBuffer, 255, 0, 0), L"Sixel-reclaimed cols must survive Kitty delete-all");
     }
 
+    // A SPARSE Sixel (transparent pixels) over Kitty cells must not leave ownerless
+    // Kitty pixels: the claimed cells are cleared, so Kitty delete-all has nothing
+    // stale and Sixel's own opaque pixels survive.
+    TEST_METHOD(KittySparseSixelOverKittyNoOrphan)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,f=24,s=2,v=1,C=1;AP8AAP8A\x1b\\"); // Kitty green, 2 cols
+        _stateMachine->ProcessString(L"\x1bPq#0;2;100;0;0~$#0?~\x1b\\"); // Sixel red col0, transparent col1
+        VERIFY_IS_TRUE(BufferContainsColor(*_testGetSet->_textBuffer, 255, 0, 0));
+        _stateMachine->ProcessString(L"\x1b_Ga=d,d=a;\x1b\\");
+        VERIFY_IS_FALSE(BufferContainsColor(*_testGetSet->_textBuffer, 0, 255, 0), L"no ownerless Kitty pixel may linger under a sparse Sixel");
+        VERIFY_IS_TRUE(BufferContainsColor(*_testGetSet->_textBuffer, 255, 0, 0), L"Sixel opaque pixels survive");
+    }
+
     // An APC string with a non-'G' identifier is not Kitty graphics and is ignored.
     TEST_METHOD(NonKittyApcIgnored)
     {

@@ -62,6 +62,30 @@ bool ImageSlice::HasOwner(const uint32_t id) const noexcept
     return std::find(_columnOwners.begin(), _columnOwners.end(), id) != _columnOwners.end();
 }
 
+// Clears pixels and ownership for any column in [columnBegin,columnEnd) owned by
+// another image (nonzero id), so content claiming the cells leaves no ownerless
+// pixels behind. Untagged columns (owner 0, e.g. existing Sixel) are left alone.
+void ImageSlice::ClearForeignColumns(const til::CoordType columnBegin, const til::CoordType columnEnd)
+{
+    const auto clearBegin = std::max(columnBegin, _columnBegin);
+    const auto clearEnd = std::min(columnEnd, _columnEnd);
+    for (auto column = clearBegin; column < clearEnd; ++column)
+    {
+        const auto index = static_cast<size_t>(column - _columnBegin);
+        if (index >= _columnOwners.size() || til::at(_columnOwners, index) == 0)
+        {
+            continue;
+        }
+        til::at(_columnOwners, index) = 0;
+        auto iterator = std::next(_pixelBuffer.data(), static_cast<til::CoordType>(index) * _cellSize.width);
+        for (auto y = 0; y < _cellSize.height; y++)
+        {
+            std::memset(iterator, 0, _cellSize.width * sizeof(RGBQUAD));
+            std::advance(iterator, _pixelWidth);
+        }
+    }
+}
+
 // Clears the pixels and owner tag for every column owned by id. Returns true if
 // nothing drawable remains (no owned columns and no opaque pixels), so the caller
 // can drop the slice. Co-resident content (e.g. Sixel, owner 0) keeps the slice.
