@@ -33,10 +33,13 @@ public:
     til::CoordType ColumnOffset() const noexcept;
     til::CoordType PixelWidth() const noexcept;
 
-    // Optional owner tag (0 = none/Sixel). Lets a protocol (e.g. Kitty) target only
-    // its own slices for deletion without disturbing other images on the same buffer.
-    uint32_t ImageId() const noexcept;
-    void SetImageId(uint32_t id) noexcept;
+    // Per-column owner tags (0 = none/Sixel). Lets a protocol (e.g. Kitty) target
+    // only the cells it owns for deletion without disturbing other images that
+    // share the same row. Owners are kept aligned to [_columnBegin, _columnEnd).
+    uint32_t ColumnOwner(const til::CoordType column) const noexcept;
+    void SetColumnOwner(const til::CoordType columnBegin, const til::CoordType columnEnd, const uint32_t id);
+    bool HasOwner(const uint32_t id) const noexcept;
+    bool EraseByOwner(const uint32_t id);
 
     std::span<const RGBQUAD> Pixels() const noexcept;
     const RGBQUAD* Pixels(const til::CoordType columnBegin) const noexcept;
@@ -55,8 +58,8 @@ private:
 
     uint64_t _revision = 0;
     til::size _cellSize;
-    uint32_t _imageId = 0;
     std::vector<RGBQUAD> _pixelBuffer;
+    std::vector<uint32_t> _columnOwners;
     til::CoordType _columnBegin = 0;
     til::CoordType _columnEnd = 0;
     til::CoordType _pixelWidth = 0;
