@@ -5532,6 +5532,100 @@ public:
         VERIFY_ARE_EQUAL(0, CountImageRows(*_testGetSet->_textBuffer), L"delete must erase on-screen pixels");
     }
 
+    // ---- Kitty Unicode placeholders (U=1 virtual placement) -------------------
+    // A single U+10EEEE placeholder cell (one UTF-16 surrogate pair).
+    static const std::wstring& Placeholder()
+    {
+        static const std::wstring p = L"\xDBFB\xDEEE";
+        return p;
+    }
+
+    // a=T,U=1 stores the image but must NOT draw it at the cursor (virtual placement).
+    TEST_METHOD(KittyVirtualPlacementStoresWithoutDrawing)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,f=24,s=1,v=1;/wAA\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=1;OK\x1b\\");
+        VERIFY_ARE_EQUAL(0, CountImageRows(*_testGetSet->_textBuffer), L"U=1 must store only, not draw at the cursor");
+    }
+
+    // a=p,U=1 against a stored image is also virtual: still no cursor-anchored draw.
+    TEST_METHOD(KittyVirtualPutStoresWithoutDrawing)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1b_Ga=t,i=1,f=24,s=1,v=1;/wAA\x1b\\");
+        _stateMachine->ProcessString(L"\x1b_Ga=p,U=1,i=1;\x1b\\");
+        VERIFY_ARE_EQUAL(0, CountImageRows(*_testGetSet->_textBuffer), L"a=p,U=1 must not draw at the cursor");
+    }
+
+    // A placeholder cell whose fg = image id renders that image's pixel.
+    TEST_METHOD(KittyPlaceholderRendersImage)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,f=24,s=1,v=1;/wAA\x1b\\"); // red, virtual
+        VERIFY_ARE_EQUAL(0, CountImageRows(*_testGetSet->_textBuffer));
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m"); // fg id 1
+        _stateMachine->ProcessString(Placeholder());
+        VERIFY_IS_TRUE(BufferContainsColor(*_testGetSet->_textBuffer, 255, 0, 0), L"placeholder cell must overlay the image pixel");
+        VERIFY_IS_TRUE(CountImageRows(*_testGetSet->_textBuffer) >= 1);
+    }
+
+    // The fg id selects WHICH image: id 2 (green), so red (id 1) must not appear.
+    TEST_METHOD(KittyPlaceholderForegroundSelectsImage)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,f=24,s=1,v=1;/wAA\x1b\\"); // id1 red
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=2,f=24,s=1,v=1;AP8A\x1b\\"); // id2 green
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;2m"); // fg id 2
+        _stateMachine->ProcessString(Placeholder());
+        VERIFY_IS_TRUE(BufferContainsColor(*_testGetSet->_textBuffer, 0, 255, 0), L"id 2 selects the green image");
+        VERIFY_IS_FALSE(BufferContainsColor(*_testGetSet->_textBuffer, 255, 0, 0), L"id 1 must not be drawn");
+    }
+
+    // A run of placeholders forms a grid; a 2px-wide red|green image splits into two
+    // cells, the left red and the right green.
+    TEST_METHOD(KittyPlaceholderBlockFormsGrid)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,f=24,s=2,v=1;/wAAAP8A\x1b\\"); // 2px: red,green
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m");
+        _stateMachine->ProcessString(Placeholder() + Placeholder());
+        VERIFY_IS_TRUE(BufferContainsColor(*_testGetSet->_textBuffer, 255, 0, 0), L"left tile = red");
+        VERIFY_IS_TRUE(BufferContainsColor(*_testGetSet->_textBuffer, 0, 255, 0), L"right tile = green");
+    }
+
+    // Deleting the image by id erases placeholder-rendered cells too.
+    TEST_METHOD(KittyPlaceholderDeleteErases)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,f=24,s=1,v=1;/wAA\x1b\\");
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m");
+        _stateMachine->ProcessString(Placeholder());
+        VERIFY_IS_TRUE(BufferContainsColor(*_testGetSet->_textBuffer, 255, 0, 0));
+        _stateMachine->ProcessString(L"\x1b_Ga=d,d=i,i=1;\x1b\\");
+        VERIFY_IS_FALSE(BufferContainsColor(*_testGetSet->_textBuffer, 255, 0, 0), L"delete by id must erase placeholder pixels");
+        VERIFY_ARE_EQUAL(0, CountImageRows(*_testGetSet->_textBuffer));
+    }
+
+    // Non-placeholder text must never produce an image slice.
+    TEST_METHOD(KittyPlaceholderTextUnaffected)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,f=24,s=1,v=1;/wAA\x1b\\");
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m");
+        _stateMachine->ProcessString(L"hello");
+        VERIFY_ARE_EQUAL(0, CountImageRows(*_testGetSet->_textBuffer), L"plain text must not render the image");
+    }
+
+    // A placeholder fg with no matching stored image renders nothing (and no crash).
+    TEST_METHOD(KittyPlaceholderUnknownIdRendersNothing)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;9m"); // id 9: never transmitted
+        _stateMachine->ProcessString(Placeholder());
+        VERIFY_ARE_EQUAL(0, CountImageRows(*_testGetSet->_textBuffer));
+    }
+
     // Delete-by-id is targeted: removing image 1 must erase only its pixels and leave a
     // co-resident image (2) intact -- guards per-image cell ownership, not a blanket clear.
     TEST_METHOD(KittyGraphicsDeleteOnePreservesOther)
