@@ -929,6 +929,10 @@ void SixelParser::_maybeFlushImageBuffer(const bool endOfSequence)
                         dstSlice = dstRow.SetImageSlice(std::make_unique<ImageSlice>(_cellSize));
                         __assume(dstSlice != nullptr);
                     }
+                    // These columns are now Sixel content (no image id), so clear any
+                    // stale Kitty ownership; otherwise a later Kitty delete would scrub
+                    // these pixels.
+                    dstSlice->SetColumnOwner(columnBegin, columnEnd, 0);
                     auto dstIterator = dstSlice->MutablePixels(columnBegin, columnEnd);
                     for (auto pixelRow = 0; pixelRow < _cellSize.height; pixelRow++)
                     {
