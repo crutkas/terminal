@@ -104,9 +104,12 @@ void AdaptDispatch::_WriteToBuffer(const std::wstring_view string)
     auto& textBuffer = page.Buffer();
     auto& cursor = page.Cursor();
     auto cursorPosition = cursor.GetPosition();
-    const auto placeholderOrigin = cursorPosition;
     const auto wrapAtEOL = _api.GetSystemMode(ITerminalApi::Mode::AutoWrap);
     const auto& attributes = page.Attributes();
+    // Kitty Unicode placeholders (cells holding U+10EEEE) overlay a sub-rect of a virtually
+    // placed image. They're rendered per written segment inside the loop below, after each
+    // segment's wrap resolves, so a wrapped or scrolled run lands every cell on its real row.
+    const auto hasKittyPlaceholders = string.find(KittyPlaceholderCodePointHigh) != std::wstring_view::npos;
 
     auto [topMargin, bottomMargin] = _GetVerticalMargins(page, true);
     const auto [leftMargin, rightMargin] = _GetHorizontalMargins(page.Width());
@@ -163,6 +166,18 @@ void AdaptDispatch::_WriteToBuffer(const std::wstring_view string)
         }
         const auto textPositionAfter = state.text.data();
 
+        // Overlay any placeholders in the segment just written, on its real (post-wrap) row
+        // and from its true start column, so wrapping and bottom-of-buffer scrolls place each
+        // cell correctly rather than replaying the whole run from one pre-wrap origin.
+        if (hasKittyPlaceholders && textPositionAfter > textPositionBefore)
+        {
+            const std::wstring_view segment{ textPositionBefore, static_cast<size_t>(textPositionAfter - textPositionBefore) };
+            if (segment.find(KittyPlaceholderCodePointHigh) != std::wstring_view::npos)
+            {
+                _renderKittyPlaceholders(segment, cursorPosition.y, state.columnBegin);
+            }
+        }
+
         // If we're past the end of the line, we need to clamp the cursor
         // back into range, and if wrapping is enabled, set the delayed wrap
         // flag. The wrapping only occurs once another character is output.
@@ -200,13 +215,6 @@ void AdaptDispatch::_WriteToBuffer(const std::wstring_view string)
     // have access to the entire line of text, whereas TextBuffer writes it one
     // character at a time via the OutputCellIterator.
     textBuffer.TriggerNewTextNotification(string);
-
-    // Kitty Unicode placeholders: cells holding U+10EEEE overlay a sub-rect of a
-    // virtually-placed image, keyed by the cell's RGB foreground (the image id).
-    if (string.find(KittyPlaceholderCodePointHigh) != std::wstring_view::npos)
-    {
-        _renderKittyPlaceholders(string, placeholderOrigin);
-    }
 }
 
 // Routine Description:
@@ -5327,6 +5335,9 @@ void AdaptDispatch::_ProcessKittyCommand(const KittyControl& command, const std:
             }
             else
             {
+                // A non-virtual put cancels any prior placeholder eligibility for this id, so
+                // a later U+10EEEE cell can't keep overlaying it (mirrors the transmit path).
+                _kittyVirtualIds.erase(targetId);
                 _placeKittyImage(*target, moveCursor, targetId, command.cols, command.rows, command.srcX, command.srcY, command.srcW, command.srcH);
             }
             break;
@@ -5645,33 +5656,9 @@ void AdaptDispatch::_placeKittyImage(const KittyImage& image, const bool moveCur
         return;
     }
 
-    // Requested target pixel size: c/r set a cell span (single axis preserves aspect;
-    // neither keeps native size). Cap c/r so the aspect multiply can't overflow; this
-    // is the sampling denominator, so oversized spans clip (below) rather than squash.
-    constexpr uint32_t maxCells = 8192;
-    const auto reqCols = std::min(cols, maxCells);
-    const auto reqRows = std::min(rows, maxCells);
-    int64_t targetW64, targetH64;
-    if (reqCols != 0 && reqRows != 0)
-    {
-        targetW64 = static_cast<int64_t>(reqCols) * cellWidth;
-        targetH64 = static_cast<int64_t>(reqRows) * cellHeight;
-    }
-    else if (reqCols != 0)
-    {
-        targetW64 = static_cast<int64_t>(reqCols) * cellWidth;
-        targetH64 = static_cast<int64_t>(cropH) * targetW64 / cropW;
-    }
-    else if (reqRows != 0)
-    {
-        targetH64 = static_cast<int64_t>(reqRows) * cellHeight;
-        targetW64 = static_cast<int64_t>(cropW) * targetH64 / cropH;
-    }
-    else
-    {
-        targetW64 = cropW;
-        targetH64 = cropH;
-    }
+    // Requested target pixel size: c/r set a cell span (single axis preserves aspect; neither
+    // keeps native size). Shared with the virtual grid so a U=1 placement matches this draw.
+    const auto [targetW64, targetH64] = _kittyTargetPixels(cropW, cropH, cols, rows, cellWidth, cellHeight);
     const auto targetW = std::max<int64_t>(targetW64, 1);
     const auto targetH = std::max<int64_t>(targetH64, 1);
 
@@ -5750,25 +5737,52 @@ void AdaptDispatch::_placeKittyImage(const KittyImage& image, const bool moveCur
     }
 }
 
+// Maps a c=/r= request to a target pixel size. With both axes set each is cells*cell-size;
+// with one set the other preserves aspect; with neither the native crop size is kept. Capped
+// so the aspect multiply can't overflow. Shared by the cursor-anchored and virtual paths.
+AdaptDispatch::KittyTargetSize AdaptDispatch::_kittyTargetPixels(const int64_t cropW, const int64_t cropH, const uint32_t cols, const uint32_t rows, const int64_t cellWidth, const int64_t cellHeight) noexcept
+{
+    constexpr uint32_t maxCells = 8192;
+    const int64_t reqCols = std::min(cols, maxCells);
+    const int64_t reqRows = std::min(rows, maxCells);
+    const auto safeCropW = std::max<int64_t>(cropW, 1);
+    const auto safeCropH = std::max<int64_t>(cropH, 1);
+    if (reqCols != 0 && reqRows != 0)
+    {
+        return { reqCols * cellWidth, reqRows * cellHeight };
+    }
+    if (reqCols != 0)
+    {
+        const auto w = reqCols * cellWidth;
+        return { w, safeCropH * w / safeCropW };
+    }
+    if (reqRows != 0)
+    {
+        const auto h = reqRows * cellHeight;
+        return { safeCropW * h / safeCropH, h };
+    }
+    return { safeCropW, safeCropH };
+}
+
 // Records the fixed grid geometry of a virtual (U=1) placement so later Unicode-placeholder
-// rendering slices the image by a STABLE rows x cols grid. c=/r= give the grid directly; when
-// either is absent it's the number of cells the image spans at the host cell size
-// (ceil(pixels / cell)), matching how a cursor-anchored placement of the same image would size
-// itself. Re-storing resets the screen-row anchor so a fresh grid re-anchors on its next render.
+// rendering slices the image by a STABLE rows x cols grid. The grid is the cell span the same
+// image would occupy if drawn at the cursor (shared _kittyTargetPixels), so c-only/r-only
+// keep aspect. Re-storing resets the anchor and auto cursor so a fresh grid re-anchors next.
 void AdaptDispatch::_storeKittyVirtualPlacement(const uint32_t id, const KittyImage& image, const uint32_t cols, const uint32_t rows)
 {
     constexpr uint32_t maxCells = 8192;
     const auto cellSize = _api.GetCellSize();
-    const auto cellWidth = static_cast<uint32_t>(std::max(1, cellSize.width));
-    const auto cellHeight = static_cast<uint32_t>(std::max(1, cellSize.height));
-    auto gridCols = cols != 0 ? cols : (std::max<uint32_t>(image.width, 1) + cellWidth - 1) / cellWidth;
-    auto gridRows = rows != 0 ? rows : (std::max<uint32_t>(image.height, 1) + cellHeight - 1) / cellHeight;
-    gridCols = std::clamp<uint32_t>(gridCols, 1, maxCells);
-    gridRows = std::clamp<uint32_t>(gridRows, 1, maxCells);
+    const int64_t cellWidth = std::max(1, cellSize.width);
+    const int64_t cellHeight = std::max(1, cellSize.height);
+    const auto [targetW, targetH] = _kittyTargetPixels(image.width, image.height, cols, rows, cellWidth, cellHeight);
+    const auto gridCols = std::clamp<int64_t>((targetW + cellWidth - 1) / cellWidth, 1, maxCells);
+    const auto gridRows = std::clamp<int64_t>((targetH + cellHeight - 1) / cellHeight, 1, maxCells);
     auto& placement = _kittyVirtualIds[id];
-    placement.cols = gridCols;
-    placement.rows = gridRows;
+    placement.cols = static_cast<uint32_t>(gridCols);
+    placement.rows = static_cast<uint32_t>(gridRows);
     placement.anchorRow = -1;
+    placement.autoRow = 0;
+    placement.autoCol = 0;
 }
 
 // Maps a kitty row/column combining diacritic to its 0-based index, or -1 if the
@@ -5850,22 +5864,21 @@ void AdaptDispatch::_placeKittyPlaceholderCell(const KittyImage& image, const ui
     buffer.TriggerRedraw(Viewport::FromExclusive({ column, row, column + 1, row + 1 }));
 }
 
-// Walks the cursor's just-written line, overlaying each U+10EEEE placeholder cell with
-// its sub-rect of the (virtual) image named by the cell's RGB foreground. The grid is the
-// rows x cols recorded when the image was stored virtually (NOT inferred from this run):
-// the StateMachine splits output on newlines, so a multi-row grid arrives one line per
-// _WriteToBuffer call and counting cells here would mis-size every slice. Each cell's grid
-// (row,col) comes from its kitty combining diacritics (row then col); when a diacritic is
-// absent the column auto-increments along the run and the row is the cell's screen row
-// relative to the grid's anchor (its first-rendered screen row). The screen column is
-// advanced by each just-written glyph's real cell width, so a wide (CJK) glyph before a
-// placeholder doesn't shift it. The run is clamped to the first newline and the page width.
-void AdaptDispatch::_renderKittyPlaceholders(const std::wstring_view string, const til::point origin)
+// Overlays each U+10EEEE placeholder in one just-written segment with its sub-rect of the
+// (virtual) image named by the cell's RGB foreground. The grid (rows x cols) is the geometry
+// recorded when the image was stored virtually, so it stays constant however the cells are
+// chunked across writes. A cell's grid (row,col) comes from its kitty combining diacritics
+// (1st = row, 2nd = col; extras ignored). When the column diacritic is absent the column auto-
+// increments along the segment; when the row diacritic is absent the row tracks an anchor that
+// advances per screen line, including when a bottom-of-buffer scroll keeps the absolute row
+// fixed (a new render at or above the anchor is the next grid row). The screen column steps by
+// each glyph's real width (NavigateToNext), so a wide (CJK) glyph before a placeholder doesn't
+// shift it. Called per segment with the segment's true post-wrap row and start column.
+void AdaptDispatch::_renderKittyPlaceholders(const std::wstring_view segment, const til::CoordType screenRow, const til::CoordType startColumn)
 {
     auto page = _pages.ActivePage();
     auto& buffer = page.Buffer();
-    const auto attributes = page.Attributes();
-    const auto fg = attributes.GetForeground();
+    const auto fg = page.Attributes().GetForeground();
     if (!fg.IsRgb())
     {
         return; // no 24-bit image id => not a Kitty placeholder
@@ -5883,52 +5896,62 @@ void AdaptDispatch::_renderKittyPlaceholders(const std::wstring_view string, con
         return;
     }
     const auto& image = it->second;
+    auto& place = placement->second;
+    const auto cols = std::max<uint32_t>(place.cols, 1);
+    const auto rows = std::max<uint32_t>(place.rows, 1);
 
-    // Grid dimensions are fixed by the stored placement, so they stay constant no matter
-    // how the placeholder cells are chunked across writes.
-    const auto cols = std::max<uint32_t>(placement->second.cols, 1);
-    const auto rows = std::max<uint32_t>(placement->second.rows, 1);
-
-    // Latch the grid's top screen row on the first render; an absent row diacritic then
-    // derives its grid row from how far this line sits below that anchor (clamped to the
-    // grid). A re-store clears the anchor, so a fresh placement re-anchors here.
-    if (placement->second.anchorRow < 0)
+    // Advance the auto grid row for this screen line. Moving strictly down (wrap or a newline
+    // that didn't scroll) adds the row delta; a fresh render at or above the anchor means the
+    // previous line scrolled up off the bottom, so step to the next grid row. autoCol restarts
+    // whenever the grid row changes. Explicit row/col diacritics override per cell below.
+    if (place.anchorRow < 0)
     {
-        placement->second.anchorRow = origin.y;
+        place.autoRow = 0;
+        place.autoCol = 0;
     }
-    const auto rowOffset = std::max<til::CoordType>(origin.y - placement->second.anchorRow, 0);
-    const auto autoRow = std::min<uint32_t>(static_cast<uint32_t>(rowOffset), rows - 1);
-
-    // The just-written cells already carry the buffer's grapheme/width segmentation, so
-    // step the screen column with NavigateToNext rather than assuming one column per
-    // grapheme (which is wrong for wide glyphs).
-    const auto& row = buffer.GetRowByOffset(origin.y);
-    uint32_t autoCol = 0;
-    auto column = origin.x;
-    for (size_t i = 0; i < string.size() && column < page.Width();)
+    else if (screenRow > place.anchorRow)
     {
-        if (string[i] == L'\n' || string[i] == L'\r')
+        place.autoRow = std::min<uint32_t>(place.autoRow + static_cast<uint32_t>(screenRow - place.anchorRow), rows - 1);
+        place.autoCol = 0;
+    }
+    else
+    {
+        place.autoRow = std::min<uint32_t>(place.autoRow + 1, rows - 1);
+        place.autoCol = 0;
+    }
+    place.anchorRow = screenRow;
+
+    const auto& row = buffer.GetRowByOffset(screenRow);
+    auto column = startColumn;
+    for (size_t i = 0; i < segment.size();)
+    {
+        const auto next = buffer.GraphemeNext(segment, i);
+        if (i + 1 < next && segment[i] == KittyPlaceholderCodePointHigh && segment[i + 1] == KittyPlaceholderCodePointLow)
         {
-            break; // a fresh line is a fresh run handled by the next write
-        }
-        const auto next = buffer.GraphemeNext(string, i);
-        if (i + 1 < next && string[i] == KittyPlaceholderCodePointHigh && string[i + 1] == KittyPlaceholderCodePointLow)
-        {
-            // First/second table diacritics in the cluster give row/col; the screen-row
-            // anchor (row) and the running count (col) fill any absent diacritic.
+            // The first two recognized diacritics in the cluster give row then column; any
+            // further ones (high-bit/256-color extensions) are not supported yet, so ignore.
             auto rowDiacritic = -1;
             auto colDiacritic = -1;
             for (auto j = i + 2; j < next; ++j)
             {
-                if (const auto idx = _KittyPlaceholderDiacriticIndex(string[j]); idx >= 0)
+                if (const auto idx = _KittyPlaceholderDiacriticIndex(segment[j]); idx >= 0)
                 {
-                    (rowDiacritic < 0 ? rowDiacritic : colDiacritic) = idx;
+                    if (rowDiacritic < 0)
+                    {
+                        rowDiacritic = idx;
+                    }
+                    else if (colDiacritic < 0)
+                    {
+                        colDiacritic = idx;
+                    }
                 }
             }
-            const auto cellRow = rowDiacritic >= 0 ? static_cast<uint32_t>(rowDiacritic) : autoRow;
-            const auto cellCol = colDiacritic >= 0 ? static_cast<uint32_t>(colDiacritic) : autoCol;
-            _placeKittyPlaceholderCell(image, imageId, column, origin.y, cellRow, cellCol, rows, cols);
-            ++autoCol;
+            const auto cellRow = rowDiacritic >= 0 ? static_cast<uint32_t>(rowDiacritic) : place.autoRow;
+            const auto cellCol = colDiacritic >= 0 ? static_cast<uint32_t>(colDiacritic) : place.autoCol;
+            // The auto column follows this cell so a later auto cell continues after it, and
+            // an explicit column re-syncs the running count to that position.
+            place.autoCol = cellCol + 1;
+            _placeKittyPlaceholderCell(image, imageId, column, screenRow, cellRow, cellCol, rows, cols);
         }
         // Advance by the glyph's real cell width; guard against a non-advancing step.
         const auto nextColumn = row.NavigateToNext(column);

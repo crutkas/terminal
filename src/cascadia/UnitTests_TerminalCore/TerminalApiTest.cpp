@@ -425,13 +425,22 @@ void TerminalApiTest::KittyPlaceholderRendersInRealTerminal()
     sm.ProcessString(L"\x1b[38;2;0;0;1m");
     sm.ProcessString(std::wstring{ L'\xDBFB', L'\xDEEE' });
 
-    auto rendered = false;
-    for (til::CoordType y = 0; y < 100 && !rendered; ++y)
+    // The placeholder must render the stored image's actual color (red), not merely produce
+    // an empty slice. Scan every slice's pixels for RGB(255,0,0).
+    auto renderedRed = false;
+    for (til::CoordType y = 0; y < 100 && !renderedRed; ++y)
     {
-        if (tbi.GetRowByOffset(y).GetImageSlice())
+        if (const auto slice = tbi.GetRowByOffset(y).GetImageSlice())
         {
-            rendered = true;
+            for (const auto& px : slice->Pixels())
+            {
+                if (px.rgbRed == 255 && px.rgbGreen == 0 && px.rgbBlue == 0)
+                {
+                    renderedRed = true;
+                    break;
+                }
+            }
         }
     }
-    VERIFY_IS_TRUE(rendered, L"a placeholder cell must render an image slice in the real Terminal");
+    VERIFY_IS_TRUE(renderedRed, L"a placeholder cell must render the stored image's red pixels in the real Terminal");
 }
