@@ -5529,6 +5529,21 @@ public:
         VERIFY_IS_TRUE(BufferContainsColor(*_testGetSet->_textBuffer, 0, 255, 0), L"other image must survive");
     }
 
+    // delete-all (a=d,d=a) must erase Kitty placements but leave co-resident Sixel
+    // pixels (image id 0) untouched. Regression for the recompose Sixel-wipe.
+    TEST_METHOD(KittyDeleteAllPreservesSixel)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1bPq#0;2;100;0;0~~~~\x1b\\"); // Sixel red (id 0)
+        _stateMachine->ProcessString(L"\r\n\r\n\r\n"); // move below the Sixel rows
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,f=24,s=1,v=1;AP8A\x1b\\"); // Kitty green
+        VERIFY_IS_TRUE(BufferContainsColor(*_testGetSet->_textBuffer, 255, 0, 0));
+        VERIFY_IS_TRUE(BufferContainsColor(*_testGetSet->_textBuffer, 0, 255, 0));
+        _stateMachine->ProcessString(L"\x1b_Ga=d,d=a;\x1b\\");
+        VERIFY_IS_FALSE(BufferContainsColor(*_testGetSet->_textBuffer, 0, 255, 0), L"Kitty image must be erased");
+        VERIFY_IS_TRUE(BufferContainsColor(*_testGetSet->_textBuffer, 255, 0, 0), L"co-resident Sixel must survive a Kitty delete-all");
+    }
+
     // An APC string with a non-'G' identifier is not Kitty graphics and is ignored.
     TEST_METHOD(NonKittyApcIgnored)
     {

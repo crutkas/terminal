@@ -33,6 +33,16 @@ til::size ImageSlice::CellSize() const noexcept
     return _cellSize;
 }
 
+uint32_t ImageSlice::ImageId() const noexcept
+{
+    return _imageId;
+}
+
+void ImageSlice::SetImageId(uint32_t id) noexcept
+{
+    _imageId = id;
+}
+
 til::CoordType ImageSlice::ColumnOffset() const noexcept
 {
     return _columnBegin;
