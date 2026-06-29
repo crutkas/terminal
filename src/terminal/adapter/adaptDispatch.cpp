@@ -5752,7 +5752,7 @@ int AdaptDispatch::_KittyPlaceholderDiacriticIndex(const wchar_t ch) noexcept
 // Overlays a single placeholder cell: the (cellRow,cellCol) tile of a rows x cols
 // grid shows that fractional sub-rect of the image. Reuses the per-row ImageSlice
 // writer and tags the column with imageId so a delete-by-id erases it too.
-void AdaptDispatch::_placeKittyPlaceholderCell(const KittyImage& image, const uint32_t imageId, const til::CoordType column, const uint32_t cellRow, const uint32_t cellCol, const uint32_t rows, const uint32_t cols)
+void AdaptDispatch::_placeKittyPlaceholderCell(const KittyImage& image, const uint32_t imageId, const til::CoordType column, const til::CoordType row, const uint32_t cellRow, const uint32_t cellCol, const uint32_t rows, const uint32_t cols)
 {
     if (image.pixels.empty() || image.width == 0 || image.height == 0)
     {
@@ -5760,7 +5760,6 @@ void AdaptDispatch::_placeKittyPlaceholderCell(const KittyImage& image, const ui
     }
     auto page = _pages.ActivePage();
     auto& buffer = page.Buffer();
-    const auto row = page.Cursor().GetPosition().y;
     if (column < 0 || column >= page.Width() || row < 0 || row >= page.Bottom())
     {
         return;
@@ -5807,13 +5806,16 @@ void AdaptDispatch::_placeKittyPlaceholderCell(const KittyImage& image, const ui
     buffer.TriggerRedraw(Viewport::FromExclusive({ column, row, column + 1, row + 1 }));
 }
 
-// Walks a just-written run of text, overlaying every U+10EEEE placeholder cell with
-// its sub-rect of the (virtual) image named by the cell's RGB foreground. A contiguous
-// run forms a rows x cols grid; the cell's row/col come from the kitty combining
-// diacritics (row then col), defaulting to left-to-right auto-increment when absent.
+// Walks the cursor's just-written line, overlaying each U+10EEEE placeholder cell with
+// its sub-rect of the (virtual) image named by the cell's RGB foreground. The cells on
+// one line form a 1 x cols row of a rows x cols grid; row/col come from the kitty
+// combining diacritics (row then col), defaulting to left-to-right auto-increment. The
+// run is clamped to the first newline and to the page width; multi-row grids are split
+// vertically by the row diacritic (or driven by the app printing one line per row).
 void AdaptDispatch::_renderKittyPlaceholders(const std::wstring_view string, const til::point origin)
 {
     auto page = _pages.ActivePage();
+    auto& buffer = page.Buffer();
     const auto attributes = page.Attributes();
     const auto fg = attributes.GetForeground();
     if (!fg.IsRgb())
@@ -5829,46 +5831,65 @@ void AdaptDispatch::_renderKittyPlaceholders(const std::wstring_view string, con
     }
     const auto& image = it->second;
 
-    // Count the contiguous placeholder cells from the origin so each tile knows the
-    // grid width; track the largest row diacritic so a multi-cell run spanning rows
-    // splits the image vertically.
-    auto column = origin.x;
+    // A placeholder grapheme (the surrogate pair plus any combining diacritics) occupies
+    // one cell; cols counts cells on THIS line only (cells-per-row), so a sub-rect is the
+    // C-th of cols, not 1/total. The largest row diacritic sets the vertical grid size.
+    const auto width = std::max<til::CoordType>(page.Width() - origin.x, 0);
     uint32_t cols = 0;
     uint32_t maxRow = 0;
-    for (size_t i = 0; i + 1 < string.size(); ++i)
+    auto count = origin.x;
+    for (size_t i = 0; i < string.size() && count < page.Width();)
     {
-        if (string[i] == KittyPlaceholderCodePointHigh && string[i + 1] == KittyPlaceholderCodePointLow)
+        if (string[i] == L'\n' || string[i] == L'\r')
+        {
+            break; // count cells up to the first newline only
+        }
+        const auto next = buffer.GraphemeNext(string, i);
+        if (i + 1 < next && string[i] == KittyPlaceholderCodePointHigh && string[i + 1] == KittyPlaceholderCodePointLow)
         {
             ++cols;
-            if (const auto idx = _KittyPlaceholderDiacriticIndex(i + 2 < string.size() ? string[i + 2] : 0); idx > 0)
+            for (auto j = i + 2; j < next; ++j)
             {
-                maxRow = std::max(maxRow, static_cast<uint32_t>(idx));
+                if (const auto idx = _KittyPlaceholderDiacriticIndex(string[j]); idx > 0)
+                {
+                    maxRow = std::max(maxRow, static_cast<uint32_t>(idx));
+                    break; // first diacritic is the row
+                }
             }
         }
+        i = next;
+        ++count;
     }
     const auto rows = maxRow + 1;
+
     uint32_t autoCol = 0;
-    column = origin.x;
-    for (size_t i = 0; i + 1 < string.size() && column < page.Width();)
+    auto column = origin.x;
+    for (size_t i = 0; i < string.size() && column < page.Width() && (column - origin.x) < width;)
     {
-        if (string[i] != KittyPlaceholderCodePointHigh || string[i + 1] != KittyPlaceholderCodePointLow)
+        if (string[i] == L'\n' || string[i] == L'\r')
         {
-            ++i; // a normal glyph occupies one cell
-            ++column;
-            continue;
+            break; // a fresh line is a fresh run handled by the next write
         }
-        const auto rowDiacritic = i + 2 < string.size() ? _KittyPlaceholderDiacriticIndex(string[i + 2]) : -1;
-        const auto colDiacritic = i + 3 < string.size() ? _KittyPlaceholderDiacriticIndex(string[i + 3]) : -1;
-        const auto cellRow = rowDiacritic >= 0 ? static_cast<uint32_t>(rowDiacritic) : 0;
-        const auto cellCol = colDiacritic >= 0 ? static_cast<uint32_t>(colDiacritic) : autoCol;
-        _placeKittyPlaceholderCell(image, imageId, column, cellRow, cellCol, rows, cols);
-        ++autoCol;
-        ++column;
-        i += 2; // skip the surrogate pair, then any combining diacritics
-        while (i < string.size() && _KittyPlaceholderDiacriticIndex(string[i]) >= 0)
+        const auto next = buffer.GraphemeNext(string, i);
+        if (i + 1 < next && string[i] == KittyPlaceholderCodePointHigh && string[i + 1] == KittyPlaceholderCodePointLow)
         {
-            ++i;
+            // First/second table diacritics in the cluster give row/col; auto-increment fills any gap.
+            auto rowDiacritic = -1;
+            auto colDiacritic = -1;
+            for (auto j = i + 2; j < next; ++j)
+            {
+                if (const auto idx = _KittyPlaceholderDiacriticIndex(string[j]); idx >= 0)
+                {
+                    (rowDiacritic < 0 ? rowDiacritic : colDiacritic) = idx;
+                }
+            }
+            const auto cellRow = rowDiacritic >= 0 ? static_cast<uint32_t>(rowDiacritic) : 0;
+            const auto cellCol = colDiacritic >= 0 ? static_cast<uint32_t>(colDiacritic) : autoCol;
+            _placeKittyPlaceholderCell(image, imageId, column, origin.y, cellRow, cellCol, rows, cols);
+            ++autoCol;
         }
+        i = next;
+        ++column; // every grapheme is one cell; combining marks are part of the cluster
     }
 }
 

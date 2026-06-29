@@ -5626,6 +5626,82 @@ public:
         VERIFY_ARE_EQUAL(0, CountImageRows(*_testGetSet->_textBuffer));
     }
 
+    // A multi-row grid splits vertically: a 1x2 (red-over-green) image with row
+    // diacritics 0 and 1 on one line shows red (top tile) and green (bottom tile).
+    TEST_METHOD(KittyPlaceholderMultiRowSplitsVertically)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,f=24,s=1,v=2;/wAAAP8A\x1b\\"); // top red, bottom green
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m");
+        _stateMachine->ProcessString(Placeholder() + L"\x0305" + Placeholder() + L"\x030D"); // row 0, row 1
+        VERIFY_IS_TRUE(BufferContainsColor(*_testGetSet->_textBuffer, 255, 0, 0), L"top tile = red");
+        VERIFY_IS_TRUE(BufferContainsColor(*_testGetSet->_textBuffer, 0, 255, 0), L"bottom tile = green");
+    }
+
+    // delete-all (d=a) erases placeholder-rendered cells too.
+    TEST_METHOD(KittyPlaceholderDeleteAllErases)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,f=24,s=1,v=1;/wAA\x1b\\");
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m");
+        _stateMachine->ProcessString(Placeholder());
+        VERIFY_IS_TRUE(BufferContainsColor(*_testGetSet->_textBuffer, 255, 0, 0));
+        _stateMachine->ProcessString(L"\x1b_Ga=d,d=a;\x1b\\");
+        VERIFY_ARE_EQUAL(0, CountImageRows(*_testGetSet->_textBuffer), L"delete-all must erase placeholder pixels");
+    }
+
+    // A line mixing text and a placeholder keeps the glyphs and overlays the image.
+    TEST_METHOD(KittyPlaceholderMixedTextKeepsGlyphs)
+    {
+        _testGetSet->PrepData();
+        const auto origin = _testGetSet->_textBuffer->GetCursor().GetPosition();
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,f=24,s=1,v=1;/wAA\x1b\\");
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m");
+        _stateMachine->ProcessString(L"ab" + Placeholder() + L"cd");
+        VERIFY_IS_TRUE(BufferContainsColor(*_testGetSet->_textBuffer, 255, 0, 0), L"placeholder still overlays");
+        const auto& row = _testGetSet->_textBuffer->GetRowByOffset(origin.y);
+        VERIFY_ARE_EQUAL(L'a', row.GlyphAt(origin.x).front());
+        VERIFY_ARE_EQUAL(L'b', row.GlyphAt(origin.x + 1).front());
+        VERIFY_ARE_EQUAL(L'c', row.GlyphAt(origin.x + 3).front(), L"text after the placeholder cell survives");
+        VERIFY_ARE_EQUAL(L'd', row.GlyphAt(origin.x + 4).front());
+    }
+
+    // A non-RGB (legacy/default) foreground is not an image id: no overlay.
+    TEST_METHOD(KittyPlaceholderNonRgbFgNoOp)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,f=24,s=1,v=1;/wAA\x1b\\");
+        _stateMachine->ProcessString(Placeholder()); // default legacy fg, never set to RGB
+        VERIFY_ARE_EQUAL(0, CountImageRows(*_testGetSet->_textBuffer), L"legacy fg must not select an image");
+    }
+
+    // A 256-palette foreground (38;5;n) is indexed, not 24-bit RGB, so it must not trigger.
+    TEST_METHOD(KittyPlaceholderPaletteFgNoOp)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,f=24,s=1,v=1;/wAA\x1b\\");
+        _stateMachine->ProcessString(L"\x1b[38;5;1m"); // palette index, not RGB
+        _stateMachine->ProcessString(Placeholder());
+        VERIFY_ARE_EQUAL(0, CountImageRows(*_testGetSet->_textBuffer), L"palette fg must not select an image");
+    }
+
+    // Placeholders honor a non-default host cell size (sub-rect sampling still fills the cell).
+    TEST_METHOD(KittyPlaceholderScaledCell)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 5, 10 };
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,f=24,s=1,v=1;/wAA\x1b\\");
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m");
+        _stateMachine->ProcessString(Placeholder());
+        const auto& buffer = *_testGetSet->_textBuffer;
+        til::CoordType imageRow = -1;
+        const auto slice = FindFirstImageSlice(buffer, imageRow);
+        VERIFY_IS_NOT_NULL(slice);
+        VERIFY_ARE_EQUAL(5, slice->CellSize().width);
+        VERIFY_ARE_EQUAL(10, slice->CellSize().height);
+        VERIFY_IS_TRUE(SliceContainsColor(slice, 255, 0, 0));
+    }
+
     // Delete-by-id is targeted: removing image 1 must erase only its pixels and leave a
     // co-resident image (2) intact -- guards per-image cell ownership, not a blanket clear.
     TEST_METHOD(KittyGraphicsDeleteOnePreservesOther)
