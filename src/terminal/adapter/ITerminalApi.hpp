@@ -104,6 +104,20 @@ namespace Microsoft::Console::VirtualTerminal
             return false;
         }
 
+        // Reads the contents of an image file for Kitty graphics file/temporary
+        // transmission (t=f / t=t). Reads up to 'size' bytes (or to EOF when size==0)
+        // starting at byte 'offset' into 'out'; the host bounds the read to a safe
+        // maximum so a hostile size cannot force an unbounded allocation. When
+        // 'deleteAfter' is true (t=t) the host deletes the file after a successful
+        // read ONLY if it resides under the system temporary directory, so the medium
+        // cannot be abused to delete arbitrary files. Hosts without file access (e.g.
+        // the unit-test mock by default) leave this unimplemented and return false;
+        // the caller then reports the transfer as unreadable (EBADF).
+        virtual bool ReadKittyImageFile(const std::wstring_view /*path*/, uint64_t /*offset*/, uint64_t /*size*/, bool /*deleteAfter*/, std::vector<uint8_t>& /*out*/) noexcept
+        {
+            return false;
+        }
+
         // Returns the pixel size of a text cell, used to lay out graphics images.
         // The default is a reasonable fallback; hosts with real font metrics override.
         virtual til::size GetCellSize() const noexcept
