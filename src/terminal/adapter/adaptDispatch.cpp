@@ -104,6 +104,7 @@ void AdaptDispatch::_WriteToBuffer(const std::wstring_view string)
     auto& textBuffer = page.Buffer();
     auto& cursor = page.Cursor();
     auto cursorPosition = cursor.GetPosition();
+    const auto placeholderOrigin = cursorPosition;
     const auto wrapAtEOL = _api.GetSystemMode(ITerminalApi::Mode::AutoWrap);
     const auto& attributes = page.Attributes();
 
@@ -199,6 +200,13 @@ void AdaptDispatch::_WriteToBuffer(const std::wstring_view string)
     // have access to the entire line of text, whereas TextBuffer writes it one
     // character at a time via the OutputCellIterator.
     textBuffer.TriggerNewTextNotification(string);
+
+    // Kitty Unicode placeholders: cells holding U+10EEEE overlay a sub-rect of a
+    // virtually-placed image, keyed by the cell's RGB foreground (the image id).
+    if (string.find(KittyPlaceholderCodePointHigh) != std::wstring_view::npos)
+    {
+        _renderKittyPlaceholders(string, placeholderOrigin);
+    }
 }
 
 // Routine Description:
@@ -5031,6 +5039,9 @@ AdaptDispatch::KittyControl AdaptDispatch::_ParseKittyControl(const std::wstring
             case L'C':
                 c.noCursorMovement = _ParseKittyUint(value) != 0;
                 break;
+            case L'U':
+                c.virtualPlacement = _ParseKittyUint(value) != 0;
+                break;
             case L'm':
                 c.moreChunks = _ParseKittyUint(value) != 0;
                 c.mPresent = true;
@@ -5253,7 +5264,7 @@ void AdaptDispatch::_ProcessKittyCommand(const KittyControl& command, const std:
                 assignedId = haveId ? imageId : _kittyAssignImageId();
                 _eraseKittyImageRows(assignedId);
                 _registerKittyImage(assignedId, std::move(image));
-                if (action == L'T')
+                if (action == L'T' && !command.virtualPlacement)
                 {
                     const auto stored = _kittyImages.find(assignedId);
                     if (stored != _kittyImages.end())
@@ -5295,7 +5306,7 @@ void AdaptDispatch::_ProcessKittyCommand(const KittyControl& command, const std:
                 success = false;
                 code = L"ENOENT:image not found";
             }
-            else
+            else if (!command.virtualPlacement)
             {
                 _placeKittyImage(*target, moveCursor, targetId, command.cols, command.rows, command.srcX, command.srcY, command.srcW, command.srcH);
             }
@@ -5717,6 +5728,150 @@ void AdaptDispatch::_placeKittyImage(const KittyImage& image, const bool moveCur
         page.Cursor().SetPosition({ std::min(columnEnd, page.Width() - 1), std::min(origin.y + rowSpan, page.Bottom() - 1) });
     }
 }
+
+// Maps a kitty row/column combining diacritic to its 0-based index, or -1 if the
+// glyph isn't a placeholder diacritic. The full kitty table is 297 entries; this
+// MVP keeps the first 16 (covers small grids) and falls back to auto-increment for
+// anything outside it. Source: kitty graphics protocol "rowcolumn-diacritics".
+int AdaptDispatch::_KittyPlaceholderDiacriticIndex(const wchar_t ch) noexcept
+{
+    static constexpr wchar_t table[] = {
+        0x0305, 0x030D, 0x030E, 0x0310, 0x0312, 0x033D, 0x033E, 0x033F,
+        0x0346, 0x034A, 0x034B, 0x034C, 0x0350, 0x0351, 0x0352, 0x0357
+    };
+    for (auto i = 0; i < static_cast<int>(std::size(table)); ++i)
+    {
+        if (table[i] == ch)
+        {
+            return i;
+        }
+    }
+    return -1;
+}
+
+// Overlays a single placeholder cell: the (cellRow,cellCol) tile of a rows x cols
+// grid shows that fractional sub-rect of the image. Reuses the per-row ImageSlice
+// writer and tags the column with imageId so a delete-by-id erases it too.
+void AdaptDispatch::_placeKittyPlaceholderCell(const KittyImage& image, const uint32_t imageId, const til::CoordType column, const uint32_t cellRow, const uint32_t cellCol, const uint32_t rows, const uint32_t cols)
+{
+    if (image.pixels.empty() || image.width == 0 || image.height == 0)
+    {
+        return;
+    }
+    auto page = _pages.ActivePage();
+    auto& buffer = page.Buffer();
+    const auto row = page.Cursor().GetPosition().y;
+    if (column < 0 || column >= page.Width() || row < 0 || row >= page.Bottom())
+    {
+        return;
+    }
+    const auto cellSize = _api.GetCellSize();
+    const auto cellWidth = std::max(1, cellSize.width);
+    const auto cellHeight = std::max(1, cellSize.height);
+    const til::size clampedCellSize{ cellWidth, cellHeight };
+    const auto gridCols = std::max<uint32_t>(cols, 1);
+    const auto gridRows = std::max<uint32_t>(rows, 1);
+    const auto colIndex = std::min(cellCol, gridCols - 1);
+    const auto rowIndex = std::min(cellRow, gridRows - 1);
+    // Source sub-rect for this tile (nearest-neighbour, full cell).
+    const auto srcX = static_cast<til::CoordType>(static_cast<uint64_t>(colIndex) * image.width / gridCols);
+    const auto srcW = std::max(1, static_cast<til::CoordType>(image.width / gridCols));
+    const auto srcY = static_cast<til::CoordType>(static_cast<uint64_t>(rowIndex) * image.height / gridRows);
+    const auto srcH = std::max(1, static_cast<til::CoordType>(image.height / gridRows));
+    auto& dstRow = buffer.GetMutableRowByOffset(row);
+    auto dstSlice = dstRow.GetMutableImageSlice();
+    if (!dstSlice || dstSlice->CellSize() != clampedCellSize)
+    {
+        dstSlice = dstRow.SetImageSlice(std::make_unique<ImageSlice>(clampedCellSize));
+    }
+    auto dstIterator = dstSlice->MutablePixels(column, column + 1);
+    dstSlice->SetColumnOwner(column, column + 1, imageId);
+    for (auto pixelRow = 0; pixelRow < cellHeight; ++pixelRow)
+    {
+        const auto sampleY = srcY + std::min(srcH - 1, static_cast<til::CoordType>(static_cast<int64_t>(pixelRow) * srcH / cellHeight));
+        const auto srcRowStart = static_cast<size_t>(sampleY) * image.width;
+        for (auto pixelColumn = 0; pixelColumn < cellWidth; ++pixelColumn)
+        {
+            const auto sampleX = srcX + std::min(srcW - 1, static_cast<til::CoordType>(static_cast<int64_t>(pixelColumn) * srcW / cellWidth));
+            const auto srcIndex = srcRowStart + static_cast<size_t>(sampleX);
+            if (srcIndex < image.pixels.size())
+            {
+                til::at(dstIterator, pixelColumn) = image.pixels[srcIndex];
+            }
+        }
+        if (pixelRow + 1 < cellHeight)
+        {
+            std::advance(dstIterator, dstSlice->PixelWidth());
+        }
+    }
+    buffer.TriggerRedraw(Viewport::FromExclusive({ column, row, column + 1, row + 1 }));
+}
+
+// Walks a just-written run of text, overlaying every U+10EEEE placeholder cell with
+// its sub-rect of the (virtual) image named by the cell's RGB foreground. A contiguous
+// run forms a rows x cols grid; the cell's row/col come from the kitty combining
+// diacritics (row then col), defaulting to left-to-right auto-increment when absent.
+void AdaptDispatch::_renderKittyPlaceholders(const std::wstring_view string, const til::point origin)
+{
+    auto page = _pages.ActivePage();
+    const auto attributes = page.Attributes();
+    const auto fg = attributes.GetForeground();
+    if (!fg.IsRgb())
+    {
+        return; // no 24-bit image id => not a Kitty placeholder
+    }
+    const auto rgb = fg.GetRGB();
+    const uint32_t imageId = (static_cast<uint32_t>(GetRValue(rgb)) << 16) | (static_cast<uint32_t>(GetGValue(rgb)) << 8) | GetBValue(rgb);
+    const auto it = _kittyImages.find(imageId);
+    if (it == _kittyImages.end())
+    {
+        return;
+    }
+    const auto& image = it->second;
+
+    // Count the contiguous placeholder cells from the origin so each tile knows the
+    // grid width; track the largest row diacritic so a multi-cell run spanning rows
+    // splits the image vertically.
+    auto column = origin.x;
+    uint32_t cols = 0;
+    uint32_t maxRow = 0;
+    for (size_t i = 0; i + 1 < string.size(); ++i)
+    {
+        if (string[i] == KittyPlaceholderCodePointHigh && string[i + 1] == KittyPlaceholderCodePointLow)
+        {
+            ++cols;
+            if (const auto idx = _KittyPlaceholderDiacriticIndex(i + 2 < string.size() ? string[i + 2] : 0); idx > 0)
+            {
+                maxRow = std::max(maxRow, static_cast<uint32_t>(idx));
+            }
+        }
+    }
+    const auto rows = maxRow + 1;
+    uint32_t autoCol = 0;
+    column = origin.x;
+    for (size_t i = 0; i + 1 < string.size() && column < page.Width();)
+    {
+        if (string[i] != KittyPlaceholderCodePointHigh || string[i + 1] != KittyPlaceholderCodePointLow)
+        {
+            ++i; // a normal glyph occupies one cell
+            ++column;
+            continue;
+        }
+        const auto rowDiacritic = i + 2 < string.size() ? _KittyPlaceholderDiacriticIndex(string[i + 2]) : -1;
+        const auto colDiacritic = i + 3 < string.size() ? _KittyPlaceholderDiacriticIndex(string[i + 3]) : -1;
+        const auto cellRow = rowDiacritic >= 0 ? static_cast<uint32_t>(rowDiacritic) : 0;
+        const auto cellCol = colDiacritic >= 0 ? static_cast<uint32_t>(colDiacritic) : autoCol;
+        _placeKittyPlaceholderCell(image, imageId, column, cellRow, cellCol, rows, cols);
+        ++autoCol;
+        ++column;
+        i += 2; // skip the surrogate pair, then any combining diacritics
+        while (i < string.size() && _KittyPlaceholderDiacriticIndex(string[i]) >= 0)
+        {
+            ++i;
+        }
+    }
+}
+
 
 // Erases on-screen pixels belonging to imageId by clearing only the columns that
 // image owns, leaving co-resident Sixel (id 0) and other images intact. A slice left

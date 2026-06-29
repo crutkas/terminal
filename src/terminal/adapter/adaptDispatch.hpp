@@ -335,6 +335,7 @@ namespace Microsoft::Console::VirtualTerminal
             wchar_t medium = L'd';          // t=: transmission medium (only d=direct in MVP)
             bool noCursorMovement = false;  // C=1: leave the cursor in place after a placement
             bool hasNonChunkKey = false;    // true if any key other than 'm' was present
+            bool virtualPlacement = false;  // U=1: virtual placement (store only; drawn later via Unicode placeholders)
         };
         // A stored Kitty image: the client image number (0 = none), the pixel
         // dimensions, and the decoded BGRA pixels (empty if not yet decodable).
@@ -358,6 +359,9 @@ namespace Microsoft::Console::VirtualTerminal
         void _eraseKittyImageRows(const uint32_t imageId);
         void _clearKittyImages() noexcept;
         void _placeKittyImage(const KittyImage& image, const bool moveCursor, const uint32_t imageId, const uint32_t cols = 0, const uint32_t rows = 0, const uint32_t srcX = 0, const uint32_t srcY = 0, const uint32_t srcW = 0, const uint32_t srcH = 0);
+        void _renderKittyPlaceholders(const std::wstring_view string, const til::point origin);
+        void _placeKittyPlaceholderCell(const KittyImage& image, const uint32_t imageId, const til::CoordType column, const uint32_t cellRow, const uint32_t cellCol, const uint32_t rows, const uint32_t cols);
+        static int _KittyPlaceholderDiacriticIndex(const wchar_t ch) noexcept;
         void _ReturnOscResponse(const std::wstring_view response) const;
 
         std::vector<uint8_t> _tabStopColumns;
@@ -383,6 +387,11 @@ namespace Microsoft::Console::VirtualTerminal
         static constexpr size_t MaxKittyImages = 4096;
         static constexpr size_t MaxKittyPayload = 32 * 1024 * 1024;
         static constexpr size_t MaxKittyTotalBytes = 320 * 1024 * 1024;
+        // The kitty Unicode placeholder code point. A cell holding this glyph, with a
+        // 24-bit RGB foreground giving the image id, draws a sub-rect of a virtual
+        // (U=1) image rather than the cursor-anchored placement.
+        static constexpr wchar_t KittyPlaceholderCodePointHigh = 0xDBFB; // surrogate pair for U+10EEEE
+        static constexpr wchar_t KittyPlaceholderCodePointLow = 0xDEEE;
         uint32_t _kittyNextImageId = 1;
         size_t _kittyTotalPixelBytes = 0;
         std::unordered_map<uint32_t, KittyImage> _kittyImages;
