@@ -169,6 +169,7 @@ public:
 
     bool DecodeImageToBgra(const std::span<const uint8_t> data, std::vector<RGBQUAD>& pixels, til::size& size) noexcept override;
     til::size GetCellSize() const noexcept override;
+    bool ReadKittyImageFile(const std::wstring_view path, uint64_t offset, uint64_t size, bool deleteAfter, std::vector<uint8_t>& out) noexcept override;
 
 #pragma endregion
 
