@@ -41,6 +41,8 @@ namespace TerminalCoreUnitTests
         TEST_METHOD(SetWorkingDirectory);
 
         TEST_METHOD(GetCellSizeFallsBackWhenFontUnset);
+
+        TEST_METHOD(KittyPlaceholderRendersInRealTerminal);
     };
 };
 
@@ -406,4 +408,30 @@ void TerminalApiTest::GetCellSizeFallsBackWhenFontUnset()
     const auto cellSize = term.GetCellSize();
     VERIFY_IS_GREATER_THAN(cellSize.width, 1, L"cell width must not be a degenerate 1px");
     VERIFY_IS_GREATER_THAN(cellSize.height, 1, L"cell height must not be a degenerate 1px");
+}
+
+void TerminalApiTest::KittyPlaceholderRendersInRealTerminal()
+{
+    Terminal term{ Terminal::TestDummyMarker{} };
+    DummyRenderer renderer{ &term };
+    term.Create({ 100, 100 }, 0, renderer);
+
+    auto& tbi = *(term._mainBuffer);
+    auto& sm = *(term._stateMachine);
+
+    // Virtually store a 1x1 red image as id 1 (U=1 => no cursor draw).
+    sm.ProcessString(L"\x1b_Ga=T,i=1,U=1,f=24,s=1,v=1;/wAA\x1b\\");
+    // Foreground = image id 1 (RGB 0,0,1), then print one U+10EEEE placeholder cell.
+    sm.ProcessString(L"\x1b[38;2;0;0;1m");
+    sm.ProcessString(std::wstring{ L'\xDBFB', L'\xDEEE' });
+
+    auto rendered = false;
+    for (til::CoordType y = 0; y < 100 && !rendered; ++y)
+    {
+        if (tbi.GetRowByOffset(y).GetImageSlice())
+        {
+            rendered = true;
+        }
+    }
+    VERIFY_IS_TRUE(rendered, L"a placeholder cell must render an image slice in the real Terminal");
 }
