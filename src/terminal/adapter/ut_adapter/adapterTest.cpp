@@ -5702,6 +5702,28 @@ public:
         VERIFY_IS_TRUE(SliceContainsColor(slice, 255, 0, 0));
     }
 
+    // A placeholder fg pointing at a NON-virtual (ordinary) stored image must not
+    // overlay it: only U=1 images are placeholder-eligible.
+    TEST_METHOD(KittyPlaceholderNonVirtualIdRendersNothing)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1b_Ga=t,i=1,f=24,s=1,v=1;/wAA\x1b\\"); // stored, NOT virtual
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m");
+        _stateMachine->ProcessString(Placeholder());
+        VERIFY_ARE_EQUAL(0, CountImageRows(*_testGetSet->_textBuffer), L"plain colored placeholder must not overlay a non-virtual image");
+    }
+
+    // Non-divisible split keeps edge pixels: a 3px red/green/blue image in 2 cols shows
+    // the rightmost (blue) pixel in the second tile (2px then 1px, no drop).
+    TEST_METHOD(KittyPlaceholderNonDivisibleKeepsRightPixel)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,f=24,s=3,v=1;/wAAAP8AAAD/\x1b\\"); // red,green,blue
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m");
+        _stateMachine->ProcessString(Placeholder() + Placeholder());
+        VERIFY_IS_TRUE(BufferContainsColor(*_testGetSet->_textBuffer, 0, 0, 255), L"rightmost pixel (blue) must survive the 3px/2col split");
+    }
+
     // Delete-by-id is targeted: removing image 1 must erase only its pixels and leave a
     // co-resident image (2) intact -- guards per-image cell ownership, not a blanket clear.
     TEST_METHOD(KittyGraphicsDeleteOnePreservesOther)
