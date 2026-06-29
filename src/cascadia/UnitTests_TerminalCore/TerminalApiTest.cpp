@@ -10,6 +10,8 @@
 #include "../renderer/inc/RenderEngineBase.hpp"
 #include "consoletaeftemplates.hpp"
 
+#include <wil/resource.h>
+
 using namespace winrt::Microsoft::Terminal::Core;
 using namespace Microsoft::Terminal::Core;
 using namespace Microsoft::Console::Render;
@@ -442,6 +444,18 @@ namespace TerminalCoreUnitTests
         TEST_METHOD(KittyPlaceholderLeavesUnrecognizedTextUntouched);
         TEST_METHOD(KittyPlaceholderSuppressesGlyphAfterResize);
         TEST_METHOD(KittyPlaceholderSuppressesGlyphAfterScroll);
+        // Kitty graphics file-transmission host I/O (t=f / t=t). These exercise the real
+        // filesystem path of Terminal::ReadKittyImageFile (the shared til::read_image_file
+        // helper), including the security gates that the adapter-level mock cannot cover.
+        TEST_METHOD(ReadKittyImageFileReadsFromTemp);
+        TEST_METHOD(ReadKittyImageFileDeletesTempWithMarker);
+        TEST_METHOD(ReadKittyImageFileOutsideTempNotDeleted);
+        TEST_METHOD(ReadKittyImageFileNoMarkerNotDeleted);
+        TEST_METHOD(ReadKittyImageFileOffsetAndSizeSlice);
+        TEST_METHOD(ReadKittyImageFileOversizeSizeClampsToEof);
+        TEST_METHOD(ReadKittyImageFileRejectsUncPath);
+        TEST_METHOD(ReadKittyImageFileRejectsRelativePath);
+        TEST_METHOD(ReadKittyImageFileNonexistentFails);
     };
 };
 
@@ -861,6 +875,237 @@ void TerminalApiTest::KittyAnimationSurvivesFontAndRendererRefresh()
         advanced = FrameContainsKittyColor(fixture.engine.Snapshot(), 7, true);
     }
     VERIFY_IS_TRUE(advanced, L"animation playback must continue to the next frame after recreation");
+}
+
+// --- Kitty graphics file-transmission host I/O ------------------------------------
+//
+// These build a Terminal in TestDummyMarker mode and call ReadKittyImageFile against
+// real files, validating the security-critical behavior the adapter-level mock cannot:
+// local fixed-drive enforcement, temp-dir + "tty-graphics-protocol" marker gated
+// deletion via the open handle, offset/size slicing, and the 32 MiB read bound.
+namespace
+{
+    // The system temp directory (ends with a backslash), or empty on failure.
+    std::wstring KittyTempDir()
+    {
+        wchar_t buf[MAX_PATH + 1]{};
+        const auto len = GetTempPathW(ARRAYSIZE(buf), buf);
+        if (len == 0 || len >= ARRAYSIZE(buf))
+        {
+            return {};
+        }
+        return std::wstring{ buf, len };
+    }
+
+    // The process's current directory (ends with a backslash); used as a location that
+    // is reliably NOT under the system temp directory.
+    std::wstring KittyCurrentDir()
+    {
+        wchar_t buf[MAX_PATH + 1]{};
+        const auto len = GetCurrentDirectoryW(ARRAYSIZE(buf), buf);
+        if (len == 0 || len >= ARRAYSIZE(buf))
+        {
+            return {};
+        }
+        std::wstring dir{ buf, len };
+        if (!dir.empty() && dir.back() != L'\\')
+        {
+            dir.push_back(L'\\');
+        }
+        return dir;
+    }
+
+    std::wstring KittyUniquePath(const std::wstring& dir, const std::wstring& namePart)
+    {
+        static unsigned int counter = 0;
+        return dir + namePart + std::to_wstring(GetCurrentProcessId()) + L"-" +
+               std::to_wstring(GetTickCount64()) + L"-" + std::to_wstring(counter++) + L".bin";
+    }
+
+    bool KittyWriteAllBytes(const std::wstring& path, const std::vector<uint8_t>& bytes)
+    {
+        wil::unique_hfile file{ CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr) };
+        if (!file)
+        {
+            return false;
+        }
+        if (bytes.empty())
+        {
+            return true;
+        }
+        DWORD written = 0;
+        return WriteFile(file.get(), bytes.data(), static_cast<DWORD>(bytes.size()), &written, nullptr) && written == bytes.size();
+    }
+
+    bool KittyFileExists(const std::wstring& path)
+    {
+        return GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES;
+    }
+}
+
+void TerminalApiTest::ReadKittyImageFileReadsFromTemp()
+{
+    Terminal term{ Terminal::TestDummyMarker{} };
+    DummyRenderer renderer{ &term };
+    term.Create({ 100, 100 }, 0, renderer);
+
+    const auto dir = KittyTempDir();
+    VERIFY_IS_FALSE(dir.empty(), L"need a usable system temp directory");
+    const auto path = KittyUniquePath(dir, L"tty-graphics-protocol-read-");
+    const std::vector<uint8_t> content{ 1, 2, 3, 4, 5 };
+    VERIFY_IS_TRUE(KittyWriteAllBytes(path, content), L"failed to create the test file");
+
+    std::vector<uint8_t> out;
+    VERIFY_IS_TRUE(term.ReadKittyImageFile(path, 0, 0, false, out), L"a readable local temp file must succeed");
+    VERIFY_ARE_EQUAL(content.size(), out.size());
+    VERIFY_IS_TRUE(out == content, L"the bytes read must equal the file contents");
+    VERIFY_IS_TRUE(KittyFileExists(path), L"deleteAfter=false must not remove the file");
+
+    DeleteFileW(path.c_str());
+}
+
+void TerminalApiTest::ReadKittyImageFileDeletesTempWithMarker()
+{
+    Terminal term{ Terminal::TestDummyMarker{} };
+    DummyRenderer renderer{ &term };
+    term.Create({ 100, 100 }, 0, renderer);
+
+    const auto dir = KittyTempDir();
+    VERIFY_IS_FALSE(dir.empty());
+    const auto path = KittyUniquePath(dir, L"tty-graphics-protocol-del-");
+    VERIFY_IS_TRUE(KittyWriteAllBytes(path, { 9, 8, 7 }));
+
+    std::vector<uint8_t> out;
+    VERIFY_IS_TRUE(term.ReadKittyImageFile(path, 0, 0, true, out), L"the read should succeed");
+    VERIFY_ARE_EQUAL(static_cast<size_t>(3), out.size());
+    VERIFY_IS_FALSE(KittyFileExists(path), L"a temp file carrying the kitty marker must be deleted after a t=t read");
+
+    if (KittyFileExists(path))
+    {
+        DeleteFileW(path.c_str());
+    }
+}
+
+void TerminalApiTest::ReadKittyImageFileOutsideTempNotDeleted()
+{
+    Terminal term{ Terminal::TestDummyMarker{} };
+    DummyRenderer renderer{ &term };
+    term.Create({ 100, 100 }, 0, renderer);
+
+    // The current directory (the test's output folder) is a local, writable location
+    // that is not under the system temp directory.
+    const auto dir = KittyCurrentDir();
+    VERIFY_IS_FALSE(dir.empty());
+    const auto path = KittyUniquePath(dir, L"tty-graphics-protocol-outside-");
+    VERIFY_IS_TRUE(KittyWriteAllBytes(path, { 4, 5, 6 }));
+
+    std::vector<uint8_t> out;
+    VERIFY_IS_TRUE(term.ReadKittyImageFile(path, 0, 0, true, out), L"the read should still succeed");
+    VERIFY_IS_TRUE(KittyFileExists(path), L"a file OUTSIDE the temp dir must never be deleted, even with deleteAfter (anti arbitrary-delete)");
+
+    DeleteFileW(path.c_str());
+}
+
+void TerminalApiTest::ReadKittyImageFileNoMarkerNotDeleted()
+{
+    Terminal term{ Terminal::TestDummyMarker{} };
+    DummyRenderer renderer{ &term };
+    term.Create({ 100, 100 }, 0, renderer);
+
+    const auto dir = KittyTempDir();
+    VERIFY_IS_FALSE(dir.empty());
+    // Under temp, but the name lacks the "tty-graphics-protocol" marker.
+    const auto path = KittyUniquePath(dir, L"kitty-no-marker-");
+    VERIFY_IS_TRUE(KittyWriteAllBytes(path, { 1, 1, 1 }));
+
+    std::vector<uint8_t> out;
+    VERIFY_IS_TRUE(term.ReadKittyImageFile(path, 0, 0, true, out), L"the read should succeed");
+    VERIFY_IS_TRUE(KittyFileExists(path), L"a temp file WITHOUT the kitty marker must not be auto-deleted");
+
+    DeleteFileW(path.c_str());
+}
+
+void TerminalApiTest::ReadKittyImageFileOffsetAndSizeSlice()
+{
+    Terminal term{ Terminal::TestDummyMarker{} };
+    DummyRenderer renderer{ &term };
+    term.Create({ 100, 100 }, 0, renderer);
+
+    const auto dir = KittyTempDir();
+    VERIFY_IS_FALSE(dir.empty());
+    const auto path = KittyUniquePath(dir, L"tty-graphics-protocol-slice-");
+    const std::vector<uint8_t> content{ 'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H' };
+    VERIFY_IS_TRUE(KittyWriteAllBytes(path, content));
+
+    std::vector<uint8_t> out;
+    VERIFY_IS_TRUE(term.ReadKittyImageFile(path, 2, 3, false, out), L"offset+size read should succeed");
+    const std::vector<uint8_t> expected{ 'C', 'D', 'E' };
+    VERIFY_ARE_EQUAL(expected.size(), out.size());
+    VERIFY_IS_TRUE(out == expected, L"O=2,S=3 must read exactly bytes [2,5) of the file");
+
+    DeleteFileW(path.c_str());
+}
+
+void TerminalApiTest::ReadKittyImageFileOversizeSizeClampsToEof()
+{
+    Terminal term{ Terminal::TestDummyMarker{} };
+    DummyRenderer renderer{ &term };
+    term.Create({ 100, 100 }, 0, renderer);
+
+    const auto dir = KittyTempDir();
+    VERIFY_IS_FALSE(dir.empty());
+    const auto path = KittyUniquePath(dir, L"tty-graphics-protocol-clamp-");
+    const std::vector<uint8_t> content{ 10, 20, 30, 40, 50 };
+    VERIFY_IS_TRUE(KittyWriteAllBytes(path, content));
+
+    std::vector<uint8_t> out;
+    // Ask for far more than the file holds; the read must clamp to the file's size.
+    VERIFY_IS_TRUE(term.ReadKittyImageFile(path, 0, 100ull * 1024 * 1024, false, out), L"read should succeed");
+    VERIFY_ARE_EQUAL(content.size(), out.size(), L"an oversize S= must clamp to EOF (the file size)");
+    VERIFY_IS_TRUE(out == content);
+
+    DeleteFileW(path.c_str());
+}
+
+void TerminalApiTest::ReadKittyImageFileRejectsUncPath()
+{
+    Terminal term{ Terminal::TestDummyMarker{} };
+    DummyRenderer renderer{ &term };
+    term.Create({ 100, 100 }, 0, renderer);
+
+    // A UNC path must be rejected up front (no SMB connection, no NTLM handshake).
+    std::vector<uint8_t> out{ 7, 7, 7 };
+    VERIFY_IS_FALSE(term.ReadKittyImageFile(L"\\\\127.0.0.1\\share\\never.bin", 0, 0, false, out), L"a UNC path must be rejected");
+    VERIFY_ARE_EQUAL(static_cast<size_t>(0), out.size(), L"a rejected read must leave the output empty");
+}
+
+void TerminalApiTest::ReadKittyImageFileRejectsRelativePath()
+{
+    Terminal term{ Terminal::TestDummyMarker{} };
+    DummyRenderer renderer{ &term };
+    term.Create({ 100, 100 }, 0, renderer);
+
+    // Relative paths are rejected so a client cannot read a file resolved against the
+    // terminal's own working directory.
+    std::vector<uint8_t> out;
+    VERIFY_IS_FALSE(term.ReadKittyImageFile(L"relative\\file.bin", 0, 0, false, out), L"a non-absolute path must be rejected");
+    VERIFY_ARE_EQUAL(static_cast<size_t>(0), out.size());
+}
+
+void TerminalApiTest::ReadKittyImageFileNonexistentFails()
+{
+    Terminal term{ Terminal::TestDummyMarker{} };
+    DummyRenderer renderer{ &term };
+    term.Create({ 100, 100 }, 0, renderer);
+
+    const auto dir = KittyTempDir();
+    VERIFY_IS_FALSE(dir.empty());
+    // A unique path we never create.
+    const auto path = KittyUniquePath(dir, L"tty-graphics-protocol-missing-");
+
+    std::vector<uint8_t> out;
+    VERIFY_IS_FALSE(term.ReadKittyImageFile(path, 0, 0, false, out), L"a missing file must fail (EBADF)");
+    VERIFY_ARE_EQUAL(static_cast<size_t>(0), out.size());
 }
 
 void TerminalApiTest::KittyPlaceholderRendersInRealTerminal()

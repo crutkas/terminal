@@ -5136,11 +5136,13 @@ AdaptDispatch::KittyControl AdaptDispatch::_ParseKittyControl(const std::wstring
             case L'O':
                 // Uppercase O is the byte offset into a transmitted file (t=f / t=t);
                 // lowercase keys s/v are the pixel width/height, so case matters here.
-                c.fileOffset = _ParseKittyUint(value);
+                // Parsed as 64-bit so a real >4 GiB offset is preserved, not truncated.
+                c.fileOffset = _ParseKittyUint64(value);
                 break;
             case L'S':
-                // Uppercase S is the number of file bytes to read (0 = to EOF).
-                c.fileSize = _ParseKittyUint(value);
+                // Uppercase S is the number of file bytes to read (0 = to EOF), 64-bit so
+                // a large request is not silently wrapped (the host caps the actual read).
+                c.fileSize = _ParseKittyUint64(value);
                 break;
             case L'o':
                 c.compression = value.front();
@@ -5640,19 +5642,38 @@ void AdaptDispatch::_ProcessKittyCommand(const KittyControl& command, const std:
                 // data but the image FILE PATH (UTF-8 bytes). Read the file contents
                 // into `bytes` so the format-specific validation/decode below treats
                 // it exactly like a direct payload. The host bounds the read to a safe
-                // size (MaxKittyPayload), so a hostile S= cannot force a huge alloc.
-                // A temporary file (t=t) is deleted by the host after a successful
-                // read, but only when it resides under the system temp directory (the
-                // host enforces this; see ITerminalApi::ReadKittyImageFile).
+                // size (MaxKittyPayload), so a hostile S= cannot force a huge alloc, and
+                // restricts reads to local fixed-drive files (see ReadKittyImageFile).
+                //
+                // A temporary file (t=t) is deleted by the host after a successful read,
+                // but only when it resides under the system temp directory and carries
+                // kitty's "tty-graphics-protocol" marker. A query (a=q) validates the
+                // request without storing, so it must NOT delete: only a real transmit
+                // (a=t / a=T) of a t=t file requests deletion.
+                //
+                // Convert the UTF-8 path with MB_ERR_INVALID_CHARS so a malformed path is
+                // rejected here (path stays empty -> EBADF below) rather than silently
+                // mangled into U+FFFD substitutions: unlike til::u8u16, which uses no
+                // flags and substitutes, this rejects invalid input deterministically.
                 std::wstring path;
-                const std::string pathUtf8(bytes.begin(), bytes.end());
-                if (FAILED(til::u8u16(pathUtf8, path)))
+                if (!bytes.empty() && bytes.size() <= static_cast<size_t>(INT_MAX))
                 {
-                    path.clear(); // invalid UTF-8 path -> treated as unreadable below
+                    const std::string pathUtf8(bytes.begin(), bytes.end());
+                    const auto len8 = static_cast<int>(pathUtf8.size());
+                    const auto needed = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, pathUtf8.data(), len8, nullptr, 0);
+                    if (needed > 0)
+                    {
+                        path.resize(static_cast<size_t>(needed));
+                        if (MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, pathUtf8.data(), len8, path.data(), needed) != needed)
+                        {
+                            path.clear();
+                        }
+                    }
                 }
+                const auto deleteAfter = (medium == L't') && (action != L'q');
                 std::vector<uint8_t> fileBytes;
                 if (path.empty() ||
-                    !_api.ReadKittyImageFile(path, command.fileOffset, command.fileSize, medium == L't', fileBytes))
+                    !_api.ReadKittyImageFile(path, command.fileOffset, command.fileSize, deleteAfter, fileBytes))
                 {
                     success = false;
                     code = L"EBADF:could not read file";
@@ -6106,6 +6127,32 @@ int32_t AdaptDispatch::_ParseKittyInt(const std::wstring_view value) noexcept
     }
     return magnitude > 0x7FFFFFFFu ? INT32_MAX : static_cast<int32_t>(magnitude);
 }
+
+// Like _ParseKittyUint but for the 64-bit file offset/size keys (O=/S=). Clamps to
+// UINT64_MAX on overflow so a hostile run of digits cannot wrap; the host bounds the
+// actual read and rejects an offset past EOF, so a clamped value just fails cleanly.
+uint64_t AdaptDispatch::_ParseKittyUint64(const std::wstring_view value) noexcept
+{
+    uint64_t result = 0;
+    for (const auto ch : value)
+    {
+        if (ch < L'0' || ch > L'9')
+        {
+            break;
+        }
+        const auto digit = static_cast<uint64_t>(ch - L'0');
+        // Detect overflow before it happens: clamp rather than wrap.
+        if (result > (UINT64_MAX - digit) / 10)
+        {
+            result = UINT64_MAX;
+            break;
+        }
+        result = result * 10 + digit;
+    }
+    return result;
+}
+
+// Returns an unused image id, skipping ids that are already registered.
 uint32_t AdaptDispatch::_kittyAssignImageId()
 {
     while (_kittyImages.find(_kittyNextImageId) != _kittyImages.end() || _kittyNextImageId == 0)

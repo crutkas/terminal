@@ -340,8 +340,8 @@ namespace Microsoft::Console::VirtualTerminal
             uint32_t cellOffsetY = 0; // Y=: y pixel offset of the image within the first cell
             uint32_t upperX = 0;  // X=: animation replacement mode or composition source x
             uint32_t upperY = 0;  // Y=: animation background RGBA or composition source y
-            uint32_t fileOffset = 0; // O=: byte offset into a transmitted file (t=f / t=t)
-            uint32_t fileSize = 0;   // S=: bytes to read from the file (0 = to EOF, host-bounded)
+            uint64_t fileOffset = 0; // O=: byte offset into a transmitted file (t=f / t=t)
+            uint64_t fileSize = 0;   // S=: bytes to read from the file (0 = to EOF, host-bounded)
             bool moreChunks = false;
             bool mPresent = false;
             bool haveId = false;
@@ -481,6 +481,7 @@ namespace Microsoft::Console::VirtualTerminal
         void _clearKittyChunk() noexcept;
         static uint32_t _ParseKittyUint(const std::wstring_view value) noexcept;
         static int32_t _ParseKittyInt(const std::wstring_view value) noexcept;
+        static uint64_t _ParseKittyUint64(const std::wstring_view value) noexcept;
         static bool _DecodeKittyBase64(const std::string_view input, std::vector<uint8_t>& output) noexcept;
         static std::vector<RGBQUAD> _decodeKittyPixels(const uint32_t format, const std::vector<uint8_t>& bytes);
         static RGBQUAD _kittyRgbaColor(uint32_t rgba) noexcept;
