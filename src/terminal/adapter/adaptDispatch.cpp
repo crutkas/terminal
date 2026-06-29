@@ -5640,18 +5640,18 @@ void AdaptDispatch::_placeKittyImage(const KittyImage& image, const bool moveCur
         targetW64 = cropW;
         targetH64 = cropH;
     }
-    const auto targetW = static_cast<til::CoordType>(std::max<int64_t>(targetW64, 1));
-    const auto targetH = static_cast<til::CoordType>(std::max<int64_t>(targetH64, 1));
+    const auto targetW = std::max<int64_t>(targetW64, 1);
+    const auto targetH = std::max<int64_t>(targetH64, 1);
 
     const auto columnBegin = origin.x;
-    const auto columns = (targetW + cellWidth - 1) / cellWidth;
+    const auto columns = static_cast<til::CoordType>(std::min<int64_t>((targetW + cellWidth - 1) / cellWidth, page.Width()));
     const auto columnEnd = std::min(columnBegin + columns, page.Width());
     if (columnEnd <= columnBegin)
     {
         return;
     }
-    const auto drawWidth = std::min(targetW, (columnEnd - columnBegin) * cellWidth);
-    const auto rowSpan = (targetH + cellHeight - 1) / cellHeight;
+    const auto drawWidth = std::min<til::CoordType>(static_cast<til::CoordType>(std::min<int64_t>(targetW, INT32_MAX)), (columnEnd - columnBegin) * cellWidth);
+    const auto rowSpan = static_cast<til::CoordType>(std::min<int64_t>((targetH + cellHeight - 1) / cellHeight, page.Bottom()));
     // Precompute the source column for each drawn pixel (nearest-neighbour) so the hot
     // loop is a table lookup, not a 64-bit divide per pixel.
     std::vector<til::CoordType> sampleXMap(static_cast<size_t>(drawWidth));
