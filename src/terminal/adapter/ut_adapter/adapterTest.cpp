@@ -5853,6 +5853,17 @@ public:
         VERIFY_IS_FALSE(BufferContainsColor(*_testGetSet->_textBuffer, 255, 0, 0));
     }
 
+    // A tall 1px-wide image with a huge c forces a large aspect-derived height; targets
+    // stay 64-bit so it clips to the page instead of wrapping negative.
+    TEST_METHOD(KittyGraphicsTallAspectNoOverflow)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,f=24,s=1,v=500,c=8192;" + std::wstring(2000, L'/') + L"\x1b\\");
+        const auto bottom = _testGetSet->_textBuffer->GetSize().Height();
+        VERIFY_IS_TRUE(CountImageRows(*_testGetSet->_textBuffer) >= 1, L"tall scaled image renders");
+        VERIFY_IS_TRUE(_testGetSet->_textBuffer->GetCursor().GetPosition().y < bottom, L"row span stays page-bounded");
+    }
+
     // An APC string with a non-'G' identifier is not Kitty graphics and is ignored.
     TEST_METHOD(NonKittyApcIgnored)
     {
