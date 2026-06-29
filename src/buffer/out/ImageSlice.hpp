@@ -40,6 +40,7 @@ public:
     void SetColumnOwner(const til::CoordType columnBegin, const til::CoordType columnEnd, const uint32_t id);
     bool HasOwner(const uint32_t id) const noexcept;
     bool EraseByOwner(const uint32_t id);
+    void ClearForeignColumns(const til::CoordType columnBegin, const til::CoordType columnEnd);
 
     std::span<const RGBQUAD> Pixels() const noexcept;
     const RGBQUAD* Pixels(const til::CoordType columnBegin) const noexcept;
