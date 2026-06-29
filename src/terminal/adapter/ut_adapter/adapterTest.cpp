@@ -5696,6 +5696,113 @@ public:
         VERIFY_ARE_EQUAL(static_cast<BYTE>(0), padding.rgbBlue, L"Padding must be transparent.");
     }
 
+    // ---- Placement geometry (c/r scale, x/y/w/h crop) ----
+
+    // c= scales the placement width to that many cells: a 1px red image with c=3
+    // spans three columns (30px at cellWidth 10), preserving aspect span on screen.
+    TEST_METHOD(KittyGraphicsColsScalesWidth)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,f=24,s=1,v=1,c=3;/wAA\x1b\\"); // 1px red, c=3
+        const auto& buffer = *_testGetSet->_textBuffer;
+        til::CoordType imageRow = -1;
+        const auto slice = FindFirstImageSlice(buffer, imageRow);
+        VERIFY_IS_NOT_NULL(slice);
+        VERIFY_ARE_EQUAL(30, slice->PixelWidth()); // 3 cells * 10px
+        VERIFY_IS_TRUE(SliceContainsColor(slice, 255, 0, 0));
+    }
+
+    // r= scales the placement height to that many cells: a 1px red image with r=2
+    // spans two text rows (40px at cellHeight 20) instead of the native one.
+    TEST_METHOD(KittyGraphicsRowsScalesHeight)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,f=24,s=1,v=1,r=2;/wAA\x1b\\"); // 1px red, r=2
+        VERIFY_ARE_EQUAL(2, CountImageRows(*_testGetSet->_textBuffer)); // 2 rows, not 1
+        VERIFY_IS_TRUE(BufferContainsColor(*_testGetSet->_textBuffer, 255, 0, 0));
+    }
+
+    // c+r together force an exact cell span: 1px red at c=2,r=2 fills 2 columns x 2 rows.
+    TEST_METHOD(KittyGraphicsColsRowsBothScale)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,f=24,s=1,v=1,c=2,r=2;/wAA\x1b\\");
+        const auto& buffer = *_testGetSet->_textBuffer;
+        til::CoordType imageRow = -1;
+        const auto slice = FindFirstImageSlice(buffer, imageRow);
+        VERIFY_IS_NOT_NULL(slice);
+        VERIFY_ARE_EQUAL(20, slice->PixelWidth()); // 2 cells * 10px
+        VERIFY_ARE_EQUAL(2, CountImageRows(buffer)); // 2 rows
+    }
+
+    // A single axis preserves the crop's aspect: a 2x2 image at c=4 becomes 4 cols
+    // wide and (aspect-matched) 2 rows tall.
+    TEST_METHOD(KittyGraphicsColsOnlyPreservesAspect)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,f=24,s=2,v=2,c=4;/wAA/wAA/wAA/wAA\x1b\\"); // 2x2 red
+        const auto& buffer = *_testGetSet->_textBuffer;
+        til::CoordType imageRow = -1;
+        const auto slice = FindFirstImageSlice(buffer, imageRow);
+        VERIFY_IS_NOT_NULL(slice);
+        VERIFY_ARE_EQUAL(40, slice->PixelWidth()); // 4 cells * 10px
+        VERIFY_ARE_EQUAL(2, CountImageRows(buffer)); // 2*40/2 = 40px => 2 rows
+    }
+
+    // x/w crop a source sub-rect in pixels: a 2px image (red|green) cropped x=1,w=1
+    // renders only the green pixel, never the cropped-out red.
+    TEST_METHOD(KittyGraphicsCropSelectsSubRect)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,f=24,s=2,v=1,x=1,w=1;/wAAAP8A\x1b\\"); // red|green, crop right
+        const auto& buffer = *_testGetSet->_textBuffer;
+        til::CoordType imageRow = -1;
+        const auto slice = FindFirstImageSlice(buffer, imageRow);
+        VERIFY_IS_NOT_NULL(slice);
+        VERIFY_IS_TRUE(SliceContainsColor(slice, 0, 255, 0), L"cropped sub-rect is the green pixel");
+        VERIFY_IS_FALSE(SliceContainsColor(slice, 255, 0, 0), L"cropped-out red must not render");
+    }
+
+    // w=0 extends the crop to the right edge: x=1,w=0 on a 2px image still yields green.
+    TEST_METHOD(KittyGraphicsCropWidthZeroToEdge)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,f=24,s=2,v=1,x=1;/wAAAP8A\x1b\\"); // crop x=1 to edge
+        const auto& buffer = *_testGetSet->_textBuffer;
+        til::CoordType imageRow = -1;
+        const auto slice = FindFirstImageSlice(buffer, imageRow);
+        VERIFY_IS_NOT_NULL(slice);
+        VERIFY_IS_TRUE(SliceContainsColor(slice, 0, 255, 0));
+        VERIFY_IS_FALSE(SliceContainsColor(slice, 255, 0, 0));
+    }
+
+    // A hostile column count clamps to the page rather than overflowing; the slice
+    // is bounded and the cursor lands on the last column.
+    TEST_METHOD(KittyGraphicsHugeColsClamps)
+    {
+        _testGetSet->PrepData();
+        const auto width = _testGetSet->_textBuffer->GetSize().Width();
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,f=24,s=1,v=1,c=99999999;/wAA\x1b\\");
+        const auto& buffer = *_testGetSet->_textBuffer;
+        til::CoordType imageRow = -1;
+        const auto slice = FindFirstImageSlice(buffer, imageRow);
+        VERIFY_IS_NOT_NULL(slice);
+        VERIFY_IS_TRUE(slice->PixelWidth() <= width * slice->CellSize().width, L"a huge c must stay page-bounded");
+        VERIFY_ARE_EQUAL(width - 1, buffer.GetCursor().GetPosition().x);
+    }
+
+    // Deleting a scaled placement still erases its (larger) on-screen footprint.
+    TEST_METHOD(KittyGraphicsDeleteErasesScaledPlacement)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,f=24,s=1,v=1,c=3,r=2;/wAA\x1b\\"); // 3 cols x 2 rows
+        VERIFY_ARE_EQUAL(2, CountImageRows(*_testGetSet->_textBuffer));
+        VERIFY_IS_TRUE(BufferContainsColor(*_testGetSet->_textBuffer, 255, 0, 0));
+        _stateMachine->ProcessString(L"\x1b_Ga=d,d=i,i=1;\x1b\\");
+        VERIFY_ARE_EQUAL(0, CountImageRows(*_testGetSet->_textBuffer));
+        VERIFY_IS_FALSE(BufferContainsColor(*_testGetSet->_textBuffer, 255, 0, 0), L"scaled placement must be fully erased");
+    }
+
     // An APC string with a non-'G' identifier is not Kitty graphics and is ignored.
     TEST_METHOD(NonKittyApcIgnored)
     {

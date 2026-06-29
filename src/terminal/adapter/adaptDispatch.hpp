@@ -322,6 +322,12 @@ namespace Microsoft::Console::VirtualTerminal
             uint32_t format = 32;
             uint32_t width = 0;
             uint32_t height = 0;
+            uint32_t cols = 0;    // c=: scale the placement to this many cell columns
+            uint32_t rows = 0;    // r=: scale the placement to this many cell rows
+            uint32_t srcX = 0;    // x=: source crop left edge in pixels
+            uint32_t srcY = 0;    // y=: source crop top edge in pixels
+            uint32_t srcW = 0;    // w=: source crop width in pixels (0 = to right edge)
+            uint32_t srcH = 0;    // h=: source crop height in pixels (0 = to bottom edge)
             bool moreChunks = false;
             bool mPresent = false;
             bool haveId = false;
@@ -351,7 +357,7 @@ namespace Microsoft::Console::VirtualTerminal
         void _eraseKittyImage(const uint32_t id);
         void _eraseKittyImageRows(const uint32_t imageId);
         void _clearKittyImages() noexcept;
-        void _placeKittyImage(const KittyImage& image, const bool moveCursor, const uint32_t imageId);
+        void _placeKittyImage(const KittyImage& image, const bool moveCursor, const uint32_t imageId, const uint32_t cols = 0, const uint32_t rows = 0, const uint32_t srcX = 0, const uint32_t srcY = 0, const uint32_t srcW = 0, const uint32_t srcH = 0);
         void _ReturnOscResponse(const std::wstring_view response) const;
 
         std::vector<uint8_t> _tabStopColumns;
