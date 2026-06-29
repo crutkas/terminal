@@ -5233,6 +5233,7 @@ void AdaptDispatch::_ProcessKittyCommand(const KittyControl& command, const std:
                     }
                 }
                 assignedId = haveId ? imageId : _kittyAssignImageId();
+                _eraseKittyImageRows(assignedId);
                 _registerKittyImage(assignedId, std::move(image));
                 if (action == L'T')
                 {
