@@ -5464,7 +5464,8 @@ void AdaptDispatch::_eraseKittyImage(const uint32_t id)
 }
 
 // Clears the entire image registry and erases all drawn kitty placements, leaving any
-// co-resident Sixel slices (image id 0) untouched.
+// co-resident Sixel pixels (image id 0) untouched. Slices that share a row with Sixel
+// keep that content; slices left fully empty are dropped.
 void AdaptDispatch::_clearKittyImages() noexcept
 try
 {
@@ -5478,10 +5479,27 @@ try
     for (auto row = 0; row < page.Bottom(); ++row)
     {
         auto& dstRow = buffer.GetMutableRowByOffset(row);
-        if (const auto slice = dstRow.GetImageSlice(); slice && slice->ImageId() != 0)
+        const auto slice = dstRow.GetMutableImageSlice();
+        if (!slice)
+        {
+            continue;
+        }
+        // Erase every owned (non-Sixel) column; co-resident Sixel (id 0) survives.
+        const auto cellWidth = std::max(1, slice->CellSize().width);
+        const auto columnBegin = slice->ColumnOffset();
+        const auto columnEnd = columnBegin + slice->PixelWidth() / cellWidth;
+        auto sliceEmpty = false;
+        for (auto column = columnBegin; column < columnEnd; ++column)
+        {
+            if (const auto owner = slice->ColumnOwner(column); owner != 0)
+            {
+                sliceEmpty = slice->EraseByOwner(owner);
+                erased = true;
+            }
+        }
+        if (sliceEmpty)
         {
             dstRow.SetImageSlice(nullptr);
-            erased = true;
         }
     }
     if (erased)
@@ -5542,9 +5560,9 @@ std::vector<RGBQUAD> AdaptDispatch::_decodeKittyPixels(const uint32_t format, co
 }
 
 // Draws a stored image at the cursor as one ImageSlice per text row (the same row
-// image mechanism as Sixel), tagging each slice with imageId so it can be erased
-// later. Unless moveCursor is false (C=1), the cursor then advances right by the
-// column span and down by the row span, per the kitty spec.
+// image mechanism as Sixel), tagging each covered column with imageId so it can be
+// erased later without disturbing co-resident cells. Unless moveCursor is false
+// (C=1), the cursor then advances right by the column span and down by the row span.
 // Protocol: https://sw.kovidgoyal.net/kitty/graphics-protocol/#controlling-displayed-image-layout
 void AdaptDispatch::_placeKittyImage(const KittyImage& image, const bool moveCursor, const uint32_t imageId)
 {
@@ -5583,8 +5601,10 @@ void AdaptDispatch::_placeKittyImage(const KittyImage& image, const bool moveCur
         {
             dstSlice = dstRow.SetImageSlice(std::make_unique<ImageSlice>(clampedCellSize));
         }
-        dstSlice->SetImageId(imageId);
         auto dstIterator = dstSlice->MutablePixels(columnBegin, columnEnd);
+        // Tag only the columns this placement covers so a later id-targeted delete
+        // erases just these cells, leaving co-resident Sixel (id 0) or other images.
+        dstSlice->SetColumnOwner(columnBegin, columnEnd, imageId);
         for (auto pixelRow = 0; pixelRow < cellHeight; ++pixelRow)
         {
             const auto srcY = row * cellHeight + pixelRow;
@@ -5613,14 +5633,14 @@ void AdaptDispatch::_placeKittyImage(const KittyImage& image, const bool moveCur
     {
         // Per the kitty spec, the cursor moves right by the column span and down by
         // the row span of the placement (clamped to the page).
-        const auto columnAdvanceEnd = std::min(origin.x + columns, page.Width());
-        page.Cursor().SetPosition({ std::min(columnAdvanceEnd, page.Width() - 1), std::min(origin.y + rows, page.Bottom() - 1) });
+        page.Cursor().SetPosition({ std::min(columnEnd, page.Width() - 1), std::min(origin.y + rows, page.Bottom() - 1) });
     }
 }
 
-// Erases on-screen pixels belonging to imageId by clearing only the row image slices
-// tagged with that id, leaving co-resident Sixel (id 0) and other images intact. Rides
-// the row lifecycle, so scroll/reflow keep slices aligned without absolute anchors.
+// Erases on-screen pixels belonging to imageId by clearing only the columns that
+// image owns, leaving co-resident Sixel (id 0) and other images intact. A slice left
+// fully empty is dropped. Rides the row lifecycle, so scroll/reflow keep ownership
+// aligned without absolute anchors.
 void AdaptDispatch::_eraseKittyImageRows(const uint32_t imageId)
 {
     if (imageId == 0)
@@ -5629,19 +5649,26 @@ void AdaptDispatch::_eraseKittyImageRows(const uint32_t imageId)
     }
     auto page = _pages.ActivePage();
     auto& buffer = page.Buffer();
-    auto erased = false;
+    auto firstRow = page.Bottom();
+    auto lastRow = 0;
     for (auto row = 0; row < page.Bottom(); ++row)
     {
         auto& dstRow = buffer.GetMutableRowByOffset(row);
-        if (const auto slice = dstRow.GetImageSlice(); slice && slice->ImageId() == imageId)
+        const auto slice = dstRow.GetMutableImageSlice();
+        if (slice && slice->HasOwner(imageId))
         {
-            dstRow.SetImageSlice(nullptr);
-            erased = true;
+            // Clear only the columns this image owns; co-resident pixels stay put.
+            if (slice->EraseByOwner(imageId))
+            {
+                dstRow.SetImageSlice(nullptr);
+            }
+            firstRow = std::min(firstRow, row);
+            lastRow = std::max(lastRow, row);
         }
     }
-    if (erased)
+    if (firstRow <= lastRow)
     {
-        buffer.TriggerRedraw(Viewport::FromExclusive({ 0, 0, page.Width(), page.Bottom() }));
+        buffer.TriggerRedraw(Viewport::FromExclusive({ 0, firstRow, page.Width(), lastRow + 1 }));
     }
 }
 
