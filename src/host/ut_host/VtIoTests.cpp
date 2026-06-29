@@ -293,8 +293,13 @@ class ::Microsoft::Console::VirtualTerminal::VtIoTests
         const auto sixel = L"\x1bPq#0;2;100;0;0~\x1b\\";
         THROW_IF_FAILED(routines.WriteConsoleWImpl(*screenInfo, sixel, written, nullptr));
         const auto sixelOut = std::string{ readOutput() };
-        VERIFY_IS_TRUE(sixelOut.find("\x1bPq#0;2;100;0;0~") != std::string::npos,
-                       L"the Sixel DCS must be forwarded verbatim through ConPTY");
+        const auto sixelBody = sixelOut.find("\x1bPq#0;2;100;0;0~");
+        VERIFY_IS_TRUE(sixelBody != std::string::npos,
+                       L"the Sixel DCS body must be forwarded verbatim through ConPTY");
+        // conhost may insert a CRLF before the ST, so assert the terminator follows the
+        // body rather than requiring it to be contiguous.
+        VERIFY_IS_TRUE(sixelOut.find("\x1b\\", sixelBody) != std::string::npos,
+                       L"the Sixel DCS terminator (ST) must also be forwarded");
     }
 
     TEST_METHOD(WriteConsoleOutputW)
