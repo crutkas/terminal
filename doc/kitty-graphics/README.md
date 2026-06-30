@@ -13,3 +13,4 @@ would drive them.
 | `04-chunked.png` | A 260×150 image reassembled from 39 base64 chunks (`m=1…m=0`) |
 | `05-gallery.png` | Inline text + image and multiple images with spec-correct cursor advance |
 | `relative-placement.png` | Relative placements — a blue child placed `P=1,Q=1,H=10,V=4` relative to a red parent, measured at exactly 10 cols / 4 rows offset |
+| `compression-zlib.png` | `o=z` zlib compression — the same image sent uncompressed (`f=24`, 4096 b64 chars) vs zlib-compressed (`o=z`, 2632 chars), rendered pixel-identical (automated diff: 0/255) |
