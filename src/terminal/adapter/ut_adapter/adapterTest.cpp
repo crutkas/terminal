@@ -5611,6 +5611,52 @@ public:
         VERIFY_IS_TRUE(SlicePixelIs(slice, 1, 0, 0, 255, 0), L"grid col 1 (right cell) = green only");
     }
 
+    // Equivalence: the placeholder render must produce the SAME pixels as a direct
+    // a=T,c,r placement of the same image, proving the two independent code paths agree
+    // (this is the basis for the side-by-side screenshot's 0-pixel diff).
+    TEST_METHOD(KittyPlaceholderMatchesDirectRender)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 4, 4 };
+        auto& buf = *_testGetSet->_textBuffer;
+        const auto cell = _testGetSet->_cellSize;
+        const std::wstring payload = L"/wAAAP8AAAD/////"; // 2x2: TL red, TR green, BL blue, BR white
+        const til::CoordType directRow = buf.GetCursor().GetPosition().y;
+        const til::CoordType phRow = directRow + 6;
+
+        // Direct placement (geometry path) at column 0, C=1 so the cursor stays put.
+        buf.GetCursor().SetPosition({ 0, directRow });
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,f=24,s=2,v=2,c=2,r=2,C=1;" + payload + L"\x1b\\");
+
+        // The same image via U=1 + a 2x2 placeholder grid at column 0.
+        _stateMachine->ProcessString(L"\x1b_Ga=t,i=2,U=1,f=24,s=2,v=2,c=2,r=2;" + payload + L"\x1b\\");
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;2m"); // fg = image id 2
+        buf.GetCursor().SetPosition({ 0, phRow });
+        _stateMachine->ProcessString(Placeholder() + Placeholder()); // grid row 0
+        buf.GetCursor().SetPosition({ 0, phRow + 1 });
+        _stateMachine->ProcessString(Placeholder() + Placeholder()); // grid row 1
+        _stateMachine->ProcessString(L"\x1b[0m");
+
+        // Every pixel of the 2-cell x 2-row footprint must be identical between the renders.
+        for (til::CoordType r = 0; r < 2; ++r)
+        {
+            const auto* sd = buf.GetRowByOffset(directRow + r).GetImageSlice();
+            const auto* sp = buf.GetRowByOffset(phRow + r).GetImageSlice();
+            VERIFY_IS_NOT_NULL(sd, L"direct render produced an image slice");
+            VERIFY_IS_NOT_NULL(sp, L"placeholder render produced an image slice");
+            for (til::CoordType py = 0; py < cell.height; ++py)
+            {
+                for (til::CoordType px = 0; px < 2 * cell.width; ++px)
+                {
+                    const auto a = SlicePixelAt(sd, px, py);
+                    const auto b = SlicePixelAt(sp, px, py);
+                    VERIFY_IS_TRUE(a.rgbRed == b.rgbRed && a.rgbGreen == b.rgbGreen && a.rgbBlue == b.rgbBlue,
+                                   L"placeholder pixel must equal the direct-render pixel");
+                }
+            }
+        }
+    }
+
     // Deleting the image by id erases placeholder-rendered cells too.
     TEST_METHOD(KittyPlaceholderDeleteErases)
     {
