@@ -5864,15 +5864,16 @@ void AdaptDispatch::_placeKittyPlaceholderCell(const KittyImage& image, const ui
 }
 
 // Overlays each U+10EEEE placeholder in one just-written segment with its sub-rect of the
-// (virtual) image named by the cell's RGB foreground. The grid (rows x cols) is the geometry
-// recorded when the image was stored virtually, so it stays constant however the cells are
-// chunked across writes. A cell's grid (row,col) comes from its kitty combining diacritics
-// (1st = row, 2nd = col; extras ignored). When the column diacritic is absent the column auto-
-// increments along the segment; when the row diacritic is absent the row tracks an anchor that
-// advances per screen line, including when a bottom-of-buffer scroll keeps the absolute row
-// fixed (a new render at or above the anchor is the next grid row). The screen column steps by
-// each glyph's real width (NavigateToNext), so a wide (CJK) glyph before a placeholder doesn't
-// shift it. Called per segment with the segment's true post-wrap row and start column.
+// (virtual) image named by the cell's foreground (24-bit RGB or a 256-color index = the id).
+// The grid (rows x cols) is the geometry recorded when the image was stored virtually, so it
+// stays constant however the cells are chunked across writes. A cell's grid (row,col) comes
+// from its kitty combining diacritics (1st = row, 2nd = col; extras ignored). Absent diacritics
+// use a linear running counter per the spec: the column auto-increments per drawn cell and
+// wraps to the next row, independent of the screen row, so scrolling and chunked writes don't
+// perturb it. The screen column steps by each glyph's real width (NavigateToNext), so a wide
+// (CJK) glyph before a placeholder doesn't shift it. Called per segment with the segment's
+// true post-wrap row and start column.
+// Protocol: https://sw.kovidgoyal.net/kitty/graphics-protocol/#unicode-placeholders
 void AdaptDispatch::_renderKittyPlaceholders(const std::wstring_view segment, const til::CoordType screenRow, const til::CoordType startColumn)
 {
     auto page = _pages.ActivePage();
