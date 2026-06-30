@@ -5350,12 +5350,15 @@ public:
         VERIFY_ARE_EQUAL(0, _testGetSet->_decodeImageCallCount);
     }
 
-    // A compressed (o=z) PNG is rejected until zlib support exists.
-    TEST_METHOD(KittyGraphicsPngZlibRejected)
+    // A malformed o=z payload (not a valid zlib stream) is rejected. f=100 + o=z now
+    // reaches the inflate step, and "iVBORw0K" decodes to a PNG signature, not a zlib
+    // stream, so the RFC 1950 header check fails.
+    // kitty spec (compression): https://sw.kovidgoyal.net/kitty/graphics-protocol/#compression
+    TEST_METHOD(KittyGraphicsZlibMalformedIsEinval)
     {
         _testGetSet->PrepData();
         _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,f=100,o=z;iVBORw0K\x1b\\");
-        _testGetSet->ValidateInputEvent(L"\x1b_Gi=1;EINVAL:unsupported compression\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=1;EINVAL:invalid compressed data\x1b\\");
     }
 
     // PNG transmit-by-number assigns a fresh id and displays the decoded image.
@@ -5488,12 +5491,15 @@ public:
         _testGetSet->ValidateInputEvent(L"\x1b_Gi=12;OK\x1b\\");
     }
 
-    // Compression (o=z, zlib) is deferred and rejected with EINVAL until implemented.
-    TEST_METHOD(KittyGraphicsZlibCompressionIsEinval)
+    // o=z (zlib) transmit: a real zlib stream of a 2x2 f=24 image inflates to exactly
+    // 12 bytes (s*v*3) and is accepted. The payload is base64(zlib.deflate([1..12])).
+    // If the inflate produced the wrong length the f=24 size check would report a
+    // mismatch, so an OK ack proves the o=z round-trip through the transmit path.
+    TEST_METHOD(KittyGraphicsZlibTransmitDecodes)
     {
         _testGetSet->PrepData();
-        _stateMachine->ProcessString(L"\x1b_Ga=t,i=13,f=24,s=2,v=2,o=z;AQIDBA==\x1b\\");
-        _testGetSet->ValidateInputEvent(L"\x1b_Gi=13;EINVAL:unsupported compression\x1b\\");
+        _stateMachine->ProcessString(L"\x1b_Ga=t,i=13,f=24,s=2,v=2,o=z;eNpjZGJmYWVj5+Dk4uYBAAF4AE8=\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=13;OK\x1b\\");
     }
 
     // A query (a=q) validates the payload like a transmit; malformed base64 is EINVAL.
@@ -5518,6 +5524,143 @@ public:
         _testGetSet->PrepData();
         _stateMachine->ProcessString(L"\x1b_Ga=t,i=7,o=x;\x1b\\");
         _testGetSet->ValidateInputEvent(L"\x1b_Gi=7;EINVAL:unsupported compression\x1b\\");
+    }
+
+    // --- o=z (zlib) inflate: direct unit tests of AdaptDispatch::_inflateKittyZlib. ---
+    // These drive the inflatelib inflater through the private helper (AdapterTest is a
+    // friend). Inputs are real zlib streams from zlib.deflateSync, i.e. exactly what
+    // kitty transmits, so an actual Huffman decode is exercised.
+
+    // A real (Huffman-coded) zlib stream inflates to the original bytes -- including the
+    // case where the output (64 bytes) is LARGER than the compressed input (12 bytes),
+    // which would catch any compressed/uncompressed size confusion in the decode.
+    TEST_METHOD(KittyInflateZlibRoundTripsCompressed)
+    {
+        // zlib.deflateSync(Buffer.alloc(64, 0xAB)) -- inflates to 64 bytes of 0xAB.
+        const std::vector<uint8_t> cAB{ 0x78, 0xda, 0x5b, 0xbd, 0x9a, 0x32, 0x00, 0x00, 0x6d, 0xeb, 0x2a, 0xc1 };
+        std::vector<uint8_t> out;
+        VERIFY_IS_TRUE(AdaptDispatch::_inflateKittyZlib(cAB, out, 32 * 1024 * 1024));
+        VERIFY_ARE_EQUAL(64u, out.size());
+        for (const auto b : out)
+        {
+            VERIFY_ARE_EQUAL(0xABu, static_cast<unsigned>(b));
+        }
+
+        // zlib.deflateSync([1..12]) -- inflates back to the 1..12 ramp.
+        const std::vector<uint8_t> c12{ 0x78, 0xda, 0x63, 0x64, 0x62, 0x66, 0x61, 0x65, 0x63, 0xe7, 0xe0, 0xe4, 0xe2, 0xe6, 0x01, 0x00, 0x01, 0x78, 0x00, 0x4f };
+        const std::vector<uint8_t> ramp{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12 };
+        out.clear();
+        VERIFY_IS_TRUE(AdaptDispatch::_inflateKittyZlib(c12, out, 32 * 1024 * 1024));
+        VERIFY_ARE_EQUAL(ramp.size(), out.size());
+        VERIFY_IS_TRUE(std::equal(out.begin(), out.end(), ramp.begin()));
+    }
+
+    // An inflated size exceeding the cap is rejected (decompression-bomb guard: the
+    // bounded streaming inflate stops once the stream crosses the cap) without ever
+    // materialising the expansion; the boundary (size == cap) is accepted.
+    TEST_METHOD(KittyInflateZlibEnforcesCap)
+    {
+        const std::vector<uint8_t> cAB{ 0x78, 0xda, 0x5b, 0xbd, 0x9a, 0x32, 0x00, 0x00, 0x6d, 0xeb, 0x2a, 0xc1 };
+        std::vector<uint8_t> out;
+        VERIFY_IS_FALSE(AdaptDispatch::_inflateKittyZlib(cAB, out, 32)); // 64 > 32 -> reject
+        VERIFY_IS_TRUE(out.empty());
+        VERIFY_IS_TRUE(AdaptDispatch::_inflateKittyZlib(cAB, out, 64)); // 64 <= 64 -> accept
+        VERIFY_ARE_EQUAL(64u, out.size());
+    }
+
+    // Raw DEFLATE (no RFC 1950 zlib header/trailer) is rejected: kitty o=z is
+    // zlib-wrapped, not raw deflate.
+    TEST_METHOD(KittyInflateZlibRejectsRawDeflate)
+    {
+        const std::vector<uint8_t> rawDef{ 0x63, 0x64, 0x62, 0x66, 0x61, 0x65, 0x63, 0xe7, 0xe0, 0xe4, 0xe2, 0xe6, 0x01, 0x00 };
+        std::vector<uint8_t> out;
+        VERIFY_IS_FALSE(AdaptDispatch::_inflateKittyZlib(rawDef, out, 32 * 1024 * 1024));
+    }
+
+    // A corrupted Adler-32 trailer is rejected (integrity check over the inflated data).
+    TEST_METHOD(KittyInflateZlibRejectsCorruptAdler)
+    {
+        std::vector<uint8_t> c12{ 0x78, 0xda, 0x63, 0x64, 0x62, 0x66, 0x61, 0x65, 0x63, 0xe7, 0xe0, 0xe4, 0xe2, 0xe6, 0x01, 0x00, 0x01, 0x78, 0x00, 0x4f };
+        c12.back() ^= 0xff; // flip the low byte of the trailing Adler-32
+        std::vector<uint8_t> out;
+        VERIFY_IS_FALSE(AdaptDispatch::_inflateKittyZlib(c12, out, 32 * 1024 * 1024));
+    }
+
+    // Too-short and bad-FCHECK headers are rejected before any inflate work.
+    TEST_METHOD(KittyInflateZlibRejectsBadHeader)
+    {
+        std::vector<uint8_t> out;
+        const std::vector<uint8_t> tooShort{ 0x78, 0xda, 0x00 };
+        VERIFY_IS_FALSE(AdaptDispatch::_inflateKittyZlib(tooShort, out, 32 * 1024 * 1024));
+        // CMF=0x78, FLG=0x00 -> (0x7800 % 31) != 0 -> FCHECK fails.
+        const std::vector<uint8_t> badCheck{ 0x78, 0x00, 0x01, 0x00, 0x00, 0x00 };
+        VERIFY_IS_FALSE(AdaptDispatch::_inflateKittyZlib(badCheck, out, 32 * 1024 * 1024));
+    }
+
+    // Trailing bytes between the DEFLATE stream and the Adler-32 are rejected (the
+    // inflater must consume exactly the deflate body): this is c12 with an extra 0x00
+    // spliced in before the 4-byte checksum.
+    TEST_METHOD(KittyInflateZlibRejectsTrailingGarbageBeforeAdler)
+    {
+        const std::vector<uint8_t> garbage{ 0x78, 0xda, 0x63, 0x64, 0x62, 0x66, 0x61, 0x65, 0x63, 0xe7, 0xe0, 0xe4, 0xe2, 0xe6, 0x01, 0x00, 0x00, 0x01, 0x78, 0x00, 0x4f };
+        std::vector<uint8_t> out;
+        VERIFY_IS_FALSE(AdaptDispatch::_inflateKittyZlib(garbage, out, 32 * 1024 * 1024));
+    }
+
+    // More malformed edges all reject cleanly: a stream that inflates to zero bytes, a
+    // 6-byte stream with an empty deflate body, an FDICT (preset-dictionary) header, and
+    // a truncated deflate stream.
+    TEST_METHOD(KittyInflateZlibRejectsMoreMalformedEdges)
+    {
+        std::vector<uint8_t> out;
+        const std::vector<uint8_t> emptyOut{ 0x78, 0x9c, 0x03, 0x00, 0x00, 0x00, 0x00, 0x01 };
+        VERIFY_IS_FALSE(AdaptDispatch::_inflateKittyZlib(emptyOut, out, 32 * 1024 * 1024));
+        const std::vector<uint8_t> sixByte{ 0x78, 0x9c, 0x00, 0x00, 0x00, 0x01 };
+        VERIFY_IS_FALSE(AdaptDispatch::_inflateKittyZlib(sixByte, out, 32 * 1024 * 1024));
+        const std::vector<uint8_t> fdict{ 0x78, 0xbb, 0x04, 0x09, 0x01, 0xa5, 0x63, 0x64, 0x62, 0x06, 0x00, 0x00, 0x0d, 0x00, 0x07 };
+        VERIFY_IS_FALSE(AdaptDispatch::_inflateKittyZlib(fdict, out, 32 * 1024 * 1024));
+        const std::vector<uint8_t> truncated{ 0x78, 0xda, 0x63, 0x64, 0x62, 0x66, 0x61, 0x65, 0x63, 0xe7, 0xe0, 0xe4, 0xe2, 0xe6, 0x01, 0x01, 0x78, 0x00, 0x4f };
+        VERIFY_IS_FALSE(AdaptDispatch::_inflateKittyZlib(truncated, out, 32 * 1024 * 1024));
+    }
+
+    // o=z over a chunked (m=1) transmission: the inflate must run on the REASSEMBLED
+    // payload, not per-chunk. The two base64 halves concatenate to zlib.deflate([1..12]).
+    TEST_METHOD(KittyGraphicsZlibChunkedTransmitDecodes)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1b_Ga=t,i=15,f=24,s=2,v=2,o=z,m=1;eNpjZGJm\x1b\\");
+        VERIFY_IS_TRUE(_testGetSet->_response.empty(), L"An intermediate chunk should not respond.");
+        _stateMachine->ProcessString(L"\x1b_Gm=0;YWVj5+Dk4uYBAAF4AE8=\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=15;OK\x1b\\");
+    }
+
+    // o=z + f=100: the inflated bytes (a PNG signature here) are handed to the host PNG
+    // decoder, exercising the compressed-then-decoded path.
+    TEST_METHOD(KittyGraphicsZlibPngTransmitDecodes)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=14,f=100,o=z;eJzrDPBz5+UCAAb9AYY=\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=14;OK\x1b\\");
+        VERIFY_IS_TRUE(_testGetSet->_decodeImageCallCount > 0, L"o=z + f=100 must reach the host PNG decoder.");
+    }
+
+    // o=z composes with file (t=f) and temporary-file (t=t) media: the compressed bytes
+    // come from the file read, then inflate, and t=t still requests deletion.
+    TEST_METHOD(KittyGraphicsZlibFileAndTempMediaInflate)
+    {
+        const std::vector<uint8_t> c12{ 0x78, 0xda, 0x63, 0x64, 0x62, 0x66, 0x61, 0x65, 0x63, 0xe7, 0xe0, 0xe4, 0xe2, 0xe6, 0x01, 0x00, 0x01, 0x78, 0x00, 0x4f };
+
+        _testGetSet->PrepData();
+        _testGetSet->_kittyFileBytes = c12; // a file whose contents are the zlib stream
+        _stateMachine->ProcessString(L"\x1b_Ga=t,i=16,f=24,s=2,v=2,t=f,o=z;L3RtcC94\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=16;OK\x1b\\");
+        VERIFY_IS_FALSE(_testGetSet->_lastKittyFileDeleteAfter, L"t=f must not request deletion.");
+
+        _testGetSet->PrepData();
+        _testGetSet->_kittyFileBytes = c12;
+        _stateMachine->ProcessString(L"\x1b_Ga=t,i=17,f=24,s=2,v=2,t=t,o=z;L3RtcC94\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=17;OK\x1b\\");
+        VERIFY_IS_TRUE(_testGetSet->_lastKittyFileDeleteAfter, L"t=t must request deletion.");
     }
 
     // Hostile dimensions cannot overflow the size check; they report a mismatch.

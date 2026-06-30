@@ -14,6 +14,13 @@
 #include "../../types/inc/Viewport.hpp"
 #include "../parser/ascii.hpp"
 
+#include <mutex>
+
+// inflatelib (microsoft/inflatelib) provides the RFC 1951 DEFLATE decoder backing the
+// Kitty graphics o=z (zlib) path. It handles raw Deflate only, so the surrounding RFC
+// 1950 zlib header and Adler-32 trailer are validated here.
+#include <inflatelib.hpp>
+
 using namespace Microsoft::Console::Types;
 using namespace Microsoft::Console::Render;
 using namespace Microsoft::Console::VirtualTerminal;
@@ -5614,9 +5621,11 @@ void AdaptDispatch::_ProcessKittyCommand(const KittyControl& command, const std:
                 code = L"EINVAL:unsupported transmission medium";
                 break;
             }
-            if (compression != 0)
+            if (compression != 0 && compression != L'z')
             {
-                // o=z (zlib) is deferred; reject it rather than store an empty image.
+                // Only o=z (zlib/DEFLATE) compression is defined by the protocol;
+                // reject any other (undefined) selector rather than guess.
+                // Protocol: https://sw.kovidgoyal.net/kitty/graphics-protocol/#compression
                 success = false;
                 code = L"EINVAL:unsupported compression";
                 break;
@@ -5699,9 +5708,28 @@ void AdaptDispatch::_ProcessKittyCommand(const KittyControl& command, const std:
                 }
                 bytes = std::move(fileBytes);
             }
+            if (compression == L'z')
+            {
+                // o=z: the bytes acquired above (from t=d base64, or a t=f / t=t file)
+                // are a zlib (RFC 1950) stream wrapping the real f=24/32 pixels or an
+                // f=100 PNG. Inflate here -- after the medium branch, before the
+                // format-specific validation/decode -- so everything downstream sees
+                // the uncompressed bytes regardless of how they arrived. The inflated
+                // size is bounded to MaxKittyPayload, so a decompression bomb is
+                // rejected without ever allocating the expanded buffer.
+                std::vector<uint8_t> inflated;
+                if (!_inflateKittyZlib(bytes, inflated, MaxKittyPayload))
+                {
+                    success = false;
+                    code = L"EINVAL:invalid compressed data";
+                    break;
+                }
+                bytes = std::move(inflated);
+            }
             // Raw pixel formats (f=24/32) require positive dimensions and an exact
             // payload of width * height * depth bytes; compare via division so hostile
-            // dimensions cannot overflow. (o=z was already rejected, so depth==direct.)
+            // dimensions cannot overflow. (Any o=z payload has already been inflated
+            // above, so `bytes` is the raw/decoded representation at this point.)
             const auto depth = format == 24 ? 3u : (format == 32 ? 4u : 0u);
             const auto directPixels = depth != 0;
             if (directPixels)
@@ -8918,6 +8946,150 @@ bool AdaptDispatch::_DecodeKittyBase64(const std::string_view input, std::vector
     }
 
     return true;
+}
+
+// Inflate an RFC 1950 zlib stream (kitty's o=z transmission). On success `output`
+// holds the decompressed bytes and the function returns true; malformed input, an
+// inflated size of zero, or a size exceeding `cap` returns false (the caller maps
+// that to an EINVAL ACK). The RFC 1951 DEFLATE body is inflated by inflatelib.
+// noexcept: any allocation failure is caught and reported as false.
+//
+// Protocol: https://sw.kovidgoyal.net/kitty/graphics-protocol/#compression  (o=z)
+// zlib container format: https://www.rfc-editor.org/rfc/rfc1950
+bool AdaptDispatch::_inflateKittyZlib(const std::vector<uint8_t>& input, std::vector<uint8_t>& output, const size_t cap) noexcept
+try
+{
+    output.clear();
+
+    // A zlib stream is a 2-byte header, the DEFLATE body, then a 4-byte big-endian
+    // Adler-32 of the uncompressed data, so the smallest valid stream is 6 bytes.
+    if (input.size() < 6)
+    {
+        return false;
+    }
+    const auto cmf = input[0];
+    const auto flg = input[1];
+    // FCHECK: the 16-bit value (CMF << 8 | FLG) must be a multiple of 31.
+    if (((static_cast<unsigned>(cmf) << 8) | flg) % 31u != 0)
+    {
+        return false;
+    }
+    // CM (low nibble of CMF) must be 8 (DEFLATE) and CINFO (high nibble) must be <= 7.
+    if ((cmf & 0x0f) != 8 || (cmf >> 4) > 7)
+    {
+        return false;
+    }
+    // FDICT (preset dictionary) is not used by kitty and is not supported here.
+    if ((flg & 0x20) != 0)
+    {
+        return false;
+    }
+
+    const auto deflateAvailable = input.size() - 2u;
+    std::span<const std::byte> remainingInput{ reinterpret_cast<const std::byte*>(input.data() + 2), deflateAvailable };
+
+    // Inflate in bounded chunks, growing the output only as the stream actually produces
+    // bytes. A decompression bomb is rejected as soon as it crosses `cap` rather than
+    // after materialising the whole expansion. We allow exactly one byte beyond `cap` so
+    // "produced more than cap" is detectable without a zero-length final call, whose
+    // "no progress" result would be ambiguous against a genuinely finished stream.
+    const auto limit = cap + 1;
+    constexpr size_t firstChunk = 8 * 1024;
+
+    inflatelib::stream stream;
+    size_t produced = 0;
+    auto reachedEnd = false;
+
+    while (!reachedEnd)
+    {
+        if (produced == output.size())
+        {
+            if (output.size() >= limit)
+            {
+                // Still producing at limit == cap + 1, so the stream exceeds `cap`.
+                break;
+            }
+            output.resize(std::min(limit, std::max(firstChunk, output.size() * 2)));
+        }
+
+        std::span<std::byte> outputWindow{ reinterpret_cast<std::byte*>(output.data() + produced), output.size() - produced };
+        const auto inputBefore = remainingInput.size();
+        const auto outputBefore = outputWindow.size();
+
+        const auto result = stream.try_inflate(remainingInput, outputWindow);
+        if (result < INFLATELIB_OK)
+        {
+            output.clear();
+            return false;
+        }
+
+        produced += outputBefore - outputWindow.size();
+        reachedEnd = result == INFLATELIB_EOF;
+
+        // Neither buffer moved and the stream is not finished, so no call can ever make
+        // progress -- a truncated DEFLATE body. Bail rather than spin.
+        if (!reachedEnd && remainingInput.size() == inputBefore && outputWindow.size() == outputBefore)
+        {
+            output.clear();
+            return false;
+        }
+    }
+
+    if (!reachedEnd || produced == 0 || produced > cap)
+    {
+        output.clear();
+        return false;
+    }
+    output.resize(produced);
+
+    // inflatelib stops at the end of the DEFLATE stream, so whatever it did not consume
+    // is the 4-byte Adler-32. Require the stream to end exactly where that trailer
+    // begins, rejecting trailing garbage and multi-member streams.
+    const auto consumed = deflateAvailable - remainingInput.size();
+    if (2u + consumed + 4u != input.size())
+    {
+        output.clear();
+        return false;
+    }
+
+    // Verify the trailing Adler-32 (RFC 1950, big-endian) over the inflated bytes so a
+    // corrupted payload is rejected rather than decoded into a garbled image.
+    const auto adler32 = [](const uint8_t* p, size_t n) noexcept -> uint32_t {
+        uint32_t a = 1;
+        uint32_t b = 0;
+        while (n != 0)
+        {
+            // Defer the modulo for up to NMAX (5552) bytes -- the longest run that
+            // cannot overflow 32 bits -- which is how zlib's own adler32() works.
+            auto k = n < 5552u ? n : size_t{ 5552 };
+            n -= k;
+            do
+            {
+                a += *p++;
+                b += a;
+            } while (--k != 0);
+            a %= 65521u;
+            b %= 65521u;
+        }
+        return (b << 16) | a;
+    };
+    const auto* const tail = input.data() + 2u + consumed;
+    const auto expected = (static_cast<uint32_t>(tail[0]) << 24) |
+                          (static_cast<uint32_t>(tail[1]) << 16) |
+                          (static_cast<uint32_t>(tail[2]) << 8) |
+                          static_cast<uint32_t>(tail[3]);
+    if (adler32(output.data(), output.size()) != expected)
+    {
+        output.clear();
+        return false;
+    }
+
+    return true;
+}
+catch (...)
+{
+    output.clear();
+    return false;
 }
 
 void AdaptDispatch::_ReturnOscResponse(const std::wstring_view response) const
