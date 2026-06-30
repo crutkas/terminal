@@ -356,14 +356,13 @@ namespace Microsoft::Console::VirtualTerminal
         // A virtual (U=1) placement's fixed grid geometry plus its auto-numbering cursor.
         // The grid (cols x rows) is recorded at store time so placeholder rendering slices
         // the image consistently no matter how the cells are chunked across writes. autoRow/
-        // autoCol track the grid cell a placeholder without explicit diacritics maps to;
-        // anchorRow is the last screen row rendered (-1 = none) and lets the auto row stay
-        // correct across newlines and bottom-of-buffer scrolls.
+        // autoCol are a running counter (per kitty spec) for placeholder cells that omit
+        // explicit row/col diacritics; they advance only when a cell is drawn and are
+        // independent of the screen row, so scrolling/wrapping/chunking don't perturb them.
         struct KittyVirtualPlacement
         {
             uint32_t cols = 1;
             uint32_t rows = 1;
-            til::CoordType anchorRow = -1;
             uint32_t autoRow = 0;
             uint32_t autoCol = 0;
         };
