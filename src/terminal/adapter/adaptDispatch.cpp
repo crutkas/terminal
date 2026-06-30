@@ -5248,28 +5248,38 @@ void AdaptDispatch::_ProcessKittyCommand(const KittyControl& command, const std:
             // A relative placement supersedes any placeholder eligibility for this id.
             _kittyVirtualIds.erase(targetImageId);
             // Draw at the resolved anchor; the cursor must NOT move for a relative placement.
-            _placeKittyImage(image, false, targetImageId, command.cols, command.rows, command.srcX, command.srcY, command.srcW, command.srcH, command.cellOffsetX, command.cellOffsetY, childAnchor);
+            const auto drawn = _placeKittyImage(image, false, targetImageId, command.cols, command.rows, command.srcX, command.srcY, command.srcW, command.srcH, command.cellOffsetX, command.cellOffsetY, childAnchor);
             KittyPlacement placement;
             placement.imageId = targetImageId;
             placement.placementId = placementId;
             placement.anchorCol = childAnchor.x;
             placement.anchorRow = childAnchor.y;
+            placement.cols = drawn.width;
+            placement.rows = drawn.height;
             placement.parentImageId = command.parentImageId;
             placement.parentPlacementId = command.parentPlacementId;
             placement.offsetH = command.offsetH;
             placement.offsetV = command.offsetV;
             placement.hasParent = true;
             placement.isVirtual = false;
-            // NB: an anonymous relative placement (no p=) is drawn above but not registered (a 0
-            // placement id has no registry key), so it is not cascade-deleted with its parent --
-            // a known MVP limitation; clients wanting group lifetime give the child a placement id.
-            _registerKittyPlacement(placement);
+            if (placementId != 0)
+            {
+                _registerKittyPlacement(placement);
+            }
+            else
+            {
+                // An anonymous relative placement (no p=) has no registry key, so track it
+                // separately purely so it can be cascade-deleted when its parent is deleted
+                // (spec: "If its parent is deleted, [it] is deleted as well.").
+                // Protocol: https://sw.kovidgoyal.net/kitty/graphics-protocol/#relative-placements
+                _kittyAnonymousPlacements.push_back(placement);
+            }
             return;
         }
         // Normal (non-relative) placement: anchor at the cursor, honoring C.
         const auto cursorPos = _pages.ActivePage().Cursor().GetPosition();
         _kittyVirtualIds.erase(targetImageId);
-        _placeKittyImage(image, moveCursor, targetImageId, command.cols, command.rows, command.srcX, command.srcY, command.srcW, command.srcH, command.cellOffsetX, command.cellOffsetY);
+        const auto drawn = _placeKittyImage(image, moveCursor, targetImageId, command.cols, command.rows, command.srcX, command.srcY, command.srcW, command.srcH, command.cellOffsetX, command.cellOffsetY);
         if (placementId != 0)
         {
             KittyPlacement placement;
@@ -5277,6 +5287,8 @@ void AdaptDispatch::_ProcessKittyCommand(const KittyControl& command, const std:
             placement.placementId = placementId;
             placement.anchorCol = cursorPos.x;
             placement.anchorRow = cursorPos.y;
+            placement.cols = drawn.width;
+            placement.rows = drawn.height;
             placement.hasParent = false;
             placement.isVirtual = false;
             _registerKittyPlacement(placement);
@@ -5498,10 +5510,16 @@ void AdaptDispatch::_ProcessKittyCommand(const KittyControl& command, const std:
             {
                 // A non-virtual put cancels any prior placeholder eligibility for this id, so
                 // a later U+10EEEE cell can't keep overlaying it (mirrors the transmit path).
-                // Re-putting the same (i, p) replaces the prior placement (move/resize).
+                // Re-putting the same (i, p) replaces the prior placement (move/resize): erase
+                // the old placement's drawn cells first so its prior pixels don't linger.
                 if (command.havePlacementId)
                 {
-                    _kittyPlacements.erase({ targetId, command.placementId });
+                    const auto existing = _kittyPlacements.find({ targetId, command.placementId });
+                    if (existing != _kittyPlacements.end())
+                    {
+                        _eraseKittyPlacementCells(existing->second);
+                        _kittyPlacements.erase(existing);
+                    }
                 }
                 displayKittyPlacement(targetId, *target);
             }
@@ -5716,6 +5734,10 @@ void AdaptDispatch::_eraseKittyImage(const uint32_t id)
     {
         pit = pit->first.first == id ? _kittyPlacements.erase(pit) : std::next(pit);
     }
+    // Likewise drop any anonymous relative placements of this id (no registry key of their own).
+    _kittyAnonymousPlacements.erase(
+        std::remove_if(_kittyAnonymousPlacements.begin(), _kittyAnonymousPlacements.end(), [id](const KittyPlacement& p) noexcept { return p.imageId == id; }),
+        _kittyAnonymousPlacements.end());
     // The eviction path always removes the front, so keep that common case O(1).
     if (!_kittyImageOrder.empty() && _kittyImageOrder.front() == id)
     {
@@ -5738,6 +5760,7 @@ try
     _kittyImageOrder.clear();
     _kittyVirtualIds.clear();
     _kittyPlacements.clear();
+    _kittyAnonymousPlacements.clear();
     _kittyTotalPixelBytes = 0;
     auto page = _pages.ActivePage();
     auto& buffer = page.Buffer();
@@ -5831,11 +5854,11 @@ std::vector<RGBQUAD> AdaptDispatch::_decodeKittyPixels(const uint32_t format, co
 // aspect) via nearest-neighbour; oversize spans clip. Cursor advances by the span unless
 // moveCursor is false (C=1).
 // Protocol: https://sw.kovidgoyal.net/kitty/graphics-protocol/#controlling-displayed-image-layout
-void AdaptDispatch::_placeKittyImage(const KittyImage& image, const bool moveCursor, const uint32_t imageId, const uint32_t cols, const uint32_t rows, const uint32_t srcX, const uint32_t srcY, const uint32_t srcW, const uint32_t srcH, const uint32_t cellOffsetX, const uint32_t cellOffsetY, const std::optional<til::point> anchor)
+til::size AdaptDispatch::_placeKittyImage(const KittyImage& image, const bool moveCursor, const uint32_t imageId, const uint32_t cols, const uint32_t rows, const uint32_t srcX, const uint32_t srcY, const uint32_t srcW, const uint32_t srcH, const uint32_t cellOffsetX, const uint32_t cellOffsetY, const std::optional<til::point> anchor)
 {
     if (image.pixels.empty() || image.width == 0 || image.height == 0)
     {
-        return;
+        return {};
     }
     auto page = _pages.ActivePage();
     auto& buffer = page.Buffer();
@@ -5862,7 +5885,7 @@ void AdaptDispatch::_placeKittyImage(const KittyImage& image, const bool moveCur
     const auto cropH = srcH == 0 ? imageHeight - cropY : std::min(static_cast<til::CoordType>(std::min<uint32_t>(srcH, image.height)), imageHeight - cropY);
     if (cropW <= 0 || cropH <= 0)
     {
-        return;
+        return {};
     }
 
     // Requested target pixel size: c/r set a cell span (single axis preserves aspect; neither
@@ -5882,7 +5905,7 @@ void AdaptDispatch::_placeKittyImage(const KittyImage& image, const bool moveCur
     const auto columnEnd = std::min(columnBegin + columns, page.Width());
     if (columnEnd <= columnBegin)
     {
-        return;
+        return {};
     }
     // Fill the whole owned footprint, so the X-offset gutter and any right-truncation are drawn.
     const auto drawWidth = static_cast<til::CoordType>(static_cast<int64_t>(columnEnd - columnBegin) * cellWidth);
@@ -5951,6 +5974,12 @@ void AdaptDispatch::_placeKittyImage(const KittyImage& image, const bool moveCur
         // the row span of the placement (clamped to the page).
         page.Cursor().SetPosition({ std::min(columnEnd, page.Width() - 1), std::min(origin.y + rowSpan, page.Bottom() - 1) });
     }
+
+    // Report the footprint actually drawn (after clamping) so the caller can track this
+    // placement's extent and later erase exactly these cells by rectangle.
+    const auto drawnColumns = columnEnd - columnBegin;
+    const auto drawnRows = std::max(0, std::min(origin.y + rowSpan, page.Bottom()) - origin.y);
+    return { drawnColumns, drawnRows };
 }
 
 // Maps a c=/r= request to a target pixel size. With both axes set each is cells*cell-size;
@@ -6056,9 +6085,30 @@ void AdaptDispatch::_registerKittyPlacement(const KittyPlacement& placement)
 // placement is removed, placements positioned relative to it are removed too; if a child's
 // image then has no remaining placements, that image is deleted as well (the parent + its
 // relative children form a group managed together). A bounded worklist guards against cycles.
+// Anonymous relative children (no placement id, tracked in _kittyAnonymousPlacements) are also
+// cascade-erased here; being id-less they are leaves and never extend the worklist.
 // Protocol: https://sw.kovidgoyal.net/kitty/graphics-protocol/#relative-placements
 void AdaptDispatch::_eraseKittyPlacementsForImage(const uint32_t imageId)
 {
+    // True if any tracked placement (registered or anonymous) still references this image id.
+    const auto imageStillPlaced = [&](const uint32_t id) noexcept {
+        for (const auto& entry : _kittyPlacements)
+        {
+            if (entry.first.first == id)
+            {
+                return true;
+            }
+        }
+        for (const auto& anon : _kittyAnonymousPlacements)
+        {
+            if (anon.imageId == id)
+            {
+                return true;
+            }
+        }
+        return false;
+    };
+
     // Collect the (imageId, placementId) pairs being removed so their relative children
     // can be found and cascaded. Process iteratively to a fixed point.
     std::deque<std::pair<uint32_t, uint32_t>> removed;
@@ -6068,6 +6118,21 @@ void AdaptDispatch::_eraseKittyPlacementsForImage(const uint32_t imageId)
         {
             removed.push_back(it->first);
             it = _kittyPlacements.erase(it);
+        }
+        else
+        {
+            ++it;
+        }
+    }
+
+    // Drop this image's own anonymous placements (their cells are covered by the caller's broad
+    // _eraseKittyImageRows(imageId), but the tracking entries must go too).
+    for (auto it = _kittyAnonymousPlacements.begin(); it != _kittyAnonymousPlacements.end();)
+    {
+        if (it->imageId == imageId)
+        {
+            _eraseKittyPlacementCells(*it);
+            it = _kittyAnonymousPlacements.erase(it);
         }
         else
         {
@@ -6086,6 +6151,9 @@ void AdaptDispatch::_eraseKittyPlacementsForImage(const uint32_t imageId)
             const auto& p = it->second;
             if (p.hasParent && p.parentImageId == parent.first && p.parentPlacementId == parent.second)
             {
+                // Erase this child placement's own cells so a sibling placement of the same image
+                // (owned by image id only) isn't wrongly cleared by the broad per-image erase.
+                _eraseKittyPlacementCells(p);
                 removed.push_back(it->first);
                 it = _kittyPlacements.erase(it);
             }
@@ -6094,24 +6162,35 @@ void AdaptDispatch::_eraseKittyPlacementsForImage(const uint32_t imageId)
                 ++it;
             }
         }
-        // If a child's image now has no placements left, delete that image too.
-        const auto childImageId = parent.first;
-        if (childImageId != imageId && _kittyImages.count(childImageId) != 0)
+
+        // Anonymous relative children of this parent: erase their pixels and drop them. They are
+        // leaves (no placement id) so they never extend the worklist. If such a child's image is
+        // then left with no placements at all, delete that image as well.
+        for (auto it = _kittyAnonymousPlacements.begin(); it != _kittyAnonymousPlacements.end();)
         {
-            auto stillPlaced = false;
-            for (const auto& entry : _kittyPlacements)
+            if (it->hasParent && it->parentImageId == parent.first && it->parentPlacementId == parent.second)
             {
-                if (entry.first.first == childImageId)
+                const auto anonImageId = it->imageId;
+                _eraseKittyPlacementCells(*it);
+                it = _kittyAnonymousPlacements.erase(it);
+                if (anonImageId != imageId && _kittyImages.count(anonImageId) != 0 && !imageStillPlaced(anonImageId))
                 {
-                    stillPlaced = true;
-                    break;
+                    _eraseKittyImage(anonImageId);
+                    _eraseKittyImageRows(anonImageId);
                 }
             }
-            if (!stillPlaced)
+            else
             {
-                _eraseKittyImage(childImageId);
-                _eraseKittyImageRows(childImageId);
+                ++it;
             }
+        }
+
+        // If a child's image now has no placements left, delete that image too.
+        const auto childImageId = parent.first;
+        if (childImageId != imageId && _kittyImages.count(childImageId) != 0 && !imageStillPlaced(childImageId))
+        {
+            _eraseKittyImage(childImageId);
+            _eraseKittyImageRows(childImageId);
         }
     }
 }
@@ -6556,7 +6635,33 @@ void AdaptDispatch::_eraseKittyImageRows(const uint32_t imageId)
     }
 }
 
-// Decodes a standard base64 string (RFC 4648, '+'/'/' alphabet, '=' padding) into
+// Erases a single placement's drawn cells using its tracked extent rectangle, leaving text and
+// any co-resident images untouched. This is the per-placement counterpart to _eraseKittyImageRows
+// (which erases ALL cells owned by an image id): because image cells are owned by image id only,
+// not by (imageId, placementId), erasing one placement of a multiply-placed image requires the
+// rect captured at draw time. The renderer is notified for the affected rows the same way.
+// Protocol: https://sw.kovidgoyal.net/kitty/graphics-protocol/#relative-placements
+void AdaptDispatch::_eraseKittyPlacementCells(const KittyPlacement& placement)
+{
+    if (placement.cols <= 0 || placement.rows <= 0)
+    {
+        return;
+    }
+    auto page = _pages.ActivePage();
+    auto& buffer = page.Buffer();
+    const auto left = std::max(0, placement.anchorCol);
+    const auto top = std::max(0, placement.anchorRow);
+    const auto right = std::min(placement.anchorCol + placement.cols, page.Width());
+    const auto bottom = std::min(placement.anchorRow + placement.rows, page.Bottom());
+    if (right <= left || bottom <= top)
+    {
+        return;
+    }
+    ImageSlice::EraseBlock(buffer, til::rect{ left, top, right, bottom });
+    buffer.TriggerRedraw(Viewport::FromExclusive({ 0, top, page.Width(), bottom }));
+}
+
+
 // bytes. Returns false on any invalid character, misplaced padding, or a length
 // that is not a multiple of four. An empty input decodes to zero bytes (success).
 bool AdaptDispatch::_DecodeKittyBase64(const std::string_view input, std::vector<uint8_t>& output) noexcept
