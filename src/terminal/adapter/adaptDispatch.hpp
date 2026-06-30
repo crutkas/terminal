@@ -22,7 +22,9 @@ Author(s):
 #include "terminalOutput.hpp"
 
 #include <unordered_map>
+#include <map>
 #include <deque>
+#include <optional>
 #include <algorithm>
 #include "../input/terminalInput.hpp"
 #include "../../types/inc/sgrStack.hpp"
@@ -338,6 +340,14 @@ namespace Microsoft::Console::VirtualTerminal
             bool noCursorMovement = false;  // C=1: leave the cursor in place after a placement
             bool hasNonChunkKey = false;    // true if any key other than 'm' was present
             bool virtualPlacement = false;  // U=1: virtual placement (store only; drawn later via Unicode placeholders)
+            // Relative placements (https://sw.kovidgoyal.net/kitty/graphics-protocol/#relative-placements).
+            uint32_t placementId = 0;        // p=: placement id (one display of an image); ignored when imageId==0
+            uint32_t parentImageId = 0;      // P=: parent image id this placement is positioned relative to
+            uint32_t parentPlacementId = 0;  // Q=: parent placement id (with P) identifying the parent placement
+            int32_t offsetH = 0;             // H=: signed horizontal cell offset from the parent anchor (+right)
+            int32_t offsetV = 0;             // V=: signed vertical cell offset from the parent anchor (+down)
+            bool havePlacementId = false;    // true if p= was present (so p= is echoed in the ack)
+            bool haveParent = false;         // true if P= was present (a relative placement was requested)
         };
         // A stored Kitty image: the client image number (0 = none), the pixel
         // dimensions, and the decoded BGRA pixels (empty if not yet decodable).
@@ -379,11 +389,31 @@ namespace Microsoft::Console::VirtualTerminal
             uint64_t targetW = 0;
             uint64_t targetH = 0;
         };
+        // A single placement (one display) of an image, identified by the (imageId, placementId)
+        // pair. anchorRow/anchorCol are the absolute top-left cell of the placement. A relative
+        // placement (hasParent) is positioned at parentAnchor + (offsetH, offsetV); a virtual
+        // (isVirtual) placement has no fixed anchor and derives one on demand from its on-screen
+        // Unicode-placeholder cells. Re-sending the same (imageId, placementId) replaces the entry.
+        // Protocol: https://sw.kovidgoyal.net/kitty/graphics-protocol/#relative-placements
+        struct KittyPlacement
+        {
+            uint32_t imageId = 0;
+            uint32_t placementId = 0;
+            til::CoordType anchorRow = 0;
+            til::CoordType anchorCol = 0;
+            uint32_t parentImageId = 0;
+            uint32_t parentPlacementId = 0;
+            int32_t offsetH = 0;
+            int32_t offsetV = 0;
+            bool hasParent = false;
+            bool isVirtual = false;
+        };
         static KittyControl _ParseKittyControl(const std::wstring_view control) noexcept;
         void _HandleKittyGraphics(const std::wstring_view control, const std::string_view payload, const bool payloadValid, const bool payloadTooLarge);
         void _ProcessKittyCommand(const KittyControl& command, const std::string_view payload, const bool payloadValid, const bool payloadTooLarge);
         void _clearKittyChunk() noexcept;
         static uint32_t _ParseKittyUint(const std::wstring_view value) noexcept;
+        static int32_t _ParseKittyInt(const std::wstring_view value) noexcept;
         static bool _DecodeKittyBase64(const std::string_view input, std::vector<uint8_t>& output) noexcept;
         static std::vector<RGBQUAD> _decodeKittyPixels(const uint32_t format, const std::vector<uint8_t>& bytes);
         uint32_t _kittyAssignImageId();
@@ -393,7 +423,13 @@ namespace Microsoft::Console::VirtualTerminal
         void _clearKittyImages() noexcept;
         void _storeKittyVirtualPlacement(const uint32_t id, const KittyImage& image, const uint32_t cols, const uint32_t rows, const uint32_t srcX, const uint32_t srcY, const uint32_t srcW, const uint32_t srcH);
         static KittyTargetSize _kittyTargetPixels(const int64_t cropW, const int64_t cropH, const uint32_t cols, const uint32_t rows, const int64_t cellWidth, const int64_t cellHeight) noexcept;
-        void _placeKittyImage(const KittyImage& image, const bool moveCursor, const uint32_t imageId, const uint32_t cols = 0, const uint32_t rows = 0, const uint32_t srcX = 0, const uint32_t srcY = 0, const uint32_t srcW = 0, const uint32_t srcH = 0, const uint32_t cellOffsetX = 0, const uint32_t cellOffsetY = 0);
+        void _placeKittyImage(const KittyImage& image, const bool moveCursor, const uint32_t imageId, const uint32_t cols = 0, const uint32_t rows = 0, const uint32_t srcX = 0, const uint32_t srcY = 0, const uint32_t srcW = 0, const uint32_t srcH = 0, const uint32_t cellOffsetX = 0, const uint32_t cellOffsetY = 0, const std::optional<til::point> anchor = std::nullopt);
+        // Relative placement registry helpers.
+        // Protocol: https://sw.kovidgoyal.net/kitty/graphics-protocol/#relative-placements
+        void _registerKittyPlacement(const KittyPlacement& placement);
+        void _eraseKittyPlacementsForImage(const uint32_t imageId);
+        std::optional<til::point> _resolveKittyPlacementAnchor(const uint32_t parentImageId, const uint32_t parentPlacementId, const std::pair<uint32_t, uint32_t> origin, std::wstring_view& code) const;
+        std::optional<til::point> _deriveVirtualPlacementAnchor(const uint32_t imageId) const;
         void _renderKittyPlaceholders(const std::wstring_view segment, const til::CoordType screenRow, const til::CoordType startColumn);
         // Returns true if a placeholder tile was drawn (the caller batches one redraw per segment).
         bool _placeKittyPlaceholderCell(const KittyImage& image, const uint32_t imageId, const til::CoordType column, const til::CoordType row, const uint32_t cellRow, const uint32_t cellCol, const KittyVirtualPlacement& place);
@@ -437,6 +473,14 @@ namespace Microsoft::Console::VirtualTerminal
         // plain colored placeholder glyph can't false-overlay an ordinary image. The value is
         // the placement's fixed grid geometry and source sampling state (KittyVirtualPlacement).
         std::unordered_map<uint32_t, KittyVirtualPlacement> _kittyVirtualIds;
+        // Placement registry, keyed by (imageId, placementId). Tracks each display of an image so
+        // a relative child (P=/Q=) can be positioned against its parent and so a parent's deletion
+        // cascades to its relative children. Bounded by MaxKittyImages-scale to match the image LRU.
+        // A relative chain may be at least MaxKittyPlacementDepth deep; exceeding it is ETOODEEP.
+        // Protocol: https://sw.kovidgoyal.net/kitty/graphics-protocol/#relative-placements
+        static constexpr int MaxKittyPlacementDepth = 8;
+        static constexpr size_t MaxKittyPlacements = MaxKittyImages * 4;
+        std::map<std::pair<uint32_t, uint32_t>, KittyPlacement> _kittyPlacements;
 
         // Chunked transmission (m=): accumulates the base64 payload across sequences;
         // only one transfer runs at a time, processed on the final chunk (m=0).
