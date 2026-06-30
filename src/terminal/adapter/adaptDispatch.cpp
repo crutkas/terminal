@@ -5223,6 +5223,8 @@ void AdaptDispatch::_ProcessKittyCommand(const KittyControl& command, const std:
                 // request without storing, so it must NOT delete: only a real transmit
                 // (a=t / a=T) of a t=t file requests deletion.
                 //
+                // Protocol (transmission media): https://sw.kovidgoyal.net/kitty/graphics-protocol/#transferring-data
+                //
                 // Convert the UTF-8 path with MB_ERR_INVALID_CHARS so a malformed path is
                 // rejected here (path stays empty -> EBADF below) rather than silently
                 // mangled into U+FFFD substitutions: unlike til::u8u16, which uses no
