@@ -22,6 +22,16 @@
     <ClCompile Include="..\precomp.cpp">
       <PrecompiledHeader>Create</PrecompiledHeader>
     </ClCompile>
+    <ClCompile Include="$(SolutionDir)oss\puff\puff.c">
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+      <CompileAs>CompileAsC</CompileAs>
+      <!-- puff.c is vendored verbatim (oss/puff); relax this TU's warnings-as-errors
+           rather than edit pristine reference source. -->
+      <TreatWarningAsError>false</TreatWarningAsError>
+      <TreatSpecificWarningsAsErrors>
+      </TreatSpecificWarningsAsErrors>
+      <DisableSpecificWarnings>4242;4244;4324;%(DisableSpecificWarnings)</DisableSpecificWarnings>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="..\adaptDispatch.hpp" />
@@ -50,4 +60,10 @@
   <!-- Careful reordering these. Some default props (contained in these files) are order sensitive. -->
   <Import Project="$(SolutionDir)src\common.build.post.props" />
   <Import Project="$(SolutionDir)src\common.nugetversions.targets" />
+  <ItemDefinitionGroup>
+    <ClCompile>
+      <!-- For the vendored puff() inflater used by the Kitty graphics o=z path. -->
+      <AdditionalIncludeDirectories>$(SolutionDir)oss\puff;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+    </ClCompile>
+  </ItemDefinitionGroup>
 </Project>
