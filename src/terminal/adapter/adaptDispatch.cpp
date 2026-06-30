@@ -4886,6 +4886,8 @@ void AdaptDispatch::_ReturnApcResponse(const std::wstring_view response) const
 // 'G' identifier is validated first; the control block (key=value pairs up to ';')
 // is accumulated, and the base64 payload after ';' is collected (bounded). Both are
 // parsed on ESC. The handler is exception-safe: any failure declines the rest.
+//
+// Protocol: https://sw.kovidgoyal.net/kitty/graphics-protocol/
 ITermDispatch::StringHandler AdaptDispatch::KittyGraphics()
 {
     return [this, control = std::wstring{}, payload = std::string{}, sawIdentifier = false, inControl = true, payloadValid = true](const auto ch) mutable noexcept -> bool {
@@ -4939,6 +4941,7 @@ ITermDispatch::StringHandler AdaptDispatch::KittyGraphics()
 // Parses a Kitty graphics control block (comma-separated key=value pairs) into a
 // KittyControl. Keys are single characters with a non-empty value; a zero or empty
 // id/number is treated as unspecified.
+// Protocol (control key reference): https://sw.kovidgoyal.net/kitty/graphics-protocol/#control-data-reference
 AdaptDispatch::KittyControl AdaptDispatch::_ParseKittyControl(const std::wstring_view control) noexcept
 {
     KittyControl c;
@@ -5072,7 +5075,10 @@ void AdaptDispatch::_HandleKittyGraphics(const std::wstring_view control, const 
 }
 
 // Validates and applies a fully-assembled Kitty graphics command, then emits the
-// acknowledgement. Ids are re-emitted as decimal only.
+// acknowledgement. Ids are re-emitted as decimal only. Actions: a=t/T transmit
+// (and display), a=p put/display, a=q query, a=d delete.
+// Protocol: https://sw.kovidgoyal.net/kitty/graphics-protocol/#display-images-on-screen
+// and https://sw.kovidgoyal.net/kitty/graphics-protocol/#deleting-images
 void AdaptDispatch::_ProcessKittyCommand(const KittyControl& command, const std::string_view payload, const bool payloadValid)
 {
     const auto action = command.action;
@@ -5435,6 +5441,7 @@ void AdaptDispatch::_clearKittyChunk() noexcept
 
 // Converts a direct-pixel payload (f=24 RGB or f=32 RGBA) into premultiplied BGRA
 // RGBQUADs (the format the renderer expects). PNG (f=100) is not decoded here yet.
+// Protocol (pixel formats): https://sw.kovidgoyal.net/kitty/graphics-protocol/#rgb-and-rgba-data
 std::vector<RGBQUAD> AdaptDispatch::_decodeKittyPixels(const uint32_t format, const std::vector<uint8_t>& bytes)
 {
     std::vector<RGBQUAD> pixels;
@@ -5473,6 +5480,7 @@ std::vector<RGBQUAD> AdaptDispatch::_decodeKittyPixels(const uint32_t format, co
 // Draws a stored image at the cursor as one ImageSlice per text row (the same row
 // image mechanism as Sixel). Unless moveCursor is false (C=1), the cursor then
 // advances right by the column span and down by the row span, per the kitty spec.
+// Protocol: https://sw.kovidgoyal.net/kitty/graphics-protocol/#controlling-displayed-image-layout
 void AdaptDispatch::_placeKittyImage(const KittyImage& image, const bool moveCursor)
 {
     if (image.pixels.empty() || image.width == 0 || image.height == 0)
