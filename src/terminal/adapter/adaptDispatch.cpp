@@ -5079,6 +5079,23 @@ AdaptDispatch::KittyControl AdaptDispatch::_ParseKittyControl(const std::wstring
             case L'U':
                 c.virtualPlacement = _ParseKittyUint(value) != 0;
                 break;
+            case L'p': // placement id: one display of an image (ignored when imageId==0)
+                c.placementId = _ParseKittyUint(value);
+                c.havePlacementId = true;
+                break;
+            case L'P': // parent image id: position this placement relative to that image's placement
+                c.parentImageId = _ParseKittyUint(value);
+                c.haveParent = true;
+                break;
+            case L'Q': // parent placement id (with P) identifying the exact parent placement
+                c.parentPlacementId = _ParseKittyUint(value);
+                break;
+            case L'H': // signed horizontal cell offset from the parent anchor (+right / -left)
+                c.offsetH = _ParseKittyInt(value);
+                break;
+            case L'V': // signed vertical cell offset from the parent anchor (+down / -up)
+                c.offsetV = _ParseKittyInt(value);
+                break;
             case L'm':
                 c.moreChunks = _ParseKittyUint(value) != 0;
                 c.mPresent = true;
@@ -5097,6 +5114,8 @@ AdaptDispatch::KittyControl AdaptDispatch::_ParseKittyControl(const std::wstring
     // A zero (or empty) id/number means "unspecified" in the kitty protocol.
     c.haveId = c.haveId && c.imageId != 0;
     c.haveNumber = c.haveNumber && c.imageNumber != 0;
+    // A placement id of 0 means "no placement id" (valid ids are 1..4294967295).
+    c.havePlacementId = c.havePlacementId && c.placementId != 0;
     return c;
 }
 
@@ -5191,6 +5210,72 @@ void AdaptDispatch::_ProcessKittyCommand(const KittyControl& command, const std:
     auto success = true;
     std::wstring_view code = L"OK";
     auto assignedId = imageId; // id to report back (auto-assigned for transmit-by-number)
+
+    // Displays an image for a put/transmit-and-display, honoring relative placements
+    // (P=/Q=/H=/V=). For a relative placement it resolves the parent's absolute anchor,
+    // offsets by (H, V), draws at that anchor without moving the cursor, and records the
+    // placement; on a resolution error it sets success/code and draws nothing. For a normal
+    // placement it draws at the cursor (honoring C) and records a placement when p= is given.
+    // Protocol: https://sw.kovidgoyal.net/kitty/graphics-protocol/#relative-placements
+    const auto displayKittyPlacement = [&](const uint32_t targetImageId, const KittyImage& image) {
+        const auto placementId = command.havePlacementId ? command.placementId : 0u;
+        if (command.haveParent)
+        {
+            // (Virtual + relative is rejected before this lambda runs, at the a=T and a=p sites;
+            // this lambda only ever executes for non-virtual placements.)
+            std::wstring_view resolveCode = L"OK";
+            const auto parentAnchor = _resolveKittyPlacementAnchor(command.parentImageId, command.parentPlacementId, { targetImageId, placementId }, resolveCode);
+            if (!parentAnchor)
+            {
+                success = false;
+                code = resolveCode;
+                return;
+            }
+            // childAnchor = parentAnchor + (H, V) in cells, clamped to the page.
+            auto page = _pages.ActivePage();
+            const auto maxCol = std::max(0, page.Width() - 1);
+            const auto maxRow = std::max(0, page.Bottom() - 1);
+            const til::point childAnchor{
+                static_cast<til::CoordType>(std::clamp<int64_t>(static_cast<int64_t>(parentAnchor->x) + command.offsetH, 0, maxCol)),
+                static_cast<til::CoordType>(std::clamp<int64_t>(static_cast<int64_t>(parentAnchor->y) + command.offsetV, 0, maxRow)),
+            };
+            // A relative placement supersedes any placeholder eligibility for this id.
+            _kittyVirtualIds.erase(targetImageId);
+            // Draw at the resolved anchor; the cursor must NOT move for a relative placement.
+            _placeKittyImage(image, false, targetImageId, command.cols, command.rows, command.srcX, command.srcY, command.srcW, command.srcH, childAnchor);
+            KittyPlacement placement;
+            placement.imageId = targetImageId;
+            placement.placementId = placementId;
+            placement.anchorCol = childAnchor.x;
+            placement.anchorRow = childAnchor.y;
+            placement.parentImageId = command.parentImageId;
+            placement.parentPlacementId = command.parentPlacementId;
+            placement.offsetH = command.offsetH;
+            placement.offsetV = command.offsetV;
+            placement.hasParent = true;
+            placement.isVirtual = false;
+            // NB: an anonymous relative placement (no p=) is drawn above but not registered (a 0
+            // placement id has no registry key), so it is not cascade-deleted with its parent --
+            // a known MVP limitation; clients wanting group lifetime give the child a placement id.
+            _registerKittyPlacement(placement);
+            return;
+        }
+        // Normal (non-relative) placement: anchor at the cursor, honoring C.
+        const auto cursorPos = _pages.ActivePage().Cursor().GetPosition();
+        _kittyVirtualIds.erase(targetImageId);
+        _placeKittyImage(image, moveCursor, targetImageId, command.cols, command.rows, command.srcX, command.srcY, command.srcW, command.srcH);
+        if (placementId != 0)
+        {
+            KittyPlacement placement;
+            placement.imageId = targetImageId;
+            placement.placementId = placementId;
+            placement.anchorCol = cursorPos.x;
+            placement.anchorRow = cursorPos.y;
+            placement.hasParent = false;
+            placement.isVirtual = false;
+            _registerKittyPlacement(placement);
+        }
+    };
 
     if (haveId && haveNumber)
     {
@@ -5300,15 +5385,35 @@ void AdaptDispatch::_ProcessKittyCommand(const KittyControl& command, const std:
                 }
                 assignedId = haveId ? imageId : _kittyAssignImageId();
                 _eraseKittyImageRows(assignedId);
+                // Re-transmitting an id replaces its pixels, so its prior placements are stale:
+                // drop them (and cascade to any relative children) before re-registering.
+                _eraseKittyPlacementsForImage(assignedId);
                 _registerKittyImage(assignedId, std::move(image));
                 if (command.virtualPlacement)
                 {
+                    if (command.haveParent)
+                    {
+                        // A virtual (U=1) placement cannot itself be relative.
+                        success = false;
+                        code = L"EINVAL:virtual placements cannot be relative";
+                        break;
+                    }
                     // Virtual (U=1): store the image and its grid geometry; the pixels are
                     // drawn later by Unicode placeholders, not at the cursor.
                     const auto stored = _kittyImages.find(assignedId);
                     if (stored != _kittyImages.end())
                     {
                         _storeKittyVirtualPlacement(assignedId, stored->second, command.cols, command.rows, command.srcX, command.srcY, command.srcW, command.srcH);
+                    }
+                    // Record a virtual placement so a relative child may reference it as a parent;
+                    // its anchor is derived on demand from its on-screen placeholder cells.
+                    if (command.havePlacementId)
+                    {
+                        KittyPlacement placement;
+                        placement.imageId = assignedId;
+                        placement.placementId = command.placementId;
+                        placement.isVirtual = true;
+                        _registerKittyPlacement(placement);
                     }
                 }
                 else
@@ -5320,7 +5425,7 @@ void AdaptDispatch::_ProcessKittyCommand(const KittyControl& command, const std:
                     const auto stored = _kittyImages.find(assignedId);
                     if (stored != _kittyImages.end())
                     {
-                        _placeKittyImage(stored->second, moveCursor, assignedId, command.cols, command.rows, command.srcX, command.srcY, command.srcW, command.srcH);
+                        displayKittyPlacement(assignedId, stored->second);
                     }
                 }
             }
@@ -5359,15 +5464,40 @@ void AdaptDispatch::_ProcessKittyCommand(const KittyControl& command, const std:
             }
             else if (command.virtualPlacement)
             {
-                // Virtual put: eligible for placeholders with the requested grid, no cursor draw.
-                _storeKittyVirtualPlacement(targetId, *target, command.cols, command.rows, command.srcX, command.srcY, command.srcW, command.srcH);
+                if (command.haveParent)
+                {
+                    // A virtual (U=1) placement cannot itself be relative.
+                    success = false;
+                    code = L"EINVAL:virtual placements cannot be relative";
+                }
+                else
+                {
+                    // Virtual put: eligible for placeholders with the requested grid, no cursor draw.
+                    _storeKittyVirtualPlacement(targetId, *target, command.cols, command.rows, command.srcX, command.srcY, command.srcW, command.srcH);
+                    // Record this virtual placement so a relative child may reference it (anchor
+                    // derived on demand). Re-putting the same (i, p) replaces just that entry via
+                    // the registry upsert below -- it must NOT cascade-delete the image's other
+                    // placements (the spec only replaces the matching (imageId, placementId)).
+                    if (command.havePlacementId)
+                    {
+                        KittyPlacement placement;
+                        placement.imageId = targetId;
+                        placement.placementId = command.placementId;
+                        placement.isVirtual = true;
+                        _registerKittyPlacement(placement);
+                    }
+                }
             }
             else
             {
                 // A non-virtual put cancels any prior placeholder eligibility for this id, so
                 // a later U+10EEEE cell can't keep overlaying it (mirrors the transmit path).
-                _kittyVirtualIds.erase(targetId);
-                _placeKittyImage(*target, moveCursor, targetId, command.cols, command.rows, command.srcX, command.srcY, command.srcW, command.srcH);
+                // Re-putting the same (i, p) replaces the prior placement (move/resize).
+                if (command.havePlacementId)
+                {
+                    _kittyPlacements.erase({ targetId, command.placementId });
+                }
+                displayKittyPlacement(targetId, *target);
             }
             break;
         }
@@ -5382,6 +5512,8 @@ void AdaptDispatch::_ProcessKittyCommand(const KittyControl& command, const std:
             case L'I':
                 if (haveId)
                 {
+                    // Cascade to any relative children before removing the image itself.
+                    _eraseKittyPlacementsForImage(imageId);
                     _eraseKittyImage(imageId);
                     _eraseKittyImageRows(imageId);
                 }
@@ -5399,6 +5531,7 @@ void AdaptDispatch::_ProcessKittyCommand(const KittyControl& command, const std:
                     if (it != _kittyImageNumbers.end())
                     {
                         const auto targetId = it->second;
+                        _eraseKittyPlacementsForImage(targetId);
                         _eraseKittyImage(targetId);
                         _eraseKittyImageRows(targetId);
                     }
@@ -5458,6 +5591,13 @@ void AdaptDispatch::_ProcessKittyCommand(const KittyControl& command, const std:
             response += fmt::format(FMT_COMPILE(L"I={}"), imageNumber);
         }
     }
+    // Echo the placement id when one was given (and an image was referenced), so the client
+    // can correlate the response with the (imageId, placementId) it sent. p is ignored when
+    // no image id/number is present (i=0).
+    if (command.havePlacementId && (haveId || haveNumber))
+    {
+        response += fmt::format(FMT_COMPILE(L",p={}"), command.placementId);
+    }
     response.push_back(L';');
     response.append(code);
     _ReturnApcResponse(response);
@@ -5484,7 +5624,26 @@ uint32_t AdaptDispatch::_ParseKittyUint(const std::wstring_view value) noexcept
     return static_cast<uint32_t>(result);
 }
 
-// Returns an unused image id, skipping ids that are already registered.
+// Parses a signed decimal integer from a Kitty control value (e.g. H=/V= cell offsets),
+// clamped to the int32 range. An optional leading '-' negates the magnitude; parsing stops
+// at the first non-digit. Always noexcept.
+int32_t AdaptDispatch::_ParseKittyInt(const std::wstring_view value) noexcept
+{
+    auto negative = false;
+    auto digits = value;
+    if (!digits.empty() && (digits.front() == L'-' || digits.front() == L'+'))
+    {
+        negative = digits.front() == L'-';
+        digits = digits.substr(1);
+    }
+    const auto magnitude = _ParseKittyUint(digits);
+    if (negative)
+    {
+        // Clamp the negative magnitude to INT32_MIN.
+        return magnitude >= 0x80000000u ? INT32_MIN : -static_cast<int32_t>(magnitude);
+    }
+    return magnitude > 0x7FFFFFFFu ? INT32_MAX : static_cast<int32_t>(magnitude);
+}
 uint32_t AdaptDispatch::_kittyAssignImageId()
 {
     while (_kittyImages.find(_kittyNextImageId) != _kittyImages.end() || _kittyNextImageId == 0)
@@ -5544,6 +5703,13 @@ void AdaptDispatch::_eraseKittyImage(const uint32_t id)
     }
     _kittyImages.erase(it);
     _kittyVirtualIds.erase(id);
+    // Drop this id's own placement entries so the registry doesn't leak when an image is
+    // evicted by the LRU. (Cascade-to-children is handled by _eraseKittyPlacementsForImage
+    // on an explicit delete; a bare eviction just releases this id's entries.)
+    for (auto pit = _kittyPlacements.begin(); pit != _kittyPlacements.end();)
+    {
+        pit = pit->first.first == id ? _kittyPlacements.erase(pit) : std::next(pit);
+    }
     // The eviction path always removes the front, so keep that common case O(1).
     if (!_kittyImageOrder.empty() && _kittyImageOrder.front() == id)
     {
@@ -5565,6 +5731,7 @@ try
     _kittyImageNumbers.clear();
     _kittyImageOrder.clear();
     _kittyVirtualIds.clear();
+    _kittyPlacements.clear();
     _kittyTotalPixelBytes = 0;
     auto page = _pages.ActivePage();
     auto& buffer = page.Buffer();
@@ -5658,7 +5825,7 @@ std::vector<RGBQUAD> AdaptDispatch::_decodeKittyPixels(const uint32_t format, co
 // aspect) via nearest-neighbour; oversize spans clip. Cursor advances by the span unless
 // moveCursor is false (C=1).
 // Protocol: https://sw.kovidgoyal.net/kitty/graphics-protocol/#controlling-displayed-image-layout
-void AdaptDispatch::_placeKittyImage(const KittyImage& image, const bool moveCursor, const uint32_t imageId, const uint32_t cols, const uint32_t rows, const uint32_t srcX, const uint32_t srcY, const uint32_t srcW, const uint32_t srcH)
+void AdaptDispatch::_placeKittyImage(const KittyImage& image, const bool moveCursor, const uint32_t imageId, const uint32_t cols, const uint32_t rows, const uint32_t srcX, const uint32_t srcY, const uint32_t srcW, const uint32_t srcH, const std::optional<til::point> anchor)
 {
     if (image.pixels.empty() || image.width == 0 || image.height == 0)
     {
@@ -5666,7 +5833,9 @@ void AdaptDispatch::_placeKittyImage(const KittyImage& image, const bool moveCur
     }
     auto page = _pages.ActivePage();
     auto& buffer = page.Buffer();
-    const auto origin = page.Cursor().GetPosition();
+    // A relative/registered placement supplies an explicit top-left anchor; otherwise the
+    // cursor is the anchor. An anchored placement never moves the cursor (see caller).
+    const auto origin = anchor.has_value() ? *anchor : page.Cursor().GetPosition();
     const auto cellSize = _api.GetCellSize();
     const auto cellWidth = std::max(1, cellSize.width);
     const auto cellHeight = std::max(1, cellSize.height);
@@ -5837,6 +6006,213 @@ void AdaptDispatch::_storeKittyVirtualPlacement(const uint32_t id, const KittyIm
     // split) for non-divisible geometry -- storing it narrower would truncate and diverge.
     placement.targetW = static_cast<uint64_t>(std::max<int64_t>(targetW, 1));
     placement.targetH = static_cast<uint64_t>(std::max<int64_t>(targetH, 1));
+}
+
+// Records (or replaces) a placement keyed by (imageId, placementId). Re-sending the same pair
+// overwrites the prior entry so a placement can be moved/resized without flicker. The registry
+// is bounded; once past MaxKittyPlacements the lowest-keyed OTHER entry is dropped (placements
+// are also evicted alongside their image's LRU eviction via _eraseKittyPlacementsForImage).
+// Protocol: https://sw.kovidgoyal.net/kitty/graphics-protocol/#relative-placements
+void AdaptDispatch::_registerKittyPlacement(const KittyPlacement& placement)
+{
+    if (placement.imageId == 0 || placement.placementId == 0)
+    {
+        return; // a placement id is only meaningful with a real image id
+    }
+    const std::pair<uint32_t, uint32_t> key{ placement.imageId, placement.placementId };
+    _kittyPlacements[key] = placement;
+    // Evict the lowest-keyed entry that ISN'T the one we just registered, so the new placement is
+    // never the victim of its own insertion (mirrors the image LRU keeping the newest).
+    while (_kittyPlacements.size() > MaxKittyPlacements)
+    {
+        auto victim = _kittyPlacements.begin();
+        if (victim->first == key && std::next(victim) != _kittyPlacements.end())
+        {
+            ++victim;
+        }
+        _kittyPlacements.erase(victim);
+    }
+}
+
+// Removes every placement of an image and cascade-deletes any relative children: when a
+// placement is removed, placements positioned relative to it are removed too; if a child's
+// image then has no remaining placements, that image is deleted as well (the parent + its
+// relative children form a group managed together). A bounded worklist guards against cycles.
+// Protocol: https://sw.kovidgoyal.net/kitty/graphics-protocol/#relative-placements
+void AdaptDispatch::_eraseKittyPlacementsForImage(const uint32_t imageId)
+{
+    // Collect the (imageId, placementId) pairs being removed so their relative children
+    // can be found and cascaded. Process iteratively to a fixed point.
+    std::deque<std::pair<uint32_t, uint32_t>> removed;
+    for (auto it = _kittyPlacements.begin(); it != _kittyPlacements.end();)
+    {
+        if (it->first.first == imageId)
+        {
+            removed.push_back(it->first);
+            it = _kittyPlacements.erase(it);
+        }
+        else
+        {
+            ++it;
+        }
+    }
+
+    // Guard the cascade with an upper bound so a malformed graph can't loop forever.
+    auto guard = MaxKittyPlacements + 1;
+    while (!removed.empty() && guard-- > 0)
+    {
+        const auto parent = removed.front();
+        removed.pop_front();
+        for (auto it = _kittyPlacements.begin(); it != _kittyPlacements.end();)
+        {
+            const auto& p = it->second;
+            if (p.hasParent && p.parentImageId == parent.first && p.parentPlacementId == parent.second)
+            {
+                removed.push_back(it->first);
+                it = _kittyPlacements.erase(it);
+            }
+            else
+            {
+                ++it;
+            }
+        }
+        // If a child's image now has no placements left, delete that image too.
+        const auto childImageId = parent.first;
+        if (childImageId != imageId && _kittyImages.count(childImageId) != 0)
+        {
+            auto stillPlaced = false;
+            for (const auto& entry : _kittyPlacements)
+            {
+                if (entry.first.first == childImageId)
+                {
+                    stillPlaced = true;
+                    break;
+                }
+            }
+            if (!stillPlaced)
+            {
+                _eraseKittyImage(childImageId);
+                _eraseKittyImageRows(childImageId);
+            }
+        }
+    }
+}
+
+// Derives the on-screen anchor of a virtual (U=1) parent from its Unicode-placeholder cells:
+// the top-left is the minimum x over all cells whose ImageSlice column-owner == imageId and the
+// minimum y over the rows that contain such a cell. Returns nullopt if no placeholder cell for
+// the image is currently on screen.
+// Protocol: https://sw.kovidgoyal.net/kitty/graphics-protocol/#relative-placements
+std::optional<til::point> AdaptDispatch::_deriveVirtualPlacementAnchor(const uint32_t imageId) const
+{
+    if (imageId == 0)
+    {
+        return std::nullopt;
+    }
+    auto page = _pages.ActivePage();
+    auto& buffer = page.Buffer();
+    auto minRow = page.Bottom();
+    auto minCol = page.Width();
+    auto found = false;
+    for (auto row = 0; row < page.Bottom(); ++row)
+    {
+        const auto& dstRow = buffer.GetRowByOffset(row);
+        const auto slice = dstRow.GetImageSlice();
+        if (!slice || !slice->HasOwner(imageId))
+        {
+            continue;
+        }
+        const auto cellWidth = std::max(1, slice->CellSize().width);
+        const auto columnBegin = slice->ColumnOffset();
+        const auto columnEnd = std::min(columnBegin + slice->PixelWidth() / cellWidth, page.Width());
+        for (auto column = columnBegin; column < columnEnd; ++column)
+        {
+            if (slice->ColumnOwner(column) == imageId)
+            {
+                minRow = std::min(minRow, row);
+                minCol = std::min(minCol, column);
+                found = true;
+            }
+        }
+    }
+    if (!found)
+    {
+        return std::nullopt;
+    }
+    return til::point{ minCol, minRow };
+}
+
+// Resolves the on-screen top-left anchor that a relative child (whose own key is `origin`)
+// should be positioned against: the IMMEDIATE parent's already-resolved, clamped anchor (a
+// normal placement stores its absolute top-left; a relative one stored the clamped anchor it
+// was drawn at; a virtual one derives it from its placeholder cells). Anchoring off the parent's
+// actual drawn position -- rather than re-deriving it from the chain root -- means a parent that
+// was itself clamped to a screen edge anchors its children correctly. The rest of the ancestry is
+// still walked, purely to validate it. On failure sets `code` and returns nullopt:
+//   ENOPARENT  - a referenced parent does not exist (and is not a virtual image on screen)
+//   ECYCLE     - the chain loops back to an already-visited placement (including `origin`)
+//   ETOODEEP   - the chain exceeds MaxKittyPlacementDepth links
+// Protocol: https://sw.kovidgoyal.net/kitty/graphics-protocol/#relative-placements
+std::optional<til::point> AdaptDispatch::_resolveKittyPlacementAnchor(const uint32_t parentImageId, const uint32_t parentPlacementId, const std::pair<uint32_t, uint32_t> origin, std::wstring_view& code) const
+{
+    // Seed the visited set with the child being created so a re-put that loops back to it
+    // (A -> ... -> A) is detected as a cycle even when the old A had a fixed anchor.
+    std::vector<std::pair<uint32_t, uint32_t>> visited{ origin };
+    std::pair<uint32_t, uint32_t> key{ parentImageId, parentPlacementId };
+    std::optional<til::point> immediateAnchor; // captured at depth 1; the child anchors off this
+    for (auto depth = 1; depth <= MaxKittyPlacementDepth; ++depth)
+    {
+        if (std::find(visited.begin(), visited.end(), key) != visited.end())
+        {
+            code = L"ECYCLE:relative placement cycle";
+            return std::nullopt;
+        }
+        visited.push_back(key);
+
+        const auto it = _kittyPlacements.find(key);
+        if (it == _kittyPlacements.end())
+        {
+            // Not a registered placement. An ANONYMOUS virtual image (U=1 with no placement id)
+            // is still a valid parent referenced as (imageId, 0): its anchor comes from the
+            // on-screen Unicode-placeholder cells owned by that image id. A non-zero Q that
+            // matched no registered placement is a dangling reference -> ENOPARENT.
+            if (key.second == 0 && _kittyVirtualIds.count(key.first) != 0)
+            {
+                const auto derived = _deriveVirtualPlacementAnchor(key.first);
+                if (!derived)
+                {
+                    code = L"ENOPARENT:relative parent not found";
+                    return std::nullopt;
+                }
+                if (depth == 1)
+                {
+                    immediateAnchor = derived;
+                }
+                return immediateAnchor; // a virtual image is always a chain leaf
+            }
+            code = L"ENOPARENT:relative parent not found";
+            return std::nullopt;
+        }
+
+        const auto& p = it->second;
+        if (depth == 1)
+        {
+            // The child's position comes from this immediate parent's actual anchor.
+            immediateAnchor = p.isVirtual ? _deriveVirtualPlacementAnchor(key.first) : std::optional<til::point>{ til::point{ p.anchorCol, p.anchorRow } };
+            if (!immediateAnchor)
+            {
+                code = L"ENOPARENT:relative parent not found"; // virtual parent with no on-screen cells
+                return std::nullopt;
+            }
+        }
+        if (p.isVirtual || !p.hasParent)
+        {
+            return immediateAnchor; // reached a leaf (virtual or a normal root); chain is valid
+        }
+        key = { p.parentImageId, p.parentPlacementId }; // keep walking to validate the ancestry
+    }
+    code = L"ETOODEEP:relative placement chain too deep";
+    return std::nullopt;
 }
 
 // Maps a kitty row/column combining diacritic to its 0-based index, or -1 if the glyph isn't a
