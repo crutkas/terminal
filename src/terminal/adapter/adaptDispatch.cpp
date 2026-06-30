@@ -5022,6 +5022,12 @@ AdaptDispatch::KittyControl AdaptDispatch::_ParseKittyControl(const std::wstring
             case L'h':
                 c.srcH = _ParseKittyUint(value);
                 break;
+            case L'X':
+                c.cellOffsetX = _ParseKittyUint(value);
+                break;
+            case L'Y':
+                c.cellOffsetY = _ParseKittyUint(value);
+                break;
             case L'o':
                 c.compression = value.front();
                 break;
@@ -5258,7 +5264,7 @@ void AdaptDispatch::_ProcessKittyCommand(const KittyControl& command, const std:
                     const auto stored = _kittyImages.find(assignedId);
                     if (stored != _kittyImages.end())
                     {
-                        _placeKittyImage(stored->second, moveCursor, assignedId, command.cols, command.rows, command.srcX, command.srcY, command.srcW, command.srcH);
+                        _placeKittyImage(stored->second, moveCursor, assignedId, command.cols, command.rows, command.srcX, command.srcY, command.srcW, command.srcH, command.cellOffsetX, command.cellOffsetY);
                     }
                 }
             }
@@ -5297,7 +5303,7 @@ void AdaptDispatch::_ProcessKittyCommand(const KittyControl& command, const std:
             }
             else
             {
-                _placeKittyImage(*target, moveCursor, targetId, command.cols, command.rows, command.srcX, command.srcY, command.srcW, command.srcH);
+                _placeKittyImage(*target, moveCursor, targetId, command.cols, command.rows, command.srcX, command.srcY, command.srcW, command.srcH, command.cellOffsetX, command.cellOffsetY);
             }
             break;
         }
@@ -5586,7 +5592,7 @@ std::vector<RGBQUAD> AdaptDispatch::_decodeKittyPixels(const uint32_t format, co
 // aspect) via nearest-neighbour; oversize spans clip. Cursor advances by the span unless
 // moveCursor is false (C=1).
 // Protocol: https://sw.kovidgoyal.net/kitty/graphics-protocol/#controlling-displayed-image-layout
-void AdaptDispatch::_placeKittyImage(const KittyImage& image, const bool moveCursor, const uint32_t imageId, const uint32_t cols, const uint32_t rows, const uint32_t srcX, const uint32_t srcY, const uint32_t srcW, const uint32_t srcH)
+void AdaptDispatch::_placeKittyImage(const KittyImage& image, const bool moveCursor, const uint32_t imageId, const uint32_t cols, const uint32_t rows, const uint32_t srcX, const uint32_t srcY, const uint32_t srcW, const uint32_t srcH, const uint32_t cellOffsetX, const uint32_t cellOffsetY)
 {
     if (image.pixels.empty() || image.width == 0 || image.height == 0)
     {
@@ -5601,6 +5607,11 @@ void AdaptDispatch::_placeKittyImage(const KittyImage& image, const bool moveCur
     const til::size clampedCellSize{ cellWidth, cellHeight };
     const auto imageWidth = static_cast<til::CoordType>(image.width);
     const auto imageHeight = static_cast<til::CoordType>(image.height);
+    // X/Y shift the image within the first cell (a sub-cell pixel offset), clamped to the
+    // cell. The leading offset pixels are left transparent and the image may spill one
+    // extra cell to the right/bottom.
+    const auto offsetX = static_cast<til::CoordType>(std::min<uint32_t>(cellOffsetX, static_cast<uint32_t>(cellWidth - 1)));
+    const auto offsetY = static_cast<til::CoordType>(std::min<uint32_t>(cellOffsetY, static_cast<uint32_t>(cellHeight - 1)));
 
     // Source crop in pixels (x,y,w,h), clamped to the image; w/h=0 (or past the edge)
     // extends to the right/bottom edge.
@@ -5644,20 +5655,24 @@ void AdaptDispatch::_placeKittyImage(const KittyImage& image, const bool moveCur
     const auto targetH = std::max<int64_t>(targetH64, 1);
 
     const auto columnBegin = origin.x;
-    const auto columns = static_cast<til::CoordType>(std::min<int64_t>((targetW + cellWidth - 1) / cellWidth, page.Width()));
+    // The destination spans the X offset plus the scaled image, so it can reach one cell
+    // further right than the image alone.
+    const auto spanWidthPx = offsetX + static_cast<til::CoordType>(std::min<int64_t>(targetW, INT32_MAX));
+    const auto columns = static_cast<til::CoordType>(std::min<int64_t>((static_cast<int64_t>(spanWidthPx) + cellWidth - 1) / cellWidth, page.Width()));
     const auto columnEnd = std::min(columnBegin + columns, page.Width());
     if (columnEnd <= columnBegin)
     {
         return;
     }
-    const auto drawWidth = std::min<til::CoordType>(static_cast<til::CoordType>(std::min<int64_t>(targetW, INT32_MAX)), (columnEnd - columnBegin) * cellWidth);
-    const auto rowSpan = static_cast<til::CoordType>(std::min<int64_t>((targetH + cellHeight - 1) / cellHeight, page.Bottom()));
-    // Precompute the source column for each drawn pixel (nearest-neighbour) so the hot
-    // loop is a table lookup, not a 64-bit divide per pixel.
+    const auto drawWidth = std::min<til::CoordType>(spanWidthPx, (columnEnd - columnBegin) * cellWidth);
+    const auto spanHeightPx = offsetY + static_cast<til::CoordType>(std::min<int64_t>(targetH, INT32_MAX));
+    const auto rowSpan = static_cast<til::CoordType>(std::min<int64_t>((static_cast<int64_t>(spanHeightPx) + cellHeight - 1) / cellHeight, page.Bottom()));
+    // Precompute the source column for each drawn destination pixel (nearest-neighbour).
+    // Destination columns before the X offset have no source (sentinel -1 = transparent).
     std::vector<til::CoordType> sampleXMap(static_cast<size_t>(drawWidth));
     for (auto x = 0; x < drawWidth; ++x)
     {
-        sampleXMap[x] = cropX + std::min(cropW - 1, static_cast<til::CoordType>(static_cast<int64_t>(x) * cropW / targetW));
+        sampleXMap[x] = x < offsetX ? -1 : cropX + std::min(cropW - 1, static_cast<til::CoordType>(static_cast<int64_t>(x - offsetX) * cropW / targetW));
     }
     for (auto row = 0; row < rowSpan; ++row)
     {
@@ -5680,21 +5695,24 @@ void AdaptDispatch::_placeKittyImage(const KittyImage& image, const bool moveCur
         for (auto pixelRow = 0; pixelRow < cellHeight; ++pixelRow)
         {
             const auto dstY = row * cellHeight + pixelRow;
-            // Clear the full owned span first so padding (the last cell's pixels beyond
-            // the scaled image, or rows past targetH) never retains a co-resident image's
-            // stale pixels that this placement now owns.
+            // Clear the full owned span first so gutters and padding never retain a
+            // co-resident image's stale pixels that this placement now owns.
             for (auto pixelColumn = 0; pixelColumn < ownedWidth; ++pixelColumn)
             {
                 til::at(dstIterator, pixelColumn) = RGBQUAD{};
             }
-            if (dstY < targetH)
+            // Destination rows before the Y offset (and past the image bottom) are blank.
+            const auto srcDstY = dstY - offsetY;
+            if (srcDstY >= 0 && srcDstY < targetH)
             {
-                // Nearest-neighbour: map this target row back into the crop, then offset
-                // by the crop origin to index the full image.
-                const auto sampleY = cropY + std::min(cropH - 1, static_cast<til::CoordType>(static_cast<int64_t>(dstY) * cropH / targetH));
+                const auto sampleY = cropY + std::min(cropH - 1, static_cast<til::CoordType>(static_cast<int64_t>(srcDstY) * cropH / targetH));
                 const auto srcRowStart = static_cast<size_t>(sampleY) * image.width;
                 for (auto pixelColumn = 0; pixelColumn < drawWidth; ++pixelColumn)
                 {
+                    if (sampleXMap[pixelColumn] < 0)
+                    {
+                        continue; // transparent X-offset gutter
+                    }
                     const auto srcIndex = srcRowStart + static_cast<size_t>(sampleXMap[pixelColumn]);
                     if (srcIndex < image.pixels.size())
                     {
