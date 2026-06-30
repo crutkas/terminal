@@ -328,6 +328,8 @@ namespace Microsoft::Console::VirtualTerminal
             uint32_t srcY = 0;    // y=: source crop top edge in pixels
             uint32_t srcW = 0;    // w=: source crop width in pixels (0 = to right edge)
             uint32_t srcH = 0;    // h=: source crop height in pixels (0 = to bottom edge)
+            uint32_t cellOffsetX = 0; // X=: x pixel offset of the image within the first cell
+            uint32_t cellOffsetY = 0; // Y=: y pixel offset of the image within the first cell
             bool moreChunks = false;
             bool mPresent = false;
             bool haveId = false;
@@ -357,7 +359,7 @@ namespace Microsoft::Console::VirtualTerminal
         void _eraseKittyImage(const uint32_t id);
         void _eraseKittyImageRows(const uint32_t imageId);
         void _clearKittyImages() noexcept;
-        void _placeKittyImage(const KittyImage& image, const bool moveCursor, const uint32_t imageId, const uint32_t cols = 0, const uint32_t rows = 0, const uint32_t srcX = 0, const uint32_t srcY = 0, const uint32_t srcW = 0, const uint32_t srcH = 0);
+        void _placeKittyImage(const KittyImage& image, const bool moveCursor, const uint32_t imageId, const uint32_t cols = 0, const uint32_t rows = 0, const uint32_t srcX = 0, const uint32_t srcY = 0, const uint32_t srcW = 0, const uint32_t srcH = 0, const uint32_t cellOffsetX = 0, const uint32_t cellOffsetY = 0);
         void _ReturnOscResponse(const std::wstring_view response) const;
 
         std::vector<uint8_t> _tabStopColumns;

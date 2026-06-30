@@ -5872,6 +5872,21 @@ public:
         VERIFY_IS_TRUE(BufferContainsColor(*_testGetSet->_textBuffer, 255, 0, 0), L"huge w clamps to edge, image still renders");
     }
 
+    // X/Y shift the image within the first cell by a sub-cell pixel offset. A 1px red
+    // image in a 4px cell placed with X=2 lands at destination pixel (2,0); the leading
+    // gutter pixels stay transparent.
+    TEST_METHOD(KittyGraphicsCellOffsetShiftsImage)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 4, 4 };
+        const auto origin = _testGetSet->_textBuffer->GetCursor().GetPosition();
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,f=24,s=1,v=1,X=2,Y=0;/wAA\x1b\\"); // 1px red, X offset 2
+        const auto* slice = _testGetSet->_textBuffer->GetRowByOffset(origin.y).GetImageSlice();
+        VERIFY_IS_NOT_NULL(slice);
+        VERIFY_ARE_EQUAL(0, static_cast<int>(SlicePixelAt(slice, 0, 0).rgbRed), L"the X-offset gutter pixel (0,0) is transparent");
+        VERIFY_ARE_EQUAL(255, static_cast<int>(SlicePixelAt(slice, 2, 0).rgbRed), L"the red pixel is shifted to x=2");
+    }
+
     // An APC string with a non-'G' identifier is not Kitty graphics and is ignored.
     TEST_METHOD(NonKittyApcIgnored)
     {
