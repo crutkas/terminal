@@ -5767,7 +5767,7 @@ AdaptDispatch::KittyTargetSize AdaptDispatch::_kittyTargetPixels(const int64_t c
 // Records the fixed grid geometry of a virtual (U=1) placement so later Unicode-placeholder
 // rendering slices the image by a STABLE rows x cols grid. The grid is the cell span the same
 // image would occupy if drawn at the cursor (shared _kittyTargetPixels), so c-only/r-only
-// keep aspect. Re-storing resets the anchor and auto cursor so a fresh grid re-anchors next.
+// keep aspect. Re-storing resets the auto counter so a fresh placement numbers from (0,0).
 void AdaptDispatch::_storeKittyVirtualPlacement(const uint32_t id, const KittyImage& image, const uint32_t cols, const uint32_t rows)
 {
     constexpr uint32_t maxCells = 8192;
@@ -5780,7 +5780,6 @@ void AdaptDispatch::_storeKittyVirtualPlacement(const uint32_t id, const KittyIm
     auto& placement = _kittyVirtualIds[id];
     placement.cols = static_cast<uint32_t>(gridCols);
     placement.rows = static_cast<uint32_t>(gridRows);
-    placement.anchorRow = -1;
     placement.autoRow = 0;
     placement.autoCol = 0;
 }
@@ -5900,27 +5899,10 @@ void AdaptDispatch::_renderKittyPlaceholders(const std::wstring_view segment, co
     const auto cols = std::max<uint32_t>(place.cols, 1);
     const auto rows = std::max<uint32_t>(place.rows, 1);
 
-    // Advance the auto grid row for this screen line. Moving strictly down (wrap or a newline
-    // that didn't scroll) adds the row delta; a fresh render at or above the anchor means the
-    // previous line scrolled up off the bottom, so step to the next grid row. autoCol restarts
-    // whenever the grid row changes. Explicit row/col diacritics override per cell below.
-    if (place.anchorRow < 0)
-    {
-        place.autoRow = 0;
-        place.autoCol = 0;
-    }
-    else if (screenRow > place.anchorRow)
-    {
-        place.autoRow = std::min<uint32_t>(place.autoRow + static_cast<uint32_t>(screenRow - place.anchorRow), rows - 1);
-        place.autoCol = 0;
-    }
-    else
-    {
-        place.autoRow = std::min<uint32_t>(place.autoRow + 1, rows - 1);
-        place.autoCol = 0;
-    }
-    place.anchorRow = screenRow;
-
+    // Per the kitty spec, an absent row/col diacritic uses a running counter that advances
+    // only when a placeholder cell is drawn (col++ per cell; on overflow col=0, row++). The
+    // counter is independent of the screen row, so scrolling and chunked writes don't affect
+    // it. Explicit diacritics override and re-sync the counter to that cell.
     const auto& row = buffer.GetRowByOffset(screenRow);
     auto column = startColumn;
     for (size_t i = 0; i < segment.size();)
@@ -5948,10 +5930,16 @@ void AdaptDispatch::_renderKittyPlaceholders(const std::wstring_view segment, co
             }
             const auto cellRow = rowDiacritic >= 0 ? static_cast<uint32_t>(rowDiacritic) : place.autoRow;
             const auto cellCol = colDiacritic >= 0 ? static_cast<uint32_t>(colDiacritic) : place.autoCol;
-            // The auto column follows this cell so a later auto cell continues after it, and
-            // an explicit column re-syncs the running count to that position.
-            place.autoCol = cellCol + 1;
             _placeKittyPlaceholderCell(image, imageId, column, screenRow, cellRow, cellCol, rows, cols);
+            // Advance the running counter past this cell (wrapping col -> row), so the next
+            // auto cell continues sequentially regardless of screen row, wrap, or scroll.
+            place.autoRow = cellRow;
+            place.autoCol = cellCol + 1;
+            if (place.autoCol >= cols)
+            {
+                place.autoCol = 0;
+                place.autoRow = std::min<uint32_t>(place.autoRow + 1, rows - 1);
+            }
         }
         // Advance by the glyph's real cell width; guard against a non-advancing step.
         const auto nextColumn = row.NavigateToNext(column);
