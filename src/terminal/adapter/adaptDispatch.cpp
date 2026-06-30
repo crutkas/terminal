@@ -5656,17 +5656,19 @@ void AdaptDispatch::_placeKittyImage(const KittyImage& image, const bool moveCur
 
     const auto columnBegin = origin.x;
     // The destination spans the X offset plus the scaled image, so it can reach one cell
-    // further right than the image alone.
-    const auto spanWidthPx = offsetX + static_cast<til::CoordType>(std::min<int64_t>(targetW, INT32_MAX));
-    const auto columns = static_cast<til::CoordType>(std::min<int64_t>((static_cast<int64_t>(spanWidthPx) + cellWidth - 1) / cellWidth, page.Width()));
+    // further right than the image alone. Keep the span math in 64-bit (targetW/H may be
+    // up to ~INT32_MAX from aspect scaling) and clamp to the page before narrowing, so the
+    // offset addition can't overflow til::CoordType (int32).
+    const int64_t spanWidthPx = static_cast<int64_t>(offsetX) + targetW;
+    const auto columns = static_cast<til::CoordType>(std::min<int64_t>((spanWidthPx + cellWidth - 1) / cellWidth, page.Width()));
     const auto columnEnd = std::min(columnBegin + columns, page.Width());
     if (columnEnd <= columnBegin)
     {
         return;
     }
-    const auto drawWidth = std::min<til::CoordType>(spanWidthPx, (columnEnd - columnBegin) * cellWidth);
-    const auto spanHeightPx = offsetY + static_cast<til::CoordType>(std::min<int64_t>(targetH, INT32_MAX));
-    const auto rowSpan = static_cast<til::CoordType>(std::min<int64_t>((static_cast<int64_t>(spanHeightPx) + cellHeight - 1) / cellHeight, page.Bottom()));
+    const auto drawWidth = static_cast<til::CoordType>(std::min<int64_t>(spanWidthPx, static_cast<int64_t>(columnEnd - columnBegin) * cellWidth));
+    const int64_t spanHeightPx = static_cast<int64_t>(offsetY) + targetH;
+    const auto rowSpan = static_cast<til::CoordType>(std::min<int64_t>((spanHeightPx + cellHeight - 1) / cellHeight, page.Bottom()));
     // Precompute the source column for each drawn destination pixel (nearest-neighbour).
     // Destination columns before the X offset have no source (sentinel -1 = transparent).
     std::vector<til::CoordType> sampleXMap(static_cast<size_t>(drawWidth));
@@ -5703,22 +5705,23 @@ void AdaptDispatch::_placeKittyImage(const KittyImage& image, const bool moveCur
             }
             // Destination rows before the Y offset (and past the image bottom) are blank.
             const auto srcDstY = dstY - offsetY;
-            if (srcDstY >= 0 && srcDstY < targetH)
+            const auto rowInImage = srcDstY >= 0 && srcDstY < targetH;
+            const auto sampleY = rowInImage ? cropY + std::min(cropH - 1, static_cast<til::CoordType>(static_cast<int64_t>(srcDstY) * cropH / targetH)) : 0;
+            const auto srcRowStart = static_cast<size_t>(sampleY) * image.width;
+            // Always write every covered pixel (transparent for the X/Y gutters and past
+            // the image) so a reused slice never shows stale content under these columns.
+            for (auto pixelColumn = 0; pixelColumn < drawWidth; ++pixelColumn)
             {
-                const auto sampleY = cropY + std::min(cropH - 1, static_cast<til::CoordType>(static_cast<int64_t>(srcDstY) * cropH / targetH));
-                const auto srcRowStart = static_cast<size_t>(sampleY) * image.width;
-                for (auto pixelColumn = 0; pixelColumn < drawWidth; ++pixelColumn)
+                RGBQUAD px{};
+                if (rowInImage && sampleXMap[pixelColumn] >= 0)
                 {
-                    if (sampleXMap[pixelColumn] < 0)
-                    {
-                        continue; // transparent X-offset gutter
-                    }
                     const auto srcIndex = srcRowStart + static_cast<size_t>(sampleXMap[pixelColumn]);
                     if (srcIndex < image.pixels.size())
                     {
-                        til::at(dstIterator, pixelColumn) = image.pixels[srcIndex];
+                        px = image.pixels[srcIndex];
                     }
                 }
+                til::at(dstIterator, pixelColumn) = px;
             }
             if (pixelRow + 1 < cellHeight)
             {
