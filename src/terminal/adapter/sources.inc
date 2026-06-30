@@ -38,11 +38,13 @@ SOURCES= \
     ..\SixelParser.cpp \
     ..\adaptDispatchGraphics.cpp \
     ..\terminalOutput.cpp \
+    ..\..\..\oss\puff\puff.c \
 
 INCLUDES = \
     $(INCLUDES); \
     ..; \
     ..\..\parser; \
+    ..\..\..\oss\puff; \
 
 TARGETLIBS= \
     $(TARGETLIBS) \
