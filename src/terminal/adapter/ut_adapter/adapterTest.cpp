@@ -7298,6 +7298,129 @@ public:
         VERIFY_ARE_EQUAL(2u, indepStill->ColumnOwner(indepPos.x), L"the independent placement of image 2 must survive");
     }
 
+    // d=i with a p key deletes ONLY the (imageId, placementId) placement: its pixels are erased
+    // and it leaves the registry, while the image's other placement (and the image) survive.
+    // Spec: https://sw.kovidgoyal.net/kitty/graphics-protocol/#deleting-images
+    TEST_METHOD(KittyDeletePlacementByIdAndPlacementId)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        auto& buf = *_testGetSet->_textBuffer;
+
+        _pDispatch->CursorPosition(3, 3);
+        const auto posA = buf.GetCursor().GetPosition();
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,p=1,f=24,s=1,v=1,C=1;/wAA\x1b\\"); // (1,1) red at A
+        _pDispatch->CursorPosition(9, 9);
+        const auto posB = buf.GetCursor().GetPosition();
+        _stateMachine->ProcessString(L"\x1b_Ga=p,i=1,p=2,C=1;\x1b\\"); // (1,2) at B
+        VERIFY_ARE_EQUAL(static_cast<size_t>(2), _pDispatch->_kittyPlacements.size());
+
+        const auto* sliceA = buf.GetRowByOffset(posA.y).GetImageSlice();
+        VERIFY_IS_NOT_NULL(sliceA);
+        VERIFY_ARE_EQUAL(1u, sliceA->ColumnOwner(posA.x));
+        const auto* sliceB = buf.GetRowByOffset(posB.y).GetImageSlice();
+        VERIFY_IS_NOT_NULL(sliceB);
+        VERIFY_ARE_EQUAL(1u, sliceB->ColumnOwner(posB.x));
+
+        _stateMachine->ProcessString(L"\x1b_Ga=d,d=i,i=1,p=1;\x1b\\"); // delete only placement (1,1)
+        VERIFY_ARE_EQUAL(static_cast<size_t>(1), _pDispatch->_kittyPlacements.size());
+        VERIFY_ARE_EQUAL(static_cast<size_t>(0), _pDispatch->_kittyPlacements.count({ 1u, 1u }), L"placement (1,1) is removed");
+        VERIFY_ARE_EQUAL(static_cast<size_t>(1), _pDispatch->_kittyPlacements.count({ 1u, 2u }), L"placement (1,2) survives");
+
+        const auto* goneA = buf.GetRowByOffset(posA.y).GetImageSlice();
+        VERIFY_IS_TRUE(goneA == nullptr || goneA->ColumnOwner(posA.x) == 0, L"placement (1,1) pixels must be erased");
+        const auto* stillB = buf.GetRowByOffset(posB.y).GetImageSlice();
+        VERIFY_IS_NOT_NULL(stillB);
+        VERIFY_ARE_EQUAL(1u, stillB->ColumnOwner(posB.x), L"placement (1,2) pixels must survive");
+
+        _testGetSet->_response.clear();
+        _stateMachine->ProcessString(L"\x1b_Ga=p,i=1,p=5;\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=1,p=5;OK\x1b\\"); // image 1 still exists
+    }
+
+    // Deleting an image's last placement by (imageId, placementId) removes the image itself.
+    TEST_METHOD(KittyDeleteLastPlacementRemovesImage)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        auto& buf = *_testGetSet->_textBuffer;
+        _pDispatch->CursorPosition(3, 3);
+        const auto pos = buf.GetCursor().GetPosition();
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,p=1,f=24,s=1,v=1,C=1;/wAA\x1b\\"); // only placement (1,1)
+        VERIFY_ARE_EQUAL(static_cast<size_t>(1), _pDispatch->_kittyPlacements.size());
+        const auto* slice = buf.GetRowByOffset(pos.y).GetImageSlice();
+        VERIFY_IS_NOT_NULL(slice);
+        VERIFY_ARE_EQUAL(1u, slice->ColumnOwner(pos.x));
+
+        _stateMachine->ProcessString(L"\x1b_Ga=d,d=i,i=1,p=1;\x1b\\"); // delete the only placement
+        VERIFY_IS_TRUE(_pDispatch->_kittyPlacements.empty());
+        const auto* gone = buf.GetRowByOffset(pos.y).GetImageSlice();
+        VERIFY_IS_TRUE(gone == nullptr || gone->ColumnOwner(pos.x) == 0, L"the placement's pixels must be erased");
+
+        _testGetSet->_response.clear();
+        _stateMachine->ProcessString(L"\x1b_Ga=p,i=1;\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=1;ENOENT:image not found\x1b\\"); // image deleted with its last placement
+    }
+
+    // Deleting a single placement cascades to its relative children, removing the child placement
+    // and (when it was the child image's only placement) the child image too.
+    TEST_METHOD(KittyDeletePlacementCascadesToRelativeChildren)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        auto& buf = *_testGetSet->_textBuffer;
+        _pDispatch->CursorPosition(4, 4);
+        const auto parentPos = buf.GetCursor().GetPosition();
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,p=1,f=24,s=1,v=1,C=1;/wAA\x1b\\"); // parent (1,1) red
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=2,p=1,P=1,Q=1,H=1,V=0,f=24,s=1,v=1,C=1;AP8A\x1b\\"); // child (2,1) green rel (1,1)
+        VERIFY_ARE_EQUAL(static_cast<size_t>(2), _pDispatch->_kittyPlacements.size());
+
+        const auto childCol = parentPos.x + 1;
+        const auto* childSlice = buf.GetRowByOffset(parentPos.y).GetImageSlice();
+        VERIFY_IS_NOT_NULL(childSlice);
+        VERIFY_ARE_EQUAL(2u, childSlice->ColumnOwner(childCol));
+
+        _stateMachine->ProcessString(L"\x1b_Ga=d,d=i,i=1,p=1;\x1b\\"); // delete (1,1) -> cascades to its child
+        VERIFY_IS_TRUE(_pDispatch->_kittyPlacements.empty(), L"deleting the parent placement cascades to its relative child");
+
+        const auto* erased = buf.GetRowByOffset(parentPos.y).GetImageSlice();
+        VERIFY_IS_TRUE(erased == nullptr || erased->ColumnOwner(parentPos.x) == 0, L"the parent placement's pixels must be erased");
+        VERIFY_IS_TRUE(erased == nullptr || erased->ColumnOwner(childCol) == 0, L"the child placement's pixels must be erased");
+
+        _testGetSet->_response.clear();
+        _stateMachine->ProcessString(L"\x1b_Ga=p,i=2;\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=2;ENOENT:image not found\x1b\\"); // child image 2 deleted too
+        _stateMachine->ProcessString(L"\x1b_Ga=p,i=1;\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=1;ENOENT:image not found\x1b\\"); // parent image 1 deleted (last placement)
+    }
+
+    // Regression: d=i WITHOUT a p key still deletes the whole image (all of its placements).
+    TEST_METHOD(KittyDeleteImageWithoutPlacementIdStillDeletesWholeImage)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        auto& buf = *_testGetSet->_textBuffer;
+        _pDispatch->CursorPosition(3, 3);
+        const auto posA = buf.GetCursor().GetPosition();
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,p=1,f=24,s=1,v=1,C=1;/wAA\x1b\\"); // (1,1) at A
+        _pDispatch->CursorPosition(9, 9);
+        const auto posB = buf.GetCursor().GetPosition();
+        _stateMachine->ProcessString(L"\x1b_Ga=p,i=1,p=2,C=1;\x1b\\"); // (1,2) at B
+        VERIFY_ARE_EQUAL(static_cast<size_t>(2), _pDispatch->_kittyPlacements.size());
+
+        _stateMachine->ProcessString(L"\x1b_Ga=d,d=i,i=1;\x1b\\"); // no p= -> whole-image delete
+        VERIFY_IS_TRUE(_pDispatch->_kittyPlacements.empty(), L"delete by id without p removes all of the image's placements");
+
+        const auto* goneA = buf.GetRowByOffset(posA.y).GetImageSlice();
+        VERIFY_IS_TRUE(goneA == nullptr || goneA->ColumnOwner(posA.x) == 0);
+        const auto* goneB = buf.GetRowByOffset(posB.y).GetImageSlice();
+        VERIFY_IS_TRUE(goneB == nullptr || goneB->ColumnOwner(posB.x) == 0);
+
+        _testGetSet->_response.clear();
+        _stateMachine->ProcessString(L"\x1b_Ga=p,i=1;\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=1;ENOENT:image not found\x1b\\"); // whole image gone
+    }
+
     // An APC string with a non-'G' identifier is not Kitty graphics and is ignored.
     TEST_METHOD(NonKittyApcIgnored)
     {
