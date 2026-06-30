@@ -5887,6 +5887,22 @@ public:
         VERIFY_ARE_EQUAL(255, static_cast<int>(SlicePixelAt(slice, 2, 0).rgbRed), L"the red pixel is shifted to x=2");
     }
 
+    // Regression: an X/Y offset over a REUSED slice must clear the gutter, not leave the
+    // previous image's pixels showing. Place a red image, then a green one shifted by X=2;
+    // the gutter that was red must become transparent.
+    TEST_METHOD(KittyGraphicsCellOffsetClearsStaleGutter)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 4, 4 };
+        const auto origin = _testGetSet->_textBuffer->GetCursor().GetPosition();
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,f=24,s=1,v=1,C=1;/wAA\x1b\\"); // red at (0,0)
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=2,f=24,s=1,v=1,X=2;AP8A\x1b\\"); // green shifted to (2,0)
+        const auto* slice = _testGetSet->_textBuffer->GetRowByOffset(origin.y).GetImageSlice();
+        VERIFY_IS_NOT_NULL(slice);
+        VERIFY_ARE_EQUAL(0, static_cast<int>(SlicePixelAt(slice, 0, 0).rgbRed), L"the reused gutter pixel must be cleared, not the old red");
+        VERIFY_ARE_EQUAL(255, static_cast<int>(SlicePixelAt(slice, 2, 0).rgbGreen), L"green sits at the X offset");
+    }
+
     // An APC string with a non-'G' identifier is not Kitty graphics and is ignored.
     TEST_METHOD(NonKittyApcIgnored)
     {
