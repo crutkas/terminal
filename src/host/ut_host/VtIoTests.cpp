@@ -273,6 +273,7 @@ class ::Microsoft::Console::VirtualTerminal::VtIoTests
     // Proves that graphics sequences (Kitty APC, Sixel DCS) emitted by a shell are
     // forwarded verbatim through the ConPTY to the connected terminal, rather than being
     // consumed by conhost. This is what lets a real terminal render shell graphics.
+    // Kitty graphics protocol: https://sw.kovidgoyal.net/kitty/graphics-protocol/
     TEST_METHOD(GraphicsSequencesArePassedThroughToConpty)
     {
         resetContents();
