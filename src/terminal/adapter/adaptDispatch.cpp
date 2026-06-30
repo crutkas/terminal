@@ -5530,10 +5530,18 @@ void AdaptDispatch::_ProcessKittyCommand(const KittyControl& command, const std:
             case L'I':
                 if (haveId)
                 {
-                    // Cascade to any relative children before removing the image itself.
-                    _eraseKittyPlacementsForImage(imageId);
-                    _eraseKittyImage(imageId);
-                    _eraseKittyImageRows(imageId);
+                    if (command.havePlacementId)
+                    {
+                        // Spec: with a p key, delete only the (imageId, placementId) placement.
+                        _deleteKittyPlacement(imageId, command.placementId);
+                    }
+                    else
+                    {
+                        // Cascade to any relative children before removing the image itself.
+                        _eraseKittyPlacementsForImage(imageId);
+                        _eraseKittyImage(imageId);
+                        _eraseKittyImageRows(imageId);
+                    }
                 }
                 else
                 {
@@ -5549,9 +5557,17 @@ void AdaptDispatch::_ProcessKittyCommand(const KittyControl& command, const std:
                     if (it != _kittyImageNumbers.end())
                     {
                         const auto targetId = it->second;
-                        _eraseKittyPlacementsForImage(targetId);
-                        _eraseKittyImage(targetId);
-                        _eraseKittyImageRows(targetId);
+                        if (command.havePlacementId)
+                        {
+                            // Spec: with a p key, delete only the (imageId, placementId) placement.
+                            _deleteKittyPlacement(targetId, command.placementId);
+                        }
+                        else
+                        {
+                            _eraseKittyPlacementsForImage(targetId);
+                            _eraseKittyImage(targetId);
+                            _eraseKittyImageRows(targetId);
+                        }
                     }
                 }
                 else
@@ -6072,25 +6088,6 @@ void AdaptDispatch::_registerKittyPlacement(const KittyPlacement& placement)
 // Protocol: https://sw.kovidgoyal.net/kitty/graphics-protocol/#relative-placements
 void AdaptDispatch::_eraseKittyPlacementsForImage(const uint32_t imageId)
 {
-    // True if any tracked placement (registered or anonymous) still references this image id.
-    const auto imageStillPlaced = [&](const uint32_t id) noexcept {
-        for (const auto& entry : _kittyPlacements)
-        {
-            if (entry.first.first == id)
-            {
-                return true;
-            }
-        }
-        for (const auto& anon : _kittyAnonymousPlacements)
-        {
-            if (anon.imageId == id)
-            {
-                return true;
-            }
-        }
-        return false;
-    };
-
     // Collect the (imageId, placementId) pairs being removed so their relative children
     // can be found and cascaded. Process iteratively to a fixed point.
     std::deque<std::pair<uint32_t, uint32_t>> removed;
@@ -6122,6 +6119,39 @@ void AdaptDispatch::_eraseKittyPlacementsForImage(const uint32_t imageId)
         }
     }
 
+    // The caller deletes `imageId` itself separately, so protect it from auto-deletion here.
+    _cascadeKittyPlacementChildren(removed, imageId);
+}
+
+// True if any tracked placement (registered or anonymous) still references this image id.
+bool AdaptDispatch::_kittyImageHasPlacements(const uint32_t id) const noexcept
+{
+    for (const auto& entry : _kittyPlacements)
+    {
+        if (entry.first.first == id)
+        {
+            return true;
+        }
+    }
+    for (const auto& anon : _kittyAnonymousPlacements)
+    {
+        if (anon.imageId == id)
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Cascade-deletes the relative children of every placement key in `removed`, iterating to a
+// fixed point. For each removed (imageId, placementId): registered children positioned relative
+// to it are erased (own cells + registry entry) and themselves enqueued; anonymous (id-less,
+// leaf) children are erased; and any image left with no placements is deleted -- except
+// `keepImageId`, which the CALLER deletes separately and so must not be auto-deleted here. A
+// bounded worklist guards against cycles in a malformed graph.
+// Protocol: https://sw.kovidgoyal.net/kitty/graphics-protocol/#relative-placements
+void AdaptDispatch::_cascadeKittyPlacementChildren(std::deque<std::pair<uint32_t, uint32_t>>& removed, const uint32_t keepImageId)
+{
     // Guard the cascade with an upper bound so a malformed graph can't loop forever.
     auto guard = MaxKittyPlacements + 1;
     while (!removed.empty() && guard-- > 0)
@@ -6155,7 +6185,7 @@ void AdaptDispatch::_eraseKittyPlacementsForImage(const uint32_t imageId)
                 const auto anonImageId = it->imageId;
                 _eraseKittyPlacementCells(*it);
                 it = _kittyAnonymousPlacements.erase(it);
-                if (anonImageId != imageId && _kittyImages.count(anonImageId) != 0 && !imageStillPlaced(anonImageId))
+                if (anonImageId != keepImageId && _kittyImages.count(anonImageId) != 0 && !_kittyImageHasPlacements(anonImageId))
                 {
                     _eraseKittyImage(anonImageId);
                     _eraseKittyImageRows(anonImageId);
@@ -6169,12 +6199,32 @@ void AdaptDispatch::_eraseKittyPlacementsForImage(const uint32_t imageId)
 
         // If a child's image now has no placements left, delete that image too.
         const auto childImageId = parent.first;
-        if (childImageId != imageId && _kittyImages.count(childImageId) != 0 && !imageStillPlaced(childImageId))
+        if (childImageId != keepImageId && _kittyImages.count(childImageId) != 0 && !_kittyImageHasPlacements(childImageId))
         {
             _eraseKittyImage(childImageId);
             _eraseKittyImageRows(childImageId);
         }
     }
+}
+
+// Deletes a single placement (imageId, placementId): erases its own on-screen cells, removes it
+// from the registry, cascades to its relative children (registered + anonymous), and deletes any
+// image left with no placements -- including imageId itself if this was its last placement
+// (keepImageId=0 protects nothing, since kitty image ids are >= 1). A no-op if the placement
+// isn't registered. Spec: "If you specify a p key for the placement id as well, then only the
+// placement with the specified image id and placement id will be deleted."
+// Protocol: https://sw.kovidgoyal.net/kitty/graphics-protocol/#deleting-images
+void AdaptDispatch::_deleteKittyPlacement(const uint32_t imageId, const uint32_t placementId)
+{
+    const auto it = _kittyPlacements.find({ imageId, placementId });
+    if (it == _kittyPlacements.end())
+    {
+        return;
+    }
+    _eraseKittyPlacementCells(it->second);
+    std::deque<std::pair<uint32_t, uint32_t>> removed{ { imageId, placementId } };
+    _kittyPlacements.erase(it);
+    _cascadeKittyPlacementChildren(removed, 0);
 }
 
 // Derives the on-screen anchor of a virtual (U=1) parent from its Unicode-placeholder cells:
