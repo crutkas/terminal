@@ -328,6 +328,8 @@ namespace Microsoft::Console::VirtualTerminal
             uint32_t srcY = 0;    // y=: source crop top edge in pixels
             uint32_t srcW = 0;    // w=: source crop width in pixels (0 = to right edge)
             uint32_t srcH = 0;    // h=: source crop height in pixels (0 = to bottom edge)
+            uint32_t cellOffsetX = 0; // X=: x pixel offset of the image within the first cell
+            uint32_t cellOffsetY = 0; // Y=: y pixel offset of the image within the first cell
             bool moreChunks = false;
             bool mPresent = false;
             bool haveId = false;
@@ -391,7 +393,7 @@ namespace Microsoft::Console::VirtualTerminal
         void _clearKittyImages() noexcept;
         void _storeKittyVirtualPlacement(const uint32_t id, const KittyImage& image, const uint32_t cols, const uint32_t rows, const uint32_t srcX, const uint32_t srcY, const uint32_t srcW, const uint32_t srcH);
         static KittyTargetSize _kittyTargetPixels(const int64_t cropW, const int64_t cropH, const uint32_t cols, const uint32_t rows, const int64_t cellWidth, const int64_t cellHeight) noexcept;
-        void _placeKittyImage(const KittyImage& image, const bool moveCursor, const uint32_t imageId, const uint32_t cols = 0, const uint32_t rows = 0, const uint32_t srcX = 0, const uint32_t srcY = 0, const uint32_t srcW = 0, const uint32_t srcH = 0);
+        void _placeKittyImage(const KittyImage& image, const bool moveCursor, const uint32_t imageId, const uint32_t cols = 0, const uint32_t rows = 0, const uint32_t srcX = 0, const uint32_t srcY = 0, const uint32_t srcW = 0, const uint32_t srcH = 0, const uint32_t cellOffsetX = 0, const uint32_t cellOffsetY = 0);
         void _renderKittyPlaceholders(const std::wstring_view segment, const til::CoordType screenRow, const til::CoordType startColumn);
         // Returns true if a placeholder tile was drawn (the caller batches one redraw per segment).
         bool _placeKittyPlaceholderCell(const KittyImage& image, const uint32_t imageId, const til::CoordType column, const til::CoordType row, const uint32_t cellRow, const uint32_t cellCol, const KittyVirtualPlacement& place);
