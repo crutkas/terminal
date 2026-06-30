@@ -5594,6 +5594,18 @@ public:
         VERIFY_IS_FALSE(BufferContainsColor(*_testGetSet->_textBuffer, 255, 0, 0), L"id 1 must not be drawn");
     }
 
+    // The image id may also be carried by a 256-color foreground (38;5;N), not just a
+    // 24-bit RGB color. A virtual image stored as id N then renders via a placeholder
+    // whose foreground is the 256-color index N.
+    TEST_METHOD(KittyPlaceholder256ColorForegroundSelectsImage)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=200,f=24,s=1,v=1;AP8A\x1b\\"); // id 200 green
+        _stateMachine->ProcessString(L"\x1b[38;5;200m"); // 256-color fg index 200 = image id 200
+        _stateMachine->ProcessString(Placeholder());
+        VERIFY_IS_TRUE(BufferContainsColor(*_testGetSet->_textBuffer, 0, 255, 0), L"256-color fg index selects image id 200");
+    }
+
     // A run of placeholders forms a grid; a 2px-wide red|green image with a host cell size of
     // 1px spans a 2x1 grid, so the left cell is red ONLY and the right cell is green ONLY.
     // Positional pixel checks (not a whole-row color scan) prove the two tiles are distinct.
@@ -5910,13 +5922,15 @@ public:
     }
 
     // A 256-palette foreground (38;5;n) is indexed, not 24-bit RGB, so it must not trigger.
-    TEST_METHOD(KittyPlaceholderPaletteFgNoOp)
+    // A 256-color foreground whose index does NOT match a stored virtual id must not
+    // overlay — the U=1 gate still applies to indexed ids just like RGB ids.
+    TEST_METHOD(KittyPlaceholder256ColorUnknownIdNoOp)
     {
         _testGetSet->PrepData();
-        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,f=24,s=1,v=1;/wAA\x1b\\");
-        _stateMachine->ProcessString(L"\x1b[38;5;1m"); // palette index, not RGB
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,f=24,s=1,v=1;/wAA\x1b\\"); // only id 1 is virtual
+        _stateMachine->ProcessString(L"\x1b[38;5;7m"); // 256-color index 7, no such image
         _stateMachine->ProcessString(Placeholder());
-        VERIFY_ARE_EQUAL(0, CountImageRows(*_testGetSet->_textBuffer), L"palette fg must not select an image");
+        VERIFY_ARE_EQUAL(0, CountImageRows(*_testGetSet->_textBuffer), L"a 256-color id with no virtual image must not overlay");
     }
 
     // Placeholders honor a non-default host cell size (sub-rect sampling still fills the cell).
