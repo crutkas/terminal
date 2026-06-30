@@ -5879,6 +5879,24 @@ public:
         VERIFY_IS_FALSE(SliceContainsColor(second, 255, 0, 0), L"the advanced auto row must not repeat the top tile (red)");
     }
 
+    // Two placeholder cells of a multi-COLUMN grid sent in SEPARATE writes on the same
+    // screen row must continue along the grid columns (0,0)->(0,1), not advance the grid
+    // row. The auto counter is independent of the screen row, so chunked writes are stable.
+    TEST_METHOD(KittyPlaceholderChunkedSameRowContinuesColumns)
+    {
+        _testGetSet->PrepData();
+        const auto origin = _testGetSet->_textBuffer->GetCursor().GetPosition();
+        // 2x2 image: TL red, TR green, BL blue, BR white.
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,f=24,s=2,v=2,c=2,r=2;/wAAAP8AAAD/////\x1b\\");
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m");
+        _stateMachine->ProcessString(Placeholder()); // (0,0) = TL red
+        _stateMachine->ProcessString(Placeholder()); // separate write, same row -> (0,1) = TR green
+        const auto* slice = _testGetSet->_textBuffer->GetRowByOffset(origin.y).GetImageSlice();
+        VERIFY_IS_TRUE(SliceContainsColor(slice, 255, 0, 0), L"col 0 = TL red");
+        VERIFY_IS_TRUE(SliceContainsColor(slice, 0, 255, 0), L"col 1 = TR green (auto col continued, same grid row)");
+        VERIFY_IS_FALSE(SliceContainsColor(slice, 0, 0, 255), L"must not drop to grid row 1 (blue) on a same-row chunk");
+    }
+
     // Re-storing a placement (re-transmit/put of the same virtual id) re-anchors the auto row,
     // so the next placeholder starts again at grid row 0. Without the reset, the stale anchor
     // would advance the row and show the wrong tile.
