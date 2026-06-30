@@ -271,6 +271,8 @@ namespace til // Terminal Implementation Library. Also: "Today I Learned"
     // and Terminal::ReadKittyImageFile; the ConPTY delete-suppression gate lives at
     // those call sites, not here.
     //
+    // Protocol (transmission media): https://sw.kovidgoyal.net/kitty/graphics-protocol/#transferring-data
+    //
     // Security model:
     //  * Only LOCAL, FIXED-drive, drive-absolute files are read. A path that is not of
     //    the form "X:\..." (relative, drive-relative, or rooted) is rejected, as is any
