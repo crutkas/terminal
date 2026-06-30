@@ -6045,7 +6045,7 @@ void AdaptDispatch::_renderKittyPlaceholders(const std::wstring_view segment, co
             }
             const auto attributes = row.GetAttrByColumn(column);
             const auto fg = attributes.GetForeground();
-            if (fg.IsRgb() && idHighByte <= 255)
+            if ((fg.IsRgb() || fg.IsIndex256()) && idHighByte <= 255)
             {
                 const auto imageIdLow = colorId(fg);
 
