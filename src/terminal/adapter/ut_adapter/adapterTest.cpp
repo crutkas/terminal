@@ -7163,6 +7163,141 @@ public:
         _testGetSet->ValidateInputEvent(L"\x1b_Gi=2,p=1;ENOPARENT:relative parent not found\x1b\\");
     }
 
+    // Bug #29: re-putting the same (imageId, placementId) to a new position must erase the prior
+    // pixels (a move/resize without leftover ghosts), not just redraw at the new spot.
+    // Protocol: https://sw.kovidgoyal.net/kitty/graphics-protocol/#relative-placements
+    TEST_METHOD(KittyRePutMoveErasesOldPixels)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        auto& buf = *_testGetSet->_textBuffer;
+        _stateMachine->ProcessString(L"\x1b_Ga=t,i=1,f=24,s=1,v=1;/wAA\x1b\\"); // store red
+
+        _pDispatch->CursorPosition(4, 4);
+        const auto posA = buf.GetCursor().GetPosition();
+        _stateMachine->ProcessString(L"\x1b_Ga=p,i=1,p=1,C=1;\x1b\\"); // put at A
+        const auto* firstSlice = buf.GetRowByOffset(posA.y).GetImageSlice();
+        VERIFY_IS_NOT_NULL(firstSlice);
+        VERIFY_ARE_EQUAL(1u, firstSlice->ColumnOwner(posA.x), L"A owns the placement after the first put");
+
+        _pDispatch->CursorPosition(8, 8);
+        const auto posB = buf.GetCursor().GetPosition();
+        _stateMachine->ProcessString(L"\x1b_Ga=p,i=1,p=1,C=1;\x1b\\"); // re-put at B
+        VERIFY_ARE_EQUAL(static_cast<size_t>(1), _pDispatch->_kittyPlacements.size(), L"re-put replaces, not appends");
+
+        const auto* sliceA = buf.GetRowByOffset(posA.y).GetImageSlice();
+        VERIFY_IS_TRUE(sliceA == nullptr || sliceA->ColumnOwner(posA.x) == 0, L"the prior position's pixels must be erased on re-put");
+        const auto* sliceB = buf.GetRowByOffset(posB.y).GetImageSlice();
+        VERIFY_IS_NOT_NULL(sliceB);
+        VERIFY_ARE_EQUAL(1u, sliceB->ColumnOwner(posB.x), L"the new position holds the re-put placement");
+        VERIFY_IS_TRUE(SliceContainsColor(sliceB, 255, 0, 0), L"the re-put placement still shows the image color");
+    }
+
+    // Bug #29 (precise erase): re-putting one placement of a multiply-placed image must not disturb
+    // a sibling placement of the same image (cells are owned by image id only, so erase by rect).
+    TEST_METHOD(KittyRePutMoveKeepsSiblingPlacement)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        auto& buf = *_testGetSet->_textBuffer;
+        _stateMachine->ProcessString(L"\x1b_Ga=t,i=1,f=24,s=1,v=1;/wAA\x1b\\"); // store red
+
+        _pDispatch->CursorPosition(3, 3);
+        const auto posA = buf.GetCursor().GetPosition();
+        _stateMachine->ProcessString(L"\x1b_Ga=p,i=1,p=1,C=1;\x1b\\"); // placement (1,1) at A
+
+        _pDispatch->CursorPosition(6, 6);
+        const auto posB = buf.GetCursor().GetPosition();
+        _stateMachine->ProcessString(L"\x1b_Ga=p,i=1,p=2,C=1;\x1b\\"); // placement (1,2) at B
+        VERIFY_ARE_EQUAL(static_cast<size_t>(2), _pDispatch->_kittyPlacements.size());
+
+        _pDispatch->CursorPosition(9, 9);
+        const auto posC = buf.GetCursor().GetPosition();
+        _stateMachine->ProcessString(L"\x1b_Ga=p,i=1,p=1,C=1;\x1b\\"); // re-put (1,1) to C
+        VERIFY_ARE_EQUAL(static_cast<size_t>(2), _pDispatch->_kittyPlacements.size());
+
+        const auto* sliceB = buf.GetRowByOffset(posB.y).GetImageSlice();
+        VERIFY_IS_NOT_NULL(sliceB);
+        VERIFY_ARE_EQUAL(1u, sliceB->ColumnOwner(posB.x), L"the sibling placement (1,2) must be intact after re-putting (1,1)");
+
+        const auto* sliceA = buf.GetRowByOffset(posA.y).GetImageSlice();
+        VERIFY_IS_TRUE(sliceA == nullptr || sliceA->ColumnOwner(posA.x) == 0, L"the old (1,1) position must be erased");
+
+        const auto* sliceC = buf.GetRowByOffset(posC.y).GetImageSlice();
+        VERIFY_IS_NOT_NULL(sliceC);
+        VERIFY_ARE_EQUAL(1u, sliceC->ColumnOwner(posC.x), L"the re-put (1,1) now lives at C");
+    }
+
+    // Bug #28: an anonymous relative placement (no p=) must be cascade-deleted with its parent and
+    // its pixels erased (spec: "If its parent is deleted, [it] is deleted as well.").
+    // Protocol: https://sw.kovidgoyal.net/kitty/graphics-protocol/#relative-placements
+    TEST_METHOD(KittyAnonymousRelativeCascadeErasesPixels)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        _pDispatch->CursorPosition(4, 4);
+        auto& buf = *_testGetSet->_textBuffer;
+        const auto parentPos = buf.GetCursor().GetPosition();
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,p=1,f=24,s=1,v=1,C=1;/wAA\x1b\\"); // parent red
+
+        // Anonymous relative child (image 2, NO p=) at parent+(1,1).
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=2,P=1,Q=1,H=1,V=1,f=24,s=1,v=1;AP8A\x1b\\"); // green
+        VERIFY_ARE_EQUAL(static_cast<size_t>(1), _pDispatch->_kittyAnonymousPlacements.size(), L"an anonymous relative placement is tracked for cascade");
+        const auto* childSlice = buf.GetRowByOffset(parentPos.y + 1).GetImageSlice();
+        VERIFY_IS_NOT_NULL(childSlice);
+        VERIFY_ARE_EQUAL(2u, childSlice->ColumnOwner(parentPos.x + 1), L"anonymous child drew at parent+(1,1)");
+
+        _stateMachine->ProcessString(L"\x1b_Ga=d,d=i,i=1;\x1b\\"); // delete parent image 1
+        VERIFY_IS_TRUE(_pDispatch->_kittyAnonymousPlacements.empty(), L"deleting the parent removes the anonymous child tracking");
+        const auto* gone = buf.GetRowByOffset(parentPos.y + 1).GetImageSlice();
+        VERIFY_IS_TRUE(gone == nullptr || gone->ColumnOwner(parentPos.x + 1) == 0, L"the anonymous child's pixels must be erased");
+
+        _testGetSet->_response.clear();
+        _stateMachine->ProcessString(L"\x1b_Ga=p,i=2;\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=2;ENOENT:image not found\x1b\\"); // child image 2 deleted too
+    }
+
+    // Bug #29 (precise cascade): deleting a parent erases a registered relative child's pixels, but
+    // an independent placement of the SAME child image must survive (not be cleared by a broad erase).
+    TEST_METHOD(KittyChildPlacementCascadeKeepsSiblingImagePixels)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        _pDispatch->CursorPosition(3, 3);
+        auto& buf = *_testGetSet->_textBuffer;
+        const auto parentPos = buf.GetCursor().GetPosition();
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,p=1,f=24,s=1,v=1,C=1;/wAA\x1b\\"); // parent (1,1)
+
+        // Image 2 placed relative to (1,1) as (2,1), at parent+(1,0).
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=2,p=1,P=1,Q=1,H=1,V=0,f=24,s=1,v=1,C=1;AP8A\x1b\\");
+        const auto relChildCol = parentPos.x + 1;
+        const auto relChildRow = parentPos.y;
+        const auto* relSlice = buf.GetRowByOffset(relChildRow).GetImageSlice();
+        VERIFY_IS_NOT_NULL(relSlice);
+        VERIFY_ARE_EQUAL(2u, relSlice->ColumnOwner(relChildCol), L"relative child of image 2 drew next to parent");
+
+        // Image 2 ALSO placed independently (no parent) elsewhere as (2,2).
+        _pDispatch->CursorPosition(9, 9);
+        const auto indepPos = buf.GetCursor().GetPosition();
+        _stateMachine->ProcessString(L"\x1b_Ga=p,i=2,p=2,C=1;\x1b\\");
+        const auto* indepSlice = buf.GetRowByOffset(indepPos.y).GetImageSlice();
+        VERIFY_IS_NOT_NULL(indepSlice);
+        VERIFY_ARE_EQUAL(2u, indepSlice->ColumnOwner(indepPos.x), L"independent placement of image 2 drew at the cursor");
+        VERIFY_ARE_EQUAL(static_cast<size_t>(3), _pDispatch->_kittyPlacements.size());
+
+        _stateMachine->ProcessString(L"\x1b_Ga=d,d=i,i=1;\x1b\\"); // delete parent image 1
+        VERIFY_ARE_EQUAL(static_cast<size_t>(1), _pDispatch->_kittyPlacements.size());
+        VERIFY_ARE_EQUAL(static_cast<size_t>(0), _pDispatch->_kittyPlacements.count({ 2u, 1u }), L"the relative child placement is removed");
+        VERIFY_ARE_EQUAL(static_cast<size_t>(1), _pDispatch->_kittyPlacements.count({ 2u, 2u }), L"the independent placement survives");
+
+        const auto* relGone = buf.GetRowByOffset(relChildRow).GetImageSlice();
+        VERIFY_IS_TRUE(relGone == nullptr || relGone->ColumnOwner(relChildCol) == 0, L"the relative child's pixels must be erased");
+
+        const auto* indepStill = buf.GetRowByOffset(indepPos.y).GetImageSlice();
+        VERIFY_IS_NOT_NULL(indepStill);
+        VERIFY_ARE_EQUAL(2u, indepStill->ColumnOwner(indepPos.x), L"the independent placement of image 2 must survive");
+    }
+
     // An APC string with a non-'G' identifier is not Kitty graphics and is ignored.
     TEST_METHOD(NonKittyApcIgnored)
     {

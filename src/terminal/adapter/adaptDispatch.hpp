@@ -399,6 +399,10 @@ namespace Microsoft::Console::VirtualTerminal
             uint32_t placementId = 0;
             til::CoordType anchorRow = 0;
             til::CoordType anchorCol = 0;
+            // The drawn footprint in cells (top-left at anchorCol/anchorRow), captured after
+            // clamping so a re-put or cascade can erase exactly this placement's cells by rect.
+            til::CoordType cols = 0;
+            til::CoordType rows = 0;
             uint32_t parentImageId = 0;
             uint32_t parentPlacementId = 0;
             int32_t offsetH = 0;
@@ -421,10 +425,15 @@ namespace Microsoft::Console::VirtualTerminal
         void _clearKittyImages() noexcept;
         void _storeKittyVirtualPlacement(const uint32_t id, const KittyImage& image, const uint32_t cols, const uint32_t rows, const uint32_t srcX, const uint32_t srcY, const uint32_t srcW, const uint32_t srcH);
         static KittyTargetSize _kittyTargetPixels(const int64_t cropW, const int64_t cropH, const uint32_t cols, const uint32_t rows, const int64_t cellWidth, const int64_t cellHeight) noexcept;
-        void _placeKittyImage(const KittyImage& image, const bool moveCursor, const uint32_t imageId, const uint32_t cols = 0, const uint32_t rows = 0, const uint32_t srcX = 0, const uint32_t srcY = 0, const uint32_t srcW = 0, const uint32_t srcH = 0, const std::optional<til::point> anchor = std::nullopt);
+        til::size _placeKittyImage(const KittyImage& image, const bool moveCursor, const uint32_t imageId, const uint32_t cols = 0, const uint32_t rows = 0, const uint32_t srcX = 0, const uint32_t srcY = 0, const uint32_t srcW = 0, const uint32_t srcH = 0, const std::optional<til::point> anchor = std::nullopt);
         // Relative placement registry helpers.
         // Protocol: https://sw.kovidgoyal.net/kitty/graphics-protocol/#relative-placements
         void _registerKittyPlacement(const KittyPlacement& placement);
+        // Erases just one placement's drawn cells (by its tracked extent rect), leaving text and
+        // co-resident images untouched -- a per-placement erase for a re-put (move/resize) or a
+        // precise cascade delete, since image cells are owned by image id only, not (id, p).
+        // Protocol: https://sw.kovidgoyal.net/kitty/graphics-protocol/#relative-placements
+        void _eraseKittyPlacementCells(const KittyPlacement& placement);
         void _eraseKittyPlacementsForImage(const uint32_t imageId);
         std::optional<til::point> _resolveKittyPlacementAnchor(const uint32_t parentImageId, const uint32_t parentPlacementId, const std::pair<uint32_t, uint32_t> origin, std::wstring_view& code) const;
         std::optional<til::point> _deriveVirtualPlacementAnchor(const uint32_t imageId) const;
@@ -479,6 +488,12 @@ namespace Microsoft::Console::VirtualTerminal
         static constexpr int MaxKittyPlacementDepth = 8;
         static constexpr size_t MaxKittyPlacements = MaxKittyImages * 4;
         std::map<std::pair<uint32_t, uint32_t>, KittyPlacement> _kittyPlacements;
+        // Anonymous relative placements (drawn with a parent but no placement id of their own).
+        // They have no registry key, so they're tracked here purely so a parent's deletion can
+        // cascade-erase them (spec: "If its parent is deleted, [it] is deleted as well."). Being
+        // id-less they are always leaves -- they can never themselves be a parent.
+        // Protocol: https://sw.kovidgoyal.net/kitty/graphics-protocol/#relative-placements
+        std::vector<KittyPlacement> _kittyAnonymousPlacements;
 
         // Chunked transmission (m=): accumulates the base64 payload across sequences;
         // only one transfer runs at a time, processed on the final chunk (m=0).
