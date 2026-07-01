@@ -7361,6 +7361,129 @@ public:
         VERIFY_ARE_EQUAL(2u, indepStill->ColumnOwner(indepPos.x), L"the independent placement of image 2 must survive");
     }
 
+    // Fix H1 (mutate-after-validate): a RELATIVE re-put that fails to resolve must NOT destroy the
+    // existing placement. The prior code erased the old (i,p) placement and removed its registry
+    // entry BEFORE resolving the new anchor, so a re-put resolving to ECYCLE/ENOPARENT/ETOODEEP
+    // wiped a still-valid placement. This guards that a failed re-put leaves the placement intact.
+    TEST_METHOD(KittyFailedRelativeRePutKeepsExistingPlacement)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        _pDispatch->CursorPosition(4, 4);
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,p=1,f=24,s=1,v=1,C=1;/wAA\x1b\\"); // (1,1) normal (no parent)
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=2,p=1,P=1,Q=1,f=24,s=1,v=1,C=1;AP8A\x1b\\"); // (2,1) relative to (1,1)
+        VERIFY_ARE_EQUAL(static_cast<size_t>(2), _pDispatch->_kittyPlacements.size());
+        const auto before = _pDispatch->_kittyPlacements.at({ 1u, 1u });
+
+        _testGetSet->_response.clear();
+        // Re-put (1,1) as a child of (2,1): 1 -> 2 -> 1 closes a cycle, so resolution fails.
+        _stateMachine->ProcessString(L"\x1b_Ga=p,i=1,p=1,P=2,Q=1,C=1;\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=1,p=1;ECYCLE:relative placement cycle\x1b\\");
+
+        // The original (1,1) must still exist, unchanged (not destroyed by the failed re-put).
+        VERIFY_ARE_EQUAL(static_cast<size_t>(2), _pDispatch->_kittyPlacements.size(), L"a failed re-put must not add or remove a placement");
+        VERIFY_ARE_EQUAL(static_cast<size_t>(1), _pDispatch->_kittyPlacements.count({ 1u, 1u }), L"the existing placement must survive a failed relative re-put");
+        const auto after = _pDispatch->_kittyPlacements.at({ 1u, 1u });
+        VERIFY_ARE_EQUAL(before.anchorCol, after.anchorCol, L"the surviving placement keeps its original anchor column");
+        VERIFY_ARE_EQUAL(before.anchorRow, after.anchorRow, L"the surviving placement keeps its original anchor row");
+        VERIFY_ARE_EQUAL(before.hasParent, after.hasParent, L"the surviving placement keeps its original (non-relative) parentage");
+    }
+
+    // Fix H2 (owner-scoped erase): deleting one placement must not clobber a DIFFERENT co-resident
+    // image whose cells overlap the deleted placement's rect. The prior code used an owner-blind
+    // rect erase (EraseBlock) that zeroed every cell in the rect regardless of owner. Here image1
+    // is 4 cells wide and image2 (independent, non-relative) overwrites the middle two cells;
+    // deleting image1's placement must leave image2's cells intact.
+    TEST_METHOD(KittyDeletePlacementKeepsCoResidentImage)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        auto& buf = *_testGetSet->_textBuffer;
+
+        _pDispatch->CursorPosition(3, 4); // 0-based row 2, col 3
+        const auto pos1 = buf.GetCursor().GetPosition();
+        // image1 (1,1): 1px red scaled to 4 cells => owns cols [pos1.x, pos1.x+4).
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,p=1,f=24,s=1,v=1,c=4,C=1;/wAA\x1b\\");
+        const auto* row1 = buf.GetRowByOffset(pos1.y).GetImageSlice();
+        VERIFY_IS_NOT_NULL(row1);
+        VERIFY_ARE_EQUAL(1u, row1->ColumnOwner(pos1.x), L"image1 owns its left cell");
+        VERIFY_ARE_EQUAL(1u, row1->ColumnOwner(pos1.x + 3), L"image1 owns its right cell");
+
+        // image2 (2,1): 1px green scaled to 2 cells, placed one cell right on the SAME row, so it
+        // overwrites image1's middle two cells (cols pos1.x+1, pos1.x+2). Independent (no parent).
+        _pDispatch->CursorPosition(3, 5); // 0-based col pos1.x+1
+        const auto pos2 = buf.GetCursor().GetPosition();
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=2,p=1,f=24,s=1,v=1,c=2,C=1;AP8A\x1b\\");
+        const auto* row2 = buf.GetRowByOffset(pos2.y).GetImageSlice();
+        VERIFY_IS_NOT_NULL(row2);
+        VERIFY_ARE_EQUAL(2u, row2->ColumnOwner(pos1.x + 1), L"image2 took over the middle cells");
+        VERIFY_ARE_EQUAL(2u, row2->ColumnOwner(pos1.x + 2), L"image2 took over the middle cells");
+
+        // Delete image1's placement: only image1's cells must be erased; image2's must survive.
+        _stateMachine->ProcessString(L"\x1b_Ga=d,d=i,i=1,p=1;\x1b\\");
+        const auto* after = buf.GetRowByOffset(pos1.y).GetImageSlice();
+        VERIFY_IS_NOT_NULL(after, L"the slice survives because image2 still owns cells in it");
+        VERIFY_ARE_EQUAL(0u, after->ColumnOwner(pos1.x), L"image1's left cell was erased");
+        VERIFY_ARE_EQUAL(0u, after->ColumnOwner(pos1.x + 3), L"image1's right cell was erased");
+        VERIFY_ARE_EQUAL(2u, after->ColumnOwner(pos1.x + 1), L"co-resident image2 must survive the owner-scoped erase");
+        VERIFY_ARE_EQUAL(2u, after->ColumnOwner(pos1.x + 2), L"co-resident image2 must survive the owner-scoped erase");
+        VERIFY_IS_TRUE(SliceContainsColor(after, 0, 255, 0), L"image2's green pixels must remain");
+    }
+
+    // Fix H3 (bounded anonymous placements): a hostile stream of anonymous relative placements
+    // (P= parent, no p=) must not grow _kittyAnonymousPlacements without limit. This drives more
+    // than MaxKittyPlacements anonymous placements and asserts the vector stays bounded, guarding
+    // against an unbounded-memory DoS from untrusted input.
+    TEST_METHOD(KittyAnonymousRelativePlacementsAreBounded)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        _pDispatch->CursorPosition(4, 4);
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,p=1,f=24,s=1,v=1,C=1;/wAA\x1b\\"); // parent (1,1)
+        _stateMachine->ProcessString(L"\x1b_Ga=t,i=2,f=24,s=1,v=1;AP8A\x1b\\"); // store image 2 (green)
+
+        // Each a=p,i=2,P=1,Q=1 (NO p=) creates an anonymous relative placement of image 2.
+        for (uint32_t k = 0; k < AdaptDispatch::MaxKittyPlacements + 50; ++k)
+        {
+            _stateMachine->ProcessString(L"\x1b_Ga=p,i=2,P=1,Q=1,H=1,V=1,C=1;\x1b\\");
+        }
+        VERIFY_IS_TRUE(_pDispatch->_kittyAnonymousPlacements.size() <= AdaptDispatch::MaxKittyPlacements,
+                       L"anonymous relative placements must stay bounded by MaxKittyPlacements");
+    }
+
+    // Fix M1 (registry-cap eviction integrity): when _kittyPlacements hits its cap, evicting a
+    // victim must erase the victim's drawn cells (no ghost pixels) AND cascade-delete its relative
+    // children (no dangling child referencing a gone parent). The prior code only erased the map
+    // entry. Here a real drawn parent (1,1) has a relative child (2,1); flooding the registry past
+    // the cap evicts (1,1) (the lowest key) and must take its child and its pixels with it.
+    TEST_METHOD(KittyRegistryCapEvictionErasesGhostAndCascadesChild)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        auto& buf = *_testGetSet->_textBuffer;
+        _stateMachine->ProcessString(L"\x1b_Ga=t,i=1,f=24,s=1,v=1;/wAA\x1b\\"); // store image 1 (red)
+
+        _pDispatch->CursorPosition(4, 4);
+        const auto parentPos = buf.GetCursor().GetPosition();
+        _stateMachine->ProcessString(L"\x1b_Ga=p,i=1,p=1,C=1;\x1b\\"); // parent (1,1) drawn at the cursor
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=2,p=1,P=1,Q=1,H=1,V=0,f=24,s=1,v=1,C=1;AP8A\x1b\\"); // child (2,1) rel (1,1)
+        VERIFY_ARE_EQUAL(static_cast<size_t>(1), _pDispatch->_kittyPlacements.count({ 1u, 1u }));
+        VERIFY_ARE_EQUAL(static_cast<size_t>(1), _pDispatch->_kittyPlacements.count({ 2u, 1u }));
+
+        // Flood the registry past its cap with cheap VIRTUAL placements of image 1 (no draw, no
+        // re-transmit). (1,1) is the lowest-keyed entry, so it is the first eviction victim.
+        for (uint32_t k = 2; k <= AdaptDispatch::MaxKittyPlacements + 2; ++k)
+        {
+            _stateMachine->ProcessString(L"\x1b_Ga=p,U=1,i=1,p=" + std::to_wstring(k) + L";\x1b\\");
+        }
+
+        VERIFY_IS_TRUE(_pDispatch->_kittyPlacements.size() <= AdaptDispatch::MaxKittyPlacements, L"the placement registry must stay bounded");
+        VERIFY_ARE_EQUAL(static_cast<size_t>(0), _pDispatch->_kittyPlacements.count({ 1u, 1u }), L"the parent (1,1) was evicted at the cap");
+        VERIFY_ARE_EQUAL(static_cast<size_t>(0), _pDispatch->_kittyPlacements.count({ 2u, 1u }), L"the evicted parent's relative child must be cascaded, not left dangling");
+        const auto* ghost = buf.GetRowByOffset(parentPos.y).GetImageSlice();
+        VERIFY_IS_TRUE(ghost == nullptr || ghost->ColumnOwner(parentPos.x) == 0, L"the evicted parent's drawn cell must be erased (no ghost pixels)");
+    }
+
     // d=i with a p key deletes ONLY the (imageId, placementId) placement: its pixels are erased
     // and it leaves the registry, while the image's other placement (and the image) survive.
     // Spec: https://sw.kovidgoyal.net/kitty/graphics-protocol/#deleting-images

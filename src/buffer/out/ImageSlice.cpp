@@ -91,11 +91,25 @@ void ImageSlice::ClearForeignColumns(const til::CoordType columnBegin, const til
 // can drop the slice. Co-resident content (e.g. Sixel, owner 0) keeps the slice.
 bool ImageSlice::EraseByOwner(const uint32_t id)
 {
+    return EraseByOwner(id, _columnBegin, _columnEnd);
+}
+
+// Column-bounded variant of EraseByOwner: clears the pixels and owner tag only for
+// columns in [columnBegin, columnEnd) that are owned by id, leaving columns outside
+// that range (and columns owned by a different image) untouched. This lets a single
+// Kitty placement be erased without clobbering a co-resident image that overlaps the
+// same row but different columns. Returns true if nothing drawable remains in the
+// whole slice (no owned columns and no opaque untagged pixels), so the caller can
+// drop the slice.
+bool ImageSlice::EraseByOwner(const uint32_t id, const til::CoordType columnBegin, const til::CoordType columnEnd)
+{
     if (id == 0 || _pixelBuffer.empty())
     {
         return false;
     }
-    for (auto column = _columnBegin; column < _columnEnd; ++column)
+    const auto eraseBegin = std::max(_columnBegin, columnBegin);
+    const auto eraseEnd = std::min(_columnEnd, columnEnd);
+    for (auto column = eraseBegin; column < eraseEnd; ++column)
     {
         const auto index = static_cast<size_t>(column - _columnBegin);
         if (index >= _columnOwners.size() || til::at(_columnOwners, index) != id)
