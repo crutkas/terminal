@@ -5521,6 +5521,8 @@ public:
         VERIFY_IS_TRUE(BufferContainsColor(*_testGetSet->_textBuffer, 0, 255, 0), L"other image must survive");
     }
 
+    // Delete-by-id must erase the image's on-screen PIXELS, not just drop the registry entry --
+    // a delete that left the drawn cells behind would ghost the image after it was "deleted".
     TEST_METHOD(KittyGraphicsDeleteErasesPixels)
     {
         _testGetSet->PrepData();
@@ -5530,6 +5532,8 @@ public:
         VERIFY_ARE_EQUAL(0, CountImageRows(*_testGetSet->_textBuffer), L"delete must erase on-screen pixels");
     }
 
+    // Delete-by-id is targeted: removing image 1 must erase only its pixels and leave a
+    // co-resident image (2) intact -- guards per-image cell ownership, not a blanket clear.
     TEST_METHOD(KittyGraphicsDeleteOnePreservesOther)
     {
         _testGetSet->PrepData();
