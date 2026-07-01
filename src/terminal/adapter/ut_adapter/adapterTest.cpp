@@ -4809,7 +4809,8 @@ public:
         VERIFY_IS_TRUE(SliceContainsColor(slice, 255, 0, 0));
     }
 
-    // An RGB (f=24) image renders the same red pixel (alpha implied opaque).
+    // The f=24 (3-byte RGB) path must render the same pixel as the f=32 (RGBA) path with alpha
+    // implied opaque -- guards that omitting the alpha channel doesn't drop or mis-color the image.
     TEST_METHOD(KittyGraphicsRgbImageDisplays)
     {
         _testGetSet->PrepData();
@@ -4822,7 +4823,8 @@ public:
         VERIFY_IS_TRUE(SliceContainsColor(slice, 255, 0, 0));
     }
 
-    // A 40px-tall image (cell height 20) spans two text rows.
+    // Guards pixel->text-row rounding at the two-row boundary: a 40px-tall image at the host's
+    // 20px cell height must span exactly two rows (40/20), not collapse to one or overflow to three.
     TEST_METHOD(KittyGraphicsTallImageSpansRows)
     {
         _testGetSet->PrepData();
@@ -4835,7 +4837,8 @@ public:
         VERIFY_ARE_EQUAL(2, CountImageRows(*_testGetSet->_textBuffer));
     }
 
-    // The image is placed starting at the cursor's column.
+    // Images anchor at the CURRENT cursor column, not column 0 -- guards cursor-relative
+    // horizontal placement so an image drawn after text lands where the cursor is.
     TEST_METHOD(KittyGraphicsImagePlacedAtCursorColumn)
     {
         _testGetSet->PrepData();
@@ -4882,7 +4885,8 @@ public:
         VERIFY_ARE_EQUAL(128, static_cast<int>(px.rgbReserved));
     }
 
-    // A 20px-wide image spans two cells (PixelWidth 20).
+    // Verifies pixel->cell-column mapping: a 20px-wide image at the host's 10px cell width must
+    // occupy two whole cells (PixelWidth 20), i.e. width is laid out in cells, not truncated.
     TEST_METHOD(KittyGraphicsWideImageSpansColumns)
     {
         _testGetSet->PrepData();
@@ -4944,7 +4948,8 @@ public:
         VERIFY_ARE_EQUAL(1, CountImageRows(buffer)); // 2px tall => 1 row
     }
 
-    // Each row of a multi-row image actually contains the image color.
+    // Guards that EVERY row of a multi-row image is drawn, not just the first: each text row the
+    // image spans must actually contain the image color (per-row slice population).
     TEST_METHOD(KittyGraphicsTallImageEachRowHasColor)
     {
         _testGetSet->PrepData();
