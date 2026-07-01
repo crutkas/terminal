@@ -5219,6 +5219,22 @@ void AdaptDispatch::_ProcessKittyCommand(const KittyControl& command, const std:
     // Protocol: https://sw.kovidgoyal.net/kitty/graphics-protocol/#relative-placements
     const auto displayKittyPlacement = [&](const uint32_t targetImageId, const KittyImage& image) {
         const auto placementId = command.havePlacementId ? command.placementId : 0u;
+        // Re-putting the same (imageId, placementId) replaces just that placement (move/resize):
+        // erase its prior drawn cells and drop its registry entry so its old pixels don't linger.
+        // This must only run once the NEW placement is known to succeed (see the relative branch),
+        // so a failed re-put leaves the existing placement untouched. It deliberately does NOT
+        // cascade to the old placement's children -- the spec replaces only the matching (i, p).
+        const auto erasePriorPlacement = [&]() {
+            if (placementId != 0)
+            {
+                const auto existing = _kittyPlacements.find({ targetImageId, placementId });
+                if (existing != _kittyPlacements.end())
+                {
+                    _eraseKittyPlacementCells(existing->second);
+                    _kittyPlacements.erase(existing);
+                }
+            }
+        };
         if (command.haveParent)
         {
             // (Virtual + relative is rejected before this lambda runs, at the a=T and a=p sites;
@@ -5227,6 +5243,9 @@ void AdaptDispatch::_ProcessKittyCommand(const KittyControl& command, const std:
             const auto parentAnchor = _resolveKittyPlacementAnchor(command.parentImageId, command.parentPlacementId, { targetImageId, placementId }, resolveCode);
             if (!parentAnchor)
             {
+                // Resolution failed (ECYCLE/ENOPARENT/ETOODEEP): draw nothing and, crucially,
+                // leave the prior (targetImageId, placementId) placement intact -- we have not
+                // touched the registry or any cells yet.
                 success = false;
                 code = resolveCode;
                 return;
@@ -5239,6 +5258,9 @@ void AdaptDispatch::_ProcessKittyCommand(const KittyControl& command, const std:
                 static_cast<til::CoordType>(std::clamp<int64_t>(static_cast<int64_t>(parentAnchor->x) + command.offsetH, 0, maxCol)),
                 static_cast<til::CoordType>(std::clamp<int64_t>(static_cast<int64_t>(parentAnchor->y) + command.offsetV, 0, maxRow)),
             };
+            // The anchor resolved, so the new placement will succeed: only NOW erase/replace the
+            // prior placement (mutate-after-validate), then draw and register the new one.
+            erasePriorPlacement();
             // A relative placement supersedes any placeholder eligibility for this id.
             _kittyVirtualIds.erase(targetImageId);
             // Draw at the resolved anchor; the cursor must NOT move for a relative placement.
@@ -5265,13 +5287,24 @@ void AdaptDispatch::_ProcessKittyCommand(const KittyControl& command, const std:
                 // An anonymous relative placement (no p=) has no registry key, so track it
                 // separately purely so it can be cascade-deleted when its parent is deleted
                 // (spec: "If its parent is deleted, [it] is deleted as well.").
+                // Bound the vector like the registry so a hostile stream of anonymous relative
+                // placements can't grow it without limit: evict the OLDEST (front) first,
+                // erasing its cells so no ghost pixels linger (anonymous placements are leaves,
+                // so no cascade is needed).
                 // Protocol: https://sw.kovidgoyal.net/kitty/graphics-protocol/#relative-placements
+                while (_kittyAnonymousPlacements.size() >= MaxKittyPlacements)
+                {
+                    _eraseKittyPlacementCells(_kittyAnonymousPlacements.front());
+                    _kittyAnonymousPlacements.erase(_kittyAnonymousPlacements.begin());
+                }
                 _kittyAnonymousPlacements.push_back(placement);
             }
             return;
         }
-        // Normal (non-relative) placement: anchor at the cursor, honoring C.
+        // Normal (non-relative) placement: anchor at the cursor, honoring C. This branch cannot
+        // fail, so erase-prior-then-draw-then-register is safe.
         const auto cursorPos = _pages.ActivePage().Cursor().GetPosition();
+        erasePriorPlacement();
         _kittyVirtualIds.erase(targetImageId);
         const auto drawn = _placeKittyImage(image, moveCursor, targetImageId, command.cols, command.rows, command.srcX, command.srcY, command.srcW, command.srcH);
         if (placementId != 0)
@@ -5504,17 +5537,10 @@ void AdaptDispatch::_ProcessKittyCommand(const KittyControl& command, const std:
             {
                 // A non-virtual put cancels any prior placeholder eligibility for this id, so
                 // a later U+10EEEE cell can't keep overlaying it (mirrors the transmit path).
-                // Re-putting the same (i, p) replaces the prior placement (move/resize): erase
-                // the old placement's drawn cells first so its prior pixels don't linger.
-                if (command.havePlacementId)
-                {
-                    const auto existing = _kittyPlacements.find({ targetId, command.placementId });
-                    if (existing != _kittyPlacements.end())
-                    {
-                        _eraseKittyPlacementCells(existing->second);
-                        _kittyPlacements.erase(existing);
-                    }
-                }
+                // Re-putting the same (i, p) replaces the prior placement (move/resize); that
+                // replacement is now handled inside displayKittyPlacement, which erases the prior
+                // placement's cells ONLY once the new placement is known to succeed. This avoids
+                // destroying an existing placement when a relative re-put fails to resolve.
                 displayKittyPlacement(targetId, *target);
             }
             break;
@@ -6067,7 +6093,12 @@ void AdaptDispatch::_registerKittyPlacement(const KittyPlacement& placement)
     const std::pair<uint32_t, uint32_t> key{ placement.imageId, placement.placementId };
     _kittyPlacements[key] = placement;
     // Evict the lowest-keyed entry that ISN'T the one we just registered, so the new placement is
-    // never the victim of its own insertion (mirrors the image LRU keeping the newest).
+    // never the victim of its own insertion (mirrors the image LRU keeping the newest). Evicting a
+    // victim must (a) erase its drawn cells so no ghost pixels linger and (b) cascade to its
+    // relative children so none are left dangling with a gone parent. Capture the victim's key +
+    // value BY VALUE before erasing, because _cascadeKittyPlacementChildren mutates
+    // _kittyPlacements; re-check size() and re-fetch begin() each iteration (never hold an iterator
+    // across the cascade).
     while (_kittyPlacements.size() > MaxKittyPlacements)
     {
         auto victim = _kittyPlacements.begin();
@@ -6075,7 +6106,12 @@ void AdaptDispatch::_registerKittyPlacement(const KittyPlacement& placement)
         {
             ++victim;
         }
+        const auto victimKey = victim->first;
+        const auto victimValue = victim->second;
+        _eraseKittyPlacementCells(victimValue);
         _kittyPlacements.erase(victim);
+        std::deque<std::pair<uint32_t, uint32_t>> removed{ victimKey };
+        _cascadeKittyPlacementChildren(removed, 0);
     }
 }
 
@@ -6689,7 +6725,22 @@ void AdaptDispatch::_eraseKittyPlacementCells(const KittyPlacement& placement)
     {
         return;
     }
-    ImageSlice::EraseBlock(buffer, til::rect{ left, top, right, bottom });
+    // Erase only the columns this placement's image owns within its rect, mirroring
+    // _eraseKittyImageRows but bounded to [left, right). An owner-blind rect erase
+    // (EraseBlock) would zero a DIFFERENT co-resident image that overlaps this rect.
+    const auto imageId = placement.imageId;
+    for (auto row = top; row < bottom; ++row)
+    {
+        auto& dstRow = buffer.GetMutableRowByOffset(row);
+        const auto slice = dstRow.GetMutableImageSlice();
+        if (slice && slice->HasOwner(imageId))
+        {
+            if (slice->EraseByOwner(imageId, left, right))
+            {
+                dstRow.SetImageSlice(nullptr);
+            }
+        }
+    }
     buffer.TriggerRedraw(Viewport::FromExclusive({ 0, top, page.Width(), bottom }));
 }
 
