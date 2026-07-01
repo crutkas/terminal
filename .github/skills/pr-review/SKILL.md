@@ -73,6 +73,28 @@ as all-added diffs (new files in a feature usually live there — e.g. a new
 `oss/<lib>/` or a new test file). For `all`, run both diff commands and
 concatenate with a clear separator banner.
 
+#### 1d. Reading file content for verification — TARGET THE PR BRANCH, NOT THE WORKING TREE
+
+The `view` and `grep` tools read the **working tree** (whatever branch is
+currently checked out). When the PR head branch is **not** the checked-out
+branch — common with stacked branches, or when you diff `origin/<headRef>` from
+another branch — those tools show the **wrong branch** and will make you
+"confirm" or "refute" a finding against stale code. (Observed in practice: an
+orchestrator `grep` for a new symbol returned *no match* only because the working
+tree was a sibling branch that predated the symbol — a false refutation.)
+
+Rules:
+
+- Prefer to **check out the PR head branch first** (`git checkout <headRef>`).
+  Then `view`/`grep` and the diff's line numbers all line up, and the sub-agents
+  read the right files. Restore the user's original branch when done.
+- If you do **not** check it out, then for the `branch`/`all` scopes substitute
+  `origin/<headRef>` for `HEAD` in every diff command, and read any file content
+  for verification via **`git show <headRef>:<path>`** (pipe to
+  `Select-String -Context N,N` for grep-like context) — never via `view`/`grep`.
+- Diff and finding line numbers are **post-change** (the head side); resolve them
+  against the head ref, not the working tree.
+
 ### 2. Diff-size guardrail
 
 - **0 files** → nothing to review; stop (for working/staged, suggest the other scope).
@@ -191,6 +213,11 @@ section so the user sees scope, not just verdict.
   is mandatory.
 - **Cite evidence.** Every kept finding references a specific file + line range
   in the diff.
+- **Verify against the PR branch, not the working tree.** `view`/`grep` read the
+  checked-out branch; if that isn't the PR head, check it out or read via
+  `git show <headRef>:<path>` (see 1d). A stale-branch read produces false
+  confirmations/refutations — this applies to the orchestrator's own spot-checks
+  and to every sub-agent.
 - **Clean-room awareness.** kitty is GPLv3; flag any code/comment that looks
   copied or translated from kitty/its tests (behavior must be derived from the
   public spec; only permissive/public-domain third-party code may be vendored).
@@ -201,9 +228,22 @@ Build each dimension prompt from these blocks, in order:
 
 1. **Role line.** "You are the `<dimension>` sub-agent for this Windows Terminal fork's PR review skill."
 2. **Diff context.** Base ref, head ref, file list with line counts, and the full unified diff.
+   If the PR head branch is **not** checked out, tell the sub-agent to read any
+   surrounding source via `git show <headRef>:<path>` (pass the exact `<headRef>`) —
+   its `view`/`grep` tools would otherwise read the wrong branch (see 1d).
 3. **Area classification.** Which files in the diff fall under this dimension's focus.
-4. **Shared contract.** Inline the contents of `.github/skills/pr-review/dimensions/_shared-contract.md`.
-5. **Dimension instructions.** Inline the contents of `.github/skills/pr-review/dimensions/<name>.md`.
+4. **Shared contract.** Paste the **actual text** of
+   `.github/skills/pr-review/dimensions/_shared-contract.md` into the prompt. Read
+   it yourself first — from the working tree if present, else via
+   `git show <skill-ref>:.github/skills/pr-review/dimensions/_shared-contract.md`
+   (the skill may live on a `tooling/` branch that is NOT the branch under review,
+   so the file can be absent from the working tree). Do **not** merely tell the
+   sub-agent to open the path — if it's absent on the reviewed branch the agent
+   runs with no contract (observed: a dimension agent reported "contract files not
+   present" and reviewed without them).
+5. **Dimension instructions.** Likewise paste the **actual text** of
+   `.github/skills/pr-review/dimensions/<name>.md` (same working-tree-or-`git show`
+   read).
 6. **Closing instruction.** "Return only the markdown specified by the shared contract. No preamble, no narration."
 
 For #8 (multi-model), additionally pass the consolidated critical/high findings
