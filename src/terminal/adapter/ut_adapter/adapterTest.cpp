@@ -5639,6 +5639,63 @@ public:
         VERIFY_IS_TRUE(BufferContainsColor(*_testGetSet->_textBuffer, 255, 0, 0), L"Sixel opaque pixels survive");
     }
 
+    // Regression (why): cap eviction removed the registry entry but did NOT un-draw
+    // the evicted image's on-screen pixels (delete-by-id un-draws, but the LRU
+    // eviction path missed it), leaving an orphaned ghost on screen. This guards
+    // that exceeding MaxKittyImages un-draws the evicted image's pixels, not just
+    // its registry entry.
+    TEST_METHOD(KittyGraphicsEvictionErasesPixels)
+    {
+        _testGetSet->PrepData();
+        // Display id 1 (a=T) as a visible red pixel so it has on-screen pixels.
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,f=24,s=1,v=1;/wAA\x1b\\");
+        VERIFY_ARE_EQUAL(static_cast<size_t>(1), _pDispatch->_kittyImages.count(1), L"id 1 must be registered.");
+        VERIFY_IS_TRUE(BufferContainsColor(*_testGetSet->_textBuffer, 255, 0, 0), L"id 1 must be drawn before eviction.");
+        VERIFY_ARE_EQUAL(1, CountImageRows(*_testGetSet->_textBuffer));
+
+        // Flood MaxKittyImages + 1 store-only transmits (a=t) to exceed the count
+        // cap and evict id 1, the oldest. Store-only entries draw nothing themselves.
+        for (auto n = 2; n <= static_cast<int>(AdaptDispatch::MaxKittyImages) + 2; ++n)
+        {
+            _stateMachine->ProcessString(L"\x1b_Ga=t,i=" + std::to_wstring(n) + L",f=24,s=1,v=1;AAAA\x1b\\");
+        }
+
+        VERIFY_ARE_EQUAL(static_cast<size_t>(0), _pDispatch->_kittyImages.count(1), L"id 1 must be evicted from the registry.");
+        VERIFY_IS_FALSE(BufferContainsColor(*_testGetSet->_textBuffer, 255, 0, 0), L"Eviction must un-draw id 1's on-screen pixels, not just the registry entry.");
+        VERIFY_ARE_EQUAL(0, CountImageRows(*_testGetSet->_textBuffer), L"No orphaned ghost row may remain after eviction.");
+    }
+
+    // Regression (why): a narrower placement over an existing image tagged the FULL
+    // cell range as its owner but only wrote drawWidth pixels per row (and broke past
+    // imageHeight), so the padding retained the co-resident image's stale pixels now
+    // owner-tagged as the new image. This guards that a narrower placement clears the
+    // owned padding instead of inheriting a co-resident image's pixels.
+    TEST_METHOD(KittyGraphicsPlacementClearsPaddingOnOverlap)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 10, 20 }; // a cell is 10px wide
+        _stateMachine->ProcessString(L"\x1b[1;1H"); // home the cursor so the image sits at column 0
+        // Image A: solid RED, exactly one cell wide (s=10, v=1), placed with C=1 so
+        // the cursor does not move.
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,f=24,s=10,v=1,C=1;/wAA/wAA/wAA/wAA/wAA/wAA/wAA/wAA/wAA/wAA\x1b\\");
+        // Image B: solid GREEN, a HALF cell wide (s=5, v=1), placed at the SAME cursor.
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=2,f=24,s=5,v=1,C=1;AP8AAP8AAP8AAP8AAP8A\x1b\\");
+
+        til::CoordType imageRow = -1;
+        const auto slice = FindFirstImageSlice(*_testGetSet->_textBuffer, imageRow);
+        VERIFY_IS_NOT_NULL(slice, L"An image slice must exist after placement.");
+        // A content pixel inside B's drawn half-cell must be green.
+        const auto content = SlicePixelAt(slice, 2, 0);
+        VERIFY_ARE_EQUAL(static_cast<BYTE>(0), content.rgbRed, L"Content pixel must not be red.");
+        VERIFY_ARE_EQUAL(static_cast<BYTE>(255), content.rgbGreen, L"Content pixel must be green.");
+        // A padding pixel in B's owned cell (beyond B's 5px width) must be cleared,
+        // not A's leftover red.
+        const auto padding = SlicePixelAt(slice, 7, 0);
+        VERIFY_ARE_EQUAL(static_cast<BYTE>(0), padding.rgbRed, L"Padding must not retain A's red under B's owner.");
+        VERIFY_ARE_EQUAL(static_cast<BYTE>(0), padding.rgbGreen, L"Padding must be transparent.");
+        VERIFY_ARE_EQUAL(static_cast<BYTE>(0), padding.rgbBlue, L"Padding must be transparent.");
+    }
+
     // An APC string with a non-'G' identifier is not Kitty graphics and is ignored.
     TEST_METHOD(NonKittyApcIgnored)
     {
