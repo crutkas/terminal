@@ -456,6 +456,7 @@ namespace TerminalCoreUnitTests
         TEST_METHOD(ReadKittyImageFileRejectsUncPath);
         TEST_METHOD(ReadKittyImageFileRejectsRelativePath);
         TEST_METHOD(ReadKittyImageFileNonexistentFails);
+        TEST_METHOD(ReadKittyImageFileRejectsCharDevice);
     };
 };
 
@@ -1106,6 +1107,26 @@ void TerminalApiTest::ReadKittyImageFileNonexistentFails()
     std::vector<uint8_t> out;
     VERIFY_IS_FALSE(term.ReadKittyImageFile(path, 0, 0, false, out), L"a missing file must fail (EBADF)");
     VERIFY_ARE_EQUAL(static_cast<size_t>(0), out.size());
+}
+
+void TerminalApiTest::ReadKittyImageFileRejectsCharDevice()
+{
+    Terminal term{ Terminal::TestDummyMarker{} };
+    DummyRenderer renderer{ &term };
+    term.Create({ 100, 100 }, 0, renderer);
+
+    const auto dir = KittyTempDir();
+    VERIFY_IS_FALSE(dir.empty());
+    // A drive-absolute path to the NUL character device on the temp dir's (fixed) drive. NUL is a
+    // reserved name that resolves to a device in any directory, so this passes the drive/namespace
+    // checks and opens successfully -- but it is NOT a regular file. The spec's "only regular files
+    // may be read" rule (GetFileType == FILE_TYPE_DISK) must refuse it, so a client cannot make the
+    // terminal read from a device.
+    const auto devicePath = dir.substr(0, 3) + L"NUL"; // e.g. "C:\\NUL"
+
+    std::vector<uint8_t> out{ 1, 2, 3 };
+    VERIFY_IS_FALSE(term.ReadKittyImageFile(devicePath, 0, 0, false, out), L"a character device (NUL) must be refused: only regular files may be read");
+    VERIFY_ARE_EQUAL(static_cast<size_t>(0), out.size(), L"a rejected read must leave the output empty");
 }
 
 void TerminalApiTest::KittyPlaceholderRendersInRealTerminal()

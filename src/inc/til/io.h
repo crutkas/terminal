@@ -358,6 +358,18 @@ namespace til // Terminal Implementation Library. Also: "Today I Learned"
             return false;
         }
 
+        // Spec requirement (kitty graphics protocol): only REGULAR files may be read via t=f/t=t;
+        // device/pipe/socket "special" files must be refused. GetFileType on the open handle is
+        // FILE_TYPE_DISK only for a real on-disk file; a character device (e.g. a reserved name
+        // like NUL/CON resolved against a drive), a pipe, or an unknown type is rejected. The path
+        // checks above already block the device namespace and non-fixed volumes; this is the
+        // explicit, auditable form of the spec's "regular files only" rule and closes the
+        // reserved-name edge.
+        if (GetFileType(file.get()) != FILE_TYPE_DISK)
+        {
+            return false;
+        }
+
         // Resolves the fully-normalized on-disk path for an open handle (following
         // symlinks/junctions and 8.3 short names), or empty on failure. With
         // VOLUME_NAME_DOS every result is prefixed with "\\?\" (e.g. "\\?\C:\dir\file",
