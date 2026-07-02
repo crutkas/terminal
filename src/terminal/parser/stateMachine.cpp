@@ -662,11 +662,10 @@ void StateMachine::_ActionInterrupt(const bool wasEscape)
     else if (_state == VTStates::ApcString && _apcStringHandler)
     {
         // ESC terminates the APC string and finalizes the handler; CAN/SUB
-        // cancel it without finalizing (per ECMA-48).
-        if (wasEscape)
-        {
-            _apcStringHandler(AsciiChars::ESC);
-        }
+        // cancel it without finalizing (per ECMA-48). In both cases the handler
+        // is invoked so it can release cross-sequence state (e.g. an in-progress
+        // Kitty chunked transfer): ESC signals finalize, CAN signals abort.
+        _apcStringHandler(wasEscape ? AsciiChars::ESC : AsciiChars::CAN);
         _apcStringHandler = nullptr;
     }
 }

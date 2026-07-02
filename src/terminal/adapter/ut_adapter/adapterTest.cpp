@@ -5433,6 +5433,79 @@ public:
         _testGetSet->ValidateInputEvent(L"\x1b_Gi=1;ENOENT:image not found\x1b\\"); // id 1 discarded
     }
 
+    // Regression (why): the kitty chunked-transmission spec allows a continuation
+    // chunk to carry 'q' (quiet) alongside 'm'. Previously any key other than 'm'
+    // set hasNonChunkKey, so a final "m=0,q=2" chunk was misclassified as a fresh
+    // command; that cleared the pending upload and DROPPED the transfer. This guards
+    // that a spec-allowed 'q' on a continuation chunk does not abort the transfer:
+    // the image is still assembled and stored, and q=2 suppresses the ack.
+    TEST_METHOD(KittyGraphicsChunkedContinuationQuietDoesNotDropTransfer)
+    {
+        _testGetSet->PrepData();
+        // Three chunks of "AAAA" (3 bytes each) assemble 9 bytes == 3*1*3 for f=24.
+        _stateMachine->ProcessString(L"\x1b_Ga=t,i=42,f=24,s=3,v=1,m=1;AAAA\x1b\\"); // first chunk
+        VERIFY_IS_TRUE(_testGetSet->_response.empty(), L"An intermediate chunk must not respond.");
+        _stateMachine->ProcessString(L"\x1b_Gm=1;AAAA\x1b\\"); // middle continuation chunk
+        VERIFY_IS_TRUE(_testGetSet->_response.empty(), L"An intermediate chunk must not respond.");
+        // Final continuation chunk carries q=2: the transfer must complete (not drop),
+        // storing the image, and q=2 must suppress the acknowledgement.
+        _stateMachine->ProcessString(L"\x1b_Gm=0,q=2;AAAA\x1b\\");
+        VERIFY_IS_TRUE(_testGetSet->_response.empty(), L"q=2 on the final chunk must suppress the ack.");
+        VERIFY_ARE_EQUAL(static_cast<size_t>(1), _pDispatch->_kittyImages.count(42), L"The chunked image must be stored, not dropped.");
+    }
+
+    // Regression (why): the KittyGraphics handler set a single payloadValid flag both
+    // for malformed base64 and for an oversize payload, so _ProcessKittyCommand always
+    // reported EINVAL and the advertised EFBIG was never returned. This guards that a
+    // payload exceeding MaxKittyPayload reports EFBIG (not EINVAL) and stores nothing.
+    TEST_METHOD(KittyGraphicsOversizePayloadIsEfbig)
+    {
+        _testGetSet->PrepData();
+        // Build a direct (non-chunked) transmit whose base64 payload exceeds the
+        // 32 MiB MaxKittyPayload cap so the oversize branch trips.
+        constexpr size_t maxPayload = 32 * 1024 * 1024;
+        std::wstring sequence = L"\x1b_Ga=t,i=77,f=24,s=1,v=1;";
+        sequence.append(maxPayload + 8, L'A'); // > MaxKittyPayload base64 chars
+        sequence.append(L"\x1b\\");
+        _stateMachine->ProcessString(sequence);
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=77;EFBIG:payload exceeds maximum size\x1b\\");
+        VERIFY_ARE_EQUAL(static_cast<size_t>(0), _pDispatch->_kittyImages.count(77), L"An oversize payload must not store an image.");
+    }
+
+    // Regression (why): a CAN/SUB that aborts an APC used to null the handler WITHOUT
+    // finalizing, so AdaptDispatch never learned the transfer was aborted and
+    // _kittyChunkActive stayed set; a later bare "m=0" was then treated as a
+    // continuation and finalized STALE chunk data (storing a corrupt image). This
+    // guards that a CAN-aborted APC clears the chunk state so a later "m=" cannot
+    // finalize a stale transfer, while a normal (unaborted) chunked transfer works.
+    TEST_METHOD(KittyGraphicsCanAbortClearsChunkState)
+    {
+        _testGetSet->PrepData();
+        // First chunk completes normally (ESC), leaving a transfer in progress with
+        // exactly 3 pending bytes ("AAAA") that would satisfy s=1,v=1,f=24.
+        _stateMachine->ProcessString(L"\x1b_Ga=t,i=90,f=24,s=1,v=1,m=1;AAAA\x1b\\");
+        VERIFY_IS_TRUE(_testGetSet->_response.empty(), L"An intermediate chunk must not respond.");
+        VERIFY_IS_TRUE(_pDispatch->_kittyChunkActive, L"The first chunk should leave a transfer active.");
+
+        // A continuation chunk is aborted mid-APC by a CAN; its payload must be
+        // dropped AND the pending transfer discarded.
+        _stateMachine->ProcessString(L"\x1b_Gm=1;BBBB\x18");
+        VERIFY_IS_TRUE(_testGetSet->_response.empty(), L"CAN must abort without an acknowledgement.");
+        VERIFY_IS_FALSE(_pDispatch->_kittyChunkActive, L"CAN must clear the pending chunk state.");
+
+        // A later bare "m=0" must NOT finalize the aborted transfer. Because the chunk
+        // state was cleared it is treated as a fresh (and here, incomplete) command, so
+        // no stale image id 90 is ever stored.
+        _stateMachine->ProcessString(L"\x1b_Gm=0;\x1b\\");
+        VERIFY_ARE_EQUAL(static_cast<size_t>(0), _pDispatch->_kittyImages.count(90), L"The aborted transfer must not have been finalized.");
+
+        // A normal (unaborted) chunked transfer must still assemble and store.
+        _stateMachine->ProcessString(L"\x1b_Ga=t,i=92,f=24,s=2,v=1,m=1;AAAA\x1b\\");
+        _stateMachine->ProcessString(L"\x1b_Gm=0;AAAA\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=92;OK\x1b\\");
+        VERIFY_ARE_EQUAL(static_cast<size_t>(1), _pDispatch->_kittyImages.count(92), L"A normal chunked transfer must still work.");
+    }
+
     // An APC string with a non-'G' identifier is not Kitty graphics and is ignored.
     TEST_METHOD(NonKittyApcIgnored)
     {
