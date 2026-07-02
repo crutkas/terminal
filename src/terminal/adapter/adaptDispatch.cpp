@@ -5703,26 +5703,30 @@ void AdaptDispatch::_placeKittyImage(const KittyImage& image, const bool moveCur
     const auto targetH = std::max<int64_t>(targetH64, 1);
 
     const auto columnBegin = origin.x;
-    // The destination spans the X offset plus the scaled image, so it can reach one cell
-    // further right than the image alone. Keep the span math in 64-bit (targetW/H may be
-    // up to ~INT32_MAX from aspect scaling) and clamp to the page before narrowing, so the
-    // offset addition can't overflow til::CoordType (int32).
-    const int64_t spanWidthPx = static_cast<int64_t>(offsetX) + targetW;
+    // Per the kitty spec, a sub-cell X/Y offset is NOT added to the number of columns/rows:
+    // the placement rectangle (and thus the cursor advance) is sized by the image footprint
+    // alone; the offset merely shifts the content within that footprint, and any overflow is
+    // truncated on the right/bottom edge. Keep the span math in 64-bit (targetW/H may be up to
+    // ~INT32_MAX from aspect scaling) and clamp to the page before narrowing.
+    const int64_t spanWidthPx = targetW;
     const auto columns = static_cast<til::CoordType>(std::min<int64_t>((spanWidthPx + cellWidth - 1) / cellWidth, page.Width()));
     const auto columnEnd = std::min(columnBegin + columns, page.Width());
     if (columnEnd <= columnBegin)
     {
         return;
     }
-    const auto drawWidth = static_cast<til::CoordType>(std::min<int64_t>(spanWidthPx, static_cast<int64_t>(columnEnd - columnBegin) * cellWidth));
-    const int64_t spanHeightPx = static_cast<int64_t>(offsetY) + targetH;
+    // Fill the whole owned footprint, so the X-offset gutter and any right-truncation are drawn.
+    const auto drawWidth = static_cast<til::CoordType>(static_cast<int64_t>(columnEnd - columnBegin) * cellWidth);
+    const int64_t spanHeightPx = targetH;
     const auto rowSpan = static_cast<til::CoordType>(std::min<int64_t>((spanHeightPx + cellHeight - 1) / cellHeight, page.Bottom()));
     // Precompute the source column for each drawn destination pixel (nearest-neighbour).
-    // Destination columns before the X offset have no source (sentinel -1 = transparent).
+    // Columns before the X offset OR past the shifted image's right edge have no source
+    // (sentinel -1 = transparent), so a right-shifted image is truncated, not stretched.
     std::vector<til::CoordType> sampleXMap(static_cast<size_t>(drawWidth));
     for (auto x = 0; x < drawWidth; ++x)
     {
-        sampleXMap[x] = x < offsetX ? -1 : cropX + std::min(cropW - 1, static_cast<til::CoordType>(static_cast<int64_t>(x - offsetX) * cropW / targetW));
+        const auto imgX = x - offsetX;
+        sampleXMap[x] = (imgX < 0 || imgX >= targetW) ? -1 : cropX + std::min(cropW - 1, static_cast<til::CoordType>(static_cast<int64_t>(imgX) * cropW / targetW));
     }
     for (auto row = 0; row < rowSpan; ++row)
     {

@@ -6903,6 +6903,24 @@ public:
         VERIFY_ARE_EQUAL(255, static_cast<int>(SlicePixelAt(slice, 2, 0).rgbGreen), L"green sits at the X offset");
     }
 
+    // Regression (why): the kitty spec says a sub-cell X/Y offset is NOT added to the number of
+    // columns/rows, and the cursor advances by the image's cell footprint only. The old code used
+    // spanWidthPx = offsetX + targetW, so a 1-cell-wide image with an X offset spilled into a 2nd
+    // column (and advanced the cursor an extra cell). This guards that the offset shifts within the
+    // footprint (right-truncated) without enlarging the placement's owned columns.
+    TEST_METHOD(KittyGraphicsCellOffsetDoesNotEnlargeSpan)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 4, 4 };
+        const auto origin = _testGetSet->_textBuffer->GetCursor().GetPosition();
+        // A 4px-wide image is exactly one 4px cell; X=2 shifts it right by 2px WITHIN that cell.
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,f=24,s=4,v=1,X=2,C=1;/wAA/wAA/wAA/wAA\x1b\\");
+        const auto* slice = _testGetSet->_textBuffer->GetRowByOffset(origin.y).GetImageSlice();
+        VERIFY_IS_NOT_NULL(slice);
+        VERIFY_ARE_EQUAL(1u, slice->ColumnOwner(origin.x), L"the image's single cell is owned");
+        VERIFY_ARE_EQUAL(0u, slice->ColumnOwner(origin.x + 1), L"a sub-cell X offset must not extend the placement into a 2nd column");
+    }
+
     // An APC string with a non-'G' identifier is not Kitty graphics and is ignored.
     TEST_METHOD(NonKittyApcIgnored)
     {
