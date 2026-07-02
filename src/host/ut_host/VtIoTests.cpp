@@ -284,8 +284,11 @@ class ::Microsoft::Console::VirtualTerminal::VtIoTests
         const auto kitty = L"\x1b_Ga=T,i=1,f=24,s=1,v=1;/wAA\x1b\\";
         THROW_IF_FAILED(routines.WriteConsoleWImpl(*screenInfo, kitty, written, nullptr));
         const auto kittyOut = std::string{ readOutput() };
-        VERIFY_IS_TRUE(kittyOut.find("\x1b_Ga=T,i=1,f=24,s=1,v=1;/wAA\x1b\\") != std::string::npos,
-                       L"the Kitty APC must be forwarded verbatim through ConPTY");
+        // Byte-for-byte equality: the ENTIRE forwarded output must equal the APC exactly. A
+        // substring search would let conhost prepend/append/mutate bytes and still pass. The
+        // Kitty APC contains no newline, so conhost does not split it.
+        VERIFY_ARE_EQUAL(std::string("\x1b_Ga=T,i=1,f=24,s=1,v=1;/wAA\x1b\\"), kittyOut,
+                         L"the Kitty APC must be forwarded verbatim through ConPTY");
 
         resetContents();
         std::ignore = readOutput();
@@ -294,13 +297,14 @@ class ::Microsoft::Console::VirtualTerminal::VtIoTests
         const auto sixel = L"\x1bPq#0;2;100;0;0~\x1b\\";
         THROW_IF_FAILED(routines.WriteConsoleWImpl(*screenInfo, sixel, written, nullptr));
         const auto sixelOut = std::string{ readOutput() };
-        const auto sixelBody = sixelOut.find("\x1bPq#0;2;100;0;0~");
-        VERIFY_IS_TRUE(sixelBody != std::string::npos,
-                       L"the Sixel DCS body must be forwarded verbatim through ConPTY");
-        // conhost may insert a CRLF before the ST, so assert the terminator follows the
-        // body rather than requiring it to be contiguous.
-        VERIFY_IS_TRUE(sixelOut.find("\x1b\\", sixelBody) != std::string::npos,
-                       L"the Sixel DCS terminator (ST) must also be forwarded");
+        // conhost may insert a CRLF before the ST (a documented DCS-wrapping quirk), so the Sixel
+        // stream is not byte-identical. Strip any inserted CR/LF and assert the remainder equals
+        // the input EXACTLY -- this proves no OTHER mutation, which a substring search would miss.
+        auto sixelStripped = sixelOut;
+        sixelStripped.erase(std::remove(sixelStripped.begin(), sixelStripped.end(), '\r'), sixelStripped.end());
+        sixelStripped.erase(std::remove(sixelStripped.begin(), sixelStripped.end(), '\n'), sixelStripped.end());
+        VERIFY_ARE_EQUAL(std::string("\x1bPq#0;2;100;0;0~\x1b\\"), sixelStripped,
+                         L"the Sixel DCS must be forwarded verbatim (modulo an inserted CRLF) through ConPTY");
     }
 
     TEST_METHOD(WriteConsoleOutputW)
