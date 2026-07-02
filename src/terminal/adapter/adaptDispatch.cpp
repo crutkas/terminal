@@ -5826,8 +5826,14 @@ void AdaptDispatch::_placeKittyPlaceholderCell(const KittyImage& image, const ui
     const til::size clampedCellSize{ cellWidth, cellHeight };
     const auto gridCols = std::max<uint32_t>(cols, 1);
     const auto gridRows = std::max<uint32_t>(rows, 1);
-    const auto colIndex = std::min(cellCol, gridCols - 1);
-    const auto rowIndex = std::min(cellRow, gridRows - 1);
+    // An explicit row/column outside the placement grid selects no tile: draw nothing rather
+    // than clamping to (and duplicating) the edge tile.
+    if (cellCol >= gridCols || cellRow >= gridRows)
+    {
+        return;
+    }
+    const auto colIndex = cellCol;
+    const auto rowIndex = cellRow;
     // Tile boundaries computed from the cumulative edges so a non-divisible image keeps
     // its right/bottom pixels (e.g. 3px across 2 cols -> 2px tile then 1px tile, no drop).
     const auto srcX = static_cast<til::CoordType>(static_cast<uint64_t>(colIndex) * image.width / gridCols);
@@ -5911,10 +5917,14 @@ void AdaptDispatch::_renderKittyPlaceholders(const std::wstring_view segment, co
         const auto next = buffer.GraphemeNext(segment, i);
         if (i + 1 < next && segment[i] == KittyPlaceholderCodePointHigh && segment[i + 1] == KittyPlaceholderCodePointLow)
         {
-            // The first two recognized diacritics in the cluster give row then column; any
-            // further ones (high-bit/256-color extensions) are not supported yet, so ignore.
+            // The first two recognized diacritics in the cluster give row then column. A third
+            // encodes the most significant byte of a >24-bit image id, which isn't supported yet
+            // (#24). A non-zero third byte means we cannot identify the image, so skip the cell
+            // rather than render the WRONG low-24-bit image; a third diacritic of 0 leaves a plain
+            // 24-bit id, so it still renders.
             auto rowDiacritic = -1;
             auto colDiacritic = -1;
+            auto idHighByte = 0;
             for (auto j = i + 2; j < next; ++j)
             {
                 if (const auto idx = _KittyPlaceholderDiacriticIndex(segment[j]); idx >= 0)
@@ -5927,19 +5937,26 @@ void AdaptDispatch::_renderKittyPlaceholders(const std::wstring_view segment, co
                     {
                         colDiacritic = idx;
                     }
+                    else if (idHighByte == 0)
+                    {
+                        idHighByte = idx;
+                    }
                 }
             }
-            const auto cellRow = rowDiacritic >= 0 ? static_cast<uint32_t>(rowDiacritic) : place.autoRow;
-            const auto cellCol = colDiacritic >= 0 ? static_cast<uint32_t>(colDiacritic) : place.autoCol;
-            _placeKittyPlaceholderCell(image, imageId, column, screenRow, cellRow, cellCol, rows, cols);
-            // Advance the running counter past this cell (wrapping col -> row), so the next
-            // auto cell continues sequentially regardless of screen row, wrap, or scroll.
-            place.autoRow = cellRow;
-            place.autoCol = cellCol + 1;
-            if (place.autoCol >= cols)
+            if (idHighByte == 0)
             {
-                place.autoCol = 0;
-                place.autoRow = std::min<uint32_t>(place.autoRow + 1, rows - 1);
+                const auto cellRow = rowDiacritic >= 0 ? static_cast<uint32_t>(rowDiacritic) : place.autoRow;
+                const auto cellCol = colDiacritic >= 0 ? static_cast<uint32_t>(colDiacritic) : place.autoCol;
+                _placeKittyPlaceholderCell(image, imageId, column, screenRow, cellRow, cellCol, rows, cols);
+                // Advance the running counter past this cell (wrapping col -> row), so the next
+                // auto cell continues sequentially regardless of screen row, wrap, or scroll.
+                place.autoRow = cellRow;
+                place.autoCol = cellCol + 1;
+                if (place.autoCol >= cols)
+                {
+                    place.autoCol = 0;
+                    place.autoRow = std::min<uint32_t>(place.autoRow + 1, rows - 1);
+                }
             }
         }
         // Advance by the glyph's real cell width; guard against a non-advancing step.
