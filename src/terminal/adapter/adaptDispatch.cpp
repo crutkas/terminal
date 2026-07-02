@@ -5429,7 +5429,9 @@ void AdaptDispatch::_registerKittyImage(const uint32_t id, KittyImage&& image)
     while (_kittyImageOrder.size() > 1 &&
            (_kittyImageOrder.size() > MaxKittyImages || _kittyTotalPixelBytes > MaxKittyTotalBytes))
     {
-        _eraseKittyImage(_kittyImageOrder.front());
+        const auto evictedId = _kittyImageOrder.front();
+        _eraseKittyImageRows(evictedId); // un-draw the evicted image's on-screen pixels (no orphaned ghost)
+        _eraseKittyImage(evictedId);
     }
 }
 
@@ -5606,21 +5608,27 @@ void AdaptDispatch::_placeKittyImage(const KittyImage& image, const bool moveCur
         // Tag only the columns this placement covers so a later id-targeted delete
         // erases just these cells, leaving co-resident Sixel (id 0) or other images.
         dstSlice->SetColumnOwner(columnBegin, columnEnd, imageId);
+        const til::CoordType ownedWidth = (columnEnd - columnBegin) * cellWidth;
         for (auto pixelRow = 0; pixelRow < cellHeight; ++pixelRow)
         {
             const auto srcY = row * cellHeight + pixelRow;
-            if (srcY >= imageHeight)
+            // Clear the full owned span first so padding (the last cell's pixels beyond
+            // the image, or rows past imageHeight) never retains a co-resident image's
+            // stale pixels that this placement now owns.
+            for (auto pixelColumn = 0; pixelColumn < ownedWidth; ++pixelColumn)
             {
-                break;
+                til::at(dstIterator, pixelColumn) = RGBQUAD{};
             }
-            const auto srcRowStart = static_cast<size_t>(srcY) * image.width;
-            if (srcRowStart + static_cast<size_t>(drawWidth) > image.pixels.size())
+            if (srcY < imageHeight)
             {
-                break;
-            }
-            for (auto pixelColumn = 0; pixelColumn < drawWidth; ++pixelColumn)
-            {
-                til::at(dstIterator, pixelColumn) = image.pixels[srcRowStart + pixelColumn];
+                const auto srcRowStart = static_cast<size_t>(srcY) * image.width;
+                if (srcRowStart + static_cast<size_t>(drawWidth) <= image.pixels.size())
+                {
+                    for (auto pixelColumn = 0; pixelColumn < drawWidth; ++pixelColumn)
+                    {
+                        til::at(dstIterator, pixelColumn) = image.pixels[srcRowStart + pixelColumn];
+                    }
+                }
             }
             if (pixelRow + 1 < cellHeight)
             {
