@@ -5871,6 +5871,41 @@ public:
         VERIFY_IS_FALSE(BufferContainsColor(*_testGetSet->_textBuffer, 255, 0, 0), L"col 1 must not show the left tile (red)");
     }
 
+    // Regression (why): a 3rd rowcolumn diacritic encodes the high byte of a >24-bit image id,
+    // which isn't supported yet (#24). The old code IGNORED the 3rd diacritic and rendered the
+    // low-24-bit image -- the WRONG image (an id collision). This guards that a NON-ZERO 3rd
+    // diacritic skips the cell (draws nothing) rather than mis-rendering, while a plain 24-bit
+    // id (3rd diacritic absent or 0) still renders.
+    TEST_METHOD(KittyPlaceholderThirdDiacriticSkipsUnsupportedId)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,f=24,s=1,v=1;/wAA\x1b\\"); // id1 red (24-bit)
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m"); // fg id 1
+        _stateMachine->ProcessString(Placeholder() + L"\x0305" + L"\x0305"); // row 0, col 0, no 3rd -> renders
+        VERIFY_IS_TRUE(BufferContainsColor(*_testGetSet->_textBuffer, 255, 0, 0), L"a plain 24-bit id placeholder renders");
+
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,f=24,s=1,v=1;/wAA\x1b\\"); // id1 red
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m");
+        // A 3rd diacritic with a NON-ZERO index (\x030D = 1) = high id byte => a >24-bit id.
+        _stateMachine->ProcessString(Placeholder() + L"\x0305" + L"\x0305" + L"\x030D");
+        VERIFY_IS_FALSE(BufferContainsColor(*_testGetSet->_textBuffer, 255, 0, 0), L"a non-zero 3rd diacritic (>24-bit id) must skip the cell, not render the low-24-bit image");
+    }
+
+    // Regression (why): an explicit column/row diacritic OUTSIDE the placement grid used to be
+    // CLAMPED to the edge tile (std::min(cellCol, gridCols-1)), duplicating that tile. This
+    // guards that an out-of-grid cell draws NOTHING instead. A 2x1 grid (red|green) addressed at
+    // col index 2 (>= the 2 columns) must render neither tile.
+    TEST_METHOD(KittyPlaceholderOutOfGridDrawsNothing)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,f=24,s=2,v=1,c=2,r=1;/wAAAP8A\x1b\\"); // red|green, 2x1 grid
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m");
+        _stateMachine->ProcessString(Placeholder() + L"\x0305" + L"\x030E"); // row 0, col 2 (out of a 2-col grid)
+        VERIFY_IS_FALSE(BufferContainsColor(*_testGetSet->_textBuffer, 255, 0, 0), L"out-of-grid col must not clamp to the left tile");
+        VERIFY_IS_FALSE(BufferContainsColor(*_testGetSet->_textBuffer, 0, 255, 0), L"out-of-grid col must not clamp to the right (edge) tile");
+    }
+
     // Row + column diacritics address a 2D tile: a 2x2 image (red,green / blue,white) in a
     // 2x2 grid addressed (row 1, col 1) shows ONLY white; the other three tiles are absent.
     TEST_METHOD(KittyPlaceholderRowColAddressesTile)
