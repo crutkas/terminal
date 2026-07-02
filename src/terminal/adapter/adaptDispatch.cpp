@@ -4890,9 +4890,19 @@ void AdaptDispatch::_ReturnApcResponse(const std::wstring_view response) const
 // Protocol: https://sw.kovidgoyal.net/kitty/graphics-protocol/
 ITermDispatch::StringHandler AdaptDispatch::KittyGraphics()
 {
-    return [this, control = std::wstring{}, payload = std::string{}, sawIdentifier = false, inControl = true, payloadValid = true](const auto ch) mutable noexcept -> bool {
+    return [this, control = std::wstring{}, payload = std::string{}, sawIdentifier = false, inControl = true, payloadValid = true, payloadTooLarge = false](const auto ch) mutable noexcept -> bool {
         try
         {
+            if (ch == AsciiChars::CAN)
+            {
+                // A CAN/SUB aborted this APC (see StateMachine::_ActionInterrupt, which
+                // signals the abort with AsciiChars::CAN). Discard any cross-sequence
+                // Kitty chunk state so a later bare 'm=' cannot finalize this aborted
+                // transfer, and decline without processing the partial payload. A real
+                // APC data byte can never be 0x18 because CAN itself triggers the abort.
+                _clearKittyChunk();
+                return false;
+            }
             if (!sawIdentifier)
             {
                 sawIdentifier = true;
@@ -4900,7 +4910,7 @@ ITermDispatch::StringHandler AdaptDispatch::KittyGraphics()
             }
             if (ch == AsciiChars::ESC)
             {
-                _HandleKittyGraphics(control, payload, payloadValid);
+                _HandleKittyGraphics(control, payload, payloadValid, payloadTooLarge);
                 return false;
             }
             if (inControl && ch == L';')
@@ -4927,7 +4937,10 @@ ITermDispatch::StringHandler AdaptDispatch::KittyGraphics()
             }
             else
             {
+                // The payload exceeds MaxKittyPayload; flag it distinctly so the command
+                // is reported as EFBIG (too large) rather than EINVAL (malformed).
                 payloadValid = false;
+                payloadTooLarge = true;
             }
             return true;
         }
@@ -4957,9 +4970,11 @@ AdaptDispatch::KittyControl AdaptDispatch::_ParseKittyControl(const std::wstring
         {
             const auto key = pair.front();
             const auto value = pair.substr(eq + 1);
-            if (key != L'm')
+            if (key != L'm' && key != L'q')
             {
-                c.hasNonChunkKey = true; // distinguishes a fresh command from an 'm=' continuation
+                // Per the kitty chunked-transmission spec, a continuation chunk may
+                // carry both 'm' and 'q' (quiet); neither marks a fresh command.
+                c.hasNonChunkKey = true; // distinguishes a fresh command from an 'm='/'q=' continuation
             }
             switch (key)
             {
@@ -5022,7 +5037,7 @@ AdaptDispatch::KittyControl AdaptDispatch::_ParseKittyControl(const std::wstring
 // Dispatches a Kitty graphics command. A chunked transmission (m=1) accumulates its
 // base64 payload across sequences and is processed only when the final chunk (m=0)
 // arrives, using the control from the first chunk. Only one transfer runs at a time.
-void AdaptDispatch::_HandleKittyGraphics(const std::wstring_view control, const std::string_view payload, const bool payloadValid)
+void AdaptDispatch::_HandleKittyGraphics(const std::wstring_view control, const std::string_view payload, const bool payloadValid, const bool payloadTooLarge)
 {
     const auto command = _ParseKittyControl(control);
 
@@ -5043,13 +5058,24 @@ void AdaptDispatch::_HandleKittyGraphics(const std::wstring_view control, const 
             _kittyChunkControl = command;
             _kittyChunkPayload.clear();
             _kittyChunkPayloadValid = true;
+            _kittyChunkPayloadTooLarge = false;
         }
 
         // Accumulate this chunk's payload, bounded in total by MaxKittyPayload.
         _kittyChunkPayloadValid = _kittyChunkPayloadValid && payloadValid;
+        _kittyChunkPayloadTooLarge = _kittyChunkPayloadTooLarge || payloadTooLarge;
+
+        // The kitty spec allows the quiet (q) setting on any chunk, including the
+        // final one; carry a non-default value forward so it governs the assembled
+        // command's acknowledgement.
+        if (command.quiet != 0)
+        {
+            _kittyChunkControl.quiet = command.quiet;
+        }
         if (_kittyChunkPayload.size() + payload.size() > MaxKittyPayload)
         {
             _kittyChunkPayloadValid = false;
+            _kittyChunkPayloadTooLarge = true;
         }
         else
         {
@@ -5066,12 +5092,13 @@ void AdaptDispatch::_HandleKittyGraphics(const std::wstring_view control, const 
         finalControl.moreChunks = false;
         const auto finalPayload = std::move(_kittyChunkPayload);
         const auto finalValid = _kittyChunkPayloadValid;
+        const auto finalTooLarge = _kittyChunkPayloadTooLarge;
         _clearKittyChunk();
-        _ProcessKittyCommand(finalControl, finalPayload, finalValid);
+        _ProcessKittyCommand(finalControl, finalPayload, finalValid, finalTooLarge);
         return;
     }
 
-    _ProcessKittyCommand(command, payload, payloadValid);
+    _ProcessKittyCommand(command, payload, payloadValid, payloadTooLarge);
 }
 
 // Validates and applies a fully-assembled Kitty graphics command, then emits the
@@ -5079,7 +5106,7 @@ void AdaptDispatch::_HandleKittyGraphics(const std::wstring_view control, const 
 // (and display), a=p put/display, a=q query, a=d delete.
 // Protocol: https://sw.kovidgoyal.net/kitty/graphics-protocol/#display-images-on-screen
 // and https://sw.kovidgoyal.net/kitty/graphics-protocol/#deleting-images
-void AdaptDispatch::_ProcessKittyCommand(const KittyControl& command, const std::string_view payload, const bool payloadValid)
+void AdaptDispatch::_ProcessKittyCommand(const KittyControl& command, const std::string_view payload, const bool payloadValid, const bool payloadTooLarge)
 {
     const auto action = command.action;
     const auto deleteTarget = command.deleteTarget;
@@ -5138,7 +5165,16 @@ void AdaptDispatch::_ProcessKittyCommand(const KittyControl& command, const std:
             if (!payloadValid || !_DecodeKittyBase64(payload, bytes))
             {
                 success = false;
-                code = L"EINVAL:bad payload";
+                if (payloadTooLarge)
+                {
+                    // An oversize payload is reported as EFBIG (too large) and nothing is
+                    // stored; only a genuinely malformed payload gets EINVAL.
+                    code = L"EFBIG:payload exceeds maximum size";
+                }
+                else
+                {
+                    code = L"EINVAL:bad payload";
+                }
                 break;
             }
             // Raw pixel formats (f=24/32) require positive dimensions and an exact
@@ -5435,6 +5471,7 @@ void AdaptDispatch::_clearKittyChunk() noexcept
 {
     _kittyChunkActive = false;
     _kittyChunkPayloadValid = true;
+    _kittyChunkPayloadTooLarge = false;
     _kittyChunkControl = {};
     _kittyChunkPayload = {};
 }

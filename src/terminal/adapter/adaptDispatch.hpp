@@ -340,8 +340,8 @@ namespace Microsoft::Console::VirtualTerminal
             std::vector<RGBQUAD> pixels;
         };
         static KittyControl _ParseKittyControl(const std::wstring_view control) noexcept;
-        void _HandleKittyGraphics(const std::wstring_view control, const std::string_view payload, const bool payloadValid);
-        void _ProcessKittyCommand(const KittyControl& command, const std::string_view payload, const bool payloadValid);
+        void _HandleKittyGraphics(const std::wstring_view control, const std::string_view payload, const bool payloadValid, const bool payloadTooLarge);
+        void _ProcessKittyCommand(const KittyControl& command, const std::string_view payload, const bool payloadValid, const bool payloadTooLarge);
         void _clearKittyChunk() noexcept;
         static uint32_t _ParseKittyUint(const std::wstring_view value) noexcept;
         static bool _DecodeKittyBase64(const std::string_view input, std::vector<uint8_t>& output) noexcept;
@@ -386,6 +386,7 @@ namespace Microsoft::Console::VirtualTerminal
         // only one transfer runs at a time, processed on the final chunk (m=0).
         bool _kittyChunkActive = false;
         bool _kittyChunkPayloadValid = true;
+        bool _kittyChunkPayloadTooLarge = false;
         KittyControl _kittyChunkControl;
         std::string _kittyChunkPayload;
 
