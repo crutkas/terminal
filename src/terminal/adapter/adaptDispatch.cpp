@@ -5782,8 +5782,17 @@ void AdaptDispatch::_storeKittyVirtualPlacement(const uint32_t id, const KittyIm
     // a direct c/r draw would, and the grid aspect follows the CROP (not the full image).
     const auto cropX = std::min<int64_t>(srcX, imageWidth);
     const auto cropY = std::min<int64_t>(srcY, imageHeight);
-    const auto cropW = std::max<int64_t>(1, srcW == 0 ? imageWidth - cropX : std::min<int64_t>(std::min<int64_t>(srcW, imageWidth), imageWidth - cropX));
-    const auto cropH = std::max<int64_t>(1, srcH == 0 ? imageHeight - cropY : std::min<int64_t>(std::min<int64_t>(srcH, imageHeight), imageHeight - cropY));
+    const auto cropW = srcW == 0 ? imageWidth - cropX : std::min<int64_t>(std::min<int64_t>(srcW, imageWidth), imageWidth - cropX);
+    const auto cropH = srcH == 0 ? imageHeight - cropY : std::min<int64_t>(std::min<int64_t>(srcH, imageHeight), imageHeight - cropY);
+    if (cropW <= 0 || cropH <= 0)
+    {
+        // An empty crop (x/y at or past the image edge) displays nothing, matching _placeKittyImage.
+        // Register no virtual grid -- and drop any prior one on re-put -- so a later placeholder for
+        // this id draws nothing rather than sampling outside the crop (which would read the adjacent
+        // pixel row and leak cropped-out data).
+        _kittyVirtualIds.erase(id);
+        return;
+    }
     const auto [targetW, targetH] = _kittyTargetPixels(cropW, cropH, cols, rows, cellWidth, cellHeight);
     const auto gridCols = std::clamp<int64_t>((targetW + cellWidth - 1) / cellWidth, 1, maxCells);
     const auto gridRows = std::clamp<int64_t>((targetH + cellHeight - 1) / cellHeight, 1, maxCells);
@@ -5974,12 +5983,13 @@ void AdaptDispatch::_renderKittyPlaceholders(const std::wstring_view segment, co
         {
             // The first two recognized diacritics in the cluster give row then column. A third
             // encodes the most significant byte of a >24-bit image id, which isn't supported yet
-            // (#24). A non-zero third byte means we cannot identify the image, so skip the cell
+            // (#38). A non-zero third byte means we cannot identify the image, so skip the cell
             // rather than render the WRONG low-24-bit image; a third diacritic of 0 leaves a plain
-            // 24-bit id, so it still renders.
+            // 24-bit id, so it still renders. idHighByte starts at -1 (absent) so a 4th+ diacritic
+            // cannot overwrite an explicit 3rd diacritic of index 0 (the spec ignores extras).
             auto rowDiacritic = -1;
             auto colDiacritic = -1;
-            auto idHighByte = 0;
+            auto idHighByte = -1;
             for (auto j = i + 2; j < next; ++j)
             {
                 // A row/col diacritic may be an astral combining mark (index >= 283 in the
@@ -6001,13 +6011,13 @@ void AdaptDispatch::_renderKittyPlaceholders(const std::wstring_view segment, co
                     {
                         colDiacritic = idx;
                     }
-                    else if (idHighByte == 0)
+                    else if (idHighByte < 0)
                     {
                         idHighByte = idx;
                     }
                 }
             }
-            if (idHighByte == 0)
+            if (idHighByte <= 0)
             {
                 const auto cellRow = rowDiacritic >= 0 ? static_cast<uint32_t>(rowDiacritic) : place.autoRow;
                 const auto cellCol = colDiacritic >= 0 ? static_cast<uint32_t>(colDiacritic) : place.autoCol;

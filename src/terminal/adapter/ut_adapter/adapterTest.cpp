@@ -5689,6 +5689,36 @@ public:
         VERIFY_IS_FALSE(BufferContainsColor(*_testGetSet->_textBuffer, 0, 0, 255), L"cropped-out blue must not appear");
     }
 
+    // A virtual placement whose crop is entirely OUTSIDE the image (x past the right edge) must
+    // display nothing -- matching a direct a=T with an empty crop -- rather than storing a 1px
+    // edge crop that samples past the crop into the adjacent pixel row. Regression for the
+    // degenerate-crop leak (the crop was forced to a minimum of 1px).
+    TEST_METHOD(KittyPlaceholderCropOutsideImageDrawsNothing)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        // 2x2 image (TL red, TR green, BL blue, BR white); x=5 is past the 2px width -> empty crop.
+        _stateMachine->ProcessString(L"\x1b_Ga=t,i=1,U=1,f=24,s=2,v=2,x=5,c=2,r=2;/wAAAP8AAAD/////\x1b\\");
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m"); // fg = image id 1
+        _stateMachine->ProcessString(Placeholder() + Placeholder());
+        VERIFY_ARE_EQUAL(0, CountImageRows(*_testGetSet->_textBuffer), L"an empty crop must draw no placeholder cells");
+        VERIFY_IS_FALSE(BufferContainsColor(*_testGetSet->_textBuffer, 255, 0, 0), L"no image pixel may leak from an empty crop (red)");
+        VERIFY_IS_FALSE(BufferContainsColor(*_testGetSet->_textBuffer, 0, 0, 255), L"no adjacent-row pixel may leak from an empty crop (blue)");
+    }
+
+    // A 4th combining diacritic must be IGNORED (spec: only the first three are used). Regression:
+    // idHighByte started at 0, so a 4th diacritic overwrote an explicit 3rd diacritic of index 0
+    // and wrongly skipped the cell. With row 0 + col 0 + 3rd=0 (U+0305) + a non-zero 4th (U+030D),
+    // the cell must still render the plain 24-bit image.
+    TEST_METHOD(KittyPlaceholderFourthDiacriticIgnored)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,f=24,s=1,v=1;/wAA\x1b\\"); // id 1 red
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m"); // fg = image id 1
+        _stateMachine->ProcessString(Placeholder() + L"\x0305" + L"\x0305" + L"\x0305" + L"\x030D"); // row0,col0,3rd=0,4th=1
+        VERIFY_IS_TRUE(BufferContainsColor(*_testGetSet->_textBuffer, 255, 0, 0), L"a 4th diacritic must be ignored; the cell still renders (3rd byte = 0)");
+    }
+
     // Deleting the image by id erases placeholder-rendered cells too.
     TEST_METHOD(KittyPlaceholderDeleteErases)
     {
