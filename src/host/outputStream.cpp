@@ -468,9 +468,16 @@ void ConhostInternalGetSet::ShowNotification(std::wstring_view /*title*/, std::w
 
 bool ConhostInternalGetSet::ReadKittyImageFile(const std::wstring_view path, uint64_t offset, uint64_t size, bool deleteAfter, std::vector<uint8_t>& out) noexcept
 {
-    // Under ConPTY the connected terminal (e.g. Windows Terminal) also processes this
-    // forwarded APC and owns deletion of a t=t temporary file. Deleting it here would
-    // remove it before that terminal can read it, so only the final terminal deletes:
-    // suppress the delete whenever we are in ConPTY mode.
-    return til::read_image_file(path, offset, size, deleteAfter && !IsConPTY(), out);
+    // Under ConPTY, conhost is parse-only: it has no renderer, its ACK is suppressed
+    // (ReturnResponse early-returns in VtIo mode), and the raw APC is forwarded verbatim to
+    // the connected terminal (e.g. Windows Terminal), which performs the file read and owns
+    // t=t deletion. Reading the file here would be redundant filesystem access in the wrong
+    // process context (and deleting it would remove it before the terminal can read it), so
+    // skip the read entirely and let the final terminal handle the transmission.
+    if (IsConPTY())
+    {
+        out.clear();
+        return false;
+    }
+    return til::read_image_file(path, offset, size, deleteAfter, out);
 }
