@@ -5337,12 +5337,80 @@ public:
         _testGetSet->ValidateInputEvent(L"\x1b_Gi=1;EINVAL:unsupported transmission medium\x1b\\");
     }
 
-    // An unsupported delete target (e.g. positional d=p) is rejected, not acted on.
+    // A spec delete target not yet implemented -- z-index (d=z, needs #21) -- is rejected, not
+    // acted on. (The positional selectors d=c/p/x/y/r are now implemented; z/q/f remain gated.)
     TEST_METHOD(KittyGraphicsDeleteUnsupportedTargetIsEinval)
     {
         _testGetSet->PrepData();
-        _stateMachine->ProcessString(L"\x1b_Ga=d,d=p,i=5;\x1b\\");
+        _stateMachine->ProcessString(L"\x1b_Ga=d,d=z,i=5;\x1b\\");
         _testGetSet->ValidateInputEvent(L"\x1b_Gi=5;EINVAL:unsupported delete target\x1b\\");
+    }
+
+    // d=r deletes every image whose id is in the inclusive range [x, y]; ids outside survive.
+    TEST_METHOD(KittyGraphicsDeleteByIdRange)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1b_Ga=t,i=5,f=24,s=1,v=1;AAAA\x1b\\");
+        _stateMachine->ProcessString(L"\x1b_Ga=t,i=6,f=24,s=1,v=1;AAAA\x1b\\");
+        _stateMachine->ProcessString(L"\x1b_Ga=t,i=9,f=24,s=1,v=1;AAAA\x1b\\");
+        _stateMachine->ProcessString(L"\x1b_Ga=d,d=r,x=5,y=6;\x1b\\"); // delete ids 5..6
+        VERIFY_ARE_EQUAL(static_cast<size_t>(0), _pDispatch->_kittyImages.count(5), L"id 5 (in range) deleted");
+        VERIFY_ARE_EQUAL(static_cast<size_t>(0), _pDispatch->_kittyImages.count(6), L"id 6 (in range) deleted");
+        VERIFY_ARE_EQUAL(static_cast<size_t>(1), _pDispatch->_kittyImages.count(9), L"id 9 (outside range) survives");
+    }
+
+    // d=c deletes the placement intersecting the current cursor cell (C=1 keeps the cursor on it).
+    TEST_METHOD(KittyGraphicsDeleteAtCursor)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        _testGetSet->_textBuffer->GetCursor().SetPosition({ 0, 0 });
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,f=24,s=1,v=1,C=1;/wAA\x1b\\"); // red at cursor (0,0), cursor stays
+        VERIFY_IS_TRUE(BufferContainsColor(*_testGetSet->_textBuffer, 255, 0, 0));
+        _stateMachine->ProcessString(L"\x1b_Ga=d,d=c;\x1b\\");
+        VERIFY_IS_FALSE(BufferContainsColor(*_testGetSet->_textBuffer, 255, 0, 0), L"the image at the cursor cell must be deleted");
+    }
+
+    // d=p (x,y are 1-based) deletes only the placement at that cell; a different cell is untouched.
+    TEST_METHOD(KittyGraphicsDeleteAtCell)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        _testGetSet->_textBuffer->GetCursor().SetPosition({ 2, 1 });
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,f=24,s=1,v=1,C=1;/wAA\x1b\\"); // red at 0-based (2,1)
+        VERIFY_IS_TRUE(BufferContainsColor(*_testGetSet->_textBuffer, 255, 0, 0));
+        _stateMachine->ProcessString(L"\x1b_Ga=d,d=p,x=1,y=1;\x1b\\"); // 1-based (1,1) = 0-based (0,0): no match
+        VERIFY_IS_TRUE(BufferContainsColor(*_testGetSet->_textBuffer, 255, 0, 0), L"a non-matching cell must not delete it");
+        _stateMachine->ProcessString(L"\x1b_Ga=d,d=p,x=3,y=2;\x1b\\"); // 1-based (3,2) = 0-based (2,1): match
+        VERIFY_IS_FALSE(BufferContainsColor(*_testGetSet->_textBuffer, 255, 0, 0), L"the image at cell (3,2) must be deleted");
+    }
+
+    // d=x deletes placements intersecting column x (1-based); an image in another column survives.
+    TEST_METHOD(KittyGraphicsDeleteByColumn)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        _testGetSet->_textBuffer->GetCursor().SetPosition({ 0, 0 });
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,f=24,s=1,v=1,C=1;/wAA\x1b\\"); // red at col 0
+        _testGetSet->_textBuffer->GetCursor().SetPosition({ 3, 0 });
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=2,f=24,s=1,v=1,C=1;AP8A\x1b\\"); // green at col 3
+        _stateMachine->ProcessString(L"\x1b_Ga=d,d=x,x=1;\x1b\\"); // column 1 (1-based) = screen col 0
+        VERIFY_IS_FALSE(BufferContainsColor(*_testGetSet->_textBuffer, 255, 0, 0), L"the image in column 0 must be deleted");
+        VERIFY_IS_TRUE(BufferContainsColor(*_testGetSet->_textBuffer, 0, 255, 0), L"the image in column 3 must survive");
+    }
+
+    // d=y deletes placements intersecting row y (1-based); an image on another row survives.
+    TEST_METHOD(KittyGraphicsDeleteByRow)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        _testGetSet->_textBuffer->GetCursor().SetPosition({ 0, 0 });
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,f=24,s=1,v=1,C=1;/wAA\x1b\\"); // red on row 0
+        _testGetSet->_textBuffer->GetCursor().SetPosition({ 0, 2 });
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=2,f=24,s=1,v=1,C=1;AP8A\x1b\\"); // green on row 2
+        _stateMachine->ProcessString(L"\x1b_Ga=d,d=y,y=1;\x1b\\"); // row 1 (1-based) = screen row 0
+        VERIFY_IS_FALSE(BufferContainsColor(*_testGetSet->_textBuffer, 255, 0, 0), L"the image on row 0 must be deleted");
+        VERIFY_IS_TRUE(BufferContainsColor(*_testGetSet->_textBuffer, 0, 255, 0), L"the image on row 2 must survive");
     }
 
     // Delete-by-id (d=i) without an id is rejected.
