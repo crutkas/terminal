@@ -5608,7 +5608,46 @@ void AdaptDispatch::_ProcessKittyCommand(const KittyControl& command, const std:
                     code = L"EINVAL:delete by number requires I";
                 }
                 break;
-            default: // positional (d=p) and other selectors are not in this MVP
+            case L'c': // placements intersecting the current cursor cell
+            case L'C':
+            {
+                auto page = _pages.ActivePage();
+                const auto cursor = page.Cursor().GetPosition();
+                _deleteKittyImagesIntersecting(cursor.x, cursor.y, cursor.x + 1, cursor.y + 1);
+                break;
+            }
+            case L'p': // placements intersecting the cell at (x, y) [x/y are 1-based]
+            case L'P':
+                if (command.srcX != 0 && command.srcY != 0)
+                {
+                    const auto px = static_cast<til::CoordType>(std::min<uint32_t>(command.srcX, static_cast<uint32_t>(INT32_MAX))) - 1;
+                    const auto py = static_cast<til::CoordType>(std::min<uint32_t>(command.srcY, static_cast<uint32_t>(INT32_MAX))) - 1;
+                    _deleteKittyImagesIntersecting(px, py, px + 1, py + 1);
+                }
+                break;
+            case L'x': // placements intersecting column x [1-based]
+            case L'X':
+                if (command.srcX != 0)
+                {
+                    auto page = _pages.ActivePage();
+                    const auto col = static_cast<til::CoordType>(std::min<uint32_t>(command.srcX, static_cast<uint32_t>(INT32_MAX))) - 1;
+                    _deleteKittyImagesIntersecting(col, 0, col + 1, page.Bottom());
+                }
+                break;
+            case L'y': // placements intersecting row y [1-based]
+            case L'Y':
+                if (command.srcY != 0)
+                {
+                    auto page = _pages.ActivePage();
+                    const auto rowY = static_cast<til::CoordType>(std::min<uint32_t>(command.srcY, static_cast<uint32_t>(INT32_MAX))) - 1;
+                    _deleteKittyImagesIntersecting(0, rowY, page.Width(), rowY + 1);
+                }
+                break;
+            case L'r': // images with id in the inclusive range [x, y]
+            case L'R':
+                _deleteKittyImagesInIdRange(command.srcX, command.srcY);
+                break;
+            default: // z-index (d=z/q, need #21) and animation (d=f, need #22) selectors are not yet supported
                 success = false;
                 code = L"EINVAL:unsupported delete target";
                 break;
@@ -6279,6 +6318,81 @@ void AdaptDispatch::_deleteKittyPlacement(const uint32_t imageId, const uint32_t
     std::deque<std::pair<uint32_t, uint32_t>> removed{ { imageId, placementId } };
     _kittyPlacements.erase(it);
     _cascadeKittyPlacementChildren(removed, 0);
+}
+
+// Deletes every NON-VIRTUAL image with at least one on-screen cell inside the half-open cell
+// rect [left,right) x [top,bottom): erases all of the image's pixels, drops its placements
+// (cascading to relative children), and frees its data -- matching delete-by-id (d=i). Backs the
+// positional selectors d=c (cursor cell), d=p (cell x,y), d=x (column), d=y (row). Uses the
+// on-screen column-owner tags (the authoritative record: a plain a=T placement carries no tracked
+// extent, only owner tags). Per the kitty spec these selectors never affect virtual (U=1)
+// placeholder images -- those are manipulated as text -- so ids present in _kittyVirtualIds are
+// skipped.
+// Protocol: https://sw.kovidgoyal.net/kitty/graphics-protocol/#deleting-images
+void AdaptDispatch::_deleteKittyImagesIntersecting(const til::CoordType left, const til::CoordType top, const til::CoordType right, const til::CoordType bottom)
+{
+    auto page = _pages.ActivePage();
+    auto& buffer = page.Buffer();
+    const auto rowBegin = std::max(0, top);
+    const auto rowEnd = std::min(bottom, page.Bottom());
+    const auto colBegin = std::max(0, left);
+    const auto colEnd = std::min(right, page.Width());
+    if (rowEnd <= rowBegin || colEnd <= colBegin)
+    {
+        return;
+    }
+    // Collect owners first; erasing mutates the buffer, so we must not delete while scanning. The
+    // affected set is tiny (usually one image), so a linear-dedup vector is enough.
+    std::vector<uint32_t> affected;
+    for (auto row = rowBegin; row < rowEnd; ++row)
+    {
+        const auto slice = buffer.GetRowByOffset(row).GetImageSlice();
+        if (!slice)
+        {
+            continue;
+        }
+        for (auto col = colBegin; col < colEnd; ++col)
+        {
+            const auto id = slice->ColumnOwner(col);
+            if (id != 0 && _kittyVirtualIds.count(id) == 0 && std::find(affected.begin(), affected.end(), id) == affected.end())
+            {
+                affected.push_back(id);
+            }
+        }
+    }
+    for (const auto id : affected)
+    {
+        _eraseKittyPlacementsForImage(id);
+        _eraseKittyImage(id);
+        _eraseKittyImageRows(id);
+    }
+}
+
+// Deletes every image whose id is in the INCLUSIVE range [lo, hi] (kitty d=r): erases each image's
+// pixels, drops its placements (registered, anonymous, and virtual -- r/R DO affect virtual
+// placements per the spec), and frees its data. A no-op if lo/hi are unset (0) or reversed.
+// Protocol: https://sw.kovidgoyal.net/kitty/graphics-protocol/#deleting-images
+void AdaptDispatch::_deleteKittyImagesInIdRange(const uint32_t lo, const uint32_t hi)
+{
+    if (lo == 0 || hi == 0 || lo > hi)
+    {
+        return;
+    }
+    // Snapshot the matching ids first; the erase mutates _kittyImages.
+    std::vector<uint32_t> ids;
+    for (const auto& entry : _kittyImages)
+    {
+        if (entry.first >= lo && entry.first <= hi)
+        {
+            ids.push_back(entry.first);
+        }
+    }
+    for (const auto id : ids)
+    {
+        _eraseKittyPlacementsForImage(id);
+        _eraseKittyImage(id);
+        _eraseKittyImageRows(id);
+    }
 }
 
 // Derives the on-screen anchor of a virtual (U=1) parent from its Unicode-placeholder cells:
