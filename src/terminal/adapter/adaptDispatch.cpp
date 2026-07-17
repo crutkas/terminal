@@ -5616,30 +5616,34 @@ void AdaptDispatch::_ProcessKittyCommand(const KittyControl& command, const std:
                 _deleteKittyImagesIntersecting(cursor.x, cursor.y, cursor.x + 1, cursor.y + 1);
                 break;
             }
-            case L'p': // placements intersecting the cell at (x, y) [x/y are 1-based]
+            case L'p': // placements intersecting the cell at (x, y) [x/y 1-based, viewport-relative]
             case L'P':
                 if (command.srcX != 0 && command.srcY != 0)
                 {
-                    const auto px = static_cast<til::CoordType>(std::min<uint32_t>(command.srcX, static_cast<uint32_t>(INT32_MAX))) - 1;
-                    const auto py = static_cast<til::CoordType>(std::min<uint32_t>(command.srcY, static_cast<uint32_t>(INT32_MAX))) - 1;
+                    auto page = _pages.ActivePage();
+                    // Protocol x/y are 1-based and viewport-relative; on-screen owner cells are
+                    // buffer-absolute, so the row is offset by the viewport top (page.Top()). int64
+                    // math + clamps keep a hostile x/y from overflowing til::CoordType.
+                    const auto px = static_cast<til::CoordType>(std::min<int64_t>(static_cast<int64_t>(command.srcX) - 1, page.Width()));
+                    const auto py = static_cast<til::CoordType>(std::min<int64_t>(static_cast<int64_t>(page.Top()) + command.srcY - 1, page.Bottom()));
                     _deleteKittyImagesIntersecting(px, py, px + 1, py + 1);
                 }
                 break;
-            case L'x': // placements intersecting column x [1-based]
+            case L'x': // placements intersecting column x [1-based, viewport-relative]
             case L'X':
                 if (command.srcX != 0)
                 {
                     auto page = _pages.ActivePage();
-                    const auto col = static_cast<til::CoordType>(std::min<uint32_t>(command.srcX, static_cast<uint32_t>(INT32_MAX))) - 1;
-                    _deleteKittyImagesIntersecting(col, 0, col + 1, page.Bottom());
+                    const auto col = static_cast<til::CoordType>(std::min<int64_t>(static_cast<int64_t>(command.srcX) - 1, page.Width()));
+                    _deleteKittyImagesIntersecting(col, page.Top(), col + 1, page.Bottom());
                 }
                 break;
-            case L'y': // placements intersecting row y [1-based]
+            case L'y': // placements intersecting row y [1-based, viewport-relative]
             case L'Y':
                 if (command.srcY != 0)
                 {
                     auto page = _pages.ActivePage();
-                    const auto rowY = static_cast<til::CoordType>(std::min<uint32_t>(command.srcY, static_cast<uint32_t>(INT32_MAX))) - 1;
+                    const auto rowY = static_cast<til::CoordType>(std::min<int64_t>(static_cast<int64_t>(page.Top()) + command.srcY - 1, page.Bottom()));
                     _deleteKittyImagesIntersecting(0, rowY, page.Width(), rowY + 1);
                 }
                 break;

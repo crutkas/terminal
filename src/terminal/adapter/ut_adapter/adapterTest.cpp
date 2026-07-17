@@ -5371,46 +5371,50 @@ public:
         VERIFY_IS_FALSE(BufferContainsColor(*_testGetSet->_textBuffer, 255, 0, 0), L"the image at the cursor cell must be deleted");
     }
 
-    // d=p (x,y are 1-based) deletes only the placement at that cell; a different cell is untouched.
+    // d=p (x,y are 1-based, VIEWPORT-relative) deletes only the placement at that cell; a different
+    // cell is untouched. The mock viewport top is 20, so protocol y maps to buffer row 20+(y-1);
+    // the image sits at buffer row 26 == protocol y 7 (columns are viewport-independent).
     TEST_METHOD(KittyGraphicsDeleteAtCell)
     {
         _testGetSet->PrepData();
         _testGetSet->_cellSize = { 1, 1 };
-        _testGetSet->_textBuffer->GetCursor().SetPosition({ 2, 1 });
-        _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,f=24,s=1,v=1,C=1;/wAA\x1b\\"); // red at 0-based (2,1)
+        _testGetSet->_textBuffer->GetCursor().SetPosition({ 2, 26 }); // col 2, buffer row 26 (viewport row 7)
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,f=24,s=1,v=1,C=1;/wAA\x1b\\");
         VERIFY_IS_TRUE(BufferContainsColor(*_testGetSet->_textBuffer, 255, 0, 0));
-        _stateMachine->ProcessString(L"\x1b_Ga=d,d=p,x=1,y=1;\x1b\\"); // 1-based (1,1) = 0-based (0,0): no match
+        _stateMachine->ProcessString(L"\x1b_Ga=d,d=p,x=1,y=1;\x1b\\"); // protocol (1,1) -> col 0, buffer row 20: no match
         VERIFY_IS_TRUE(BufferContainsColor(*_testGetSet->_textBuffer, 255, 0, 0), L"a non-matching cell must not delete it");
-        _stateMachine->ProcessString(L"\x1b_Ga=d,d=p,x=3,y=2;\x1b\\"); // 1-based (3,2) = 0-based (2,1): match
-        VERIFY_IS_FALSE(BufferContainsColor(*_testGetSet->_textBuffer, 255, 0, 0), L"the image at cell (3,2) must be deleted");
+        _stateMachine->ProcessString(L"\x1b_Ga=d,d=p,x=3,y=7;\x1b\\"); // protocol (3,7) -> col 2, buffer row 26: match
+        VERIFY_IS_FALSE(BufferContainsColor(*_testGetSet->_textBuffer, 255, 0, 0), L"the image at viewport cell (3,7) must be deleted");
     }
 
-    // d=x deletes placements intersecting column x (1-based); an image in another column survives.
+    // d=x deletes placements intersecting column x (1-based) within the viewport; an image in
+    // another column survives. Images sit at buffer row 25 (inside the top=20 viewport).
     TEST_METHOD(KittyGraphicsDeleteByColumn)
     {
         _testGetSet->PrepData();
         _testGetSet->_cellSize = { 1, 1 };
-        _testGetSet->_textBuffer->GetCursor().SetPosition({ 0, 0 });
+        _testGetSet->_textBuffer->GetCursor().SetPosition({ 0, 25 });
         _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,f=24,s=1,v=1,C=1;/wAA\x1b\\"); // red at col 0
-        _testGetSet->_textBuffer->GetCursor().SetPosition({ 3, 0 });
+        _testGetSet->_textBuffer->GetCursor().SetPosition({ 3, 25 });
         _stateMachine->ProcessString(L"\x1b_Ga=T,i=2,f=24,s=1,v=1,C=1;AP8A\x1b\\"); // green at col 3
-        _stateMachine->ProcessString(L"\x1b_Ga=d,d=x,x=1;\x1b\\"); // column 1 (1-based) = screen col 0
+        _stateMachine->ProcessString(L"\x1b_Ga=d,d=x,x=1;\x1b\\"); // column 1 (1-based) = col 0
         VERIFY_IS_FALSE(BufferContainsColor(*_testGetSet->_textBuffer, 255, 0, 0), L"the image in column 0 must be deleted");
         VERIFY_IS_TRUE(BufferContainsColor(*_testGetSet->_textBuffer, 0, 255, 0), L"the image in column 3 must survive");
     }
 
-    // d=y deletes placements intersecting row y (1-based); an image on another row survives.
+    // d=y deletes placements intersecting row y (1-based, VIEWPORT-relative); an image on another
+    // row survives. Viewport top is 20, so protocol y=6 -> buffer row 25.
     TEST_METHOD(KittyGraphicsDeleteByRow)
     {
         _testGetSet->PrepData();
         _testGetSet->_cellSize = { 1, 1 };
-        _testGetSet->_textBuffer->GetCursor().SetPosition({ 0, 0 });
-        _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,f=24,s=1,v=1,C=1;/wAA\x1b\\"); // red on row 0
-        _testGetSet->_textBuffer->GetCursor().SetPosition({ 0, 2 });
-        _stateMachine->ProcessString(L"\x1b_Ga=T,i=2,f=24,s=1,v=1,C=1;AP8A\x1b\\"); // green on row 2
-        _stateMachine->ProcessString(L"\x1b_Ga=d,d=y,y=1;\x1b\\"); // row 1 (1-based) = screen row 0
-        VERIFY_IS_FALSE(BufferContainsColor(*_testGetSet->_textBuffer, 255, 0, 0), L"the image on row 0 must be deleted");
-        VERIFY_IS_TRUE(BufferContainsColor(*_testGetSet->_textBuffer, 0, 255, 0), L"the image on row 2 must survive");
+        _testGetSet->_textBuffer->GetCursor().SetPosition({ 0, 25 });
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,f=24,s=1,v=1,C=1;/wAA\x1b\\"); // red on buffer row 25 (viewport row 6)
+        _testGetSet->_textBuffer->GetCursor().SetPosition({ 0, 27 });
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=2,f=24,s=1,v=1,C=1;AP8A\x1b\\"); // green on buffer row 27
+        _stateMachine->ProcessString(L"\x1b_Ga=d,d=y,y=6;\x1b\\"); // protocol row 6 -> buffer row 25
+        VERIFY_IS_FALSE(BufferContainsColor(*_testGetSet->_textBuffer, 255, 0, 0), L"the image on viewport row 6 must be deleted");
+        VERIFY_IS_TRUE(BufferContainsColor(*_testGetSet->_textBuffer, 0, 255, 0), L"the image on row 27 must survive");
     }
 
     // Delete-by-id (d=i) without an id is rejected.
