@@ -264,9 +264,24 @@ namespace til // Terminal Implementation Library. Also: "Today I Learned"
         }
     } // io
 
+    // Outcome of read_image_file, mapped by the Kitty adapter to the protocol's file
+    // error codes: ok -> (no error); not_found -> ENOENT (the allowed path names no
+    // existing file); invalid -> EINVAL (the request itself is malformed: empty path,
+    // an unsupported path form, or a bad byte range); read_error -> EBADF (the file
+    // exists/is refused but cannot be read: not a regular file, wrong volume, access
+    // or I/O failure).
+    enum class read_image_result : uint8_t
+    {
+        ok,
+        not_found,
+        invalid,
+        read_error,
+    };
+
     // Reads up to a bounded number of bytes from a LOCAL image file for the Kitty
-    // graphics file/temporary transmission media (t=f / t=t), into 'out'. Returns
-    // false (the caller reports EBADF) on any I/O error or policy rejection. This is
+    // graphics file/temporary transmission media (t=f / t=t), into 'out'. Returns a
+    // read_image_result the caller maps to the kitty file error codes: not_found ->
+    // ENOENT, invalid -> EINVAL, read_error -> EBADF, ok -> success. This is
     // the single shared implementation behind ConhostInternalGetSet::ReadKittyImageFile
     // and Terminal::ReadKittyImageFile; the ConPTY delete-suppression gate lives at
     // those call sites, not here.
@@ -289,7 +304,7 @@ namespace til // Terminal Implementation Library. Also: "Today I Learned"
     //    AND its name contains kitty's "tty-graphics-protocol" marker, so the medium
     //    cannot delete arbitrary files.
     // Never throws.
-    _TIL_INLINEPREFIX bool read_image_file(const std::wstring_view path, uint64_t offset, uint64_t size, bool deleteAfter, std::vector<uint8_t>& out) noexcept
+    _TIL_INLINEPREFIX read_image_result read_image_file(const std::wstring_view path, uint64_t offset, uint64_t size, bool deleteAfter, std::vector<uint8_t>& out) noexcept
     {
         out.clear();
 
@@ -299,7 +314,7 @@ namespace til // Terminal Implementation Library. Also: "Today I Learned"
 
         if (path.empty())
         {
-            return false;
+            return read_image_result::invalid;
         }
 
         const auto isSep = [](const wchar_t c) noexcept { return c == L'\\' || c == L'/'; };
@@ -308,7 +323,7 @@ namespace til // Terminal Implementation Library. Also: "Today I Learned"
         // characters are separators ("\\server\share", "\\.\dev", "\\?\...", "//host/..").
         if (path.size() >= 2 && isSep(path[0]) && isSep(path[1]))
         {
-            return false;
+            return read_image_result::invalid;
         }
 
         // Require a drive-absolute local path ("X:\..."): reject relative and drive-
@@ -318,7 +333,7 @@ namespace til // Terminal Implementation Library. Also: "Today I Learned"
         const auto isAlpha = (driveLetter >= L'a' && driveLetter <= L'z') || (driveLetter >= L'A' && driveLetter <= L'Z');
         if (path.size() < 3 || !isAlpha || path[1] != L':' || !isSep(path[2]))
         {
-            return false;
+            return read_image_result::invalid;
         }
 
         // Defense in depth: reject a non-fixed drive letter BEFORE opening, so a mapped
@@ -328,7 +343,7 @@ namespace til // Terminal Implementation Library. Also: "Today I Learned"
         const wchar_t driveRoot[]{ driveLetter, L':', L'\\', L'\0' };
         if (GetDriveTypeW(driveRoot) != DRIVE_FIXED)
         {
-            return false;
+            return read_image_result::invalid;
         }
 
         std::wstring pathStr;
@@ -338,7 +353,7 @@ namespace til // Terminal Implementation Library. Also: "Today I Learned"
         }
         catch (...)
         {
-            return false;
+            return read_image_result::read_error;
         }
 
         // Open read-only; request DELETE only when we might remove a temp file so a plain
@@ -355,7 +370,10 @@ namespace til // Terminal Implementation Library. Also: "Today I Learned"
         }
         if (!file)
         {
-            return false;
+            const auto err = GetLastError();
+            return (err == ERROR_FILE_NOT_FOUND || err == ERROR_PATH_NOT_FOUND)
+                       ? read_image_result::not_found
+                       : read_image_result::read_error;
         }
 
         // Spec requirement (kitty graphics protocol): only REGULAR files may be read via t=f/t=t;
@@ -367,7 +385,7 @@ namespace til // Terminal Implementation Library. Also: "Today I Learned"
         // reserved-name edge.
         if (GetFileType(file.get()) != FILE_TYPE_DISK)
         {
-            return false;
+            return read_image_result::read_error;
         }
 
         // Resolves the fully-normalized on-disk path for an open handle (following
@@ -401,7 +419,7 @@ namespace til // Terminal Implementation Library. Also: "Today I Learned"
         const auto canonical = finalPath(file.get());
         if (canonical.empty())
         {
-            return false;
+            return read_image_result::read_error;
         }
 
         // Reject a UNC final path. A drive-absolute client path can still resolve through
@@ -410,7 +428,7 @@ namespace til // Terminal Implementation Library. Also: "Today I Learned"
         if (canonical.size() >= uncPrefix.size() &&
             CompareStringOrdinal(canonical.c_str(), static_cast<int>(uncPrefix.size()), uncPrefix.data(), static_cast<int>(uncPrefix.size()), TRUE) == CSTR_EQUAL)
         {
-            return false;
+            return read_image_result::read_error;
         }
 
         // Require a fixed local volume: reject network/removable/optical drives
@@ -418,18 +436,18 @@ namespace til // Terminal Implementation Library. Also: "Today I Learned"
         wchar_t volumeRoot[MAX_PATH]{};
         if (!GetVolumePathNameW(canonical.c_str(), volumeRoot, ARRAYSIZE(volumeRoot)) || GetDriveTypeW(volumeRoot) != DRIVE_FIXED)
         {
-            return false;
+            return read_image_result::read_error;
         }
 
         LARGE_INTEGER fileSize{};
         if (!GetFileSizeEx(file.get(), &fileSize) || fileSize.QuadPart < 0)
         {
-            return false;
+            return read_image_result::read_error;
         }
         const auto total = static_cast<uint64_t>(fileSize.QuadPart);
         if (offset > total)
         {
-            return false; // offset past end of file
+            return read_image_result::invalid; // offset past end of file
         }
 
         // Bytes to read: what remains after the offset, clamped by the client's S= when
@@ -447,7 +465,7 @@ namespace til // Terminal Implementation Library. Also: "Today I Learned"
             move.QuadPart = static_cast<LONGLONG>(offset);
             if (!SetFilePointerEx(file.get(), move, nullptr, FILE_BEGIN))
             {
-                return false;
+                return read_image_result::read_error;
             }
         }
 
@@ -458,14 +476,14 @@ namespace til // Terminal Implementation Library. Also: "Today I Learned"
         catch (...)
         {
             out.clear();
-            return false;
+            return read_image_result::read_error;
         }
 
         DWORD read = 0;
         if (toRead != 0 && !ReadFile(file.get(), out.data(), static_cast<DWORD>(toRead), &read, nullptr))
         {
             out.clear();
-            return false;
+            return read_image_result::read_error;
         }
         out.resize(read);
 
@@ -533,6 +551,6 @@ namespace til // Terminal Implementation Library. Also: "Today I Learned"
             }
         }
 
-        return true; // the handle closes here; a set disposition removes the inode.
+        return read_image_result::ok; // the handle closes here; a set disposition removes the inode.
     }
 } // til
