@@ -5968,20 +5968,43 @@ public:
     // low-24-bit image -- the WRONG image (an id collision). This guards that a NON-ZERO 3rd
     // diacritic skips the cell (draws nothing) rather than mis-rendering, while a plain 24-bit
     // id (3rd diacritic absent or 0) still renders.
-    TEST_METHOD(KittyPlaceholderThirdDiacriticSkipsUnsupportedId)
+    // #38: a 3rd rowcolumn diacritic supplies the HIGH byte of a >24-bit image id. The fg gives
+    // the low 24 bits, so a 3rd diacritic of index N selects id (N<<24)|low -- a DIFFERENT image
+    // than the low-24-bit one. Transmit id=1 (red) and id=0x01000001 (green) with the same low
+    // bits; the 3rd diacritic picks between them.
+    TEST_METHOD(KittyPlaceholderThirdDiacriticSelectsHighByteImage)
     {
         _testGetSet->PrepData();
-        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,f=24,s=1,v=1;/wAA\x1b\\"); // id1 red (24-bit)
-        _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m"); // fg id 1
-        _stateMachine->ProcessString(Placeholder() + L"\x0305" + L"\x0305"); // row 0, col 0, no 3rd -> renders
-        VERIFY_IS_TRUE(BufferContainsColor(*_testGetSet->_textBuffer, 255, 0, 0), L"a plain 24-bit id placeholder renders");
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,f=24,s=1,v=1;/wAA\x1b\\"); // id 0x000001 red
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=16777217,f=24,s=1,v=1;AP8A\x1b\\"); // id 0x01000001 green
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m"); // fg low bits = 1
+        _stateMachine->ProcessString(Placeholder() + L"\x0305" + L"\x0305"); // no 3rd -> id 1 -> red
+        _stateMachine->ProcessString(Placeholder() + L"\x0305" + L"\x0305" + L"\x030D"); // 3rd=1 -> id 0x01000001 -> green
+        VERIFY_IS_TRUE(BufferContainsColor(*_testGetSet->_textBuffer, 255, 0, 0), L"no 3rd diacritic selects the low-24-bit image (red)");
+        VERIFY_IS_TRUE(BufferContainsColor(*_testGetSet->_textBuffer, 0, 255, 0), L"a 3rd diacritic of index 1 selects the >24-bit image (green)");
+    }
 
+    // A 3rd diacritic composing an id with no transmitted image draws nothing -- it is NOT
+    // mis-rendered as the low-24-bit image (the original id-collision hazard).
+    TEST_METHOD(KittyPlaceholderUnknownHighByteIdSkips)
+    {
         _testGetSet->PrepData();
-        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,f=24,s=1,v=1;/wAA\x1b\\"); // id1 red
-        _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m");
-        // A 3rd diacritic with a NON-ZERO index (\x030D = 1) = high id byte => a >24-bit id.
-        _stateMachine->ProcessString(Placeholder() + L"\x0305" + L"\x0305" + L"\x030D");
-        VERIFY_IS_FALSE(BufferContainsColor(*_testGetSet->_textBuffer, 255, 0, 0), L"a non-zero 3rd diacritic (>24-bit id) must skip the cell, not render the low-24-bit image");
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,f=24,s=1,v=1;/wAA\x1b\\"); // only id 1 (red) exists
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m"); // fg low bits = 1
+        _stateMachine->ProcessString(Placeholder() + L"\x0305" + L"\x0305" + L"\x030D"); // 3rd=1 -> id 0x01000001 (absent)
+        VERIFY_IS_FALSE(BufferContainsColor(*_testGetSet->_textBuffer, 255, 0, 0), L"a >24-bit id with no image must skip, not render the low-24-bit image");
+    }
+
+    // A 3rd diacritic whose index exceeds 255 cannot be an image-id high byte (a byte is 0-255).
+    // Without a guard, index 285 (astral U+1D185) shift-wraps to high byte 0x1D and would compose
+    // id 0x1D000001 with fg low bits 1; an image at that id must NOT render -- the cell is skipped.
+    TEST_METHOD(KittyPlaceholderThirdDiacriticAboveByteRangeSkips)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=486539265,f=24,s=1,v=1;AP8A\x1b\\"); // id 0x1D000001 green
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m"); // fg low bits = 1
+        _stateMachine->ProcessString(Placeholder() + L"\x0305" + L"\x0305" + L"\xD834\xDD85"); // 3rd = U+1D185 (index 285 > 255)
+        VERIFY_IS_FALSE(BufferContainsColor(*_testGetSet->_textBuffer, 0, 255, 0), L"a 3rd diacritic index > 255 must not shift-wrap into a valid id (green must not render)");
     }
 
     // Regression (why): an explicit column/row diacritic OUTSIDE the placement grid used to be
