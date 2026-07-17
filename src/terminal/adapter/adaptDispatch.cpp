@@ -5954,21 +5954,10 @@ void AdaptDispatch::_renderKittyPlaceholders(const std::wstring_view segment, co
         return; // no 24-bit image id => not a Kitty placeholder
     }
     const auto rgb = fg.GetRGB();
-    const uint32_t imageId = (static_cast<uint32_t>(GetRValue(rgb)) << 16) | (static_cast<uint32_t>(GetGValue(rgb)) << 8) | GetBValue(rgb);
-    const auto placement = _kittyVirtualIds.find(imageId);
-    if (placement == _kittyVirtualIds.end())
-    {
-        return; // only U=1 (virtual) images draw via placeholders; ordinary text must not overlay
-    }
-    const auto it = _kittyImages.find(imageId);
-    if (it == _kittyImages.end())
-    {
-        return;
-    }
-    const auto& image = it->second;
-    auto& place = placement->second;
-    const auto cols = std::max<uint32_t>(place.cols, 1);
-    const auto rows = std::max<uint32_t>(place.rows, 1);
+    // The foreground supplies the LOW 24 bits of the image id; an optional 3rd row/column
+    // diacritic supplies the high byte (bits 24-31). The effective id -- and thus which virtual
+    // image a cell references -- is therefore resolved PER CELL inside the loop below.
+    const uint32_t imageIdLow = (static_cast<uint32_t>(GetRValue(rgb)) << 16) | (static_cast<uint32_t>(GetGValue(rgb)) << 8) | GetBValue(rgb);
 
     // Per the kitty spec, an absent row/col diacritic uses a running counter that advances
     // only when a placeholder cell is drawn (col++ per cell; on overflow col=0, row++). The
@@ -5981,12 +5970,10 @@ void AdaptDispatch::_renderKittyPlaceholders(const std::wstring_view segment, co
         const auto next = buffer.GraphemeNext(segment, i);
         if (i + 1 < next && segment[i] == KittyPlaceholderCodePointHigh && segment[i + 1] == KittyPlaceholderCodePointLow)
         {
-            // The first two recognized diacritics in the cluster give row then column. A third
-            // encodes the most significant byte of a >24-bit image id, which isn't supported yet
-            // (#38). A non-zero third byte means we cannot identify the image, so skip the cell
-            // rather than render the WRONG low-24-bit image; a third diacritic of 0 leaves a plain
-            // 24-bit id, so it still renders. idHighByte starts at -1 (absent) so a 4th+ diacritic
-            // cannot overwrite an explicit 3rd diacritic of index 0 (the spec ignores extras).
+            // The first two recognized diacritics in the cluster give row then column; an optional
+            // third gives the most significant byte of a >24-bit image id (composed below).
+            // idHighByte starts at -1 (absent) so a 4th+ diacritic cannot overwrite an explicit 3rd
+            // diacritic of index 0 (the spec ignores extras); absent or 0 leaves a plain 24-bit id.
             auto rowDiacritic = -1;
             auto colDiacritic = -1;
             auto idHighByte = -1;
@@ -6017,19 +6004,34 @@ void AdaptDispatch::_renderKittyPlaceholders(const std::wstring_view segment, co
                     }
                 }
             }
-            if (idHighByte <= 0)
+            // Compose the effective id from the fg low bits and the optional high byte, then look
+            // up THAT virtual image. A non-zero high byte selects a >24-bit id; if no such image
+            // exists the cell is skipped (never rendered as the wrong low-24-bit image). Ordinary
+            // text whose fg is not a virtual image id also finds nothing and draws no overlay.
+            // The high byte is 0-255; a 3rd diacritic index > 255 cannot be a byte, so it is not a
+            // valid id and the cell is skipped (also avoids overflowing the << 24 shift).
+            if (idHighByte <= 255)
             {
-                const auto cellRow = rowDiacritic >= 0 ? static_cast<uint32_t>(rowDiacritic) : place.autoRow;
-                const auto cellCol = colDiacritic >= 0 ? static_cast<uint32_t>(colDiacritic) : place.autoCol;
-                _placeKittyPlaceholderCell(image, imageId, column, screenRow, cellRow, cellCol, rows, cols, place.cropX, place.cropY, place.cropW, place.cropH);
-                // Advance the running counter past this cell (wrapping col -> row), so the next
-                // auto cell continues sequentially regardless of screen row, wrap, or scroll.
-                place.autoRow = cellRow;
-                place.autoCol = cellCol + 1;
-                if (place.autoCol >= cols)
+                const auto imageId = idHighByte > 0 ? (imageIdLow | (static_cast<uint32_t>(idHighByte) << 24)) : imageIdLow;
+                const auto placement = _kittyVirtualIds.find(imageId);
+                const auto imageEntry = _kittyImages.find(imageId);
+                if (placement != _kittyVirtualIds.end() && imageEntry != _kittyImages.end())
                 {
-                    place.autoCol = 0;
-                    place.autoRow = std::min<uint32_t>(place.autoRow + 1, rows - 1);
+                    auto& place = placement->second;
+                    const auto cols = std::max<uint32_t>(place.cols, 1);
+                    const auto rows = std::max<uint32_t>(place.rows, 1);
+                    const auto cellRow = rowDiacritic >= 0 ? static_cast<uint32_t>(rowDiacritic) : place.autoRow;
+                    const auto cellCol = colDiacritic >= 0 ? static_cast<uint32_t>(colDiacritic) : place.autoCol;
+                    _placeKittyPlaceholderCell(imageEntry->second, imageId, column, screenRow, cellRow, cellCol, rows, cols, place.cropX, place.cropY, place.cropW, place.cropH);
+                    // Advance the running counter past this cell (wrapping col -> row), so the next
+                    // auto cell continues sequentially regardless of screen row, wrap, or scroll.
+                    place.autoRow = cellRow;
+                    place.autoCol = cellCol + 1;
+                    if (place.autoCol >= cols)
+                    {
+                        place.autoCol = 0;
+                        place.autoRow = std::min<uint32_t>(place.autoRow + 1, rows - 1);
+                    }
                 }
             }
         }
