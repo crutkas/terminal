@@ -4634,18 +4634,202 @@ public:
         _testGetSet->ValidateInputEvent(L"\x1b_Gi=5;OK\x1b\\");
     }
 
-    // Deleting by id (d=i) removes only the targeted image; others survive.
+    // Deleting by id (d=I) removes only the targeted image and frees its data; others survive.
     TEST_METHOD(KittyGraphicsDeleteByIdPreservesOthers)
     {
         _testGetSet->PrepData();
         _stateMachine->ProcessString(L"\x1b_Ga=t,i=8,f=24,s=1,v=1;AAAA\x1b\\");
         _stateMachine->ProcessString(L"\x1b_Ga=t,i=9,f=24,s=1,v=1;AAAA\x1b\\");
-        _stateMachine->ProcessString(L"\x1b_Ga=d,d=i,i=8;\x1b\\");
+        _stateMachine->ProcessString(L"\x1b_Ga=d,d=I,i=8;\x1b\\");
         _testGetSet->_response.clear();
         _stateMachine->ProcessString(L"\x1b_Ga=p,i=8;\x1b\\");
         _testGetSet->ValidateInputEvent(L"\x1b_Gi=8;ENOENT:image not found\x1b\\");
         _stateMachine->ProcessString(L"\x1b_Ga=p,i=9;\x1b\\");
         _testGetSet->ValidateInputEvent(L"\x1b_Gi=9;OK\x1b\\");
+    }
+
+    // Lowercase d=i deletes the placement and erases the on-screen pixels but KEEPS the image data,
+    // so a later a=p re-displays it without re-transmitting (kitty spec: lowercase keeps data).
+    TEST_METHOD(KittyGraphicsDeleteLowercaseKeepsImageData)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,f=24,s=1,v=1,C=1;/wAA\x1b\\"); // display red
+        VERIFY_IS_TRUE(BufferContainsColor(*_testGetSet->_textBuffer, 255, 0, 0));
+        _stateMachine->ProcessString(L"\x1b_Ga=d,d=i,i=1;\x1b\\"); // lowercase: keep the image data
+        VERIFY_IS_FALSE(BufferContainsColor(*_testGetSet->_textBuffer, 255, 0, 0), L"lowercase delete still erases on-screen pixels");
+        _testGetSet->_response.clear();
+        _stateMachine->ProcessString(L"\x1b_Ga=p,i=1;\x1b\\"); // image data survived -> OK, not ENOENT
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=1;OK\x1b\\");
+    }
+
+    // Lowercase d=n (by number) keeps the image data too; it stays findable by its number.
+    TEST_METHOD(KittyGraphicsDeleteLowercaseByNumberKeepsData)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1b_Ga=t,I=7,f=24,s=1,v=1;AAAA\x1b\\"); // image number 7
+        _stateMachine->ProcessString(L"\x1b_Ga=d,d=n,I=7;\x1b\\"); // lowercase n: keep data
+        _testGetSet->_response.clear();
+        _stateMachine->ProcessString(L"\x1b_Ga=p,I=7;\x1b\\"); // still resolvable by number
+        _testGetSet->ValidateInputEvent(L"\x1b_GI=7;OK\x1b\\");
+    }
+
+    // Lowercase d=i,p deleting an image's LAST placement keeps the image data (uppercase would free
+    // it -- see KittyDeleteLastPlacementRemovesImage), so a new placement can still be created.
+    TEST_METHOD(KittyGraphicsDeleteLastPlacementLowercaseKeepsImage)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,p=1,f=24,s=1,v=1,C=1;/wAA\x1b\\"); // only placement (1,1)
+        _stateMachine->ProcessString(L"\x1b_Ga=d,d=i,i=1,p=1;\x1b\\"); // lowercase: delete placement, keep data
+        VERIFY_IS_TRUE(_pDispatch->_kittyPlacements.empty(), L"the placement is removed");
+        _testGetSet->_response.clear();
+        _stateMachine->ProcessString(L"\x1b_Ga=p,i=1,p=2;\x1b\\"); // image data survived -> new placement OK
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=1,p=2;OK\x1b\\");
+    }
+
+    // Lowercase d=r (id range) keeps the image data of every id in the range.
+    TEST_METHOD(KittyGraphicsDeleteRangeLowercaseKeepsData)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1b_Ga=t,i=5,f=24,s=1,v=1;AAAA\x1b\\");
+        _stateMachine->ProcessString(L"\x1b_Ga=d,d=r,x=5,y=5;\x1b\\"); // lowercase r: keep data
+        VERIFY_ARE_EQUAL(static_cast<size_t>(1), _pDispatch->_kittyImages.count(5), L"lowercase d=r keeps the image data");
+        _testGetSet->_response.clear();
+        _stateMachine->ProcessString(L"\x1b_Ga=p,i=5;\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=5;OK\x1b\\");
+    }
+
+    // Group lifetime: even a LOWERCASE parent delete frees a relative child's image (the child has
+    // no placement left), per the group semantics, while the parent's OWN data is kept (lowercase).
+    TEST_METHOD(KittyGraphicsDeleteLowercaseParentKeepsDataFreesChild)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,p=1,f=24,s=1,v=1,C=1;/wAA\x1b\\"); // parent (1,1)
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=2,p=1,P=1,Q=1,f=24,s=1,v=1,C=1;AP8A\x1b\\"); // child (2,1) rel parent
+        _stateMachine->ProcessString(L"\x1b_Ga=d,d=i,i=1;\x1b\\"); // lowercase delete of the parent image
+        _testGetSet->_response.clear();
+        _stateMachine->ProcessString(L"\x1b_Ga=p,i=2;\x1b\\"); // child image freed by the group cascade
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=2;ENOENT:image not found\x1b\\");
+        _stateMachine->ProcessString(L"\x1b_Ga=p,i=1;\x1b\\"); // parent DATA kept (lowercase)
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=1;OK\x1b\\");
+    }
+
+    // Lowercase d=i on a VIRTUAL (U=1) image deletes the virtual placement -- a later placeholder is
+    // inert -- but keeps the image DATA so a=p still displays it. (Virtual placements are deleted by
+    // i/I/n/N/r/R regardless of case; only the data free is case-gated.)
+    TEST_METHOD(KittyGraphicsDeleteLowercaseVirtualDropsPlacementKeepsData)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,f=24,s=1,v=1;/wAA\x1b\\"); // virtual red
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m"); // fg = image id 1
+        _stateMachine->ProcessString(Placeholder());
+        VERIFY_IS_TRUE(BufferContainsColor(*_testGetSet->_textBuffer, 255, 0, 0), L"placeholder overlays the virtual image");
+
+        _stateMachine->ProcessString(L"\x1b_Ga=d,d=i,i=1;\x1b\\"); // lowercase: drop virtual placement, keep data
+        _stateMachine->ProcessString(Placeholder()); // a new placeholder must be inert now
+        VERIFY_ARE_EQUAL(0, CountImageRows(*_testGetSet->_textBuffer), L"the virtual placement is gone; a re-printed placeholder is inert");
+
+        _testGetSet->_response.clear();
+        _stateMachine->ProcessString(L"\x1b_Ga=p,i=1;\x1b\\"); // image DATA survived
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=1;OK\x1b\\");
+    }
+
+    // Lowercase single-placement delete (d=i,i=1,p=1) of a VIRTUAL placement drops the per-image
+    // virtual grid (a re-printed placeholder is inert) and keeps the image DATA. A virtual placement
+    // draws no cells of its own, so d=i,p exercises _deleteKittyPlacement's virtual-grid teardown
+    // rather than a per-placement cell erase -- without it the grid (and pixels) would survive and
+    // the lowercase p= delete would be a no-op.
+    TEST_METHOD(KittyGraphicsDeleteLowercaseVirtualPlacementByIdKeepsData)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,p=1,f=24,s=1,v=1;/wAA\x1b\\"); // virtual red, placement id 1
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m"); // fg = image id 1
+        _stateMachine->ProcessString(Placeholder());
+        VERIFY_IS_TRUE(BufferContainsColor(*_testGetSet->_textBuffer, 255, 0, 0), L"placeholder overlays the virtual image");
+
+        _stateMachine->ProcessString(L"\x1b_Ga=d,d=i,i=1,p=1;\x1b\\"); // lowercase: drop just this virtual placement, keep data
+        _stateMachine->ProcessString(Placeholder()); // a new placeholder must be inert now
+        VERIFY_ARE_EQUAL(0, CountImageRows(*_testGetSet->_textBuffer), L"the virtual placement is gone; a re-printed placeholder is inert");
+
+        _testGetSet->_response.clear();
+        _stateMachine->ProcessString(L"\x1b_Ga=p,i=1;\x1b\\"); // image DATA survived
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=1;OK\x1b\\");
+    }
+
+    // Uppercase single-placement delete (d=I,i=1,p=1) of a VIRTUAL placement drops the grid AND
+    // frees the image data (the image has no placements left) -- the case-gated other half of the
+    // lowercase test above, proving _deleteKittyPlacement's freeData path reaches virtual images.
+    TEST_METHOD(KittyGraphicsDeleteUppercaseVirtualPlacementByIdFreesData)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,p=1,f=24,s=1,v=1;/wAA\x1b\\"); // virtual red, placement id 1
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m"); // fg = image id 1
+        _stateMachine->ProcessString(Placeholder());
+        VERIFY_IS_TRUE(BufferContainsColor(*_testGetSet->_textBuffer, 255, 0, 0), L"placeholder overlays the virtual image");
+
+        _stateMachine->ProcessString(L"\x1b_Ga=d,d=I,i=1,p=1;\x1b\\"); // uppercase: drop placement AND free data
+        _testGetSet->_response.clear();
+        _stateMachine->ProcessString(L"\x1b_Ga=p,i=1;\x1b\\"); // image DATA freed
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=1;ENOENT:image not found\x1b\\");
+    }
+
+    // Deleting a VIRTUAL placement of an image that ALSO has a NORMAL placement must never wipe the
+    // sibling normal placement -- both share the per-image owner tag and move together under
+    // scrolling, so there is no scroll-safe way to erase just the placeholder cells. We guarantee
+    // the sibling's pixels survive (p='s delete-only-this-placement) by skipping the whole-image
+    // erase when a normal sibling exists; the now-inert placeholder pixels are left (grid dropped,
+    // so nothing re-renders). Regression for the reviewer's mixed-state finding.
+    TEST_METHOD(KittyGraphicsDeleteVirtualPlacementKeepsSiblingNormalPlacement)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        auto& buf = *_testGetSet->_textBuffer;
+
+        // A NORMAL placement (1,1) drawn at a known cell (C=1 keeps the cursor put).
+        _pDispatch->CursorPosition(3, 3);
+        const auto normalPos = buf.GetCursor().GetPosition();
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,p=1,f=24,s=1,v=1,C=1;/wAA\x1b\\"); // red, non-virtual
+        const auto* normalSlice = buf.GetRowByOffset(normalPos.y).GetImageSlice();
+        VERIFY_IS_NOT_NULL(normalSlice);
+        VERIFY_ARE_EQUAL(1u, normalSlice->ColumnOwner(normalPos.x), L"the normal placement (1,1) owns its cell");
+
+        // A VIRTUAL placement (1,2) of the SAME image, shown by a placeholder on a different row.
+        _stateMachine->ProcessString(L"\x1b_Ga=p,U=1,i=1,p=2,c=1,r=1;\x1b\\"); // register the virtual grid + placement (1,2)
+        _pDispatch->CursorPosition(12, 12);
+        const auto phPos = buf.GetCursor().GetPosition();
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m"); // fg = image id 1
+        _stateMachine->ProcessString(L"\xDBFB\xDEEE"); // one U+10EEEE placeholder
+        const auto* phSlice = buf.GetRowByOffset(phPos.y).GetImageSlice();
+        VERIFY_IS_NOT_NULL(phSlice);
+        VERIFY_ARE_EQUAL(1u, phSlice->ColumnOwner(phPos.x), L"the virtual placement's placeholder owns its cell");
+
+        _stateMachine->ProcessString(L"\x1b_Ga=d,d=i,i=1,p=2;\x1b\\"); // lowercase: delete just the virtual placement
+
+        VERIFY_ARE_EQUAL(static_cast<size_t>(0), _pDispatch->_kittyPlacements.count({ 1u, 2u }), L"the virtual placement (1,2) is gone");
+        VERIFY_ARE_EQUAL(static_cast<size_t>(1), _pDispatch->_kittyPlacements.count({ 1u, 1u }), L"the normal placement (1,1) survives");
+        VERIFY_ARE_EQUAL(static_cast<size_t>(1), _pDispatch->_kittyImages.count(1u), L"lowercase kept the image data");
+        // The invariant we guarantee: the surviving normal placement (1,1) keeps its pixels.
+        const auto* normalAfter = buf.GetRowByOffset(normalPos.y).GetImageSlice();
+        VERIFY_IS_NOT_NULL(normalAfter);
+        VERIFY_ARE_EQUAL(1u, normalAfter->ColumnOwner(normalPos.x), L"the surviving normal placement (1,1) keeps its pixels");
+        // The placeholder pixels are intentionally left inert (grid dropped): erasing them is not
+        // scroll-safe without risking the sibling, so the sibling wins. Documented limitation.
+        const auto* phAfter = buf.GetRowByOffset(phPos.y).GetImageSlice();
+        VERIFY_IS_TRUE(phAfter != nullptr && phAfter->ColumnOwner(phPos.x) == 1u, L"placeholder pixels are left inert to protect the sibling (tracked follow-up)");
+    }
+
+    // Deleting the ONLY (virtual) placement of an image still erases its placeholder pixels even
+    // after the buffer scrolls -- the erase is owner-tag-based (scroll-safe), not anchor-based.
+    TEST_METHOD(KittyGraphicsDeleteVirtualPlacementErasesAfterScroll)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,p=1,f=24,s=1,v=1;/wAA\x1b\\"); // virtual red, placement id 1
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m"); // fg = image id 1
+        _stateMachine->ProcessString(Placeholder());
+        VERIFY_IS_TRUE(BufferContainsColor(*_testGetSet->_textBuffer, 255, 0, 0), L"placeholder overlays the virtual image");
+
+        _stateMachine->ProcessString(L"\r\n\r\n"); // scroll the placeholder up a couple rows
+        _stateMachine->ProcessString(L"\x1b_Ga=d,d=i,i=1,p=1;\x1b\\"); // lowercase single-placement delete
+        VERIFY_IS_FALSE(BufferContainsColor(*_testGetSet->_textBuffer, 255, 0, 0), L"the scroll-safe erase clears the placeholder pixels wherever they scrolled");
     }
 
     // Delete-all (a=d,d=a) clears every registered image.
@@ -5004,7 +5188,7 @@ public:
     {
         _testGetSet->PrepData();
         _stateMachine->ProcessString(L"\x1b_Ga=t,i=5,f=32,s=1,v=1;/wAA/w==\x1b\\");
-        _stateMachine->ProcessString(L"\x1b_Ga=d,d=i,i=5;\x1b\\");
+        _stateMachine->ProcessString(L"\x1b_Ga=d,d=I,i=5;\x1b\\");
         _testGetSet->_response.clear();
         _stateMachine->ProcessString(L"\x1b_Ga=p,i=5;\x1b\\");
         _testGetSet->ValidateInputEvent(L"\x1b_Gi=5;ENOENT:image not found\x1b\\");
@@ -5178,13 +5362,13 @@ public:
         _testGetSet->ValidateInputEvent(L"\x1b_Gi=2,I=7;OK\x1b\\");
     }
 
-    // Delete by number (d=n) removes only the targeted image; others survive.
+    // Delete by number (d=N) removes only the targeted image and frees its data; others survive.
     TEST_METHOD(KittyGraphicsDeleteByNumber)
     {
         _testGetSet->PrepData();
         _stateMachine->ProcessString(L"\x1b_Ga=t,I=7,f=24,s=1,v=1;AAAA\x1b\\");
         _stateMachine->ProcessString(L"\x1b_Ga=t,I=8,f=24,s=1,v=1;AAAA\x1b\\");
-        _stateMachine->ProcessString(L"\x1b_Ga=d,d=n,I=7;\x1b\\");
+        _stateMachine->ProcessString(L"\x1b_Ga=d,d=N,I=7;\x1b\\");
         _testGetSet->_response.clear();
         _stateMachine->ProcessString(L"\x1b_Ga=p,I=7;\x1b\\");
         _testGetSet->ValidateInputEvent(L"\x1b_GI=7;ENOENT:image not found\x1b\\");
@@ -5353,7 +5537,7 @@ public:
         _stateMachine->ProcessString(L"\x1b_Ga=t,i=5,f=24,s=1,v=1;AAAA\x1b\\");
         _stateMachine->ProcessString(L"\x1b_Ga=t,i=6,f=24,s=1,v=1;AAAA\x1b\\");
         _stateMachine->ProcessString(L"\x1b_Ga=t,i=9,f=24,s=1,v=1;AAAA\x1b\\");
-        _stateMachine->ProcessString(L"\x1b_Ga=d,d=r,x=5,y=6;\x1b\\"); // delete ids 5..6
+        _stateMachine->ProcessString(L"\x1b_Ga=d,d=R,x=5,y=6;\x1b\\"); // delete ids 5..6 (uppercase frees data)
         VERIFY_ARE_EQUAL(static_cast<size_t>(0), _pDispatch->_kittyImages.count(5), L"id 5 (in range) deleted");
         VERIFY_ARE_EQUAL(static_cast<size_t>(0), _pDispatch->_kittyImages.count(6), L"id 6 (in range) deleted");
         VERIFY_ARE_EQUAL(static_cast<size_t>(1), _pDispatch->_kittyImages.count(9), L"id 9 (outside range) survives");
@@ -5499,7 +5683,7 @@ public:
         VERIFY_ARE_EQUAL(static_cast<size_t>(16), _pDispatch->_kittyTotalPixelBytes);
         _stateMachine->ProcessString(L"\x1b_Ga=t,i=1,f=32,s=2,v=2;AAAAAAAAAAAAAAAAAAAAAA==\x1b\\"); // replace
         VERIFY_ARE_EQUAL(static_cast<size_t>(16), _pDispatch->_kittyTotalPixelBytes);
-        _stateMachine->ProcessString(L"\x1b_Ga=d,d=i,i=1;\x1b\\"); // delete frees bytes
+        _stateMachine->ProcessString(L"\x1b_Ga=d,d=I,i=1;\x1b\\"); // delete frees bytes
         VERIFY_ARE_EQUAL(static_cast<size_t>(0), _pDispatch->_kittyTotalPixelBytes);
     }
 
@@ -7121,7 +7305,7 @@ public:
         _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,p=1,f=24,s=1,v=1,C=1;/wAA\x1b\\"); // parent
         _stateMachine->ProcessString(L"\x1b_Ga=T,i=2,p=1,P=1,Q=1,f=24,s=1,v=1,C=1;AP8A\x1b\\"); // child rel parent
         VERIFY_ARE_EQUAL(static_cast<size_t>(2), _pDispatch->_kittyPlacements.size());
-        _stateMachine->ProcessString(L"\x1b_Ga=d,d=i,i=1;\x1b\\"); // delete parent image
+        _stateMachine->ProcessString(L"\x1b_Ga=d,d=I,i=1;\x1b\\"); // delete parent image
         VERIFY_IS_TRUE(_pDispatch->_kittyPlacements.empty(), L"deleting the parent cascades to remove all group placements");
         _testGetSet->_response.clear();
         _stateMachine->ProcessString(L"\x1b_Ga=p,i=2;\x1b\\");
@@ -7610,7 +7794,7 @@ public:
         VERIFY_IS_NOT_NULL(slice);
         VERIFY_ARE_EQUAL(1u, slice->ColumnOwner(pos.x));
 
-        _stateMachine->ProcessString(L"\x1b_Ga=d,d=i,i=1,p=1;\x1b\\"); // delete the only placement
+        _stateMachine->ProcessString(L"\x1b_Ga=d,d=I,i=1,p=1;\x1b\\"); // delete the only placement
         VERIFY_IS_TRUE(_pDispatch->_kittyPlacements.empty());
         const auto* gone = buf.GetRowByOffset(pos.y).GetImageSlice();
         VERIFY_IS_TRUE(gone == nullptr || gone->ColumnOwner(pos.x) == 0, L"the placement's pixels must be erased");
@@ -7638,7 +7822,7 @@ public:
         VERIFY_IS_NOT_NULL(childSlice);
         VERIFY_ARE_EQUAL(2u, childSlice->ColumnOwner(childCol));
 
-        _stateMachine->ProcessString(L"\x1b_Ga=d,d=i,i=1,p=1;\x1b\\"); // delete (1,1) -> cascades to its child
+        _stateMachine->ProcessString(L"\x1b_Ga=d,d=I,i=1,p=1;\x1b\\"); // delete (1,1) -> cascades to its child
         VERIFY_IS_TRUE(_pDispatch->_kittyPlacements.empty(), L"deleting the parent placement cascades to its relative child");
 
         const auto* erased = buf.GetRowByOffset(parentPos.y).GetImageSlice();
@@ -7666,7 +7850,7 @@ public:
         _stateMachine->ProcessString(L"\x1b_Ga=p,i=1,p=2,C=1;\x1b\\"); // (1,2) at B
         VERIFY_ARE_EQUAL(static_cast<size_t>(2), _pDispatch->_kittyPlacements.size());
 
-        _stateMachine->ProcessString(L"\x1b_Ga=d,d=i,i=1;\x1b\\"); // no p= -> whole-image delete
+        _stateMachine->ProcessString(L"\x1b_Ga=d,d=I,i=1;\x1b\\"); // no p= -> whole-image delete
         VERIFY_IS_TRUE(_pDispatch->_kittyPlacements.empty(), L"delete by id without p removes all of the image's placements");
 
         const auto* goneA = buf.GetRowByOffset(posA.y).GetImageSlice();
