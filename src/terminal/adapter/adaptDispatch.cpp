@@ -5546,6 +5546,12 @@ void AdaptDispatch::_ProcessKittyCommand(const KittyControl& command, const std:
             break;
         }
         case L'd': // delete
+        {
+            // Lowercase d= selectors delete placements + on-screen pixels but KEEP the image data
+            // (so a later a=p re-displays without re-transmitting); the UPPERCASE variant also frees
+            // the image data once the image has no placements left. (d=a/d=A keep the current
+            // clear-all behavior regardless; their virtual-placement nuances are tracked separately.)
+            const auto freeData = (deleteTarget >= L'A' && deleteTarget <= L'Z');
             switch (deleteTarget)
             {
             case L'a': // all images (the default when d= is omitted)
@@ -5559,13 +5565,20 @@ void AdaptDispatch::_ProcessKittyCommand(const KittyControl& command, const std:
                     if (command.havePlacementId)
                     {
                         // Spec: with a p key, delete only the (imageId, placementId) placement.
-                        _deleteKittyPlacement(imageId, command.placementId);
+                        _deleteKittyPlacement(imageId, command.placementId, freeData);
                     }
                     else
                     {
                         // Cascade to any relative children before removing the image itself.
                         _eraseKittyPlacementsForImage(imageId);
-                        _eraseKittyImage(imageId);
+                        // A virtual (U=1) placement is itself a placement, deleted by i/I/n/N/r/R
+                        // regardless of case (spec); only the image DATA free is case-gated, so drop
+                        // the virtual grid here so a later placeholder doesn't re-render it.
+                        _kittyVirtualIds.erase(imageId);
+                        if (freeData)
+                        {
+                            _eraseKittyImage(imageId);
+                        }
                         _eraseKittyImageRows(imageId);
                     }
                 }
@@ -5586,12 +5599,16 @@ void AdaptDispatch::_ProcessKittyCommand(const KittyControl& command, const std:
                         if (command.havePlacementId)
                         {
                             // Spec: with a p key, delete only the (imageId, placementId) placement.
-                            _deleteKittyPlacement(targetId, command.placementId);
+                            _deleteKittyPlacement(targetId, command.placementId, freeData);
                         }
                         else
                         {
                             _eraseKittyPlacementsForImage(targetId);
-                            _eraseKittyImage(targetId);
+                            _kittyVirtualIds.erase(targetId); // delete the virtual placement regardless of case (see d=i)
+                            if (freeData)
+                            {
+                                _eraseKittyImage(targetId);
+                            }
                             _eraseKittyImageRows(targetId);
                         }
                     }
@@ -5607,7 +5624,7 @@ void AdaptDispatch::_ProcessKittyCommand(const KittyControl& command, const std:
             {
                 auto page = _pages.ActivePage();
                 const auto cursor = page.Cursor().GetPosition();
-                _deleteKittyImagesIntersecting(cursor.x, cursor.y, cursor.x + 1, cursor.y + 1);
+                _deleteKittyImagesIntersecting(cursor.x, cursor.y, cursor.x + 1, cursor.y + 1, freeData);
                 break;
             }
             case L'p': // placements intersecting the cell at (x, y) [x/y 1-based, viewport-relative]
@@ -5620,7 +5637,7 @@ void AdaptDispatch::_ProcessKittyCommand(const KittyControl& command, const std:
                     // math + clamps keep a hostile x/y from overflowing til::CoordType.
                     const auto px = static_cast<til::CoordType>(std::min<int64_t>(static_cast<int64_t>(command.srcX) - 1, page.Width()));
                     const auto py = static_cast<til::CoordType>(std::min<int64_t>(static_cast<int64_t>(page.Top()) + command.srcY - 1, page.Bottom()));
-                    _deleteKittyImagesIntersecting(px, py, px + 1, py + 1);
+                    _deleteKittyImagesIntersecting(px, py, px + 1, py + 1, freeData);
                 }
                 break;
             case L'x': // placements intersecting column x [1-based, viewport-relative]
@@ -5629,7 +5646,7 @@ void AdaptDispatch::_ProcessKittyCommand(const KittyControl& command, const std:
                 {
                     auto page = _pages.ActivePage();
                     const auto col = static_cast<til::CoordType>(std::min<int64_t>(static_cast<int64_t>(command.srcX) - 1, page.Width()));
-                    _deleteKittyImagesIntersecting(col, page.Top(), col + 1, page.Bottom());
+                    _deleteKittyImagesIntersecting(col, page.Top(), col + 1, page.Bottom(), freeData);
                 }
                 break;
             case L'y': // placements intersecting row y [1-based, viewport-relative]
@@ -5638,12 +5655,12 @@ void AdaptDispatch::_ProcessKittyCommand(const KittyControl& command, const std:
                 {
                     auto page = _pages.ActivePage();
                     const auto rowY = static_cast<til::CoordType>(std::min<int64_t>(static_cast<int64_t>(page.Top()) + command.srcY - 1, page.Bottom()));
-                    _deleteKittyImagesIntersecting(0, rowY, page.Width(), rowY + 1);
+                    _deleteKittyImagesIntersecting(0, rowY, page.Width(), rowY + 1, freeData);
                 }
                 break;
             case L'r': // images with id in the inclusive range [x, y]
             case L'R':
-                _deleteKittyImagesInIdRange(command.srcX, command.srcY);
+                _deleteKittyImagesInIdRange(command.srcX, command.srcY, freeData);
                 break;
             default: // z-index (d=z/q, need #21) and animation (d=f, need #22) selectors are not yet supported
                 success = false;
@@ -5651,6 +5668,7 @@ void AdaptDispatch::_ProcessKittyCommand(const KittyControl& command, const std:
                 break;
             }
             break;
+        }
         default: // unrecognized action
             success = false;
             code = L"EINVAL:unknown action";
@@ -6222,6 +6240,27 @@ bool AdaptDispatch::_kittyImageHasPlacements(const uint32_t id) const noexcept
     return false;
 }
 
+// True if any surviving NON-virtual placement (registered or anonymous) references this image id.
+// Anonymous placements are never virtual, so any anonymous entry for the id counts.
+bool AdaptDispatch::_kittyImageHasNonVirtualPlacements(const uint32_t id) const noexcept
+{
+    for (const auto& entry : _kittyPlacements)
+    {
+        if (entry.first.first == id && !entry.second.isVirtual)
+        {
+            return true;
+        }
+    }
+    for (const auto& anon : _kittyAnonymousPlacements)
+    {
+        if (anon.imageId == id)
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
 // Cascade-deletes the relative children of every placement key in `removed`, iterating to a
 // fixed point. For each removed (imageId, placementId): registered children positioned relative
 // to it are erased (own cells + registry entry) and themselves enqueued; anonymous (id-less,
@@ -6287,23 +6326,47 @@ void AdaptDispatch::_cascadeKittyPlacementChildren(std::deque<std::pair<uint32_t
 }
 
 // Deletes a single placement (imageId, placementId): erases its own on-screen cells, removes it
-// from the registry, cascades to its relative children (registered + anonymous), and deletes any
-// image left with no placements -- including imageId itself if this was its last placement
-// (keepImageId=0 protects nothing, since kitty image ids are >= 1). A no-op if the placement
-// isn't registered. Spec: "If you specify a p key for the placement id as well, then only the
-// placement with the specified image id and placement id will be deleted."
+// from the registry, and cascades to its relative children (registered + anonymous). When freeData
+// is true (an UPPERCASE selector) an image left with no placements is also freed -- including
+// imageId itself if this was its last placement; when false (lowercase) the image DATA is kept so a
+// later a=p can re-display it. Relative children are freed either way, per the group lifetime. A
+// no-op if the placement isn't registered. Spec: "If you specify a p key for the placement id as
+// well, then only the placement with the specified image id and placement id will be deleted."
 // Protocol: https://sw.kovidgoyal.net/kitty/graphics-protocol/#deleting-images
-void AdaptDispatch::_deleteKittyPlacement(const uint32_t imageId, const uint32_t placementId)
+void AdaptDispatch::_deleteKittyPlacement(const uint32_t imageId, const uint32_t placementId, const bool freeData)
 {
     const auto it = _kittyPlacements.find({ imageId, placementId });
     if (it == _kittyPlacements.end())
     {
         return;
     }
+    const auto wasVirtual = it->second.isVirtual;
     _eraseKittyPlacementCells(it->second);
     std::deque<std::pair<uint32_t, uint32_t>> removed{ { imageId, placementId } };
     _kittyPlacements.erase(it);
-    _cascadeKittyPlacementChildren(removed, 0);
+    if (wasVirtual)
+    {
+        // A virtual (U=1) placement draws no cells of its own -- it is shown via Unicode
+        // placeholders driven by the per-image _kittyVirtualIds grid -- so _eraseKittyPlacementCells
+        // above was a no-op. Drop the grid so future placeholders stop rendering, then erase this
+        // image's already-drawn placeholder pixels via the scroll-safe, owner-tag-based whole-image
+        // erase. Placeholder cells and any NORMAL placement of the same image share the per-image
+        // owner tag and move together under scrolling, so there is no scroll-safe way to erase only
+        // the placeholder cells; when a normal sibling survives we skip the erase to guarantee its
+        // pixels are never wiped (p='s delete-only-this-placement), leaving the now-inert
+        // placeholder pixels (the grid is gone, so nothing re-renders). Precise erase in that mixed
+        // case needs per-placement owner tracking -- tracked in #39. The image DATA free
+        // stays case-gated by the cascade below (lowercase keeps it).
+        _kittyVirtualIds.erase(imageId);
+        if (!_kittyImageHasNonVirtualPlacements(imageId))
+        {
+            _eraseKittyImageRows(imageId);
+        }
+    }
+    // keepImageId protects imageId from the cascade's free-if-unused: lowercase (freeData=false)
+    // keeps imageId's data; uppercase frees it when it has no placements left. Children (different
+    // ids) are freed either way.
+    _cascadeKittyPlacementChildren(removed, freeData ? 0 : imageId);
 }
 
 // Deletes every NON-VIRTUAL image with at least one on-screen cell inside the half-open cell
@@ -6315,7 +6378,7 @@ void AdaptDispatch::_deleteKittyPlacement(const uint32_t imageId, const uint32_t
 // placeholder images -- those are manipulated as text -- so ids present in _kittyVirtualIds are
 // skipped.
 // Protocol: https://sw.kovidgoyal.net/kitty/graphics-protocol/#deleting-images
-void AdaptDispatch::_deleteKittyImagesIntersecting(const til::CoordType left, const til::CoordType top, const til::CoordType right, const til::CoordType bottom)
+void AdaptDispatch::_deleteKittyImagesIntersecting(const til::CoordType left, const til::CoordType top, const til::CoordType right, const til::CoordType bottom, const bool freeData)
 {
     auto page = _pages.ActivePage();
     auto& buffer = page.Buffer();
@@ -6349,16 +6412,20 @@ void AdaptDispatch::_deleteKittyImagesIntersecting(const til::CoordType left, co
     for (const auto id : affected)
     {
         _eraseKittyPlacementsForImage(id);
-        _eraseKittyImage(id);
+        if (freeData)
+        {
+            _eraseKittyImage(id);
+        }
         _eraseKittyImageRows(id);
     }
 }
 
 // Deletes every image whose id is in the INCLUSIVE range [lo, hi] (kitty d=r): erases each image's
-// pixels, drops its placements (registered, anonymous, and virtual -- r/R DO affect virtual
-// placements per the spec), and frees its data. A no-op if lo/hi are unset (0) or reversed.
+// pixels and drops its placements (registered, anonymous, and virtual -- r/R DO affect virtual
+// placements per the spec). When freeData is true (d=R) the image data is also freed; when false
+// (d=r) the data is kept for a later a=p. A no-op if lo/hi are unset (0) or reversed.
 // Protocol: https://sw.kovidgoyal.net/kitty/graphics-protocol/#deleting-images
-void AdaptDispatch::_deleteKittyImagesInIdRange(const uint32_t lo, const uint32_t hi)
+void AdaptDispatch::_deleteKittyImagesInIdRange(const uint32_t lo, const uint32_t hi, const bool freeData)
 {
     if (lo == 0 || hi == 0 || lo > hi)
     {
@@ -6376,7 +6443,11 @@ void AdaptDispatch::_deleteKittyImagesInIdRange(const uint32_t lo, const uint32_
     for (const auto id : ids)
     {
         _eraseKittyPlacementsForImage(id);
-        _eraseKittyImage(id);
+        _kittyVirtualIds.erase(id); // r/R delete virtual placements regardless of case (spec)
+        if (freeData)
+        {
+            _eraseKittyImage(id);
+        }
         _eraseKittyImageRows(id);
     }
 }

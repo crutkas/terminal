@@ -437,15 +437,21 @@ namespace Microsoft::Console::VirtualTerminal
         void _eraseKittyPlacementsForImage(const uint32_t imageId);
         // True if any tracked placement (registered or anonymous) still references this image id.
         bool _kittyImageHasPlacements(const uint32_t id) const noexcept;
+        // True if any surviving NON-virtual placement (registered or anonymous) references this image
+        // id. Used to decide whether erasing a deleted virtual placement's placeholder pixels (a
+        // scroll-safe, owner-tag-based whole-image erase) would also wipe a same-image normal
+        // placement (they share the per-image owner tag), in which case the erase is skipped.
+        bool _kittyImageHasNonVirtualPlacements(const uint32_t id) const noexcept;
         // Cascade-deletes the relative children of each removed placement key (registered +
         // anonymous), deleting any orphaned image except `keepImageId`, which the caller deletes.
         void _cascadeKittyPlacementChildren(std::deque<std::pair<uint32_t, uint32_t>>& removed, const uint32_t keepImageId);
-        // Deletes only the (imageId, placementId) placement and its relative children, removing
-        // imageId too if this was its last placement.
+        // Deletes only the (imageId, placementId) placement and its relative children. When freeData
+        // is true (an uppercase selector) imageId's data is also freed if this was its last
+        // placement; when false (lowercase) the image data is kept for a later a=p.
         // Protocol: https://sw.kovidgoyal.net/kitty/graphics-protocol/#deleting-images
-        void _deleteKittyPlacement(const uint32_t imageId, const uint32_t placementId);
-        void _deleteKittyImagesIntersecting(const til::CoordType left, const til::CoordType top, const til::CoordType right, const til::CoordType bottom);
-        void _deleteKittyImagesInIdRange(const uint32_t lo, const uint32_t hi);
+        void _deleteKittyPlacement(const uint32_t imageId, const uint32_t placementId, const bool freeData);
+        void _deleteKittyImagesIntersecting(const til::CoordType left, const til::CoordType top, const til::CoordType right, const til::CoordType bottom, const bool freeData);
+        void _deleteKittyImagesInIdRange(const uint32_t lo, const uint32_t hi, const bool freeData);
         std::optional<til::point> _resolveKittyPlacementAnchor(const uint32_t parentImageId, const uint32_t parentPlacementId, const std::pair<uint32_t, uint32_t> origin, std::wstring_view& code) const;
         std::optional<til::point> _deriveVirtualPlacementAnchor(const uint32_t imageId) const;
         void _renderKittyPlaceholders(const std::wstring_view segment, const til::CoordType screenRow, const til::CoordType startColumn);
