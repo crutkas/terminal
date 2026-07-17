@@ -391,7 +391,7 @@ namespace Microsoft::Console::VirtualTerminal
         void _placeKittyImage(const KittyImage& image, const bool moveCursor, const uint32_t imageId, const uint32_t cols = 0, const uint32_t rows = 0, const uint32_t srcX = 0, const uint32_t srcY = 0, const uint32_t srcW = 0, const uint32_t srcH = 0);
         void _renderKittyPlaceholders(const std::wstring_view segment, const til::CoordType screenRow, const til::CoordType startColumn);
         void _placeKittyPlaceholderCell(const KittyImage& image, const uint32_t imageId, const til::CoordType column, const til::CoordType row, const uint32_t cellRow, const uint32_t cellCol, const uint32_t rows, const uint32_t cols, const uint32_t cropX, const uint32_t cropY, const uint32_t cropW, const uint32_t cropH);
-        static int _KittyPlaceholderDiacriticIndex(const wchar_t ch) noexcept;
+        static int _KittyPlaceholderDiacriticIndex(const char32_t ch) noexcept;
         void _ReturnOscResponse(const std::wstring_view response) const;
 
         std::vector<uint8_t> _tabStopColumns;
