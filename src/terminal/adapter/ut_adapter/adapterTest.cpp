@@ -5657,6 +5657,38 @@ public:
         }
     }
 
+    // A virtual (U=1) placement created WITH a crop rect (x/y/w/h) must render the cropped
+    // sub-image, not the whole image. The 4x4 source has four distinct 2x2 quadrants (TL red,
+    // TR green, BL blue, BR white); cropping to the bottom-right (x=2,y=2,w=2,h=2) and scaling
+    // to a 2x2 grid at 1px cells must show WHITE in every placeholder cell and NONE of the
+    // other quadrants' colours. Before the crop was captured for virtual placements this drew
+    // the full image, so red/green/blue leaked in.
+    TEST_METHOD(KittyPlaceholderCropSelectsSubImage)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        const auto origin = _testGetSet->_textBuffer->GetCursor().GetPosition();
+        const std::wstring payload = L"/wAA/wAAAP8AAP8A/wAA/wAAAP8AAP8AAAD/AAD/////////AAD/AAD/////////"; // 4x4 quadrants
+        _stateMachine->ProcessString(L"\x1b_Ga=t,i=1,U=1,f=24,s=4,v=4,x=2,y=2,w=2,h=2,c=2,r=2;" + payload + L"\x1b\\");
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m"); // fg = image id 1
+        _stateMachine->ProcessString(Placeholder() + Placeholder()); // grid row 0
+        _testGetSet->_textBuffer->GetCursor().SetPosition({ origin.x, origin.y + 1 });
+        _stateMachine->ProcessString(Placeholder() + Placeholder()); // grid row 1
+        _stateMachine->ProcessString(L"\x1b[0m");
+
+        const auto* r0 = _testGetSet->_textBuffer->GetRowByOffset(origin.y).GetImageSlice();
+        const auto* r1 = _testGetSet->_textBuffer->GetRowByOffset(origin.y + 1).GetImageSlice();
+        VERIFY_IS_NOT_NULL(r0);
+        VERIFY_IS_NOT_NULL(r1);
+        VERIFY_IS_TRUE(SlicePixelIs(r0, 0, 0, 255, 255, 255), L"crop=BR: grid (0,0) must be white");
+        VERIFY_IS_TRUE(SlicePixelIs(r0, 1, 0, 255, 255, 255), L"crop=BR: grid (0,1) must be white");
+        VERIFY_IS_TRUE(SlicePixelIs(r1, 0, 0, 255, 255, 255), L"crop=BR: grid (1,0) must be white");
+        VERIFY_IS_TRUE(SlicePixelIs(r1, 1, 0, 255, 255, 255), L"crop=BR: grid (1,1) must be white");
+        VERIFY_IS_FALSE(BufferContainsColor(*_testGetSet->_textBuffer, 255, 0, 0), L"cropped-out red must not appear");
+        VERIFY_IS_FALSE(BufferContainsColor(*_testGetSet->_textBuffer, 0, 255, 0), L"cropped-out green must not appear");
+        VERIFY_IS_FALSE(BufferContainsColor(*_testGetSet->_textBuffer, 0, 0, 255), L"cropped-out blue must not appear");
+    }
+
     // Deleting the image by id erases placeholder-rendered cells too.
     TEST_METHOD(KittyPlaceholderDeleteErases)
     {

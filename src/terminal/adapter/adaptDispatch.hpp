@@ -365,6 +365,14 @@ namespace Microsoft::Console::VirtualTerminal
             uint32_t rows = 1;
             uint32_t autoRow = 0;
             uint32_t autoCol = 0;
+            // Source crop rect (pixels) captured from x/y/w/h at store time (w/h=0/past-edge
+            // already resolved and clamped to the image), so placeholder rendering samples the
+            // same sub-rect a direct c/r placement would instead of the whole image. cropW/cropH
+            // are always > 0 after _storeKittyVirtualPlacement (0 = unset => full image).
+            uint32_t cropX = 0;
+            uint32_t cropY = 0;
+            uint32_t cropW = 0;
+            uint32_t cropH = 0;
         };
         static KittyControl _ParseKittyControl(const std::wstring_view control) noexcept;
         void _HandleKittyGraphics(const std::wstring_view control, const std::string_view payload, const bool payloadValid, const bool payloadTooLarge);
@@ -378,11 +386,11 @@ namespace Microsoft::Console::VirtualTerminal
         void _eraseKittyImage(const uint32_t id);
         void _eraseKittyImageRows(const uint32_t imageId);
         void _clearKittyImages() noexcept;
-        void _storeKittyVirtualPlacement(const uint32_t id, const KittyImage& image, const uint32_t cols, const uint32_t rows);
+        void _storeKittyVirtualPlacement(const uint32_t id, const KittyImage& image, const uint32_t cols, const uint32_t rows, const uint32_t srcX, const uint32_t srcY, const uint32_t srcW, const uint32_t srcH);
         static KittyTargetSize _kittyTargetPixels(const int64_t cropW, const int64_t cropH, const uint32_t cols, const uint32_t rows, const int64_t cellWidth, const int64_t cellHeight) noexcept;
         void _placeKittyImage(const KittyImage& image, const bool moveCursor, const uint32_t imageId, const uint32_t cols = 0, const uint32_t rows = 0, const uint32_t srcX = 0, const uint32_t srcY = 0, const uint32_t srcW = 0, const uint32_t srcH = 0);
         void _renderKittyPlaceholders(const std::wstring_view segment, const til::CoordType screenRow, const til::CoordType startColumn);
-        void _placeKittyPlaceholderCell(const KittyImage& image, const uint32_t imageId, const til::CoordType column, const til::CoordType row, const uint32_t cellRow, const uint32_t cellCol, const uint32_t rows, const uint32_t cols);
+        void _placeKittyPlaceholderCell(const KittyImage& image, const uint32_t imageId, const til::CoordType column, const til::CoordType row, const uint32_t cellRow, const uint32_t cellCol, const uint32_t rows, const uint32_t cols, const uint32_t cropX, const uint32_t cropY, const uint32_t cropW, const uint32_t cropH);
         static int _KittyPlaceholderDiacriticIndex(const wchar_t ch) noexcept;
         void _ReturnOscResponse(const std::wstring_view response) const;
 
