@@ -457,6 +457,9 @@ namespace TerminalCoreUnitTests
         TEST_METHOD(ReadKittyImageFileRejectsRelativePath);
         TEST_METHOD(ReadKittyImageFileNonexistentFails);
         TEST_METHOD(ReadKittyImageFileRejectsCharDevice);
+        TEST_METHOD(ReadKittyImageFileRejectsDirectory);
+        TEST_METHOD(ReadKittyImageFileCapsAtMaxBytes);
+        TEST_METHOD(ReadKittyImageFileFailedReadKeepsTempFile);
     };
 };
 
@@ -1127,6 +1130,90 @@ void TerminalApiTest::ReadKittyImageFileRejectsCharDevice()
     std::vector<uint8_t> out{ 1, 2, 3 };
     VERIFY_IS_TRUE(til::read_image_result::read_error == term.ReadKittyImageFile(devicePath, 0, 0, false, out), L"a character device (NUL) must be refused as unreadable (EBADF): only regular files may be read");
     VERIFY_ARE_EQUAL(static_cast<size_t>(0), out.size(), L"a rejected read must leave the output empty");
+}
+
+void TerminalApiTest::ReadKittyImageFileRejectsDirectory()
+{
+    Terminal term{ Terminal::TestDummyMarker{} };
+    DummyRenderer renderer{ &term };
+    term.Create({ 100, 100 }, 0, renderer);
+
+    const auto dir = KittyTempDir();
+    VERIFY_IS_FALSE(dir.empty());
+    // A real, drive-absolute directory passes every pre-open path check (fixed local drive,
+    // not UNC, not relative) but must NOT be readable as an image. The helper opens with
+    // FILE_ATTRIBUTE_NORMAL and no FILE_FLAG_BACKUP_SEMANTICS, so CreateFileW on a directory
+    // fails with ERROR_ACCESS_DENIED -- NOT a not-found error -- and is reported as
+    // read_error (EBADF). Because a junction is itself a directory reparse point, this also
+    // covers the reparse-directory case: a client cannot point t=f/t=t at a folder.
+    const auto subdir = KittyUniquePath(dir, L"tty-graphics-protocol-dir-");
+    VERIFY_IS_TRUE(CreateDirectoryW(subdir.c_str(), nullptr) != FALSE, L"failed to create the test directory");
+
+    std::vector<uint8_t> out{ 1, 2, 3 };
+    VERIFY_IS_TRUE(til::read_image_result::read_error == term.ReadKittyImageFile(subdir, 0, 0, false, out), L"a directory must be refused as unreadable (EBADF): only regular files may be read");
+    VERIFY_ARE_EQUAL(static_cast<size_t>(0), out.size(), L"a rejected read must leave the output empty");
+
+    RemoveDirectoryW(subdir.c_str());
+}
+
+void TerminalApiTest::ReadKittyImageFileCapsAtMaxBytes()
+{
+    Terminal term{ Terminal::TestDummyMarker{} };
+    DummyRenderer renderer{ &term };
+    term.Create({ 100, 100 }, 0, renderer);
+
+    const auto dir = KittyTempDir();
+    VERIFY_IS_FALSE(dir.empty());
+    const auto path = KittyUniquePath(dir, L"tty-graphics-protocol-huge-");
+
+    // The 32 MiB hard cap in til::read_image_file. Kept in sync by intent; a mismatch here
+    // means the cap moved and this test must be revisited.
+    constexpr uint64_t cap = 32ull * 1024 * 1024;
+
+    // Create a file LARGER than the cap WITHOUT writing 33 MiB of data: extend the size with
+    // SetEndOfFile so the [0, EOF) range reads back as zeros via NTFS valid-data-length
+    // semantics (no bulk disk I/O), which is enough to exercise the read bound.
+    {
+        wil::unique_hfile f{ CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr) };
+        VERIFY_IS_TRUE(static_cast<bool>(f), L"failed to create the oversize test file");
+        LARGE_INTEGER eof{};
+        eof.QuadPart = static_cast<LONGLONG>(cap + 1024 * 1024); // 33 MiB, comfortably over the cap
+        VERIFY_IS_TRUE(SetFilePointerEx(f.get(), eof, nullptr, FILE_BEGIN) != FALSE);
+        VERIFY_IS_TRUE(SetEndOfFile(f.get()) != FALSE, L"failed to size the oversize test file");
+    }
+
+    std::vector<uint8_t> out;
+    // S=0 means "read the whole file"; the cap must still bound the result so a client cannot
+    // make the terminal allocate/return an unbounded amount from a huge (or lying) file.
+    VERIFY_IS_TRUE(til::read_image_result::ok == term.ReadKittyImageFile(path, 0, 0, false, out), L"reading a huge file must still succeed (clamped)");
+    VERIFY_ARE_EQUAL(static_cast<size_t>(cap), out.size(), L"the read must be capped at 32 MiB regardless of the file's size");
+
+    DeleteFileW(path.c_str());
+}
+
+void TerminalApiTest::ReadKittyImageFileFailedReadKeepsTempFile()
+{
+    Terminal term{ Terminal::TestDummyMarker{} };
+    DummyRenderer renderer{ &term };
+    term.Create({ 100, 100 }, 0, renderer);
+
+    const auto dir = KittyTempDir();
+    VERIFY_IS_FALSE(dir.empty());
+    // A temp file that satisfies BOTH deletion gates (under %TEMP% AND carrying the
+    // "tty-graphics-protocol" marker), so a *successful* t=t read WOULD delete it.
+    const auto path = KittyUniquePath(dir, L"tty-graphics-protocol-faildelete-");
+    VERIFY_IS_TRUE(KittyWriteAllBytes(path, { 1, 2, 3, 4 }));
+
+    // Force the operation to FAIL with an offset past EOF. deleteAfter=true opens the file
+    // WITH delete access, but deletion is decided only AFTER a successful read -- so a failed
+    // t=t must never delete its target. This proves a malformed/failed transfer cannot be
+    // turned into an arbitrary-delete primitive on a file that otherwise qualifies.
+    std::vector<uint8_t> out{ 9, 9, 9 };
+    VERIFY_IS_TRUE(til::read_image_result::invalid == term.ReadKittyImageFile(path, 1000, 0, true, out), L"an offset past EOF must fail as an invalid request");
+    VERIFY_ARE_EQUAL(static_cast<size_t>(0), out.size(), L"a failed read must leave the output empty");
+    VERIFY_IS_TRUE(KittyFileExists(path), L"a failed t=t read must NOT delete its target, even a marked temp file");
+
+    DeleteFileW(path.c_str());
 }
 
 void TerminalApiTest::KittyPlaceholderRendersInRealTerminal()
