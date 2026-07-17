@@ -5903,6 +5903,36 @@ public:
         VERIFY_IS_FALSE(BufferContainsColor(*_testGetSet->_textBuffer, 255, 0, 0), L"col 1 must not show the left tile (red)");
     }
 
+    // The rowcolumn-diacritic table now covers all 297 kitty entries (was 16), resolved by binary
+    // search including astral (surrogate-pair) combining marks. Direct checks of the private lookup
+    // (AdapterTest is a friend) at the boundaries the old 16-entry table missed.
+    TEST_METHOD(KittyPlaceholderDiacriticTableIsComplete)
+    {
+        VERIFY_ARE_EQUAL(0, AdaptDispatch::_KittyPlaceholderDiacriticIndex(0x0305)); // first entry
+        VERIFY_ARE_EQUAL(15, AdaptDispatch::_KittyPlaceholderDiacriticIndex(0x0357)); // last of the old 16
+        VERIFY_ARE_EQUAL(16, AdaptDispatch::_KittyPlaceholderDiacriticIndex(0x035B)); // first newly-covered entry
+        VERIFY_ARE_EQUAL(282, AdaptDispatch::_KittyPlaceholderDiacriticIndex(0xFE26)); // last BMP entry
+        VERIFY_ARE_EQUAL(283, AdaptDispatch::_KittyPlaceholderDiacriticIndex(0x10A0F)); // first astral entry
+        VERIFY_ARE_EQUAL(296, AdaptDispatch::_KittyPlaceholderDiacriticIndex(0x1D244)); // last entry (index 296)
+        VERIFY_ARE_EQUAL(-1, AdaptDispatch::_KittyPlaceholderDiacriticIndex(0x0041)); // 'A' is not a diacritic
+        VERIFY_ARE_EQUAL(-1, AdaptDispatch::_KittyPlaceholderDiacriticIndex(0x0306)); // a gap between entries
+    }
+
+    // End-to-end: a COLUMN diacritic for index 16 (U+035B) -- the first entry the old 16-entry table
+    // missed -- must resolve to grid column 16, not fall through to the auto-increment counter. A
+    // 20-wide image whose only red pixel is column 16 (all others green) shows red when addressed
+    // (row 0, col 16); the old table drew column 0 (green).
+    TEST_METHOD(KittyPlaceholderHighColumnDiacriticResolves)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,f=24,s=20,v=1,c=20,r=1;AP8AAP8AAP8AAP8AAP8AAP8AAP8AAP8AAP8AAP8AAP8AAP8AAP8AAP8AAP8AAP8A/wAAAP8AAP8AAP8A\x1b\\");
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m"); // fg = image id 1
+        _stateMachine->ProcessString(Placeholder() + L"\x0305" + L"\x035B"); // row 0 (index 0), col 16 (index 16)
+        VERIFY_IS_TRUE(BufferContainsColor(*_testGetSet->_textBuffer, 255, 0, 0), L"col diacritic index 16 (U+035B) must select grid column 16 (red)");
+        VERIFY_IS_FALSE(BufferContainsColor(*_testGetSet->_textBuffer, 0, 255, 0), L"column 16 is red only; the auto-increment fallback (col 0 = green) must not be used");
+    }
+
     // Regression (why): a 3rd rowcolumn diacritic encodes the high byte of a >24-bit image id,
     // which isn't supported yet (#24). The old code IGNORED the 3rd diacritic and rendered the
     // low-24-bit image -- the WRONG image (an id collision). This guards that a NON-ZERO 3rd
