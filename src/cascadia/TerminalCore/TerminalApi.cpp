@@ -478,7 +478,7 @@ til::size Terminal::GetCellSize() const noexcept
     return size;
 }
 
-bool Terminal::ReadKittyImageFile(const std::wstring_view path, uint64_t offset, uint64_t size, bool deleteAfter, std::vector<uint8_t>& out) noexcept
+til::read_image_result Terminal::ReadKittyImageFile(const std::wstring_view path, uint64_t offset, uint64_t size, bool deleteAfter, std::vector<uint8_t>& out) noexcept
 {
     // Windows Terminal is the final terminal in the chain, so it owns deletion of a t=t
     // temporary file (conhost suppresses its own delete under ConPTY). The shared helper

@@ -76,7 +76,7 @@ public:
 
     void ShowNotification(std::wstring_view title, std::wstring_view body) override;
 
-    bool ReadKittyImageFile(const std::wstring_view path, uint64_t offset, uint64_t size, bool deleteAfter, std::vector<uint8_t>& out) noexcept override;
+    til::read_image_result ReadKittyImageFile(const std::wstring_view path, uint64_t offset, uint64_t size, bool deleteAfter, std::vector<uint8_t>& out) noexcept override;
 
 private:
     Microsoft::Console::IIoProvider& _io;

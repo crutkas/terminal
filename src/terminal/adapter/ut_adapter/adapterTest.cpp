@@ -260,7 +260,7 @@ public:
         return _cellSize;
     }
 
-    bool ReadKittyImageFile(const std::wstring_view path, uint64_t offset, uint64_t size, bool deleteAfter, std::vector<uint8_t>& out) noexcept override
+    til::read_image_result ReadKittyImageFile(const std::wstring_view path, uint64_t offset, uint64_t size, bool deleteAfter, std::vector<uint8_t>& out) noexcept override
     {
         Log::Comment(L"ReadKittyImageFile MOCK called...");
         _readKittyFileCallCount++;
@@ -270,12 +270,12 @@ public:
         _lastKittyFileDeleteAfter = deleteAfter;
         if (!_readKittyFileSucceeds)
         {
-            return false;
+            return _readKittyFileResult;
         }
         // Return a synthetic image payload (not the real file contents) so unit tests
         // never touch the filesystem. Tests set _kittyFileBytes to match their f=/s=/v=.
         out = _kittyFileBytes;
-        return true;
+        return til::read_image_result::ok;
     }
 
     void PrepData()
@@ -446,6 +446,7 @@ public:
     // instead of reading the filesystem, and records what the adapter requested so
     // tests can assert path/offset/size/delete plumbing without touching real files.
     bool _readKittyFileSucceeds = true;
+    til::read_image_result _readKittyFileResult{ til::read_image_result::read_error };
     int _readKittyFileCallCount = 0;
     std::wstring _lastKittyFilePath;
     uint64_t _lastKittyFileOffset = 0;
@@ -5688,24 +5689,25 @@ public:
         VERIFY_ARE_EQUAL(UINT64_MAX, _testGetSet->_lastKittyFileOffset, L"an O= that overflows 64 bits must clamp to UINT64_MAX, not wrap.");
     }
 
-    // An empty (or non-UTF-8) payload yields an empty path: the adapter reports EBADF
-    // WITHOUT ever calling the host (no filesystem access for a path it cannot form).
-    TEST_METHOD(KittyGraphicsFileTransmitEmptyPathIsEbadf)
+    // An empty (or non-UTF-8) payload yields an empty path: the adapter reports EINVAL
+    // (a malformed request) WITHOUT ever calling the host (no filesystem access for a
+    // path it cannot form).
+    TEST_METHOD(KittyGraphicsFileTransmitEmptyPathIsEinval)
     {
         _testGetSet->PrepData();
         _stateMachine->ProcessString(L"\x1b_Ga=t,i=8,f=24,s=1,v=1,t=f;\x1b\\");
-        _testGetSet->ValidateInputEvent(L"\x1b_Gi=8;EBADF:could not read file\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=8;EINVAL:invalid image file request\x1b\\");
         VERIFY_ARE_EQUAL(0, _testGetSet->_readKittyFileCallCount, L"an empty path must not reach the host.");
     }
 
     // A payload that base64-decodes to invalid UTF-8 is rejected at conversion time
-    // (MB_ERR_INVALID_CHARS) -> empty path -> EBADF, again without any host call.
-    TEST_METHOD(KittyGraphicsFileTransmitInvalidUtf8PathIsEbadf)
+    // (MB_ERR_INVALID_CHARS) -> empty path -> EINVAL, again without any host call.
+    TEST_METHOD(KittyGraphicsFileTransmitInvalidUtf8PathIsEinval)
     {
         _testGetSet->PrepData();
         // "//79" is base64 of bytes {0xFF,0xFE,0xFD}, which is not valid UTF-8.
         _stateMachine->ProcessString(L"\x1b_Ga=t,i=8,f=24,s=1,v=1,t=f;//79\x1b\\");
-        _testGetSet->ValidateInputEvent(L"\x1b_Gi=8;EBADF:could not read file\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=8;EINVAL:invalid image file request\x1b\\");
         VERIFY_ARE_EQUAL(0, _testGetSet->_readKittyFileCallCount, L"an invalid-UTF-8 path must not reach the host.");
     }
 
