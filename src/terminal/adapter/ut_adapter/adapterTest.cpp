@@ -5500,6 +5500,23 @@ public:
         _testGetSet->PrepData();
         _stateMachine->ProcessString(L"\x1b_Ga=t,i=13,f=24,s=2,v=2,o=z;eNpjZGJmYWVj5+Dk4uYBAAF4AE8=\x1b\\");
         _testGetSet->ValidateInputEvent(L"\x1b_Gi=13;OK\x1b\\");
+
+        // Round-trip proof: the stored image must hold the EXACT inflated pixels, not merely
+        // a correctly-sized buffer. The payload inflates to [1..12] = four f=24 pixels
+        // (1,2,3)(4,5,6)(7,8,9)(10,11,12); f=24 sets reserved (alpha) to 255.
+        const auto it = _pDispatch->_kittyImages.find(13);
+        VERIFY_IS_TRUE(it != _pDispatch->_kittyImages.end(), L"the o=z transmit must store an image under id 13.");
+        VERIFY_ARE_EQUAL(2u, it->second.width);
+        VERIFY_ARE_EQUAL(2u, it->second.height);
+        VERIFY_ARE_EQUAL(static_cast<size_t>(4), it->second.pixels.size());
+        const BYTE expected[4][3]{ { 1, 2, 3 }, { 4, 5, 6 }, { 7, 8, 9 }, { 10, 11, 12 } };
+        for (size_t i = 0; i < 4; ++i)
+        {
+            VERIFY_ARE_EQUAL(static_cast<int>(expected[i][0]), static_cast<int>(it->second.pixels[i].rgbRed));
+            VERIFY_ARE_EQUAL(static_cast<int>(expected[i][1]), static_cast<int>(it->second.pixels[i].rgbGreen));
+            VERIFY_ARE_EQUAL(static_cast<int>(expected[i][2]), static_cast<int>(it->second.pixels[i].rgbBlue));
+            VERIFY_ARE_EQUAL(255, static_cast<int>(it->second.pixels[i].rgbReserved));
+        }
     }
 
     // A query (a=q) validates the payload like a transmit; malformed base64 is EINVAL.
@@ -5661,6 +5678,44 @@ public:
         _stateMachine->ProcessString(L"\x1b_Ga=t,i=17,f=24,s=2,v=2,t=t,o=z;L3RtcC94\x1b\\");
         _testGetSet->ValidateInputEvent(L"\x1b_Gi=17;OK\x1b\\");
         VERIFY_IS_TRUE(_testGetSet->_lastKittyFileDeleteAfter, L"t=t must request deletion.");
+    }
+
+    // o=z that inflates SUCCESSFULLY but to the WRONG size for the declared geometry is
+    // rejected by the post-inflate size check -- proving a compressed payload cannot smuggle
+    // a wrong-sized image past validation (the size check runs on the INFLATED bytes, not the
+    // compressed input). The payload inflates to 12 bytes (four f=24 pixels), but s=3,v=2
+    // declares six (18 bytes), so it is a size mismatch -- not a compression error -- and
+    // nothing is stored.
+    TEST_METHOD(KittyGraphicsZlibWrongInflatedSizeIsEinval)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1b_Ga=t,i=21,f=24,s=3,v=2,o=z;eNpjZGJmYWVj5+Dk4uYBAAF4AE8=\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=21;EINVAL:payload size mismatch\x1b\\");
+        VERIFY_ARE_EQUAL(static_cast<size_t>(0), _pDispatch->_kittyImages.count(21), L"a size-mismatched o=z payload must not store an image.");
+    }
+
+    // o=z + f=32 (RGBA): the inflated bytes go through the 4-byte-depth premultiply decode,
+    // which the other o=z tests (f=24 / f=100) never exercise. The payload inflates to 64
+    // bytes of 0xAB = sixteen RGBA pixels for a 4x4 image; each colour channel premultiplies
+    // by alpha 0xAB (0xAB*0xAB/255 = 114) and reserved carries the alpha (0xAB). Byte-verified
+    // so a premultiply regression on decompressed input is caught.
+    TEST_METHOD(KittyGraphicsZlibF32TransmitDecodes)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1b_Ga=t,i=22,f=32,s=4,v=4,o=z;eNpbvZoyAABt6yrB\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=22;OK\x1b\\");
+        const auto it = _pDispatch->_kittyImages.find(22);
+        VERIFY_IS_TRUE(it != _pDispatch->_kittyImages.end(), L"the o=z f=32 transmit must store an image under id 22.");
+        VERIFY_ARE_EQUAL(4u, it->second.width);
+        VERIFY_ARE_EQUAL(4u, it->second.height);
+        VERIFY_ARE_EQUAL(static_cast<size_t>(16), it->second.pixels.size());
+        for (const auto& p : it->second.pixels)
+        {
+            VERIFY_ARE_EQUAL(114, static_cast<int>(p.rgbRed));
+            VERIFY_ARE_EQUAL(114, static_cast<int>(p.rgbGreen));
+            VERIFY_ARE_EQUAL(114, static_cast<int>(p.rgbBlue));
+            VERIFY_ARE_EQUAL(0xAB, static_cast<int>(p.rgbReserved));
+        }
     }
 
     // Hostile dimensions cannot overflow the size check; they report a mismatch.
