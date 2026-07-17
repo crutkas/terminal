@@ -503,7 +503,7 @@ void TerminalApiTest::ReadKittyImageFileReadsFromTemp()
     VERIFY_IS_TRUE(KittyWriteAllBytes(path, content), L"failed to create the test file");
 
     std::vector<uint8_t> out;
-    VERIFY_IS_TRUE(term.ReadKittyImageFile(path, 0, 0, false, out), L"a readable local temp file must succeed");
+    VERIFY_IS_TRUE(til::read_image_result::ok == term.ReadKittyImageFile(path, 0, 0, false, out), L"a readable local temp file must succeed");
     VERIFY_ARE_EQUAL(content.size(), out.size());
     VERIFY_IS_TRUE(out == content, L"the bytes read must equal the file contents");
     VERIFY_IS_TRUE(KittyFileExists(path), L"deleteAfter=false must not remove the file");
@@ -523,7 +523,7 @@ void TerminalApiTest::ReadKittyImageFileDeletesTempWithMarker()
     VERIFY_IS_TRUE(KittyWriteAllBytes(path, { 9, 8, 7 }));
 
     std::vector<uint8_t> out;
-    VERIFY_IS_TRUE(term.ReadKittyImageFile(path, 0, 0, true, out), L"the read should succeed");
+    VERIFY_IS_TRUE(til::read_image_result::ok == term.ReadKittyImageFile(path, 0, 0, true, out), L"the read should succeed");
     VERIFY_ARE_EQUAL(static_cast<size_t>(3), out.size());
     VERIFY_IS_FALSE(KittyFileExists(path), L"a temp file carrying the kitty marker must be deleted after a t=t read");
 
@@ -547,7 +547,7 @@ void TerminalApiTest::ReadKittyImageFileOutsideTempNotDeleted()
     VERIFY_IS_TRUE(KittyWriteAllBytes(path, { 4, 5, 6 }));
 
     std::vector<uint8_t> out;
-    VERIFY_IS_TRUE(term.ReadKittyImageFile(path, 0, 0, true, out), L"the read should still succeed");
+    VERIFY_IS_TRUE(til::read_image_result::ok == term.ReadKittyImageFile(path, 0, 0, true, out), L"the read should still succeed");
     VERIFY_IS_TRUE(KittyFileExists(path), L"a file OUTSIDE the temp dir must never be deleted, even with deleteAfter (anti arbitrary-delete)");
 
     DeleteFileW(path.c_str());
@@ -566,7 +566,7 @@ void TerminalApiTest::ReadKittyImageFileNoMarkerNotDeleted()
     VERIFY_IS_TRUE(KittyWriteAllBytes(path, { 1, 1, 1 }));
 
     std::vector<uint8_t> out;
-    VERIFY_IS_TRUE(term.ReadKittyImageFile(path, 0, 0, true, out), L"the read should succeed");
+    VERIFY_IS_TRUE(til::read_image_result::ok == term.ReadKittyImageFile(path, 0, 0, true, out), L"the read should succeed");
     VERIFY_IS_TRUE(KittyFileExists(path), L"a temp file WITHOUT the kitty marker must not be auto-deleted");
 
     DeleteFileW(path.c_str());
@@ -585,7 +585,7 @@ void TerminalApiTest::ReadKittyImageFileOffsetAndSizeSlice()
     VERIFY_IS_TRUE(KittyWriteAllBytes(path, content));
 
     std::vector<uint8_t> out;
-    VERIFY_IS_TRUE(term.ReadKittyImageFile(path, 2, 3, false, out), L"offset+size read should succeed");
+    VERIFY_IS_TRUE(til::read_image_result::ok == term.ReadKittyImageFile(path, 2, 3, false, out), L"offset+size read should succeed");
     const std::vector<uint8_t> expected{ 'C', 'D', 'E' };
     VERIFY_ARE_EQUAL(expected.size(), out.size());
     VERIFY_IS_TRUE(out == expected, L"O=2,S=3 must read exactly bytes [2,5) of the file");
@@ -607,7 +607,7 @@ void TerminalApiTest::ReadKittyImageFileOversizeSizeClampsToEof()
 
     std::vector<uint8_t> out;
     // Ask for far more than the file holds; the read must clamp to the file's size.
-    VERIFY_IS_TRUE(term.ReadKittyImageFile(path, 0, 100ull * 1024 * 1024, false, out), L"read should succeed");
+    VERIFY_IS_TRUE(til::read_image_result::ok == term.ReadKittyImageFile(path, 0, 100ull * 1024 * 1024, false, out), L"read should succeed");
     VERIFY_ARE_EQUAL(content.size(), out.size(), L"an oversize S= must clamp to EOF (the file size)");
     VERIFY_IS_TRUE(out == content);
 
@@ -622,7 +622,7 @@ void TerminalApiTest::ReadKittyImageFileRejectsUncPath()
 
     // A UNC path must be rejected up front (no SMB connection, no NTLM handshake).
     std::vector<uint8_t> out{ 7, 7, 7 };
-    VERIFY_IS_FALSE(term.ReadKittyImageFile(L"\\\\127.0.0.1\\share\\never.bin", 0, 0, false, out), L"a UNC path must be rejected");
+    VERIFY_IS_TRUE(til::read_image_result::invalid == term.ReadKittyImageFile(L"\\\\127.0.0.1\\share\\never.bin", 0, 0, false, out), L"a UNC path must be rejected as an invalid request");
     VERIFY_ARE_EQUAL(static_cast<size_t>(0), out.size(), L"a rejected read must leave the output empty");
 }
 
@@ -635,7 +635,7 @@ void TerminalApiTest::ReadKittyImageFileRejectsRelativePath()
     // Relative paths are rejected so a client cannot read a file resolved against the
     // terminal's own working directory.
     std::vector<uint8_t> out;
-    VERIFY_IS_FALSE(term.ReadKittyImageFile(L"relative\\file.bin", 0, 0, false, out), L"a non-absolute path must be rejected");
+    VERIFY_IS_TRUE(til::read_image_result::invalid == term.ReadKittyImageFile(L"relative\\file.bin", 0, 0, false, out), L"a non-absolute path must be rejected as an invalid request");
     VERIFY_ARE_EQUAL(static_cast<size_t>(0), out.size());
 }
 
@@ -651,7 +651,7 @@ void TerminalApiTest::ReadKittyImageFileNonexistentFails()
     const auto path = KittyUniquePath(dir, L"tty-graphics-protocol-missing-");
 
     std::vector<uint8_t> out;
-    VERIFY_IS_FALSE(term.ReadKittyImageFile(path, 0, 0, false, out), L"a missing file must fail (EBADF)");
+    VERIFY_IS_TRUE(til::read_image_result::not_found == term.ReadKittyImageFile(path, 0, 0, false, out), L"a missing file must report not_found (ENOENT)");
     VERIFY_ARE_EQUAL(static_cast<size_t>(0), out.size());
 }
 
@@ -671,6 +671,6 @@ void TerminalApiTest::ReadKittyImageFileRejectsCharDevice()
     const auto devicePath = dir.substr(0, 3) + L"NUL"; // e.g. "C:\\NUL"
 
     std::vector<uint8_t> out{ 1, 2, 3 };
-    VERIFY_IS_FALSE(term.ReadKittyImageFile(devicePath, 0, 0, false, out), L"a character device (NUL) must be refused: only regular files may be read");
+    VERIFY_IS_TRUE(til::read_image_result::read_error == term.ReadKittyImageFile(devicePath, 0, 0, false, out), L"a character device (NUL) must be refused as unreadable (EBADF): only regular files may be read");
     VERIFY_ARE_EQUAL(static_cast<size_t>(0), out.size(), L"a rejected read must leave the output empty");
 }

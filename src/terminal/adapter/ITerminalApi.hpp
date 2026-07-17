@@ -24,6 +24,8 @@ Author(s):
 #include <memory>
 #include <span>
 
+#include <til/io.h>
+
 namespace Microsoft::Console::VirtualTerminal
 {
     class ITerminalApi
@@ -111,11 +113,12 @@ namespace Microsoft::Console::VirtualTerminal
         // 'deleteAfter' is true (t=t) the host deletes the file after a successful
         // read ONLY if it resides under the system temporary directory, so the medium
         // cannot be abused to delete arbitrary files. Hosts without file access (e.g.
-        // the unit-test mock by default) leave this unimplemented and return false;
-        // the caller then reports the transfer as unreadable (EBADF).
-        virtual bool ReadKittyImageFile(const std::wstring_view /*path*/, uint64_t /*offset*/, uint64_t /*size*/, bool /*deleteAfter*/, std::vector<uint8_t>& /*out*/) noexcept
+        // the unit-test mock by default) leave this unimplemented and return
+        // read_image_result::read_error; the caller then maps the result to the kitty
+        // file error codes (not_found -> ENOENT, invalid -> EINVAL, read_error -> EBADF).
+        virtual til::read_image_result ReadKittyImageFile(const std::wstring_view /*path*/, uint64_t /*offset*/, uint64_t /*size*/, bool /*deleteAfter*/, std::vector<uint8_t>& /*out*/) noexcept
         {
-            return false;
+            return til::read_image_result::read_error;
         }
 
         // Returns the pixel size of a text cell, used to lay out graphics images.

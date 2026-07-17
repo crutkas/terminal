@@ -466,7 +466,7 @@ void ConhostInternalGetSet::ShowNotification(std::wstring_view /*title*/, std::w
     // Not implemented for conhost.
 }
 
-bool ConhostInternalGetSet::ReadKittyImageFile(const std::wstring_view path, uint64_t offset, uint64_t size, bool deleteAfter, std::vector<uint8_t>& out) noexcept
+til::read_image_result ConhostInternalGetSet::ReadKittyImageFile(const std::wstring_view path, uint64_t offset, uint64_t size, bool deleteAfter, std::vector<uint8_t>& out) noexcept
 {
     // Under ConPTY, conhost is parse-only: it has no renderer, its ACK is suppressed
     // (ReturnResponse early-returns in VtIo mode), and the raw APC is forwarded verbatim to
@@ -477,7 +477,7 @@ bool ConhostInternalGetSet::ReadKittyImageFile(const std::wstring_view path, uin
     if (IsConPTY())
     {
         out.clear();
-        return false;
+        return til::read_image_result::read_error;
     }
     return til::read_image_file(path, offset, size, deleteAfter, out);
 }

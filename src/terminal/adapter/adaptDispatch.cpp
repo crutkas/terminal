@@ -5246,11 +5246,27 @@ void AdaptDispatch::_ProcessKittyCommand(const KittyControl& command, const std:
                 }
                 const auto deleteAfter = (medium == L't') && (action != L'q');
                 std::vector<uint8_t> fileBytes;
-                if (path.empty() ||
-                    !_api.ReadKittyImageFile(path, command.fileOffset, command.fileSize, deleteAfter, fileBytes))
+                // An empty path is a malformed request (EINVAL); otherwise the host reports
+                // whether the file was missing (ENOENT), the request was invalid (EINVAL), or
+                // it could not be read (EBADF). Map each to the kitty file error codes.
+                const auto readResult = path.empty()
+                                            ? til::read_image_result::invalid
+                                            : _api.ReadKittyImageFile(path, command.fileOffset, command.fileSize, deleteAfter, fileBytes);
+                if (readResult != til::read_image_result::ok)
                 {
                     success = false;
-                    code = L"EBADF:could not read file";
+                    switch (readResult)
+                    {
+                    case til::read_image_result::not_found:
+                        code = L"ENOENT:image file not found";
+                        break;
+                    case til::read_image_result::invalid:
+                        code = L"EINVAL:invalid image file request";
+                        break;
+                    default:
+                        code = L"EBADF:could not read file";
+                        break;
+                    }
                     break;
                 }
                 bytes = std::move(fileBytes);
