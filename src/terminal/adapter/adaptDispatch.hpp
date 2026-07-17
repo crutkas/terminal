@@ -444,6 +444,8 @@ namespace Microsoft::Console::VirtualTerminal
         // imageId too if this was its last placement.
         // Protocol: https://sw.kovidgoyal.net/kitty/graphics-protocol/#deleting-images
         void _deleteKittyPlacement(const uint32_t imageId, const uint32_t placementId);
+        void _deleteKittyImagesIntersecting(const til::CoordType left, const til::CoordType top, const til::CoordType right, const til::CoordType bottom);
+        void _deleteKittyImagesInIdRange(const uint32_t lo, const uint32_t hi);
         std::optional<til::point> _resolveKittyPlacementAnchor(const uint32_t parentImageId, const uint32_t parentPlacementId, const std::pair<uint32_t, uint32_t> origin, std::wstring_view& code) const;
         std::optional<til::point> _deriveVirtualPlacementAnchor(const uint32_t imageId) const;
         void _renderKittyPlaceholders(const std::wstring_view segment, const til::CoordType screenRow, const til::CoordType startColumn);
