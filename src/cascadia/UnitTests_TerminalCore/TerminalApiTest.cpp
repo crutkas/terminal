@@ -463,6 +463,13 @@ namespace TerminalCoreUnitTests
         TEST_METHOD(ReadKittyImageFileRejectsDirectory);
         TEST_METHOD(ReadKittyImageFileCapsAtMaxBytes);
         TEST_METHOD(ReadKittyImageFileFailedReadKeepsTempFile);
+
+        // Kitty graphics shared-memory host I/O (t=s).
+        TEST_METHOD(ReadKittySharedMemoryCopiesSliceAndCloses);
+        TEST_METHOD(ReadKittySharedMemoryCapsAtMaxBytes);
+        TEST_METHOD(ReadKittySharedMemoryRejectsUnsafeNames);
+        TEST_METHOD(ReadKittySharedMemoryMissingFails);
+        TEST_METHOD(ReadKittySharedMemoryRejectsOffsetPastEnd);
     };
 };
 
@@ -1004,6 +1011,36 @@ namespace
         DWORD returned{};
         return DeviceIoControl(junction.get(), fsctlSetReparsePoint, &buffer, inputBytes, nullptr, 0, &returned, nullptr) != FALSE;
     }
+
+    std::wstring KittyUniqueMappingName()
+    {
+        static unsigned int counter = 0;
+        return L"Local\\tty-graphics-protocol-" + std::to_wstring(GetCurrentProcessId()) + L"-" +
+               std::to_wstring(GetTickCount64()) + L"-" + std::to_wstring(counter++);
+    }
+
+    wil::unique_handle KittyCreateMapping(const std::wstring& name, const uint64_t size, const std::span<const uint8_t> content = {})
+    {
+        wil::unique_handle mapping{ CreateFileMappingW(INVALID_HANDLE_VALUE,
+                                                       nullptr,
+                                                       PAGE_READWRITE,
+                                                       static_cast<DWORD>(size >> 32),
+                                                       static_cast<DWORD>(size),
+                                                       name.c_str()) };
+        if (!mapping || content.empty())
+        {
+            return mapping;
+        }
+
+        const auto view = MapViewOfFile(mapping.get(), FILE_MAP_WRITE, 0, 0, content.size());
+        if (!view)
+        {
+            return {};
+        }
+        memcpy(view, content.data(), content.size());
+        UnmapViewOfFile(view);
+        return mapping;
+    }
 }
 
 void TerminalApiTest::ReadKittyImageFileReadsFromTemp()
@@ -1337,6 +1374,87 @@ void TerminalApiTest::ReadKittyImageFileFailedReadKeepsTempFile()
     VERIFY_IS_TRUE(KittyFileExists(path), L"a failed t=t read must NOT delete its target, even a marked temp file");
 
     DeleteFileW(path.c_str());
+}
+
+void TerminalApiTest::ReadKittySharedMemoryCopiesSliceAndCloses()
+{
+    Terminal term{ Terminal::TestDummyMarker{} };
+    DummyRenderer renderer{ &term };
+    term.Create({ 100, 100 }, 0, renderer);
+
+    const auto name = KittyUniqueMappingName();
+    const std::vector<uint8_t> content{ 'A', 'B', 'C', 'D', 'E', 'F' };
+    auto mapping = KittyCreateMapping(name, content.size(), content);
+    VERIFY_IS_TRUE(static_cast<bool>(mapping), L"failed to create the shared-memory test object");
+
+    std::vector<uint8_t> out;
+    VERIFY_IS_TRUE(til::read_shared_memory_result::ok == term.ReadKittySharedMemory(name, 2, 3, out));
+    const std::vector<uint8_t> expected{ 'C', 'D', 'E' };
+    VERIFY_IS_TRUE(out == expected, L"O=2,S=3 must copy exactly bytes [2,5)");
+
+    // The protocol requires Windows terminals to close (not unlink) the object. Once
+    // the creator closes its handle, no leaked terminal handle may keep the name alive.
+    mapping.reset();
+    wil::unique_handle reopened{ OpenFileMappingW(FILE_MAP_READ, FALSE, name.c_str()) };
+    VERIFY_IS_FALSE(static_cast<bool>(reopened), L"the terminal must close its mapping handle before returning");
+}
+
+void TerminalApiTest::ReadKittySharedMemoryCapsAtMaxBytes()
+{
+    Terminal term{ Terminal::TestDummyMarker{} };
+    DummyRenderer renderer{ &term };
+    term.Create({ 100, 100 }, 0, renderer);
+
+    constexpr uint64_t cap = 32ull * 1024 * 1024;
+    const auto name = KittyUniqueMappingName();
+    auto mapping = KittyCreateMapping(name, cap + 1024 * 1024);
+    VERIFY_IS_TRUE(static_cast<bool>(mapping), L"failed to create the oversize shared-memory object");
+
+    std::vector<uint8_t> out;
+    VERIFY_IS_TRUE(til::read_shared_memory_result::ok == term.ReadKittySharedMemory(name, 0, 0, out));
+    VERIFY_ARE_EQUAL(static_cast<size_t>(cap), out.size(), L"S=0 must still honor the 32 MiB hard cap");
+}
+
+void TerminalApiTest::ReadKittySharedMemoryRejectsUnsafeNames()
+{
+    Terminal term{ Terminal::TestDummyMarker{} };
+    DummyRenderer renderer{ &term };
+    term.Create({ 100, 100 }, 0, renderer);
+
+    std::vector<uint8_t> out{ 1, 2, 3 };
+    VERIFY_IS_TRUE(til::read_shared_memory_result::invalid == term.ReadKittySharedMemory(L"Global\\service-object", 0, 1, out), L"cross-session Global objects must be unreachable");
+    VERIFY_IS_TRUE(til::read_shared_memory_result::invalid == term.ReadKittySharedMemory(L"Session\\1\\object", 0, 1, out), L"system and nested object-manager paths must be rejected");
+    VERIFY_IS_TRUE(til::read_shared_memory_result::invalid == term.ReadKittySharedMemory(L"Local\\nested\\object", 0, 1, out), L"Local names may not escape into nested namespaces");
+    const std::wstring nulName{ L"Local\\foo\0bar", 13 };
+    VERIFY_IS_TRUE(til::read_shared_memory_result::invalid == term.ReadKittySharedMemory(nulName, 0, 1, out), L"embedded NULs must not truncate the opened name");
+    VERIFY_ARE_EQUAL(static_cast<size_t>(0), out.size());
+}
+
+void TerminalApiTest::ReadKittySharedMemoryMissingFails()
+{
+    Terminal term{ Terminal::TestDummyMarker{} };
+    DummyRenderer renderer{ &term };
+    term.Create({ 100, 100 }, 0, renderer);
+
+    const auto name = KittyUniqueMappingName();
+    std::vector<uint8_t> out;
+    VERIFY_IS_TRUE(til::read_shared_memory_result::not_found == term.ReadKittySharedMemory(name, 0, 1, out));
+    VERIFY_ARE_EQUAL(static_cast<size_t>(0), out.size());
+}
+
+void TerminalApiTest::ReadKittySharedMemoryRejectsOffsetPastEnd()
+{
+    Terminal term{ Terminal::TestDummyMarker{} };
+    DummyRenderer renderer{ &term };
+    term.Create({ 100, 100 }, 0, renderer);
+
+    const auto name = KittyUniqueMappingName();
+    auto mapping = KittyCreateMapping(name, 4096);
+    VERIFY_IS_TRUE(static_cast<bool>(mapping));
+
+    std::vector<uint8_t> out{ 1 };
+    VERIFY_IS_TRUE(til::read_shared_memory_result::invalid == term.ReadKittySharedMemory(name, 128 * 1024, 1, out));
+    VERIFY_ARE_EQUAL(static_cast<size_t>(0), out.size());
 }
 
 void TerminalApiTest::KittyPlaceholderRendersInRealTerminal()

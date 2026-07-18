@@ -340,13 +340,13 @@ namespace Microsoft::Console::VirtualTerminal
             uint32_t cellOffsetY = 0; // Y=: y pixel offset of the image within the first cell
             uint32_t upperX = 0;  // X=: animation replacement mode or composition source x
             uint32_t upperY = 0;  // Y=: animation background RGBA or composition source y
-            uint64_t fileOffset = 0; // O=: byte offset into a transmitted file (t=f / t=t)
-            uint64_t fileSize = 0;   // S=: bytes to read from the file (0 = to EOF, host-bounded)
+            uint64_t fileOffset = 0; // O=: byte offset into a file or shared-memory object
+            uint64_t fileSize = 0;   // S=: bytes to read (0 = to end, host-bounded)
             bool moreChunks = false;
             bool mPresent = false;
             bool haveId = false;
             bool haveNumber = false;
-            wchar_t medium = L'd';          // t=: transmission medium (only d=direct in MVP)
+            wchar_t medium = L'd';          // t=: transmission medium (d/f/t/s)
             bool noCursorMovement = false;  // C=1: leave the cursor in place after a placement
             bool hasNonChunkKey = false;    // true if any key other than m/q was present
             bool hasNonChunkKeyOtherThanAction = false; // permits required a=f on frame continuations

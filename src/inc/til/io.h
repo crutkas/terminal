@@ -279,6 +279,35 @@ namespace til // Terminal Implementation Library. Also: "Today I Learned"
         read_error,
     };
 
+    // Outcome of read_shared_memory, mapped by the Kitty adapter to the protocol's
+    // local-medium error codes.
+    enum class read_shared_memory_result : uint8_t
+    {
+        ok,
+        not_found,
+        invalid,
+        read_error,
+    };
+
+    namespace shared_memory_details
+    {
+        // A file-backed section can fault after it has been mapped (for example if its
+        // backing file is truncated). Keep SEH in a leaf with no C++ objects requiring
+        // unwinding, then translate the fault into a normal protocol read error.
+        _TIL_INLINEPREFIX bool guarded_copy(void* destination, const void* source, const size_t size) noexcept
+        {
+            __try
+            {
+                memcpy(destination, source, size);
+                return true;
+            }
+            __except (GetExceptionCode() == EXCEPTION_IN_PAGE_ERROR ? EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH)
+            {
+                return false;
+            }
+        }
+    }
+
     // Reads up to a bounded number of bytes from a LOCAL image file for the Kitty
     // graphics file/temporary transmission media (t=f / t=t), into 'out'. Returns a
     // read_image_result the caller maps to the kitty file error codes: not_found ->
@@ -666,5 +695,163 @@ namespace til // Terminal Implementation Library. Also: "Today I Learned"
         }
 
         return read_image_result::ok; // the handle closes here; a set disposition removes the inode.
+    }
+
+    // Copies bytes from a Kitty graphics t=s named shared-memory object. Windows file
+    // mappings are session-local by default; only unprefixed names and the explicit
+    // Local\ prefix are accepted so terminal output cannot reach a service's Global\
+    // object. The mapping is opened read-only, never inherited, copied into owned
+    // memory, and immediately closed. Unlike POSIX shm, Windows has no unlink step:
+    // the object disappears after every process closes its handles.
+    //
+    // S=0 means "to the end of the mapping". Windows rounds paging-file sections to a
+    // page boundary, so clients should send S= for exact non-page-aligned lengths. Raw
+    // Kitty transfers infer that exact length in the adapter when S= is omitted.
+    //
+    // Protocol (transmission media): https://sw.kovidgoyal.net/kitty/graphics-protocol/#transferring-data
+    _TIL_INLINEPREFIX read_shared_memory_result read_shared_memory(const std::wstring_view name, uint64_t offset, uint64_t size, std::vector<uint8_t>& out) noexcept
+    {
+        out.clear();
+
+        constexpr uint64_t maxBytes = 32ull * 1024 * 1024;
+        constexpr size_t maxNameChars = 32767;
+
+        const auto hasControlCharacter = std::any_of(name.begin(), name.end(), [](const wchar_t value) noexcept {
+            return value < L' ' || value == 0x7f;
+        });
+        if (name.empty() || name.size() > maxNameChars || hasControlCharacter)
+        {
+            return read_shared_memory_result::invalid;
+        }
+
+        // Kernel object prefixes are case-sensitive. Permit the current-session
+        // namespace, either implicitly or via Local\, and reject every other backslash
+        // (including Global\, Session\, and nested object-manager paths).
+        auto remainder = name;
+        if (remainder.starts_with(L"Local\\"))
+        {
+            remainder.remove_prefix(6);
+        }
+        if (remainder.empty() || remainder.find(L'\\') != std::wstring_view::npos)
+        {
+            return read_shared_memory_result::invalid;
+        }
+
+        std::wstring nameStr;
+        try
+        {
+            nameStr.assign(name);
+        }
+        catch (...)
+        {
+            return read_shared_memory_result::read_error;
+        }
+
+        wil::unique_handle mapping{ OpenFileMappingW(FILE_MAP_READ, FALSE, nameStr.c_str()) };
+        if (!mapping)
+        {
+            const auto error = GetLastError();
+            if (error == ERROR_FILE_NOT_FOUND)
+            {
+                return read_shared_memory_result::not_found;
+            }
+            if (error == ERROR_INVALID_NAME || error == ERROR_INVALID_PARAMETER)
+            {
+                return read_shared_memory_result::invalid;
+            }
+            return read_shared_memory_result::read_error;
+        }
+
+        SYSTEM_INFO systemInfo{};
+        GetSystemInfo(&systemInfo);
+        const auto granularity = static_cast<uint64_t>(systemInfo.dwAllocationGranularity);
+        if (granularity == 0)
+        {
+            return read_shared_memory_result::read_error;
+        }
+
+        const auto alignedOffset = offset - (offset % granularity);
+        const auto delta = static_cast<size_t>(offset - alignedOffset);
+        const auto offsetHigh = static_cast<DWORD>(alignedOffset >> 32);
+        const auto offsetLow = static_cast<DWORD>(alignedOffset);
+
+        const auto map = [&](const size_t bytes) noexcept {
+            return MapViewOfFile(mapping.get(), FILE_MAP_READ, offsetHigh, offsetLow, bytes);
+        };
+        const auto mapFailure = []() noexcept {
+            const auto error = GetLastError();
+            return (error == ERROR_NOT_ENOUGH_MEMORY || error == ERROR_OUTOFMEMORY)
+                       ? read_shared_memory_result::read_error
+                       : read_shared_memory_result::invalid;
+        };
+
+        auto toRead = static_cast<size_t>(std::min(size, maxBytes));
+        void* view = nullptr;
+
+        if (size != 0)
+        {
+            view = map(delta + toRead);
+            if (!view)
+            {
+                return mapFailure();
+            }
+        }
+        else
+        {
+            // Avoid mapping an attacker-sized section merely to discover its end. A
+            // bounded view succeeds for large sections; only smaller sections need the
+            // map-to-end fallback whose extent is then measured with VirtualQuery.
+            view = map(delta + static_cast<size_t>(maxBytes));
+            if (view)
+            {
+                toRead = static_cast<size_t>(maxBytes);
+            }
+            else
+            {
+                view = map(0);
+                if (!view)
+                {
+                    return mapFailure();
+                }
+
+                MEMORY_BASIC_INFORMATION info{};
+                if (VirtualQuery(view, &info, sizeof(info)) != sizeof(info) || info.RegionSize <= delta)
+                {
+                    UnmapViewOfFile(view);
+                    return read_shared_memory_result::read_error;
+                }
+                toRead = std::min(info.RegionSize - delta, static_cast<size_t>(maxBytes));
+            }
+        }
+
+        struct mapped_view
+        {
+            void* value;
+            ~mapped_view()
+            {
+                if (value)
+                {
+                    UnmapViewOfFile(value);
+                }
+            }
+        } viewGuard{ view };
+
+        try
+        {
+            out.resize(toRead);
+        }
+        catch (...)
+        {
+            out.clear();
+            return read_shared_memory_result::read_error;
+        }
+        const auto first = static_cast<const uint8_t*>(view) + delta;
+        if (!shared_memory_details::guarded_copy(out.data(), first, toRead))
+        {
+            out.clear();
+            return read_shared_memory_result::read_error;
+        }
+
+        return read_shared_memory_result::ok;
     }
 } // til

@@ -171,6 +171,7 @@ public:
     bool DecodeImageToBgra(const std::span<const uint8_t> data, std::vector<RGBQUAD>& pixels, til::size& size) noexcept override;
     til::size GetCellSize() const noexcept override;
     til::read_image_result ReadKittyImageFile(const std::wstring_view path, uint64_t offset, uint64_t size, bool deleteAfter, std::vector<uint8_t>& out) noexcept override;
+    til::read_shared_memory_result ReadKittySharedMemory(const std::wstring_view name, uint64_t offset, uint64_t size, std::vector<uint8_t>& out) noexcept override;
 
 #pragma endregion
 
