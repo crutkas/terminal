@@ -5805,6 +5805,11 @@ void AdaptDispatch::_storeKittyVirtualPlacement(const uint32_t id, const KittyIm
     placement.cropY = static_cast<uint32_t>(cropY);
     placement.cropW = static_cast<uint32_t>(cropW);
     placement.cropH = static_cast<uint32_t>(cropH);
+    // Keep the exact scaled target size (64-bit: aspect-preserving scaling can exceed 2^32) so
+    // placeholder sampling matches _placeKittyImage's continuous scaling (not a per-cell source
+    // split) for non-divisible geometry -- storing it narrower would truncate and diverge.
+    placement.targetW = static_cast<uint64_t>(std::max<int64_t>(targetW, 1));
+    placement.targetH = static_cast<uint64_t>(std::max<int64_t>(targetH, 1));
 }
 
 // Maps a kitty row/column combining diacritic to its 0-based index, or -1 if the glyph isn't a
@@ -5864,46 +5869,48 @@ int AdaptDispatch::_KittyPlaceholderDiacriticIndex(const char32_t ch) noexcept
     return -1;
 }
 
-// Overlays a single placeholder cell: the (cellRow,cellCol) tile of a rows x cols
-// grid shows that fractional sub-rect of the image. Reuses the per-row ImageSlice
-// writer and tags the column with imageId so a delete-by-id erases it too.
-void AdaptDispatch::_placeKittyPlaceholderCell(const KittyImage& image, const uint32_t imageId, const til::CoordType column, const til::CoordType row, const uint32_t cellRow, const uint32_t cellCol, const uint32_t rows, const uint32_t cols, const uint32_t cropX, const uint32_t cropY, const uint32_t cropW, const uint32_t cropH)
+// Overlays a single placeholder cell: the (cellRow,cellCol) tile of a grid shows that portion of
+// the image. Samples the SCALED TARGET (targetW x targetH) exactly as _placeKittyImage does -- the
+// whole cropped image scaled once, this cell reading the sub-rect [cellCol*cellWidth, +cellWidth) x
+// [cellRow*cellHeight, +cellHeight) -- so a virtual placeholder grid is pixel-identical to a direct
+// c/r placement even for non-divisible geometry (a per-cell source split diverged at tile edges).
+// Pixels past targetW/targetH are the aspect-preserving padding (transparent). Reuses the per-row
+// ImageSlice writer and tags the column with imageId so a delete-by-id erases it too. Does NOT
+// redraw (the caller batches one bounded redraw per segment). Returns true if a tile was drawn.
+bool AdaptDispatch::_placeKittyPlaceholderCell(const KittyImage& image, const uint32_t imageId, const til::CoordType column, const til::CoordType row, const uint32_t cellRow, const uint32_t cellCol, const KittyVirtualPlacement& place)
 {
     if (image.pixels.empty() || image.width == 0 || image.height == 0)
     {
-        return;
+        return false;
     }
     auto page = _pages.ActivePage();
     auto& buffer = page.Buffer();
     if (column < 0 || column >= page.Width() || row < 0 || row >= page.Bottom())
     {
-        return;
+        return false;
     }
     const auto cellSize = _api.GetCellSize();
     const auto cellWidth = std::max(1, cellSize.width);
     const auto cellHeight = std::max(1, cellSize.height);
     const til::size clampedCellSize{ cellWidth, cellHeight };
-    const auto gridCols = std::max<uint32_t>(cols, 1);
-    const auto gridRows = std::max<uint32_t>(rows, 1);
+    const auto gridCols = std::max<uint32_t>(place.cols, 1);
+    const auto gridRows = std::max<uint32_t>(place.rows, 1);
     // An explicit row/column outside the placement grid selects no tile: draw nothing rather
     // than clamping to (and duplicating) the edge tile.
     if (cellCol >= gridCols || cellRow >= gridRows)
     {
-        return;
+        return false;
     }
-    const auto colIndex = cellCol;
-    const auto rowIndex = cellRow;
-    // Partition the CROP rect (captured from x/y/w/h at store time), not the whole image, so a
-    // virtual placement created with a crop samples the same sub-rect a direct c/r placement
-    // would. cropW/cropH == 0 (unset) falls back to the full image. Tile boundaries use the
-    // cumulative edges so a non-divisible crop keeps its right/bottom pixels (no drop), and
-    // srcX/srcY are ABSOLUTE image coordinates so the sampling loop indexes image.pixels directly.
-    const uint64_t effW = cropW != 0 ? cropW : image.width;
-    const uint64_t effH = cropH != 0 ? cropH : image.height;
-    const auto srcX = static_cast<til::CoordType>(cropX + static_cast<uint64_t>(colIndex) * effW / gridCols);
-    const auto srcW = std::max(1, static_cast<til::CoordType>(cropX + static_cast<uint64_t>(colIndex + 1) * effW / gridCols) - srcX);
-    const auto srcY = static_cast<til::CoordType>(cropY + static_cast<uint64_t>(rowIndex) * effH / gridRows);
-    const auto srcH = std::max(1, static_cast<til::CoordType>(cropY + static_cast<uint64_t>(rowIndex + 1) * effH / gridRows) - srcY);
+    // Crop rect (absolute image pixels) captured at store time; 0 = unset => full image. targetW/H
+    // is the exact scaled size; fall back to the grid-filled size if a legacy entry lacks it.
+    const auto cropX = static_cast<til::CoordType>(place.cropX);
+    const auto cropY = static_cast<til::CoordType>(place.cropY);
+    const auto cropW = std::max<til::CoordType>(static_cast<til::CoordType>(place.cropW != 0 ? place.cropW : image.width), 1);
+    const auto cropH = std::max<til::CoordType>(static_cast<til::CoordType>(place.cropH != 0 ? place.cropH : image.height), 1);
+    const auto targetW = std::max<int64_t>(place.targetW != 0 ? static_cast<int64_t>(place.targetW) : static_cast<int64_t>(gridCols) * cellWidth, 1);
+    const auto targetH = std::max<int64_t>(place.targetH != 0 ? static_cast<int64_t>(place.targetH) : static_cast<int64_t>(gridRows) * cellHeight, 1);
+    const auto targetXBase = static_cast<int64_t>(cellCol) * cellWidth;
+    const auto targetYBase = static_cast<int64_t>(cellRow) * cellHeight;
     auto& dstRow = buffer.GetMutableRowByOffset(row);
     auto dstSlice = dstRow.GetMutableImageSlice();
     if (!dstSlice || dstSlice->CellSize() != clampedCellSize)
@@ -5914,15 +5921,22 @@ void AdaptDispatch::_placeKittyPlaceholderCell(const KittyImage& image, const ui
     dstSlice->SetColumnOwner(column, column + 1, imageId);
     for (auto pixelRow = 0; pixelRow < cellHeight; ++pixelRow)
     {
-        const auto sampleY = srcY + std::min(srcH - 1, static_cast<til::CoordType>(static_cast<int64_t>(pixelRow) * srcH / cellHeight));
+        const auto targetY = targetYBase + pixelRow;
+        const auto withinY = targetY < targetH;
+        const auto sampleY = withinY ? cropY + std::min(cropH - 1, static_cast<til::CoordType>(targetY * cropH / targetH)) : 0;
         const auto srcRowStart = static_cast<size_t>(sampleY) * image.width;
         for (auto pixelColumn = 0; pixelColumn < cellWidth; ++pixelColumn)
         {
-            const auto sampleX = srcX + std::min(srcW - 1, static_cast<til::CoordType>(static_cast<int64_t>(pixelColumn) * srcW / cellWidth));
-            const auto srcIndex = srcRowStart + static_cast<size_t>(sampleX);
-            if (srcIndex < image.pixels.size())
+            const auto targetX = targetXBase + pixelColumn;
+            if (withinY && targetX < targetW)
             {
-                til::at(dstIterator, pixelColumn) = image.pixels[srcIndex];
+                const auto sampleX = cropX + std::min(cropW - 1, static_cast<til::CoordType>(targetX * cropW / targetW));
+                const auto srcIndex = srcRowStart + static_cast<size_t>(sampleX);
+                til::at(dstIterator, pixelColumn) = srcIndex < image.pixels.size() ? image.pixels[srcIndex] : RGBQUAD{};
+            }
+            else
+            {
+                til::at(dstIterator, pixelColumn) = RGBQUAD{}; // aspect padding beyond the scaled target
             }
         }
         if (pixelRow + 1 < cellHeight)
@@ -5930,7 +5944,7 @@ void AdaptDispatch::_placeKittyPlaceholderCell(const KittyImage& image, const ui
             std::advance(dstIterator, dstSlice->PixelWidth());
         }
     }
-    buffer.TriggerRedraw(Viewport::FromExclusive({ column, row, column + 1, row + 1 }));
+    return true;
 }
 
 // Overlays each U+10EEEE placeholder in one just-written segment with its sub-rect of the
@@ -5965,6 +5979,10 @@ void AdaptDispatch::_renderKittyPlaceholders(const std::wstring_view segment, co
     // it. Explicit diacritics override and re-sync the counter to that cell.
     const auto& row = buffer.GetRowByOffset(screenRow);
     auto column = startColumn;
+    // Track the drawn placeholder cell span so ONE bounded redraw covers the whole segment/row,
+    // instead of a TriggerRedraw per cell on the text-output hot path (matches _placeKittyImage).
+    auto firstDrawnCol = page.Width();
+    auto lastDrawnCol = static_cast<til::CoordType>(-1);
     for (size_t i = 0; i < segment.size();)
     {
         const auto next = buffer.GraphemeNext(segment, i);
@@ -6022,7 +6040,11 @@ void AdaptDispatch::_renderKittyPlaceholders(const std::wstring_view segment, co
                     const auto rows = std::max<uint32_t>(place.rows, 1);
                     const auto cellRow = rowDiacritic >= 0 ? static_cast<uint32_t>(rowDiacritic) : place.autoRow;
                     const auto cellCol = colDiacritic >= 0 ? static_cast<uint32_t>(colDiacritic) : place.autoCol;
-                    _placeKittyPlaceholderCell(imageEntry->second, imageId, column, screenRow, cellRow, cellCol, rows, cols, place.cropX, place.cropY, place.cropW, place.cropH);
+                    if (_placeKittyPlaceholderCell(imageEntry->second, imageId, column, screenRow, cellRow, cellCol, place))
+                    {
+                        firstDrawnCol = std::min(firstDrawnCol, column);
+                        lastDrawnCol = std::max(lastDrawnCol, column);
+                    }
                     // Advance the running counter past this cell (wrapping col -> row), so the next
                     // auto cell continues sequentially regardless of screen row, wrap, or scroll.
                     place.autoRow = cellRow;
@@ -6039,6 +6061,12 @@ void AdaptDispatch::_renderKittyPlaceholders(const std::wstring_view segment, co
         const auto nextColumn = row.NavigateToNext(column);
         column = nextColumn > column ? nextColumn : column + 1;
         i = next;
+    }
+    // One bounded redraw for every placeholder tile drawn in this segment (avoids a per-cell
+    // TriggerRedraw on the text hot path; mirrors _placeKittyImage's single-redraw model).
+    if (lastDrawnCol >= firstDrawnCol)
+    {
+        buffer.TriggerRedraw(Viewport::FromExclusive({ firstDrawnCol, screenRow, std::min<til::CoordType>(lastDrawnCol + 1, page.Width()), screenRow + 1 }));
     }
 }
 

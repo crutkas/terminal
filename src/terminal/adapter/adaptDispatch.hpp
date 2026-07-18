@@ -373,6 +373,14 @@ namespace Microsoft::Console::VirtualTerminal
             uint32_t cropY = 0;
             uint32_t cropW = 0;
             uint32_t cropH = 0;
+            // Exact scaled target pixel size (== _placeKittyImage's targetW/targetH). Placeholder
+            // cells sample this continuous scaled space so a virtual grid is pixel-identical to a
+            // direct c/r placement even for non-divisible geometry; pixels past it are the
+            // aspect-preserving padding (transparent). 0 => fall back to gridCols/Rows * cell size.
+            // 64-bit: aspect-preserving (c-only/r-only) scaling can exceed 2^32, and truncating it
+            // would diverge the placeholder render from the direct one.
+            uint64_t targetW = 0;
+            uint64_t targetH = 0;
         };
         static KittyControl _ParseKittyControl(const std::wstring_view control) noexcept;
         void _HandleKittyGraphics(const std::wstring_view control, const std::string_view payload, const bool payloadValid, const bool payloadTooLarge);
@@ -390,7 +398,8 @@ namespace Microsoft::Console::VirtualTerminal
         static KittyTargetSize _kittyTargetPixels(const int64_t cropW, const int64_t cropH, const uint32_t cols, const uint32_t rows, const int64_t cellWidth, const int64_t cellHeight) noexcept;
         void _placeKittyImage(const KittyImage& image, const bool moveCursor, const uint32_t imageId, const uint32_t cols = 0, const uint32_t rows = 0, const uint32_t srcX = 0, const uint32_t srcY = 0, const uint32_t srcW = 0, const uint32_t srcH = 0);
         void _renderKittyPlaceholders(const std::wstring_view segment, const til::CoordType screenRow, const til::CoordType startColumn);
-        void _placeKittyPlaceholderCell(const KittyImage& image, const uint32_t imageId, const til::CoordType column, const til::CoordType row, const uint32_t cellRow, const uint32_t cellCol, const uint32_t rows, const uint32_t cols, const uint32_t cropX, const uint32_t cropY, const uint32_t cropW, const uint32_t cropH);
+        // Returns true if a placeholder tile was drawn (the caller batches one redraw per segment).
+        bool _placeKittyPlaceholderCell(const KittyImage& image, const uint32_t imageId, const til::CoordType column, const til::CoordType row, const uint32_t cellRow, const uint32_t cellCol, const KittyVirtualPlacement& place);
         static int _KittyPlaceholderDiacriticIndex(const char32_t ch) noexcept;
         void _ReturnOscResponse(const std::wstring_view response) const;
 

@@ -5657,6 +5657,108 @@ public:
         }
     }
 
+    // Non-divisible geometry: a 3px-wide image scaled across a 2-cell grid at a 3px cell size
+    // (target width 6) has tile boundaries that DON'T fall on source-pixel edges. The placeholder
+    // render must STILL equal the direct c/r placement pixel-for-pixel (#35 item 2) -- the old
+    // per-cell source split diverged here (cell 0's rightmost pixel sampled the wrong source column).
+    TEST_METHOD(KittyPlaceholderMatchesDirectRenderNonDivisible)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 3, 3 };
+        auto& buf = *_testGetSet->_textBuffer;
+        const auto cell = _testGetSet->_cellSize;
+        const std::wstring payload = L"/wAAAP8AAAD//wAAAP8AAAD//wAAAP8AAAD/"; // 3x3: columns red|green|blue
+        const til::CoordType directRow = buf.GetCursor().GetPosition().y;
+        const til::CoordType phRow = directRow + 6;
+
+        // Direct placement (geometry path) at column 0, C=1 so the cursor stays put.
+        buf.GetCursor().SetPosition({ 0, directRow });
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,f=24,s=3,v=3,c=2,r=2,C=1;" + payload + L"\x1b\\");
+
+        // The same image via U=1 + a 2x2 placeholder grid at column 0.
+        _stateMachine->ProcessString(L"\x1b_Ga=t,i=2,U=1,f=24,s=3,v=3,c=2,r=2;" + payload + L"\x1b\\");
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;2m"); // fg = image id 2
+        buf.GetCursor().SetPosition({ 0, phRow });
+        _stateMachine->ProcessString(Placeholder() + Placeholder()); // grid row 0
+        buf.GetCursor().SetPosition({ 0, phRow + 1 });
+        _stateMachine->ProcessString(Placeholder() + Placeholder()); // grid row 1
+        _stateMachine->ProcessString(L"\x1b[0m");
+
+        for (til::CoordType r = 0; r < 2; ++r)
+        {
+            const auto* sd = buf.GetRowByOffset(directRow + r).GetImageSlice();
+            const auto* sp = buf.GetRowByOffset(phRow + r).GetImageSlice();
+            VERIFY_IS_NOT_NULL(sd, L"direct render produced an image slice");
+            VERIFY_IS_NOT_NULL(sp, L"placeholder render produced an image slice");
+            for (til::CoordType py = 0; py < cell.height; ++py)
+            {
+                for (til::CoordType px = 0; px < 2 * cell.width; ++px)
+                {
+                    const auto a = SlicePixelAt(sd, px, py);
+                    const auto b = SlicePixelAt(sp, px, py);
+                    VERIFY_IS_TRUE(a.rgbRed == b.rgbRed && a.rgbGreen == b.rgbGreen && a.rgbBlue == b.rgbBlue,
+                                   L"non-divisible placeholder pixel must equal the direct-render pixel");
+                }
+            }
+        }
+    }
+
+    // A virtual placement requesting an enormous c/r must clamp its grid to maxCells (8192) so a
+    // hostile geometry can't blow up memory or the auto-counter (#35 test gap).
+    TEST_METHOD(KittyPlaceholderGridClampsToMaxCells)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,f=24,s=1,v=1,c=100000,r=100000;/wAA\x1b\\");
+        const auto it = _pDispatch->_kittyVirtualIds.find(1u);
+        VERIFY_IS_TRUE(it != _pDispatch->_kittyVirtualIds.end(), L"the virtual grid is registered");
+        VERIFY_ARE_EQUAL(8192u, it->second.cols, L"grid columns clamp to maxCells");
+        VERIFY_ARE_EQUAL(8192u, it->second.rows, L"grid rows clamp to maxCells");
+    }
+
+    // Aspect-preserving (r-only) scaling makes the exact target WIDTH exceed 2^32 for a wide image;
+    // caching it in a 32-bit field truncated it (even to 0 -> wrong "legacy" fallback), diverging the
+    // placeholder render from the direct one. The stored target size must keep full 64-bit width
+    // (#35 item 2 review finding).
+    TEST_METHOD(KittyPlaceholderLargeTargetNotTruncated)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1000 };
+        std::wstring payload;
+        for (auto i = 0; i < 525; ++i)
+        {
+            payload += L"/wAA"; // one red pixel (FF0000); 525 px total => a 525x1 f=24 image
+        }
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,f=24,s=525,v=1,r=8192;" + payload + L"\x1b\\");
+        const auto it = _pDispatch->_kittyVirtualIds.find(1u);
+        VERIFY_IS_TRUE(it != _pDispatch->_kittyVirtualIds.end(), L"the virtual grid is registered");
+        // r-only: targetW = cropW * (r*cellHeight) / cropH = 525 * (8192*1000) / 1 = 4,300,800,000.
+        const uint64_t expectedTargetW = 525ull * 8192ull * 1000ull;
+        VERIFY_IS_TRUE(expectedTargetW > (1ull << 32), L"sanity: this target width genuinely exceeds 32 bits");
+        VERIFY_ARE_EQUAL(expectedTargetW, static_cast<uint64_t>(it->second.targetW), L"the exact target width must not be truncated to 32 bits");
+    }
+
+    // A very long run of placeholders must render without error, bounded to the buffer: the auto
+    // counter wraps across the grid and the per-segment redraw stays bounded (#35 test gap; also
+    // exercises the batched-redraw path that replaced the per-cell TriggerRedraw).
+    TEST_METHOD(KittyPlaceholderHugeRunIsBounded)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,f=24,s=2,v=1,c=2,r=1;/wAAAP8A\x1b\\"); // 2x1 grid: red|green
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m"); // fg = image id 1
+        std::wstring run;
+        for (auto n = 0; n < 2000; ++n)
+        {
+            run += Placeholder();
+        }
+        _stateMachine->ProcessString(run);
+        _stateMachine->ProcessString(L"\x1b[0m");
+        VERIFY_IS_TRUE(CountImageRows(*_testGetSet->_textBuffer) >= 1, L"the huge placeholder run renders");
+        VERIFY_IS_TRUE(BufferContainsColor(*_testGetSet->_textBuffer, 255, 0, 0), L"the red tile (grid col 0) appears");
+        VERIFY_IS_TRUE(BufferContainsColor(*_testGetSet->_textBuffer, 0, 255, 0), L"the green tile (grid col 1) appears");
+    }
+
     // A virtual (U=1) placement created WITH a crop rect (x/y/w/h) must render the cropped
     // sub-image, not the whole image. The 4x4 source has four distinct 2x2 quadrants (TL red,
     // TR green, BL blue, BR white); cropping to the bottom-right (x=2,y=2,w=2,h=2) and scaling
