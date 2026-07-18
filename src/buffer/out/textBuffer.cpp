@@ -570,6 +570,7 @@ void TextBuffer::Insert(til::CoordType row, const TextAttribute& attributes, Row
         const auto& scratchAttr = scratch.Attributes();
         const auto restoreAttr = scratchAttr.slice(gsl::narrow<uint16_t>(state.columnBegin), gsl::narrow<uint16_t>(state.columnBegin + copyAmount));
         rowAttr.replace(gsl::narrow<uint16_t>(restoreState.columnBegin), gsl::narrow<uint16_t>(restoreState.columnEnd), restoreAttr);
+        r.CopyKittyPlaceholderCells(scratch, state.columnBegin, restoreState.columnBegin, restoreState.columnEnd);
         // If there is any image content, that needs to be copied too.
         ImageSlice::CopyCells(r, state.columnBegin, r, restoreState.columnBegin, restoreState.columnEnd);
     }

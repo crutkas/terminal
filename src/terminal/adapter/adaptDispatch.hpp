@@ -353,18 +353,13 @@ namespace Microsoft::Console::VirtualTerminal
             int64_t width = 0;
             int64_t height = 0;
         };
-        // A virtual (U=1) placement's fixed grid geometry plus its auto-numbering cursor.
+        // A virtual (U=1) placement's fixed grid geometry and source sampling state.
         // The grid (cols x rows) is recorded at store time so placeholder rendering slices
-        // the image consistently no matter how the cells are chunked across writes. autoRow/
-        // autoCol are a running counter (per kitty spec) for placeholder cells that omit
-        // explicit row/col diacritics; they advance only when a cell is drawn and are
-        // independent of the screen row, so scrolling/wrapping/chunking don't perturb them.
+        // the image consistently no matter how the cells are chunked across writes.
         struct KittyVirtualPlacement
         {
             uint32_t cols = 1;
             uint32_t rows = 1;
-            uint32_t autoRow = 0;
-            uint32_t autoCol = 0;
             // Source crop rect (pixels) captured from x/y/w/h at store time (w/h=0/past-edge
             // already resolved and clamped to the image), so placeholder rendering samples the
             // same sub-rect a direct c/r placement would instead of the whole image. cropW/cropH
@@ -438,7 +433,7 @@ namespace Microsoft::Console::VirtualTerminal
         std::deque<uint32_t> _kittyImageOrder;
         // Ids placed virtually (U=1): only these may be drawn by U+10EEEE placeholders, so a
         // plain colored placeholder glyph can't false-overlay an ordinary image. The value is
-        // the placement's fixed grid geometry and auto-numbering state (KittyVirtualPlacement).
+        // the placement's fixed grid geometry and source sampling state (KittyVirtualPlacement).
         std::unordered_map<uint32_t, KittyVirtualPlacement> _kittyVirtualIds;
 
         // Chunked transmission (m=): accumulates the base64 payload across sequences;

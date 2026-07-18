@@ -20,6 +20,15 @@ using namespace Microsoft::Console::VirtualTerminal;
 
 static constexpr std::wstring_view whitespace{ L" " };
 
+static KittyPlaceholderCell getKittyPlaceholderCell(const TextBuffer& buffer, const til::point position) noexcept
+{
+    if (const auto metadata = buffer.GetRowByOffset(position.y).GetKittyPlaceholderCell(position.x))
+    {
+        return *metadata;
+    }
+    return {};
+}
+
 struct XtermResourceColorTableEntry
 {
     int ColorTableIndex;
@@ -595,7 +604,12 @@ void AdaptDispatch::_ScrollRectVertically(const Page& page, const til::rect& scr
             do
             {
                 const auto current = OutputCell(*textBuffer.GetCellDataAt(srcPos));
+                const auto metadata = getKittyPlaceholderCell(textBuffer, srcPos);
                 textBuffer.WriteLine(OutputCellIterator({ &current, 1 }), dstPos);
+                if (metadata.valid)
+                {
+                    textBuffer.GetMutableRowByOffset(dstPos.y).SetKittyPlaceholderCell(dstPos.x, metadata);
+                }
                 srcView.WalkInBounds(srcPos, walkDirection);
             } while (dstView.WalkInBounds(dstPos, walkDirection));
             // Copy any image content in the affected area.
@@ -643,12 +657,19 @@ void AdaptDispatch::_ScrollRectHorizontally(const Page& page, const til::rect& s
         // to the target, so a two-cell DBCS character can't accidentally delete
         // itself when moving one cell horizontally.
         auto next = OutputCell(*textBuffer.GetCellDataAt(sourcePos));
+        auto nextMetadata = getKittyPlaceholderCell(textBuffer, sourcePos);
         do
         {
             const auto current = next;
+            const auto currentMetadata = nextMetadata;
             source.WalkInBounds(sourcePos, walkDirection);
             next = OutputCell(*textBuffer.GetCellDataAt(sourcePos));
+            nextMetadata = getKittyPlaceholderCell(textBuffer, sourcePos);
             textBuffer.WriteLine(OutputCellIterator({ &current, 1 }), targetPos);
+            if (currentMetadata.valid)
+            {
+                textBuffer.GetMutableRowByOffset(targetPos.y).SetKittyPlaceholderCell(targetPos.x, currentMetadata);
+            }
         } while (target.WalkInBounds(targetPos, walkDirection));
         // Copy any image content in the affected area.
         ImageSlice::CopyBlock(textBuffer, source.ToExclusive(), textBuffer, target.ToExclusive());
@@ -1187,17 +1208,24 @@ void AdaptDispatch::CopyRectangularArea(const VTInt top, const VTInt left, const
         // to the target, so a two-cell DBCS character can't accidentally delete
         // itself when moving one cell horizontally.
         auto next = OutputCell(*src.Buffer().GetCellDataAt(srcPos));
+        auto nextMetadata = getKittyPlaceholderCell(src.Buffer(), srcPos);
         do
         {
             const auto current = next;
+            const auto currentMetadata = nextMetadata;
             const auto currentSrcPos = srcPos;
             srcView.WalkInBounds(srcPos, walkDirection);
             next = OutputCell(*src.Buffer().GetCellDataAt(srcPos));
+            nextMetadata = getKittyPlaceholderCell(src.Buffer(), srcPos);
             // If the source position is offscreen (which can occur on double
             // width lines), then we shouldn't copy anything to the destination.
             if (currentSrcPos.x < src.Buffer().GetLineWidth(currentSrcPos.y))
             {
                 dst.Buffer().WriteLine(OutputCellIterator({ &current, 1 }), dstPos);
+                if (currentMetadata.valid)
+                {
+                    dst.Buffer().GetMutableRowByOffset(dstPos.y).SetKittyPlaceholderCell(dstPos.x, currentMetadata);
+                }
             }
         } while (dstView.WalkInBounds(dstPos, walkDirection));
         // Copy any image content in the affected area.
@@ -5768,7 +5796,8 @@ AdaptDispatch::KittyTargetSize AdaptDispatch::_kittyTargetPixels(const int64_t c
 // Records the fixed grid geometry of a virtual (U=1) placement so later Unicode-placeholder
 // rendering slices the image by a STABLE rows x cols grid. The grid is the cell span the same
 // image would occupy if drawn at the cursor (shared _kittyTargetPixels), so c-only/r-only
-// keep aspect. Re-storing resets the auto counter so a fresh placement numbers from (0,0).
+// keep aspect. Omitted placeholder coordinates are resolved from persistent left-cell metadata,
+// not placement-global state, so re-storing does not disturb already-written placeholder text.
 void AdaptDispatch::_storeKittyVirtualPlacement(const uint32_t id, const KittyImage& image, const uint32_t cols, const uint32_t rows, const uint32_t srcX, const uint32_t srcY, const uint32_t srcW, const uint32_t srcH)
 {
     constexpr uint32_t maxCells = 8192;
@@ -5799,8 +5828,6 @@ void AdaptDispatch::_storeKittyVirtualPlacement(const uint32_t id, const KittyIm
     auto& placement = _kittyVirtualIds[id];
     placement.cols = static_cast<uint32_t>(gridCols);
     placement.rows = static_cast<uint32_t>(gridRows);
-    placement.autoRow = 0;
-    placement.autoCol = 0;
     placement.cropX = static_cast<uint32_t>(cropX);
     placement.cropY = static_cast<uint32_t>(cropY);
     placement.cropW = static_cast<uint32_t>(cropW);
@@ -5951,33 +5978,27 @@ bool AdaptDispatch::_placeKittyPlaceholderCell(const KittyImage& image, const ui
 // (virtual) image named by the cell's foreground (24-bit RGB or a 256-color index = the id).
 // The grid (rows x cols) is the geometry recorded when the image was stored virtually, so it
 // stays constant however the cells are chunked across writes. A cell's grid (row,col) comes
-// from its kitty combining diacritics (1st = row, 2nd = col; extras ignored). Absent diacritics
-// use a linear running counter per the spec: the column auto-increments per drawn cell and
-// wraps to the next row, independent of the screen row, so scrolling and chunked writes don't
-// perturb it. The screen column steps by each glyph's real width (NavigateToNext), so a wide
-// (CJK) glyph before a placeholder doesn't shift it. Called per segment with the segment's
-// true post-wrap row and start column.
+// from its kitty combining diacritics (1st = row, 2nd = col). Missing values inherit only from
+// the immediate-left placeholder when the protocol's foreground/underline and adjacency gates
+// match; otherwise they default to zero. The resolved coordinates and image-id high byte are
+// stored with the text cell so inheritance survives separate writes, scrolling, and reflow.
+// The screen column steps by each glyph's real width (NavigateToNext), so a wide (CJK) glyph
+// before a placeholder doesn't shift it. Called per segment with the segment's true post-wrap
+// row and start column.
 // Protocol: https://sw.kovidgoyal.net/kitty/graphics-protocol/#unicode-placeholders
 void AdaptDispatch::_renderKittyPlaceholders(const std::wstring_view segment, const til::CoordType screenRow, const til::CoordType startColumn)
 {
     auto page = _pages.ActivePage();
     auto& buffer = page.Buffer();
-    const auto fg = page.Attributes().GetForeground();
-    if (!fg.IsRgb())
-    {
-        return; // no 24-bit image id => not a Kitty placeholder
-    }
-    const auto rgb = fg.GetRGB();
-    // The foreground supplies the LOW 24 bits of the image id; an optional 3rd row/column
-    // diacritic supplies the high byte (bits 24-31). The effective id -- and thus which virtual
-    // image a cell references -- is therefore resolved PER CELL inside the loop below.
-    const uint32_t imageIdLow = (static_cast<uint32_t>(GetRValue(rgb)) << 16) | (static_cast<uint32_t>(GetGValue(rgb)) << 8) | GetBValue(rgb);
-
-    // Per the kitty spec, an absent row/col diacritic uses a running counter that advances
-    // only when a placeholder cell is drawn (col++ per cell; on overflow col=0, row++). The
-    // counter is independent of the screen row, so scrolling and chunked writes don't affect
-    // it. Explicit diacritics override and re-sync the counter to that cell.
-    const auto& row = buffer.GetRowByOffset(screenRow);
+    auto& row = buffer.GetMutableRowByOffset(screenRow);
+    const auto colorId = [](const TextColor color) noexcept {
+        if (color.IsRgb())
+        {
+            const auto rgb = color.GetRGB();
+            return (static_cast<uint32_t>(GetRValue(rgb)) << 16) | (static_cast<uint32_t>(GetGValue(rgb)) << 8) | GetBValue(rgb);
+        }
+        return color.IsIndex256() ? static_cast<uint32_t>(color.GetIndex()) : 0u;
+    };
     auto column = startColumn;
     // Track the drawn placeholder cell span so ONE bounded redraw covers the whole segment/row,
     // instead of a TriggerRedraw per cell on the text-output hot path (matches _placeKittyImage).
@@ -6022,37 +6043,72 @@ void AdaptDispatch::_renderKittyPlaceholders(const std::wstring_view segment, co
                     }
                 }
             }
-            // Compose the effective id from the fg low bits and the optional high byte, then look
-            // up THAT virtual image. A non-zero high byte selects a >24-bit id; if no such image
-            // exists the cell is skipped (never rendered as the wrong low-24-bit image). Ordinary
-            // text whose fg is not a virtual image id also finds nothing and draws no overlay.
-            // The high byte is 0-255; a 3rd diacritic index > 255 cannot be a byte, so it is not a
-            // valid id and the cell is skipped (also avoids overflowing the << 24 shift).
-            if (idHighByte <= 255)
+            const auto attributes = row.GetAttrByColumn(column);
+            const auto fg = attributes.GetForeground();
+            if (fg.IsRgb() && idHighByte <= 255)
             {
-                const auto imageId = idHighByte > 0 ? (imageIdLow | (static_cast<uint32_t>(idHighByte) << 24)) : imageIdLow;
+                const auto imageIdLow = colorId(fg);
+
+                // Kitty's omission rules are positional:
+                //  * no diacritics: inherit row, left column + 1, and high byte;
+                //  * row only: inherit column + 1/high byte only when the rows match;
+                //  * row+column: inherit only the high byte when the coordinates are adjacent.
+                // Every inheritance case also requires matching foreground image-id and underline
+                // placement-id color values. At column 0 or after any failed gate, omitted values
+                // remain zero.
+                auto cellRow = rowDiacritic >= 0 ? static_cast<uint32_t>(rowDiacritic) : 0u;
+                auto cellCol = colDiacritic >= 0 ? static_cast<uint32_t>(colDiacritic) : 0u;
+                auto highByte = idHighByte >= 0 ? static_cast<uint8_t>(idHighByte) : uint8_t{ 0 };
+                const auto left = column > 0 ? row.GetKittyPlaceholderCell(column - 1) : nullptr;
+                const auto leftAttributes = left ? row.GetAttrByColumn(column - 1) : TextAttribute{};
+                const auto attributesMatch = left &&
+                                             colorId(leftAttributes.GetForeground()) == imageIdLow &&
+                                             colorId(leftAttributes.GetUnderlineColor()) == colorId(attributes.GetUnderlineColor());
+                if (rowDiacritic < 0)
+                {
+                    if (attributesMatch)
+                    {
+                        cellRow = left->row;
+                        cellCol = static_cast<uint32_t>(left->column) + 1;
+                        highByte = left->imageIdHighByte;
+                    }
+                }
+                else if (colDiacritic < 0)
+                {
+                    if (attributesMatch && left->row == cellRow)
+                    {
+                        cellCol = static_cast<uint32_t>(left->column) + 1;
+                        highByte = left->imageIdHighByte;
+                    }
+                }
+                else if (idHighByte < 0)
+                {
+                    if (attributesMatch && left->row == cellRow && static_cast<uint32_t>(left->column) + 1 == cellCol)
+                    {
+                        highByte = left->imageIdHighByte;
+                    }
+                }
+
+                row.SetKittyPlaceholderCell(column, KittyPlaceholderCell{
+                                                           .column = cellCol,
+                                                           .row = gsl::narrow_cast<uint16_t>(cellRow),
+                                                           .imageIdHighByte = highByte,
+                                                           .valid = true,
+                                                       });
+
+                // Compose the effective id only after resolving an omitted high byte from the
+                // left cell. A non-zero byte selects a >24-bit image; a missing image/placement
+                // draws nothing but the resolved cell metadata remains available to its right.
+                const auto imageId = highByte > 0 ? (imageIdLow | (static_cast<uint32_t>(highByte) << 24)) : imageIdLow;
                 const auto placement = _kittyVirtualIds.find(imageId);
                 const auto imageEntry = _kittyImages.find(imageId);
                 if (placement != _kittyVirtualIds.end() && imageEntry != _kittyImages.end())
                 {
-                    auto& place = placement->second;
-                    const auto cols = std::max<uint32_t>(place.cols, 1);
-                    const auto rows = std::max<uint32_t>(place.rows, 1);
-                    const auto cellRow = rowDiacritic >= 0 ? static_cast<uint32_t>(rowDiacritic) : place.autoRow;
-                    const auto cellCol = colDiacritic >= 0 ? static_cast<uint32_t>(colDiacritic) : place.autoCol;
+                    const auto& place = placement->second;
                     if (_placeKittyPlaceholderCell(imageEntry->second, imageId, column, screenRow, cellRow, cellCol, place))
                     {
                         firstDrawnCol = std::min(firstDrawnCol, column);
                         lastDrawnCol = std::max(lastDrawnCol, column);
-                    }
-                    // Advance the running counter past this cell (wrapping col -> row), so the next
-                    // auto cell continues sequentially regardless of screen row, wrap, or scroll.
-                    place.autoRow = cellRow;
-                    place.autoCol = cellCol + 1;
-                    if (place.autoCol >= cols)
-                    {
-                        place.autoCol = 0;
-                        place.autoRow = std::min<uint32_t>(place.autoRow + 1, rows - 1);
                     }
                 }
             }
