@@ -344,6 +344,7 @@ namespace Microsoft::Console::VirtualTerminal
             uint32_t parentPlacementId = 0;  // Q=: parent placement id (with P) identifying the parent placement
             int32_t offsetH = 0;             // H=: signed horizontal cell offset from the parent anchor (+right)
             int32_t offsetV = 0;             // V=: signed vertical cell offset from the parent anchor (+down)
+            int32_t zIndex = 0;              // z=: signed stacking order; negative values render under text
             bool havePlacementId = false;    // true if p= was present (so p= is echoed in the ack)
             bool haveParent = false;         // true if P= was present (a relative placement was requested)
         };
@@ -386,6 +387,7 @@ namespace Microsoft::Console::VirtualTerminal
             // would diverge the placeholder render from the direct one.
             uint64_t targetW = 0;
             uint64_t targetH = 0;
+            int32_t zIndex = 0;
         };
         // A single placement (one display) of an image, identified by the (imageId, placementId)
         // pair. anchorRow/anchorCol are the absolute top-left cell of the placement. A relative
@@ -407,6 +409,7 @@ namespace Microsoft::Console::VirtualTerminal
             uint32_t parentPlacementId = 0;
             int32_t offsetH = 0;
             int32_t offsetV = 0;
+            int32_t zIndex = 0;
             bool hasParent = false;
             bool isVirtual = false;
         };
@@ -423,9 +426,10 @@ namespace Microsoft::Console::VirtualTerminal
         void _eraseKittyImage(const uint32_t id);
         void _eraseKittyImageRows(const uint32_t imageId);
         void _clearKittyImages() noexcept;
-        void _storeKittyVirtualPlacement(const uint32_t id, const KittyImage& image, const uint32_t cols, const uint32_t rows, const uint32_t srcX, const uint32_t srcY, const uint32_t srcW, const uint32_t srcH);
+        void _storeKittyVirtualPlacement(const uint32_t id, const KittyImage& image, const uint32_t cols, const uint32_t rows, const uint32_t srcX, const uint32_t srcY, const uint32_t srcW, const uint32_t srcH, const int32_t zIndex);
         static KittyTargetSize _kittyTargetPixels(const int64_t cropW, const int64_t cropH, const uint32_t cols, const uint32_t rows, const int64_t cellWidth, const int64_t cellHeight) noexcept;
-        til::size _placeKittyImage(const KittyImage& image, const bool moveCursor, const uint32_t imageId, const uint32_t cols = 0, const uint32_t rows = 0, const uint32_t srcX = 0, const uint32_t srcY = 0, const uint32_t srcW = 0, const uint32_t srcH = 0, const std::optional<til::point> anchor = std::nullopt);
+        bool _kittyPlacementFitsMemory(const KittyImage& image, uint32_t imageId, uint32_t cols, uint32_t rows, uint32_t srcX, uint32_t srcY, uint32_t srcW, uint32_t srcH, int32_t zIndex, std::optional<til::point> anchor = std::nullopt) const noexcept;
+        til::size _placeKittyImage(const KittyImage& image, bool moveCursor, uint32_t imageId, uint32_t cols = 0, uint32_t rows = 0, uint32_t srcX = 0, uint32_t srcY = 0, uint32_t srcW = 0, uint32_t srcH = 0, int32_t zIndex = 0, std::optional<til::point> anchor = std::nullopt, const KittyPlacement* replacedPlacement = nullptr);
         // Relative placement registry helpers.
         // Protocol: https://sw.kovidgoyal.net/kitty/graphics-protocol/#relative-placements
         void _registerKittyPlacement(const KittyPlacement& placement);

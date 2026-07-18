@@ -261,9 +261,12 @@ try
 
     for (const auto r : _p.rows)
     {
-        if (r->bitmap.revision != 0 && !r->bitmap.active)
+        for (auto& bitmap : r->bitmaps)
         {
-            r->bitmap = {};
+            if (bitmap.revision != 0 && !bitmap.active)
+            {
+                bitmap = {};
+            }
         }
     }
 
@@ -545,15 +548,25 @@ try
 }
 CATCH_RETURN()
 
-[[nodiscard]] HRESULT AtlasEngine::PaintImageSlice(const ImageSlice& imageSlice, const til::CoordType targetRow, const til::CoordType viewportLeft) noexcept
+[[nodiscard]] HRESULT AtlasEngine::BeginImageSliceRow() noexcept
+{
+    return S_OK;
+}
+
+[[nodiscard]] HRESULT AtlasEngine::PaintImageSlice(const ImageSlice& imageSlice, const ImageSlice::RenderPosition position, const til::CoordType targetRow, const til::CoordType viewportLeft, const std::span<const uint8_t> backgroundMask) noexcept
 try
 {
     const auto y = clamp<til::CoordType>(targetRow, 0, _p.s->viewportCellCount.y - 1);
     const auto row = _p.rows[y];
-    const auto revision = imageSlice.Revision();
+    auto revision = imageSlice.Revision(position);
+    for (const auto value : backgroundMask)
+    {
+        revision ^= value + 0x9e3779b97f4a7c15ull + (revision << 6) + (revision >> 2);
+    }
+    revision = std::max<uint64_t>(revision, 1);
     const auto srcWidth = std::max(0, imageSlice.PixelWidth());
     const auto srcCellSize = imageSlice.CellSize();
-    auto& b = row->bitmap;
+    auto& b = til::at(row->bitmaps, static_cast<size_t>(position));
 
     // If this row's ImageSlice has changed we need to update our snapshot.
     // Theoretically another _p.rows[y]->bitmap may have this particular revision already,
@@ -561,7 +574,7 @@ try
     if (b.revision != revision)
     {
         const auto srcHeight = std::max(0, srcCellSize.height);
-        const auto pixels = imageSlice.Pixels();
+        const auto pixels = imageSlice.Pixels(position);
         const auto expectedSize = gsl::narrow_cast<size_t>(srcWidth) * gsl::narrow_cast<size_t>(srcHeight);
 
         // Sanity check.
@@ -577,6 +590,23 @@ try
         }
 
         memcpy(b.source.data(), pixels.data(), pixels.size_bytes());
+        const auto columnCount = srcCellSize.width > 0 ? srcWidth / srcCellSize.width : 0;
+        if (!backgroundMask.empty() && backgroundMask.size() == static_cast<size_t>(columnCount))
+        {
+            for (auto column = 0; column < columnCount; ++column)
+            {
+                if (til::at(backgroundMask, column) != 0)
+                {
+                    continue;
+                }
+                const auto x = column * srcCellSize.width;
+                for (auto pixelRow = 0; pixelRow < srcCellSize.height; ++pixelRow)
+                {
+                    auto first = b.source.data() + static_cast<size_t>(pixelRow) * srcWidth + x;
+                    std::fill_n(first, srcCellSize.width, 0u);
+                }
+            }
+        }
         b.revision = revision;
         b.sourceSize.x = srcWidth;
         b.sourceSize.y = srcHeight;
@@ -588,6 +618,11 @@ try
     return S_OK;
 }
 CATCH_RETURN()
+
+[[nodiscard]] HRESULT AtlasEngine::EndImageSliceRow() noexcept
+{
+    return S_OK;
+}
 
 [[nodiscard]] HRESULT AtlasEngine::PaintSelection(const til::rect& rect) noexcept
 {

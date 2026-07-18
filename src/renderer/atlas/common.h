@@ -472,7 +472,10 @@ namespace Microsoft::Console::Render::Atlas
             glyphAdvances.clear();
             glyphOffsets.clear();
             colors.clear();
-            bitmap.active = false;
+            for (auto& bitmap : bitmaps)
+            {
+                bitmap.active = false;
+            }
             gridLineRanges.clear();
             lineRendition = LineRendition::SingleWidth;
             dirtyTop = y * cellHeight;
@@ -491,7 +494,7 @@ namespace Microsoft::Console::Render::Atlas
         // Same size as glyphIndices.
         std::vector<u32> colors;
 
-        Bitmap bitmap;
+        std::array<Bitmap, 3> bitmaps;
         std::vector<GridLineRange> gridLineRanges;
         LineRendition lineRendition = LineRendition::SingleWidth;
         til::CoordType dirtyTop = 0;
