@@ -72,6 +72,17 @@ struct RowCopyTextFromState
     til::CoordType sourceColumnEnd = 0; // OUT
 };
 
+// Resolved coordinates for a Kitty Unicode image placeholder. This is stored with
+// the text cell so omitted diacritics can inherit from the immediate-left cell even
+// after separate writes, scrolling, or reflow.
+struct KittyPlaceholderCell
+{
+    uint32_t column = 0;
+    uint16_t row = 0;
+    uint8_t imageIdHighByte = 0;
+    bool valid = false;
+};
+
 // This structure is basically an inverse of ROW::_charOffsets. If you have a pointer
 // into a ROW's text this class can tell you what cell that pointer belongs to.
 struct CharToColumnMapper
@@ -170,6 +181,9 @@ public:
     DbcsAttribute DbcsAttrAt(til::CoordType column) const noexcept;
     std::wstring_view GetText() const noexcept;
     std::wstring_view GetText(til::CoordType columnBegin, til::CoordType columnEnd) const noexcept;
+    const KittyPlaceholderCell* GetKittyPlaceholderCell(til::CoordType column) const noexcept;
+    void SetKittyPlaceholderCell(til::CoordType column, const KittyPlaceholderCell& metadata);
+    void CopyKittyPlaceholderCells(const ROW& source, til::CoordType sourceColumnBegin, til::CoordType columnBegin, til::CoordType columnEnd);
     til::CoordType GetLeadingColumnAtCharOffset(ptrdiff_t offset) const noexcept;
     til::CoordType GetTrailingColumnAtCharOffset(ptrdiff_t offset) const noexcept;
     uint16_t GetCharOffset(til::CoordType col) const noexcept;
@@ -261,6 +275,7 @@ private:
     void _init() noexcept;
     void _resizeChars(uint16_t colEndDirty, uint16_t chBegDirty, size_t chEndDirty, uint16_t chEndDirtyOld);
     CharToColumnMapper _createCharToColumnMapper(ptrdiff_t offset) const noexcept;
+    void _clearKittyPlaceholderCells(til::CoordType columnBegin, til::CoordType columnEnd) noexcept;
 
     // These fields are a bit "wasteful", but it makes all this a bit more robust against
     // programming errors during initial development (which is when this comment was written).
@@ -318,6 +333,9 @@ private:
 
     // Stores any image content covering the row.
     ImageSlice::Pointer _imageSlice;
+
+    // Allocated lazily only for rows containing Kitty Unicode placeholders.
+    std::vector<KittyPlaceholderCell> _kittyPlaceholderCells;
 };
 
 #ifdef UNIT_TESTING

@@ -5632,9 +5632,9 @@ public:
         _stateMachine->ProcessString(L"\x1b_Ga=t,i=2,U=1,f=24,s=2,v=2,c=2,r=2;" + payload + L"\x1b\\");
         _stateMachine->ProcessString(L"\x1b[38;2;0;0;2m"); // fg = image id 2
         buf.GetCursor().SetPosition({ 0, phRow });
-        _stateMachine->ProcessString(Placeholder() + Placeholder()); // grid row 0
+        _stateMachine->ProcessString(Placeholder() + L"\x0305" + Placeholder()); // explicit grid row 0, then inherit
         buf.GetCursor().SetPosition({ 0, phRow + 1 });
-        _stateMachine->ProcessString(Placeholder() + Placeholder()); // grid row 1
+        _stateMachine->ProcessString(Placeholder() + L"\x030D" + Placeholder()); // explicit grid row 1, then inherit
         _stateMachine->ProcessString(L"\x1b[0m");
 
         // Every pixel of the 2-cell x 2-row footprint must be identical between the renders.
@@ -5679,9 +5679,9 @@ public:
         _stateMachine->ProcessString(L"\x1b_Ga=t,i=2,U=1,f=24,s=3,v=3,c=2,r=2;" + payload + L"\x1b\\");
         _stateMachine->ProcessString(L"\x1b[38;2;0;0;2m"); // fg = image id 2
         buf.GetCursor().SetPosition({ 0, phRow });
-        _stateMachine->ProcessString(Placeholder() + Placeholder()); // grid row 0
+        _stateMachine->ProcessString(Placeholder() + L"\x0305" + Placeholder()); // explicit grid row 0, then inherit
         buf.GetCursor().SetPosition({ 0, phRow + 1 });
-        _stateMachine->ProcessString(Placeholder() + Placeholder()); // grid row 1
+        _stateMachine->ProcessString(Placeholder() + L"\x030D" + Placeholder()); // explicit grid row 1, then inherit
         _stateMachine->ProcessString(L"\x1b[0m");
 
         for (til::CoordType r = 0; r < 2; ++r)
@@ -5738,9 +5738,9 @@ public:
         VERIFY_ARE_EQUAL(expectedTargetW, static_cast<uint64_t>(it->second.targetW), L"the exact target width must not be truncated to 32 bits");
     }
 
-    // A very long run of placeholders must render without error, bounded to the buffer: the auto
-    // counter wraps across the grid and the per-segment redraw stays bounded (#35 test gap; also
-    // exercises the batched-redraw path that replaced the per-cell TriggerRedraw).
+    // A very long run of placeholders must render without error, bounded to the buffer: each
+    // screen row resolves left-to-right and the per-segment redraw stays bounded (#35 test gap;
+    // also exercises the batched-redraw path that replaced the per-cell TriggerRedraw).
     TEST_METHOD(KittyPlaceholderHugeRunIsBounded)
     {
         _testGetSet->PrepData();
@@ -5773,9 +5773,9 @@ public:
         const std::wstring payload = L"/wAA/wAAAP8AAP8A/wAA/wAAAP8AAP8AAAD/AAD/////////AAD/AAD/////////"; // 4x4 quadrants
         _stateMachine->ProcessString(L"\x1b_Ga=t,i=1,U=1,f=24,s=4,v=4,x=2,y=2,w=2,h=2,c=2,r=2;" + payload + L"\x1b\\");
         _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m"); // fg = image id 1
-        _stateMachine->ProcessString(Placeholder() + Placeholder()); // grid row 0
+        _stateMachine->ProcessString(Placeholder() + L"\x0305" + Placeholder()); // explicit grid row 0, then inherit
         _testGetSet->_textBuffer->GetCursor().SetPosition({ origin.x, origin.y + 1 });
-        _stateMachine->ProcessString(Placeholder() + Placeholder()); // grid row 1
+        _stateMachine->ProcessString(Placeholder() + L"\x030D" + Placeholder()); // explicit grid row 1, then inherit
         _stateMachine->ProcessString(L"\x1b[0m");
 
         const auto* r0 = _testGetSet->_textBuffer->GetRowByOffset(origin.y).GetImageSlice();
@@ -6151,35 +6151,282 @@ public:
         VERIFY_IS_FALSE(BufferContainsColor(*_testGetSet->_textBuffer, 0, 255, 0), L"inferred 2-col grid keeps green out of col 0");
     }
 
-    // The auto grid row must survive a bottom-of-buffer scroll. A 1x2 (red over green) image in
-    // a 1-col, 2-row grid with NO row diacritic: the first placeholder is grid row 0 (red).
-    // Printing another placeholder at the SAME screen row is the post-scroll signature (at the
-    // bottom of the buffer a new line keeps the same absolute row), so the auto row must advance
-    // to grid row 1 (green). An absolute anchor computed rowOffset 0 and repeated red forever.
-    TEST_METHOD(KittyPlaceholderAutoRowAfterScrollAdvances)
+    // An explicit left cell establishes the resolved column inherited by a row-only cell
+    // immediately to its right. This documents the #17 spec rule in one write; the old
+    // placement-global counter happened to pass common sequential layouts but was not cell-based.
+    TEST_METHOD(KittyPlaceholderExplicitLeftInheritsSameWrite)
     {
         _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
         const auto origin = _testGetSet->_textBuffer->GetCursor().GetPosition();
-        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,f=24,s=1,v=2,c=1,r=2;/wAAAP8A\x1b\\"); // top red, bottom green
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,f=24,s=2,v=2,c=2,r=2;/wAAAP8AAAD/////\x1b\\");
         _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m");
+        _stateMachine->ProcessString(Placeholder() + L"\x030D" + L"\x0305" + Placeholder() + L"\x030D"); // (1,0), then row-only (1,1)
 
-        // First render: auto row 0 -> top tile (red).
-        _stateMachine->ProcessString(Placeholder());
-        const auto* first = _testGetSet->_textBuffer->GetRowByOffset(origin.y).GetImageSlice();
-        VERIFY_IS_TRUE(SliceContainsColor(first, 255, 0, 0), L"auto row 0 = top tile (red)");
+        const auto* slice = _testGetSet->_textBuffer->GetRowByOffset(origin.y).GetImageSlice();
+        VERIFY_IS_TRUE(SlicePixelIs(slice, 0, 0, 0, 0, 255), L"explicit (row 1, col 0) selects blue");
+        VERIFY_IS_TRUE(SlicePixelIs(slice, 1, 0, 255, 255, 255), L"the row-only cell inherits col 1 from the matching left row (white)");
+    }
 
-        // A second render landing at the SAME screen row means the prior line scrolled off the
-        // bottom; the auto row must step to grid row 1 (bottom tile, green).
-        _testGetSet->_textBuffer->GetCursor().SetPosition({ origin.x, origin.y });
+    // The left cell can have been written by an earlier ProcessString call. This requires
+    // persistent cell metadata; transient per-segment state cannot resolve the second write.
+    TEST_METHOD(KittyPlaceholderExplicitLeftInheritsAcrossWrites)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        const auto origin = _testGetSet->_textBuffer->GetCursor().GetPosition();
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,f=24,s=2,v=2,c=2,r=2;/wAAAP8AAAD/////\x1b\\");
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m");
+        _stateMachine->ProcessString(Placeholder() + L"\x030D" + L"\x0305"); // explicit (1,0)
+        _stateMachine->ProcessString(Placeholder()); // separate call, inherited (1,1)
+
+        const auto* slice = _testGetSet->_textBuffer->GetRowByOffset(origin.y).GetImageSlice();
+        VERIFY_IS_TRUE(SlicePixelIs(slice, 0, 0, 0, 0, 255), L"the earlier explicit cell remains blue");
+        VERIFY_IS_TRUE(SlicePixelIs(slice, 1, 0, 255, 255, 255), L"the later write inherits from the stored left cell");
+    }
+
+    // Writing another tile elsewhere must not advance global state used by a later omission.
+    // Old failure: explicit (0,2) reset the per-image counter, so the cell at x=1 repeated col 0
+    // instead of inheriting col 1 from its actual left neighbour.
+    TEST_METHOD(KittyPlaceholderInterleavedWriteUsesLeftNeighbor)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        auto& buffer = *_testGetSet->_textBuffer;
+        const auto origin = buffer.GetCursor().GetPosition();
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,f=24,s=3,v=1,c=3,r=1;/wAAAP8AAAD/\x1b\\");
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m");
+        _stateMachine->ProcessString(Placeholder() + L"\x0305" + L"\x0305"); // x=0, explicit col 0 (red)
+        buffer.GetCursor().SetPosition({ 10, origin.y });
+        _stateMachine->ProcessString(Placeholder() + L"\x0305" + L"\x030E"); // elsewhere, explicit col 2 (blue)
+        buffer.GetCursor().SetPosition({ 1, origin.y });
+        _stateMachine->ProcessString(Placeholder()); // must inherit col 1 from x=0
+
+        const auto* slice = buffer.GetRowByOffset(origin.y).GetImageSlice();
+        VERIFY_IS_TRUE(SlicePixelIs(slice, 1, 0, 0, 255, 0), L"interleaving cannot corrupt immediate-left inheritance (col 1 = green)");
+    }
+
+    // Foreground is part of Kitty's inheritance gate. Even though the left glyph has resolved
+    // col 1, a different foreground image id cannot inherit it and therefore defaults to col 0.
+    TEST_METHOD(KittyPlaceholderForegroundMismatchUsesDefaults)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        const auto origin = _testGetSet->_textBuffer->GetCursor().GetPosition();
+        const std::wstring payload = L"/wAAAP8AAAD/"; // red|green|blue
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,f=24,s=3,v=1,c=3,r=1;" + payload + L"\x1b\\");
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=2,f=24,s=3,v=1,c=3,r=1;" + payload + L"\x1b\\");
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m");
+        _stateMachine->ProcessString(Placeholder() + L"\x0305" + L"\x030D"); // image 1, explicit col 1 (green)
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;2m");
         _stateMachine->ProcessString(Placeholder());
-        const auto* second = _testGetSet->_textBuffer->GetRowByOffset(origin.y).GetImageSlice();
-        VERIFY_IS_TRUE(SliceContainsColor(second, 0, 255, 0), L"auto row advanced to grid row 1 (green) after the scroll signature");
-        VERIFY_IS_FALSE(SliceContainsColor(second, 255, 0, 0), L"the advanced auto row must not repeat the top tile (red)");
+
+        const auto* slice = _testGetSet->_textBuffer->GetRowByOffset(origin.y).GetImageSlice();
+        VERIFY_IS_TRUE(SlicePixelIs(slice, 0, 0, 0, 255, 0), L"the explicit image-1 cell is col 1 (green)");
+        VERIFY_IS_TRUE(SlicePixelIs(slice, 1, 0, 255, 0, 0), L"foreground mismatch rejects inheritance and defaults image 2 to col 0 (red)");
+    }
+
+    // Underline color carries the placement id and is also an exact inheritance gate. #12 stores
+    // one virtual geometry per image, but it still must not inherit coordinates across placement
+    // ids. Old failure: the per-image counter ignored underline and selected col 2 (blue).
+    TEST_METHOD(KittyPlaceholderUnderlineMismatchUsesDefaults)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        const auto origin = _testGetSet->_textBuffer->GetCursor().GetPosition();
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,f=24,s=3,v=1,c=3,r=1;/wAAAP8AAAD/\x1b\\");
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m");
+        _stateMachine->ProcessString(L"\x1b[58:2::0:0:1m");
+        _stateMachine->ProcessString(Placeholder() + L"\x0305" + L"\x030D"); // placement color 1, col 1
+        _stateMachine->ProcessString(L"\x1b[58:2::0:0:2m");
+        _stateMachine->ProcessString(Placeholder()); // placement color 2: no inheritance
+
+        const auto* slice = _testGetSet->_textBuffer->GetRowByOffset(origin.y).GetImageSlice();
+        VERIFY_IS_TRUE(SlicePixelIs(slice, 0, 0, 0, 255, 0), L"the explicit left cell is col 1 (green)");
+        VERIFY_IS_TRUE(SlicePixelIs(slice, 1, 0, 255, 0, 0), L"underline mismatch defaults to col 0 (red), not stale col 2");
+    }
+
+    // At buffer column 0 there is no left cell, so all omitted values default to zero regardless
+    // of earlier writes for the same image. The old global counter selected col 2 (blue).
+    TEST_METHOD(KittyPlaceholderColumnZeroUsesDefaults)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        auto& buffer = *_testGetSet->_textBuffer;
+        const auto origin = buffer.GetCursor().GetPosition();
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,f=24,s=3,v=1,c=3,r=1;/wAAAP8AAAD/\x1b\\");
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m");
+        buffer.GetCursor().SetPosition({ 10, origin.y });
+        _stateMachine->ProcessString(Placeholder() + L"\x0305" + L"\x030D"); // explicit col 1 elsewhere
+        buffer.GetCursor().SetPosition({ 0, origin.y + 1 });
+        _stateMachine->ProcessString(Placeholder()); // no left cell => (0,0)
+
+        const auto* slice = buffer.GetRowByOffset(origin.y + 1).GetImageSlice();
+        VERIFY_IS_TRUE(SlicePixelIs(slice, 0, 0, 255, 0, 0), L"column 0 omission defaults to grid col 0 (red)");
+    }
+
+    // A no-diacritic cell inherits the optional image-id high byte as well as row/column.
+    // Old failure: the second cell looked up low id 1 and skipped instead of continuing the
+    // >24-bit image selected explicitly by its left neighbour.
+    TEST_METHOD(KittyPlaceholderOmittedHighByteInheritsFromLeft)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        const auto origin = _testGetSet->_textBuffer->GetCursor().GetPosition();
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=16777217,f=24,s=2,v=1,c=2,r=1;/wAAAP8A\x1b\\"); // id 0x01000001
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m"); // low 24 bits
+        _stateMachine->ProcessString(Placeholder() + L"\x0305" + L"\x0305" + L"\x030D" + Placeholder());
+
+        const auto* slice = _testGetSet->_textBuffer->GetRowByOffset(origin.y).GetImageSlice();
+        VERIFY_IS_TRUE(SlicePixelIs(slice, 0, 0, 255, 0, 0), L"explicit high byte selects the >24-bit image at col 0");
+        VERIFY_IS_TRUE(SlicePixelIs(slice, 1, 0, 0, 255, 0), L"omitting all marks inherits high byte and advances to col 1");
+    }
+
+    // Placeholder metadata moves with its row. After copying the row downward (the same row
+    // lifecycle used by scrolling), an unrelated explicit write perturbs the old global counter;
+    // the adjacent omission must still inherit (1,1) from the moved left cell and render white.
+    TEST_METHOD(KittyPlaceholderMetadataSurvivesScroll)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        auto& buffer = *_testGetSet->_textBuffer;
+        const auto origin = buffer.GetCursor().GetPosition();
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,f=24,s=2,v=2,c=2,r=2;/wAAAP8AAAD/////\x1b\\");
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m");
+        _stateMachine->ProcessString(Placeholder() + L"\x030D" + L"\x0305"); // (1,0) blue
+
+        buffer.ScrollRows(origin.y, 1, 1);
+        buffer.GetCursor().SetPosition({ 10, origin.y + 2 });
+        _stateMachine->ProcessString(Placeholder() + L"\x0305" + L"\x030D"); // unrelated (0,1)
+        buffer.GetCursor().SetPosition({ 1, origin.y + 1 });
+        _stateMachine->ProcessString(Placeholder()); // inherit from the moved (1,0) cell
+
+        const auto* slice = buffer.GetRowByOffset(origin.y + 1).GetImageSlice();
+        VERIFY_IS_TRUE(SlicePixelIs(slice, 0, 0, 0, 0, 255), L"the explicit blue cell moved with the row");
+        VERIFY_IS_TRUE(SlicePixelIs(slice, 1, 0, 255, 255, 255), L"the moved metadata resolves the adjacent omission as (1,1) white");
+    }
+
+    // ICH moves cells horizontally through AdaptDispatch's cell-walking scroll path. The image
+    // pixels already moved via ImageSlice::CopyBlock, but the first metadata implementation lost
+    // the resolved placeholder coordinates because WriteLine cleared each destination cell. After
+    // shifting explicit (0,0) right, an adjacent omission must still inherit (0,1), not default
+    // back to (0,0).
+    TEST_METHOD(KittyPlaceholderMetadataSurvivesInsertCharacter)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        auto& buffer = *_testGetSet->_textBuffer;
+        const auto origin = buffer.GetCursor().GetPosition();
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,f=24,s=3,v=1,c=3,r=1;/wAAAP8AAAD/\x1b\\"); // red|green|blue
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m");
+        _stateMachine->ProcessString(Placeholder() + L"\x0305" + L"\x0305"); // explicit (0,0) red
+
+        buffer.GetCursor().SetPosition(origin);
+        _stateMachine->ProcessString(L"\x1b[@"); // ICH: move the explicit cell from x=0 to x=1
+        buffer.GetCursor().SetPosition({ origin.x + 2, origin.y });
+        _stateMachine->ProcessString(Placeholder()); // inherit (0,1) from moved x=1
+
+        const auto* slice = buffer.GetRowByOffset(origin.y).GetImageSlice();
+        VERIFY_IS_NOT_NULL(slice);
+        VERIFY_ARE_EQUAL(0u, slice->ColumnOwner(origin.x), L"ICH clears the newly inserted cell's image ownership");
+        VERIFY_ARE_EQUAL(1u, slice->ColumnOwner(origin.x + 1), L"ICH moved the explicit placeholder one cell right");
+        VERIFY_ARE_EQUAL(1u, slice->ColumnOwner(origin.x + 2), L"the adjacent omitted placeholder rendered for image 1");
+        VERIFY_IS_TRUE(SlicePixelIs(slice, origin.x + 1, 0, 255, 0, 0), L"the moved explicit placeholder remains grid col 0 (red)");
+        VERIFY_IS_TRUE(SlicePixelIs(slice, origin.x + 2, 0, 0, 255, 0), L"the adjacent omission inherits grid col 1 (green)");
+    }
+
+    // A partial-width vertical scroll uses the cell-walking path rather than rotating whole ROW
+    // storage. Metadata must be restored after each destination WriteLine just like image pixels
+    // are restored by CopyBlock. Otherwise the adjacent omission defaults to (0,0) red instead of
+    // inheriting (1,1) white from the moved (1,0) blue cell.
+    TEST_METHOD(KittyPlaceholderMetadataSurvivesPartialWidthScroll)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        auto& buffer = *_testGetSet->_textBuffer;
+        const auto origin = buffer.GetCursor().GetPosition();
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,f=24,s=2,v=2,c=2,r=2;/wAAAP8AAAD/////\x1b\\");
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m");
+        _stateMachine->ProcessString(Placeholder() + L"\x030D" + L"\x0305"); // explicit (1,0) blue
+
+        const auto page = _pDispatch->_pages.ActivePage();
+        _pDispatch->_ScrollRectVertically(page, { origin.x, origin.y, origin.x + 3, origin.y + 2 }, 1);
+        buffer.GetCursor().SetPosition({ origin.x + 1, origin.y + 1 });
+        _stateMachine->ProcessString(Placeholder()); // inherit from moved (1,0)
+
+        const auto* slice = buffer.GetRowByOffset(origin.y + 1).GetImageSlice();
+        VERIFY_IS_NOT_NULL(slice);
+        VERIFY_IS_TRUE(SlicePixelIs(slice, 0, 0, 0, 0, 255), L"the explicit blue cell moved down with the partial-width scroll");
+        VERIFY_IS_TRUE(SlicePixelIs(slice, 1, 0, 255, 255, 255), L"the adjacent omission inherits (1,1) white after the move");
+    }
+
+    // DECCRA copies cells through the same WriteLine-plus-CopyBlock pattern. Copying explicit
+    // (0,1) green to x=5 must carry its resolved metadata so an omitted cell at x=6 continues to
+    // (0,2) blue. Without the metadata copy the omission falls back to (0,0) red.
+    TEST_METHOD(KittyPlaceholderMetadataSurvivesRectangularCopy)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        auto& buffer = *_testGetSet->_textBuffer;
+        const auto origin = buffer.GetCursor().GetPosition();
+        const auto page = _pDispatch->_pages.ActivePage();
+        const auto vtRow = origin.y - page.Top() + 1;
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,f=24,s=3,v=1,c=3,r=1;/wAAAP8AAAD/\x1b\\"); // red|green|blue
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m");
+        _stateMachine->ProcessString(Placeholder() + L"\x0305" + L"\x030D"); // explicit (0,1) green
+
+        _pDispatch->CopyRectangularArea(vtRow, 1, vtRow, 1, 1, vtRow, 6, 1); // copy x=0 to x=5
+        buffer.GetCursor().SetPosition({ 6, origin.y });
+        _stateMachine->ProcessString(Placeholder()); // inherit (0,2) from copied x=5
+
+        const auto* slice = buffer.GetRowByOffset(origin.y).GetImageSlice();
+        VERIFY_IS_NOT_NULL(slice);
+        VERIFY_IS_TRUE(SlicePixelIs(slice, 5, 0, 0, 255, 0), L"DECCRA copied the explicit grid-col-1 cell (green)");
+        VERIFY_IS_TRUE(SlicePixelIs(slice, 6, 0, 0, 0, 255), L"the adjacent omission inherits grid col 2 (blue)");
+    }
+
+    // Reflow copies text in cell ranges rather than moving whole ROW objects. The resolved
+    // placeholder metadata must follow that text to its new coordinates instead of remaining
+    // attached to the old absolute row/column.
+    TEST_METHOD(KittyPlaceholderMetadataSurvivesReflow)
+    {
+        _testGetSet->PrepData();
+        auto& buffer = *_testGetSet->_textBuffer;
+        const auto origin = buffer.GetCursor().GetPosition();
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,f=24,s=2,v=2,c=2,r=2;/wAAAP8AAAD/////\x1b\\");
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m");
+        buffer.GetCursor().SetPosition({ 10, origin.y });
+        _stateMachine->ProcessString(Placeholder() + L"\x030D" + L"\x030D"); // explicit (1,1)
+
+        auto reflowed = std::make_unique<TextBuffer>(til::size{ 5, 600 }, TextAttribute{}, 0, false, &_testGetSet->_renderer);
+        TextBuffer::Reflow(buffer, *reflowed);
+
+        auto found = false;
+        til::point movedTo{ -1, -1 };
+        for (auto y = 0; y < reflowed->GetSize().Height() && !found; ++y)
+        {
+            const auto& row = reflowed->GetRowByOffset(y);
+            for (auto x = 0; x < reflowed->GetSize().Width(); ++x)
+            {
+                if (const auto metadata = row.GetKittyPlaceholderCell(x))
+                {
+                    found = true;
+                    movedTo = { x, y };
+                    VERIFY_ARE_EQUAL(1u, metadata->column, L"reflow preserves the resolved grid column");
+                    VERIFY_ARE_EQUAL(static_cast<uint16_t>(1), metadata->row, L"reflow preserves the resolved grid row");
+                    break;
+                }
+            }
+        }
+
+        VERIFY_IS_TRUE(found, L"reflowed placeholder retains its resolved metadata");
+        const til::point oldPosition{ 10, origin.y };
+        VERIFY_IS_TRUE(movedTo != oldPosition, L"metadata moved with the text rather than staying at its old absolute position");
     }
 
     // Two placeholder cells of a multi-COLUMN grid sent in SEPARATE writes on the same
     // screen row must continue along the grid columns (0,0)->(0,1), not advance the grid
-    // row. The auto counter is independent of the screen row, so chunked writes are stable.
+    // row. Persisting the first cell's resolved coordinates makes chunked writes stable.
     TEST_METHOD(KittyPlaceholderChunkedSameRowContinuesColumns)
     {
         _testGetSet->PrepData();
@@ -6195,29 +6442,26 @@ public:
         VERIFY_IS_FALSE(SliceContainsColor(slice, 0, 0, 255), L"must not drop to grid row 1 (blue) on a same-row chunk");
     }
 
-    // Re-storing a placement (re-transmit/put of the same virtual id) re-anchors the auto row,
-    // so the next placeholder starts again at grid row 0. Without the reset, the stale anchor
-    // would advance the row and show the wrong tile.
-    TEST_METHOD(KittyPlaceholderRestoreReanchors)
+    // Re-storing a virtual placement must not erase the resolved metadata attached to existing
+    // placeholder text. Old failure: resetting placement-global counters made the adjacent
+    // no-diacritic cell repeat col 0 instead of inheriting col 1 from the left cell.
+    TEST_METHOD(KittyPlaceholderRestoreKeepsLeftNeighborState)
     {
         _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
         const auto origin = _testGetSet->_textBuffer->GetCursor().GetPosition();
-        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,f=24,s=1,v=2,c=1,r=2;/wAAAP8A\x1b\\"); // top red, bottom green
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,f=24,s=2,v=1,c=2,r=1;/wAAAP8A\x1b\\"); // red|green
         _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m");
 
-        // First placeholder anchors the auto row at this screen row (grid row 0 = red).
+        _stateMachine->ProcessString(Placeholder() + L"\x0305" + L"\x0305"); // explicit (0,0)
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,f=24,s=2,v=1,c=2,r=1;/wAAAP8A\x1b\\"); // re-store same virtual id
+        _testGetSet->_textBuffer->GetCursor().SetPosition({ origin.x + 1, origin.y });
         _stateMachine->ProcessString(Placeholder());
-        VERIFY_IS_TRUE(BufferContainsColor(*_testGetSet->_textBuffer, 255, 0, 0), L"initial auto row 0 = red");
 
-        // Re-transmit the same virtual id: the placement is re-stored, resetting the anchor.
-        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,f=24,s=1,v=2,c=1,r=2;/wAAAP8A\x1b\\");
-
-        // A placeholder five rows lower must re-anchor to grid row 0 (red), not advance to green.
-        _testGetSet->_textBuffer->GetCursor().SetPosition({ origin.x, origin.y + 5 });
-        _stateMachine->ProcessString(Placeholder());
-        const auto* slice = _testGetSet->_textBuffer->GetRowByOffset(origin.y + 5).GetImageSlice();
-        VERIFY_IS_TRUE(SliceContainsColor(slice, 255, 0, 0), L"re-anchored auto row 0 = red");
-        VERIFY_IS_FALSE(SliceContainsColor(slice, 0, 255, 0), L"a re-anchored placement must not jump to grid row 1 (green)");
+        const auto* slice = _testGetSet->_textBuffer->GetRowByOffset(origin.y).GetImageSlice();
+        VERIFY_IS_NOT_NULL(slice);
+        VERIFY_ARE_EQUAL(origin.x + 1, slice->ColumnOffset(), L"only the newly rendered adjacent cell remains after re-transmit");
+        VERIFY_IS_TRUE(SlicePixelIs(slice, 0, 0, 0, 255, 0), L"re-storing the image preserves left-cell inheritance (col 1 = green)");
     }
 
     // Re-transmitting a virtual id as a NON-virtual image cancels placeholder eligibility, so a
