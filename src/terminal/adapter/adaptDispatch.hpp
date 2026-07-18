@@ -328,13 +328,13 @@ namespace Microsoft::Console::VirtualTerminal
             uint32_t srcY = 0;    // y=: source crop top edge in pixels
             uint32_t srcW = 0;    // w=: source crop width in pixels (0 = to right edge)
             uint32_t srcH = 0;    // h=: source crop height in pixels (0 = to bottom edge)
-            uint64_t fileOffset = 0; // O=: byte offset into a transmitted file (t=f / t=t)
-            uint64_t fileSize = 0;   // S=: bytes to read from the file (0 = to EOF, host-bounded)
+            uint64_t fileOffset = 0; // O=: byte offset into a file or shared-memory object
+            uint64_t fileSize = 0;   // S=: bytes to read (0 = to end, host-bounded)
             bool moreChunks = false;
             bool mPresent = false;
             bool haveId = false;
             bool haveNumber = false;
-            wchar_t medium = L'd';          // t=: transmission medium (only d=direct in MVP)
+            wchar_t medium = L'd';          // t=: transmission medium (d/f/t/s)
             bool noCursorMovement = false;  // C=1: leave the cursor in place after a placement
             bool hasNonChunkKey = false;    // true if any key other than 'm' was present
         };
