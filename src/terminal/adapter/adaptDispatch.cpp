@@ -5745,16 +5745,9 @@ void AdaptDispatch::_placeKittyImage(const KittyImage& image, const bool moveCur
         // Tag only the columns this placement covers so a later id-targeted delete
         // erases just these cells, leaving co-resident Sixel (id 0) or other images.
         dstSlice->SetColumnOwner(columnBegin, columnEnd, imageId);
-        const til::CoordType ownedWidth = (columnEnd - columnBegin) * cellWidth;
         for (auto pixelRow = 0; pixelRow < cellHeight; ++pixelRow)
         {
             const auto dstY = row * cellHeight + pixelRow;
-            // Clear the full owned span first so gutters and padding never retain a
-            // co-resident image's stale pixels that this placement now owns.
-            for (auto pixelColumn = 0; pixelColumn < ownedWidth; ++pixelColumn)
-            {
-                til::at(dstIterator, pixelColumn) = RGBQUAD{};
-            }
             // Destination rows before the Y offset (and past the image bottom) are blank.
             const auto srcDstY = dstY - offsetY;
             const auto rowInImage = srcDstY >= 0 && srcDstY < targetH;
