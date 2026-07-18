@@ -4129,6 +4129,13 @@ public:
         return idx < pixels.size() ? pixels[idx] : RGBQUAD{};
     }
 
+    static RGBQUAD SlicePixelAt(const ImageSlice* slice, const ImageSlice::RenderPosition position, til::CoordType px, til::CoordType py)
+    {
+        const auto pixels = slice->Pixels(position);
+        const auto idx = static_cast<size_t>(py) * slice->PixelWidth() + px;
+        return idx < pixels.size() ? pixels[idx] : RGBQUAD{};
+    }
+
     // Counts device-pixel columns whose pixel in the given row exactly matches a color.
     // A sixel column is one device pixel wide, so with a transparent background this
     // yields the precise drawn width -- unlike the slice's cell-rounded PixelWidth(),
@@ -6921,12 +6928,9 @@ public:
         VERIFY_ARE_EQUAL(0, CountImageRows(*_testGetSet->_textBuffer), L"No orphaned ghost row may remain after eviction.");
     }
 
-    // Regression (why): a narrower placement over an existing image tagged the FULL
-    // cell range as its owner but only wrote drawWidth pixels per row (and broke past
-    // imageHeight), so the padding retained the co-resident image's stale pixels now
-    // owner-tagged as the new image. This guards that a narrower placement clears the
-    // owned padding instead of inheriting a co-resident image's pixels.
-    TEST_METHOD(KittyGraphicsPlacementClearsPaddingOnOverlap)
+    // A placement's cell-rounded padding is transparent. With z-aware retained layers,
+    // it must reveal the lower image rather than copying those pixels into the new owner.
+    TEST_METHOD(KittyGraphicsPlacementPaddingRevealsLowerLayer)
     {
         _testGetSet->PrepData();
         _testGetSet->_cellSize = { 10, 20 }; // a cell is 10px wide
@@ -6944,10 +6948,9 @@ public:
         const auto content = SlicePixelAt(slice, 2, 0);
         VERIFY_ARE_EQUAL(static_cast<BYTE>(0), content.rgbRed, L"Content pixel must not be red.");
         VERIFY_ARE_EQUAL(static_cast<BYTE>(255), content.rgbGreen, L"Content pixel must be green.");
-        // A padding pixel in B's owned cell (beyond B's 5px width) must be cleared,
-        // not A's leftover red.
+        // A padding pixel beyond B's 5px width remains transparent in B and reveals A.
         const auto padding = SlicePixelAt(slice, 7, 0);
-        VERIFY_ARE_EQUAL(static_cast<BYTE>(0), padding.rgbRed, L"Padding must not retain A's red under B's owner.");
+        VERIFY_ARE_EQUAL(static_cast<BYTE>(255), padding.rgbRed, L"Transparent padding must reveal the lower image.");
         VERIFY_ARE_EQUAL(static_cast<BYTE>(0), padding.rgbGreen, L"Padding must be transparent.");
         VERIFY_ARE_EQUAL(static_cast<BYTE>(0), padding.rgbBlue, L"Padding must be transparent.");
     }
@@ -7861,6 +7864,368 @@ public:
         _testGetSet->_response.clear();
         _stateMachine->ProcessString(L"\x1b_Ga=p,i=1;\x1b\\");
         _testGetSet->ValidateInputEvent(L"\x1b_Gi=1;ENOENT:image not found\x1b\\"); // whole image gone
+    }
+
+    TEST_METHOD(KittyGraphicsZIndexParsingClampsSignedValues)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,p=1,z=-999999999999,f=24,s=1,v=1,C=1;/wAA\x1b\\");
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=2,p=1,z=999999999999,f=24,s=1,v=1,C=1;AP8A\x1b\\");
+
+        VERIFY_ARE_EQUAL(INT32_MIN, _pDispatch->_kittyPlacements.at({ 1u, 1u }).zIndex);
+        VERIFY_ARE_EQUAL(INT32_MAX, _pDispatch->_kittyPlacements.at({ 2u, 1u }).zIndex);
+    }
+
+    TEST_METHOD(KittyGraphicsZIndexUsesThreeRenderBands)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        const auto origin = _testGetSet->_textBuffer->GetCursor().GetPosition();
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,p=1,z=-1073741825,f=24,s=1,v=1,C=1;/wAA\x1b\\");
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=2,p=1,z=-1073741824,f=24,s=1,v=1,C=1;AP8A\x1b\\");
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=3,p=1,z=0,f=24,s=1,v=1,C=1;AAD/\x1b\\");
+
+        const auto* slice = _testGetSet->_textBuffer->GetRowByOffset(origin.y).GetImageSlice();
+        VERIFY_IS_NOT_NULL(slice);
+        const auto x = origin.x - slice->ColumnOffset();
+        const auto behindBackground = SlicePixelAt(slice, ImageSlice::RenderPosition::BehindBackground, x, 0);
+        const auto behindText = SlicePixelAt(slice, ImageSlice::RenderPosition::BehindText, x, 0);
+        const auto aboveText = SlicePixelAt(slice, ImageSlice::RenderPosition::AboveText, x, 0);
+        VERIFY_IS_TRUE(behindBackground.rgbRed == 255 && behindBackground.rgbGreen == 0 && behindBackground.rgbBlue == 0);
+        VERIFY_IS_TRUE(behindText.rgbRed == 0 && behindText.rgbGreen == 255 && behindText.rgbBlue == 0);
+        VERIFY_IS_TRUE(aboveText.rgbRed == 0 && aboveText.rgbGreen == 0 && aboveText.rgbBlue == 255);
+    }
+
+    TEST_METHOD(KittyGraphicsSameZOrdersByImageIdNotTransmissionOrder)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        const auto origin = _testGetSet->_textBuffer->GetCursor().GetPosition();
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=2,p=1,z=7,f=24,s=1,v=1,C=1;AP8A\x1b\\");
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,p=1,z=7,f=24,s=1,v=1,C=1;/wAA\x1b\\");
+
+        const auto* slice = _testGetSet->_textBuffer->GetRowByOffset(origin.y).GetImageSlice();
+        VERIFY_IS_NOT_NULL(slice);
+        const auto pixel = SlicePixelAt(slice, ImageSlice::RenderPosition::AboveText, origin.x - slice->ColumnOffset(), 0);
+        VERIFY_IS_TRUE(pixel.rgbRed == 0 && pixel.rgbGreen == 255 && pixel.rgbBlue == 0, L"higher image id must be on top at equal z");
+    }
+
+    TEST_METHOD(KittyGraphicsZLayersUseSourceOverAlpha)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        const auto origin = _testGetSet->_textBuffer->GetCursor().GetPosition();
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,p=1,z=-1,f=32,s=1,v=1,C=1;/wAAgA==\x1b\\");
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=2,p=1,z=-1,f=32,s=1,v=1,C=1;AP8AgA==\x1b\\");
+
+        const auto* slice = _testGetSet->_textBuffer->GetRowByOffset(origin.y).GetImageSlice();
+        VERIFY_IS_NOT_NULL(slice);
+        const auto pixel = SlicePixelAt(slice, ImageSlice::RenderPosition::BehindText, origin.x - slice->ColumnOffset(), 0);
+        VERIFY_ARE_EQUAL(static_cast<BYTE>(64), pixel.rgbRed);
+        VERIFY_ARE_EQUAL(static_cast<BYTE>(128), pixel.rgbGreen);
+        VERIFY_ARE_EQUAL(static_cast<BYTE>(0), pixel.rgbBlue);
+        VERIFY_ARE_EQUAL(static_cast<BYTE>(192), pixel.rgbReserved);
+    }
+
+    TEST_METHOD(KittyGraphicsDeleteTopZLayerExposesLowerImage)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        const auto origin = _testGetSet->_textBuffer->GetCursor().GetPosition();
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,p=1,z=1,f=24,s=1,v=1,C=1;/wAA\x1b\\");
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=2,p=1,z=2,f=24,s=1,v=1,C=1;AP8A\x1b\\");
+        _stateMachine->ProcessString(L"\x1b_Ga=d,d=I,i=2;\x1b\\");
+
+        const auto* slice = _testGetSet->_textBuffer->GetRowByOffset(origin.y).GetImageSlice();
+        VERIFY_IS_NOT_NULL(slice);
+        const auto pixel = SlicePixelAt(slice, ImageSlice::RenderPosition::AboveText, origin.x - slice->ColumnOffset(), 0);
+        VERIFY_IS_TRUE(pixel.rgbRed == 255 && pixel.rgbGreen == 0 && pixel.rgbBlue == 0, L"deleting the top layer must reveal the lower layer");
+    }
+
+    TEST_METHOD(KittyGraphicsZLayersSurviveScrollAndCellCopy)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        auto& buffer = *_testGetSet->_textBuffer;
+        const auto origin = buffer.GetCursor().GetPosition();
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,p=1,z=-1,f=24,s=1,v=1,C=1;/wAA\x1b\\");
+
+        buffer.ScrollRows(origin.y, 1, 1);
+        buffer.GetCursor().SetPosition({ origin.x, origin.y + 1 });
+        _stateMachine->ProcessString(L"\x1b[@");
+
+        const auto* slice = buffer.GetRowByOffset(origin.y + 1).GetImageSlice();
+        VERIFY_IS_NOT_NULL(slice);
+        const auto oldPixel = SlicePixelAt(slice, ImageSlice::RenderPosition::BehindText, origin.x - slice->ColumnOffset(), 0);
+        const auto movedPixel = SlicePixelAt(slice, ImageSlice::RenderPosition::BehindText, origin.x + 1 - slice->ColumnOffset(), 0);
+        VERIFY_ARE_EQUAL(static_cast<BYTE>(0), oldPixel.rgbReserved, L"ICH must clear the inserted cell in every z layer");
+        VERIFY_IS_TRUE(movedPixel.rgbRed == 255 && movedPixel.rgbReserved == 255, L"the negative-z image must survive row and cell copies");
+    }
+
+    TEST_METHOD(KittyGraphicsLayerCopyKeepsSixelUntagged)
+    {
+        _testGetSet->PrepData();
+        auto& buffer = *_testGetSet->_textBuffer;
+        _stateMachine->ProcessString(L"\x1bPq#0;2;100;0;0~\x1b\\");
+        til::CoordType sixelRow = -1;
+        const auto* sixelSlice = FindFirstImageSlice(buffer, sixelRow);
+        VERIFY_IS_NOT_NULL(sixelSlice);
+        const til::point origin{ sixelSlice->ColumnOffset(), sixelRow };
+        buffer.GetCursor().SetPosition(origin);
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,z=1,f=24,s=1,v=1,C=1;AP8A\x1b\\");
+        const auto* original = buffer.GetRowByOffset(origin.y).GetImageSlice();
+        VERIFY_IS_NOT_NULL(original);
+        const auto originalSixel = *original->Pixels(origin.x);
+        VERIFY_IS_TRUE(originalSixel.rgbRed == 255 && originalSixel.rgbGreen == 0, L"the co-resident Sixel plane must start red");
+
+        buffer.GetCursor().SetPosition(origin);
+        _stateMachine->ProcessString(L"\x1b[@");
+        const auto* moved = buffer.GetRowByOffset(origin.y).GetImageSlice();
+        VERIFY_IS_NOT_NULL(moved);
+        const auto movedSixel = *moved->Pixels(origin.x + 1);
+        VERIFY_IS_TRUE(movedSixel.rgbRed == 255 && movedSixel.rgbGreen == 0, L"ICH must move the untagged Sixel plane with the Kitty layer");
+        _stateMachine->ProcessString(L"\x1b_Ga=d,d=I,i=1;\x1b\\");
+
+        const auto* slice = buffer.GetRowByOffset(origin.y).GetImageSlice();
+        VERIFY_IS_NOT_NULL(slice);
+        const auto pixel = *slice->Pixels(origin.x + 1);
+        VERIFY_IS_TRUE(pixel.rgbRed == 255 && pixel.rgbGreen == 0, L"deleting moved Kitty pixels must not erase co-moved Sixel pixels");
+    }
+
+    TEST_METHOD(KittyGraphicsOmittedZIndexDefaultsAboveText)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        const auto origin = _testGetSet->_textBuffer->GetCursor().GetPosition();
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,f=24,s=1,v=1,C=1;/wAA\x1b\\");
+
+        const auto* slice = _testGetSet->_textBuffer->GetRowByOffset(origin.y).GetImageSlice();
+        VERIFY_IS_NOT_NULL(slice);
+        const auto x = origin.x - slice->ColumnOffset();
+        VERIFY_ARE_EQUAL(static_cast<BYTE>(255), SlicePixelAt(slice, ImageSlice::RenderPosition::AboveText, x, 0).rgbRed);
+        VERIFY_IS_FALSE(slice->HasPixels(ImageSlice::RenderPosition::BehindText));
+        VERIFY_IS_FALSE(slice->HasPixels(ImageSlice::RenderPosition::BehindBackground));
+    }
+
+    TEST_METHOD(KittyGraphicsVirtualPlacementUsesZIndex)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        const auto origin = _testGetSet->_textBuffer->GetCursor().GetPosition();
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,p=1,z=-1,f=24,s=1,v=1;/wAA\x1b\\");
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m");
+        _stateMachine->ProcessString(Placeholder() + L"\x0305" + L"\x0305");
+
+        const auto* slice = _testGetSet->_textBuffer->GetRowByOffset(origin.y).GetImageSlice();
+        VERIFY_IS_NOT_NULL(slice);
+        const auto pixel = SlicePixelAt(slice, ImageSlice::RenderPosition::BehindText, origin.x - slice->ColumnOffset(), 0);
+        VERIFY_ARE_EQUAL(static_cast<BYTE>(255), pixel.rgbRed);
+        VERIFY_IS_FALSE(slice->HasPixels(ImageSlice::RenderPosition::AboveText));
+    }
+
+    TEST_METHOD(KittyGraphicsRelativePlacementUsesZIndex)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        auto& buffer = *_testGetSet->_textBuffer;
+        const auto origin = buffer.GetCursor().GetPosition();
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,p=1,f=24,s=1,v=1,C=1;/wAA\x1b\\");
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=2,p=1,P=1,Q=1,H=1,z=-1,f=24,s=1,v=1,C=1;AP8A\x1b\\");
+
+        const auto* slice = buffer.GetRowByOffset(origin.y).GetImageSlice();
+        VERIFY_IS_NOT_NULL(slice);
+        const auto pixel = SlicePixelAt(slice, ImageSlice::RenderPosition::BehindText, origin.x + 1 - slice->ColumnOffset(), 0);
+        VERIFY_ARE_EQUAL(static_cast<BYTE>(255), pixel.rgbGreen);
+    }
+
+    TEST_METHOD(KittyGraphicsZLayersSurviveDECCRA)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        auto& buffer = *_testGetSet->_textBuffer;
+        const auto origin = buffer.GetCursor().GetPosition();
+        const auto page = _pDispatch->_pages.ActivePage();
+        const auto vtRow = origin.y - page.Top() + 1;
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,z=-1,f=24,s=1,v=1,C=1;/wAA\x1b\\");
+        _pDispatch->CopyRectangularArea(vtRow, origin.x + 1, vtRow, origin.x + 1, 1, vtRow, origin.x + 6, 1);
+
+        const auto* slice = buffer.GetRowByOffset(origin.y).GetImageSlice();
+        VERIFY_IS_NOT_NULL(slice);
+        const auto copied = SlicePixelAt(slice, ImageSlice::RenderPosition::BehindText, origin.x + 5 - slice->ColumnOffset(), 0);
+        VERIFY_ARE_EQUAL(static_cast<BYTE>(255), copied.rgbRed);
+    }
+
+    TEST_METHOD(KittyGraphicsDeleteAllErasesEveryOverlappingLayer)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        const auto origin = _testGetSet->_textBuffer->GetCursor().GetPosition();
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,z=-1,f=24,s=1,v=1,C=1;/wAA\x1b\\");
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=2,z=1,f=24,s=1,v=1,C=1;AP8A\x1b\\");
+        _stateMachine->ProcessString(L"\x1b_Ga=d,d=A;\x1b\\");
+
+        const auto* slice = _testGetSet->_textBuffer->GetRowByOffset(origin.y).GetImageSlice();
+        VERIFY_IS_TRUE(slice == nullptr || (!slice->HasOwner(1) && !slice->HasOwner(2)));
+    }
+
+    TEST_METHOD(KittyGraphicsCoveredVirtualParentStillAnchorsRelativeChild)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        auto& buffer = *_testGetSet->_textBuffer;
+        const auto origin = buffer.GetCursor().GetPosition();
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,p=1,z=-1,f=24,s=1,v=1;/wAA\x1b\\");
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m");
+        _stateMachine->ProcessString(Placeholder() + L"\x0305" + L"\x0305");
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;0m");
+        buffer.GetCursor().SetPosition(origin);
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=2,z=1,f=24,s=1,v=1,C=1;AP8A\x1b\\");
+
+        const auto anchor = _pDispatch->_deriveVirtualPlacementAnchor(1);
+        VERIFY_IS_TRUE(anchor.has_value());
+        VERIFY_ARE_EQUAL(origin, *anchor);
+    }
+
+    TEST_METHOD(KittyGraphicsTransparentLayerRetainsDeletionOwnership)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        const auto origin = _testGetSet->_textBuffer->GetCursor().GetPosition();
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,z=-1,f=32,s=1,v=1,C=1;AAAAAA==\x1b\\");
+
+        const auto* slice = _testGetSet->_textBuffer->GetRowByOffset(origin.y).GetImageSlice();
+        VERIFY_IS_NOT_NULL(slice);
+        VERIFY_IS_TRUE(slice->HasOwner(1), L"transparent placement cells still participate in deletion");
+        VERIFY_IS_FALSE(slice->HasPixels(ImageSlice::RenderPosition::BehindText));
+        _stateMachine->ProcessString(L"\x1b_Ga=d,d=I,i=1;\x1b\\");
+        slice = _testGetSet->_textBuffer->GetRowByOffset(origin.y).GetImageSlice();
+        VERIFY_IS_TRUE(slice == nullptr || !slice->HasOwner(1));
+    }
+
+    TEST_METHOD(KittyGraphicsZLayersSurviveReflow)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        auto& buffer = *_testGetSet->_textBuffer;
+        const auto origin = buffer.GetCursor().GetPosition();
+        buffer.GetCursor().SetPosition({ 10, origin.y });
+        _stateMachine->ProcessString(L"X");
+        buffer.GetCursor().SetPosition({ 10, origin.y });
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,z=-1,f=24,s=1,v=1,C=1;/wAA\x1b\\");
+
+        auto reflowed = std::make_unique<TextBuffer>(til::size{ 5, 600 }, TextAttribute{}, 0, false, &_testGetSet->_renderer);
+        TextBuffer::Reflow(buffer, *reflowed);
+        auto found = false;
+        for (auto row = 0; row < reflowed->GetSize().Height() && !found; ++row)
+        {
+            if (const auto* slice = reflowed->GetRowByOffset(row).GetImageSlice())
+            {
+                for (const auto& pixel : slice->Pixels(ImageSlice::RenderPosition::BehindText))
+                {
+                    found |= pixel.rgbRed == 255 && pixel.rgbReserved == 255;
+                }
+            }
+        }
+        VERIFY_IS_TRUE(found, L"reflow must preserve negative-z layer pixels");
+    }
+
+    TEST_METHOD(KittyGraphicsPlaceholderReflowLeavesOverlappingLayerInPlace)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        auto& buffer = *_testGetSet->_textBuffer;
+        const auto origin = buffer.GetCursor().GetPosition();
+        const til::point placeholderPosition{ 10, origin.y };
+
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,p=1,z=-1,f=24,s=1,v=1;/wAA\x1b\\");
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m");
+        buffer.GetCursor().SetPosition(placeholderPosition);
+        _stateMachine->ProcessString(Placeholder() + L"\x0305" + L"\x0305");
+        buffer.GetCursor().SetPosition(placeholderPosition);
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=2,p=1,z=1,f=24,s=1,v=1,C=1;AP8A\x1b\\");
+
+        auto reflowed = std::make_unique<TextBuffer>(til::size{ 5, 600 }, TextAttribute{}, 0, false, &_testGetSet->_renderer);
+        TextBuffer::Reflow(buffer, *reflowed);
+
+        auto foundPlaceholder = false;
+        auto foundOverlappingImage = false;
+        for (auto y = 0; y < reflowed->GetSize().Height(); ++y)
+        {
+            const auto& row = reflowed->GetRowByOffset(y);
+            const auto* slice = row.GetImageSlice();
+            foundOverlappingImage |= slice && slice->HasOwner(2);
+            for (auto x = 0; x < reflowed->GetSize().Width(); ++x)
+            {
+                if (!row.GetKittyPlaceholderCell(x))
+                {
+                    continue;
+                }
+
+                foundPlaceholder = true;
+                VERIFY_IS_NOT_NULL(slice);
+                VERIFY_IS_TRUE(slice->HasOwner(1), L"the placeholder's image follows its reflowed text cell");
+                VERIFY_IS_FALSE(slice->HasOwner(2), L"an unrelated overlapping layer must not follow the placeholder");
+                const auto pixel = SlicePixelAt(slice, ImageSlice::RenderPosition::BehindText, x - slice->ColumnOffset(), 0);
+                VERIFY_ARE_EQUAL(static_cast<BYTE>(255), pixel.rgbRed);
+            }
+        }
+
+        VERIFY_IS_TRUE(foundPlaceholder);
+        VERIFY_IS_TRUE(foundOverlappingImage, L"the unrelated layer remains attached to the cloned source row");
+    }
+
+    TEST_METHOD(KittyGraphicsWideningReflowPreservesJoinedRowLayers)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        auto& buffer = *_testGetSet->_textBuffer;
+        const auto origin = buffer.GetCursor().GetPosition();
+
+        buffer.GetCursor().SetPosition(origin);
+        _stateMachine->ProcessString(L"A");
+        buffer.GetCursor().SetPosition(origin);
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,p=1,z=-1,f=24,s=1,v=1,C=1;/wAA\x1b\\");
+        buffer.GetMutableRowByOffset(origin.y).SetWrapForced(true);
+
+        const til::point secondRow{ origin.x, origin.y + 1 };
+        buffer.GetCursor().SetPosition(secondRow);
+        _stateMachine->ProcessString(L"B");
+        buffer.GetCursor().SetPosition(secondRow);
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=2,p=1,z=1,f=24,s=1,v=1,C=1;AP8A\x1b\\");
+
+        auto reflowed = std::make_unique<TextBuffer>(
+            til::size{ buffer.GetSize().Width() * 2, buffer.GetSize().Height() },
+            TextAttribute{},
+            0,
+            false,
+            &_testGetSet->_renderer);
+        TextBuffer::Reflow(buffer, *reflowed);
+
+        auto foundBoth = false;
+        for (auto y = 0; y < reflowed->GetSize().Height(); ++y)
+        {
+            if (const auto* slice = reflowed->GetRowByOffset(y).GetImageSlice())
+            {
+                foundBoth |= slice->HasOwner(1) && slice->HasOwner(2);
+            }
+        }
+        VERIFY_IS_TRUE(foundBoth, L"layers from both rows must survive when widening joins wrapped rows");
+    }
+
+    TEST_METHOD(KittyGraphicsLayerCountIsBoundedAndReleased)
+    {
+        const auto availableBefore = ImageSlice::KittyLayerBytesAvailable();
+        {
+            ImageSlice slice{ { 1, 1 } };
+            for (auto z = 0; z < static_cast<int32_t>(ImageSlice::MaxKittyLayersPerSlice); ++z)
+            {
+                slice.MutablePixels(0, 1, z, 1);
+            }
+            VERIFY_IS_TRUE(slice.KittyWriteMemoryUpperBound(0, 1, INT32_MAX, 1) > ImageSlice::KittyLayerBytesAvailable());
+            VERIFY_THROWS(slice.MutablePixels(0, 1, INT32_MAX, 1), std::bad_alloc);
+        }
+        VERIFY_ARE_EQUAL(availableBefore, ImageSlice::KittyLayerBytesAvailable(), L"destroying a slice must return its retained-layer budget");
     }
 
     // An APC string with a non-'G' identifier is not Kitty graphics and is ignored.

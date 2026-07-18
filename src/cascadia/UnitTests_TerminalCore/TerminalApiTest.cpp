@@ -127,7 +127,11 @@ namespace
             return S_OK;
         }
 
-        HRESULT PaintImageSlice(const ImageSlice& imageSlice, const til::CoordType targetRow, const til::CoordType viewportLeft) noexcept override
+        HRESULT PaintImageSlice(const ImageSlice& imageSlice,
+                                const ImageSlice::RenderPosition position,
+                                const til::CoordType targetRow,
+                                const til::CoordType viewportLeft,
+                                const std::span<const uint8_t> /*backgroundMask*/) noexcept override
         try
         {
             PaintedImage image{
@@ -136,12 +140,13 @@ namespace
             };
 
             const auto columnCount = imageSlice.PixelWidth() / std::max(1, imageSlice.CellSize().width);
+            const auto pixels = imageSlice.Pixels(position);
             image.columnOwners.reserve(columnCount);
             for (til::CoordType i = 0; i < columnCount; ++i)
             {
                 const auto column = imageSlice.ColumnOffset() + i;
                 image.columnOwners.emplace_back(imageSlice.ColumnOwner(column));
-                auto pixel = imageSlice.Pixels(column);
+                auto pixel = std::next(pixels.data(), i * imageSlice.CellSize().width);
                 auto containsRed = false;
                 for (auto y = 0; y < imageSlice.CellSize().height && !containsRed; ++y)
                 {

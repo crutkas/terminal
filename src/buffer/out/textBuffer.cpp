@@ -34,6 +34,24 @@ constexpr bool allWhitespace(const std::wstring_view& text) noexcept
     return true;
 }
 
+static uint32_t kittyPlaceholderImageId(const ROW& row, const til::CoordType column) noexcept
+{
+    const auto metadata = row.GetKittyPlaceholderCell(column);
+    if (!metadata)
+    {
+        return 0;
+    }
+
+    const auto foreground = row.GetAttrByColumn(column).GetForeground();
+    const auto low = foreground.IsRgb() ?
+                         (static_cast<uint32_t>(GetRValue(foreground.GetRGB())) << 16) |
+                             (static_cast<uint32_t>(GetGValue(foreground.GetRGB())) << 8) |
+                             GetBValue(foreground.GetRGB()) :
+                     foreground.IsIndex256() ? static_cast<uint32_t>(foreground.GetIndex()) :
+                                               0u;
+    return low | (static_cast<uint32_t>(metadata->imageIdHighByte) << 24);
+}
+
 static std::atomic<uint64_t> s_lastMutationIdInitialValue;
 
 // Routine Description:
@@ -2752,6 +2770,7 @@ void TextBuffer::Reflow(TextBuffer& oldBuffer, TextBuffer& newBuffer, const View
     {
         til::point source;
         til::point destination;
+        uint32_t imageId = 0;
     };
     std::vector<KittyImageMove> kittyImageMoves;
 
@@ -2874,20 +2893,25 @@ void TextBuffer::Reflow(TextBuffer& oldBuffer, TextBuffer& newBuffer, const View
             // If we're at the start of the old row, copy its image content.
             if (oldX == 0)
             {
-                const auto preservedSlice = state.columnBegin != 0 && newRow.GetImageSlice() ?
-                                                std::make_unique<ImageSlice>(*newRow.GetImageSlice()) :
-                                                nullptr;
+                auto preservedSlice = ImageSlice::Pointer{};
+                if (state.columnBegin != 0)
+                {
+                    if (const auto slice = newRow.GetMutableImageSlice())
+                    {
+                        preservedSlice = std::make_unique<ImageSlice>(std::move(*slice));
+                    }
+                }
                 ImageSlice::CopyRow(oldRow, newRow);
                 for (auto column = 0; column < oldRowLimit; ++column)
                 {
                     if (oldRow.GetKittyPlaceholderCell(column))
                     {
-                        ImageSlice::EraseKittyCells(newRow, column, column + 1);
+                        ImageSlice::EraseKittyCells(newRow, column, column + 1, kittyPlaceholderImageId(oldRow, column));
                     }
                 }
                 if (preservedSlice)
                 {
-                    ImageSlice::MergeLegacyCells(*preservedSlice, newRow);
+                    ImageSlice::MergePreservedCells(std::move(preservedSlice), newRow);
                 }
             }
 
@@ -2898,6 +2922,7 @@ void TextBuffer::Reflow(TextBuffer& oldBuffer, TextBuffer& newBuffer, const View
                     kittyImageMoves.push_back({
                         .source = { sourceColumn, oldY },
                         .destination = { newX + sourceColumn - oldX, newY },
+                        .imageId = kittyPlaceholderImageId(oldRow, sourceColumn),
                     });
                 }
             }
@@ -2972,10 +2997,11 @@ void TextBuffer::Reflow(TextBuffer& oldBuffer, TextBuffer& newBuffer, const View
     for (const auto& move : kittyImageMoves)
     {
         auto& destinationRow = newBuffer.GetMutableRowByOffset(move.destination.y);
-        if (destinationRow.GetKittyPlaceholderCell(move.destination.x))
+        if (destinationRow.GetKittyPlaceholderCell(move.destination.x) &&
+            kittyPlaceholderImageId(destinationRow, move.destination.x) == move.imageId)
         {
             const auto& sourceRow = oldBuffer.GetRowByOffset(move.source.y);
-            ImageSlice::CopyKittyCells(sourceRow, move.source.x, destinationRow, move.destination.x, move.destination.x + 1);
+            ImageSlice::CopyKittyCells(sourceRow, move.source.x, destinationRow, move.destination.x, move.destination.x + 1, move.imageId);
         }
     }
 

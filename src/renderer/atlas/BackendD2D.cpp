@@ -225,6 +225,15 @@ void BackendD2D::_drawText(RenderingPayload& p)
         auto baselineX = 0.0f;
         auto baselineY = static_cast<f32>(p.s->font->cellSize.y * y + p.s->font->baseline);
 
+        for (size_t imageLayer = 0; imageLayer < 2; ++imageLayer)
+        {
+            const auto& bitmap = til::at(row->bitmaps, imageLayer);
+            if (bitmap.revision != 0)
+            {
+                _drawBitmap(p, bitmap, y);
+            }
+        }
+
         if (row->lineRendition != LineRendition::SingleWidth)
         {
             baselineY = _drawTextPrepareLineRendition(p, row, baselineY);
@@ -322,9 +331,10 @@ void BackendD2D::_drawText(RenderingPayload& p)
             _drawTextResetLineRendition(row);
         }
 
-        if (row->bitmap.revision != 0)
+        const auto& overlay = til::at(row->bitmaps, static_cast<size_t>(ImageSlice::RenderPosition::AboveText));
+        if (overlay.revision != 0)
         {
-            _drawBitmap(p, row, y);
+            _drawBitmap(p, overlay, y);
         }
 
         if (p.invalidatedRows.contains(y))
@@ -809,10 +819,8 @@ void BackendD2D::_drawGridlineRow(const RenderingPayload& p, const ShapedRow* ro
     }
 }
 
-void BackendD2D::_drawBitmap(const RenderingPayload& p, const ShapedRow* row, u16 y) const
+void BackendD2D::_drawBitmap(const RenderingPayload& p, const Bitmap& b, u16 y) const
 {
-    const auto& b = row->bitmap;
-
     // TODO: This could use some caching logic like BackendD3D.
     const D2D1_SIZE_U size{
         gsl::narrow_cast<UINT32>(b.sourceSize.x),

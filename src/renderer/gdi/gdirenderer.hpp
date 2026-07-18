@@ -54,9 +54,13 @@ namespace Microsoft::Console::Render
                                                    const COLORREF underlineColor,
                                                    const size_t cchLine,
                                                    const til::point coordTarget) noexcept override;
+        [[nodiscard]] HRESULT BeginImageSliceRow() noexcept override;
         [[nodiscard]] HRESULT PaintImageSlice(const ImageSlice& imageSlice,
-                                              const til::CoordType targetRow,
-                                              const til::CoordType viewportLeft) noexcept override;
+                                              ImageSlice::RenderPosition position,
+                                              til::CoordType targetRow,
+                                              til::CoordType viewportLeft,
+                                              std::span<const uint8_t> backgroundMask) noexcept override;
+        [[nodiscard]] HRESULT EndImageSliceRow() noexcept override;
         [[nodiscard]] HRESULT PaintSelection(const til::rect& rect) noexcept override;
 
         [[nodiscard]] HRESULT PaintCursor(const CursorOptions& options) noexcept override;
@@ -118,6 +122,28 @@ namespace Microsoft::Console::Render
             Soft
         };
 
+        struct ImageTextReplay
+        {
+            std::wstring text;
+            std::vector<int> widths;
+            int x = 0;
+            int y = 0;
+            UINT flags = 0;
+            RECT clip{};
+            COLORREF foreground = 0;
+            HFONT font = nullptr;
+            bool fontHasWesternScript = false;
+        };
+
+        struct ImageGridlineReplay
+        {
+            GridLineSet lines;
+            COLORREF gridlineColor = 0;
+            COLORREF underlineColor = 0;
+            size_t cellCount = 0;
+            til::point target;
+        };
+
         std::array<HFONT, static_cast<size_t>(FontType::FontCount)> _hfonts{};
 
         TEXTMETRICW _tmFontMetrics;
@@ -176,7 +202,14 @@ namespace Microsoft::Console::Render
         std::pmr::vector<std::pmr::wstring> _polyStrings;
         std::pmr::vector<std::pmr::vector<int>> _polyWidths;
 
-        std::vector<DWORD> _imageMask;
+        bool _recordImageRow = false;
+        bool _imageTransformSaved = false;
+        LineRendition _imageReplayRendition = LineRendition::SingleWidth;
+        til::CoordType _imageReplayTargetRow = 0;
+        til::CoordType _imageReplayViewportLeft = 0;
+        std::vector<ImageTextReplay> _imageTextReplay;
+        std::vector<ImageGridlineReplay> _imageGridlineReplay;
+        [[nodiscard]] HRESULT _ReplayImageText() noexcept;
 
         [[nodiscard]] HRESULT _InvalidCombine(const til::rect* const prc) noexcept;
         [[nodiscard]] HRESULT _InvalidOffset(const til::point* const ppt) noexcept;

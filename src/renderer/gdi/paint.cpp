@@ -7,6 +7,7 @@
 #include "../inc/unicode.hpp"
 
 #pragma hdrstop
+#pragma comment(lib, "Msimg32.lib")
 
 using namespace Microsoft::Console::Render;
 
@@ -425,6 +426,20 @@ bool GdiEngine::FontHasWesternScript(HDC hdc)
             pPolyTextLine->rcl.left += coordFontSize.width;
         }
 
+        if (_recordImageRow)
+        {
+            _imageTextReplay.emplace_back(
+                std::wstring{ pPolyTextLine->lpstr, pPolyTextLine->n },
+                std::vector<int>{ pPolyTextLine->pdx, pPolyTextLine->pdx + pPolyTextLine->n },
+                pPolyTextLine->x,
+                pPolyTextLine->y,
+                pPolyTextLine->uiFlags,
+                pPolyTextLine->rcl,
+                _lastFg,
+                static_cast<HFONT>(GetCurrentObject(_hdcMemoryContext, OBJ_FONT)),
+                _fontHasWesternScript);
+        }
+
         _cPolyText++;
 
         if (_cPolyText >= s_cPolyTextCache)
@@ -517,6 +532,10 @@ bool GdiEngine::FontHasWesternScript(HDC hdc)
 try
 {
     LOG_IF_FAILED(_FlushBufferLines());
+    if (_recordImageRow)
+    {
+        _imageGridlineReplay.emplace_back(lines, gridlineColor, underlineColor, cchLine, coordTarget);
+    }
 
     // Convert the target from characters to pixels.
     const auto ptTarget = coordTarget * _GetFontSize();
@@ -666,20 +685,57 @@ try
 }
 CATCH_RETURN();
 
+[[nodiscard]] HRESULT GdiEngine::BeginImageSliceRow() noexcept
+{
+    RETURN_IF_FAILED(_FlushBufferLines());
+    _recordImageRow = true;
+    _imageTransformSaved = false;
+    _imageTextReplay.clear();
+    _imageGridlineReplay.clear();
+    return S_OK;
+}
+
 [[nodiscard]] HRESULT GdiEngine::PaintImageSlice(const ImageSlice& imageSlice,
+                                                 const ImageSlice::RenderPosition position,
                                                  const til::CoordType targetRow,
-                                                 const til::CoordType viewportLeft) noexcept
+                                                 const til::CoordType viewportLeft,
+                                                 const std::span<const uint8_t> backgroundMask) noexcept
 try
 {
     LOG_IF_FAILED(_FlushBufferLines());
+    if (_recordImageRow && !_imageTransformSaved)
+    {
+        _imageTransformSaved = true;
+        _imageReplayRendition = _currentLineRendition;
+        _imageReplayTargetRow = targetRow;
+        _imageReplayViewportLeft = viewportLeft;
+    }
     LOG_IF_FAILED(ResetLineTransform());
 
-    const auto& imagePixels = imageSlice.Pixels();
-    if (_imageMask.size() < imagePixels.size())
+    const auto sourcePixels = imageSlice.Pixels(position);
+    auto maskedPixels = std::vector<RGBQUAD>{};
+    auto imagePixels = sourcePixels;
+    const auto maskCellSize = imageSlice.CellSize();
+    const auto maskPixelWidth = imageSlice.PixelWidth();
+    if (!backgroundMask.empty() && maskCellSize.width > 0 &&
+        backgroundMask.size() == static_cast<size_t>(maskPixelWidth / maskCellSize.width))
     {
-        _imageMask.resize(imagePixels.size());
+        maskedPixels.assign(sourcePixels.begin(), sourcePixels.end());
+        for (size_t column = 0; column < backgroundMask.size(); ++column)
+        {
+            if (til::at(backgroundMask, column) != 0)
+            {
+                continue;
+            }
+            const auto x = static_cast<til::CoordType>(column) * maskCellSize.width;
+            for (auto pixelRow = 0; pixelRow < maskCellSize.height; ++pixelRow)
+            {
+                auto first = maskedPixels.begin() + static_cast<size_t>(pixelRow) * maskPixelWidth + x;
+                std::fill_n(first, maskCellSize.width, RGBQUAD{});
+            }
+        }
+        imagePixels = maskedPixels;
     }
-
     const auto srcCellSize = imageSlice.CellSize();
     const auto dstCellSize = _GetFontSize();
     const auto srcWidth = imageSlice.PixelWidth();
@@ -700,26 +756,94 @@ try
         }
     };
 
-    auto allOpaque = true;
-    auto allTransparent = true;
-    for (size_t i = 0; i < imagePixels.size(); i++)
+    const auto hasVisiblePixels = std::ranges::any_of(imagePixels, [](const auto& pixel) {
+        return pixel.rgbReserved != 0;
+    });
+    if (hasVisiblePixels)
     {
-        const auto opaque = til::at(imagePixels, i).rgbReserved != 0;
-        allOpaque &= opaque;
-        allTransparent &= !opaque;
-        til::at(_imageMask, i) = (opaque ? 0 : 0xFFFFFF);
+        void* bitmapBits = nullptr;
+        wil::unique_hbitmap bitmap{ CreateDIBSection(_hdcMemoryContext, &bitmapInfo, DIB_RGB_COLORS, &bitmapBits, nullptr, 0) };
+        RETURN_LAST_ERROR_IF_NULL(bitmap.get());
+        RETURN_HR_IF_NULL(E_OUTOFMEMORY, bitmapBits);
+        memcpy(bitmapBits, imagePixels.data(), imagePixels.size_bytes());
+
+        wil::unique_hdc bitmapDc{ CreateCompatibleDC(_hdcMemoryContext) };
+        RETURN_LAST_ERROR_IF_NULL(bitmapDc.get());
+        const auto previousBitmap = SelectObject(bitmapDc.get(), bitmap.get());
+        RETURN_LAST_ERROR_IF(previousBitmap == nullptr || previousBitmap == HGDI_ERROR);
+        const auto restoreBitmap = wil::scope_exit([&]() noexcept {
+            SelectObject(bitmapDc.get(), previousBitmap);
+        });
+
+        const auto blend = BLENDFUNCTION{
+            .BlendOp = AC_SRC_OVER,
+            .BlendFlags = 0,
+            .SourceConstantAlpha = 255,
+            .AlphaFormat = AC_SRC_ALPHA,
+        };
+        RETURN_LAST_ERROR_IF(!AlphaBlend(_hdcMemoryContext, x, y, dstWidth, dstHeight, bitmapDc.get(), 0, 0, srcWidth, srcHeight, blend));
     }
 
-    if (allOpaque)
+    return S_OK;
+}
+CATCH_RETURN();
+
+[[nodiscard]] HRESULT GdiEngine::_ReplayImageText() noexcept
+try
+{
+    const auto previousFontHasWesternScript = _fontHasWesternScript;
+    const auto restoreFontScript = wil::scope_exit([&]() noexcept {
+        _fontHasWesternScript = previousFontHasWesternScript;
+    });
+    const auto previousMode = SetBkMode(_hdcMemoryContext, TRANSPARENT);
+    RETURN_LAST_ERROR_IF(previousMode == 0);
+    const auto restoreMode = wil::scope_exit([&]() noexcept {
+        SetBkMode(_hdcMemoryContext, previousMode);
+    });
+
+    for (auto& replay : _imageTextReplay)
     {
-        StretchDIBits(_hdcMemoryContext, x, y, dstWidth, dstHeight, 0, 0, srcWidth, srcHeight, imagePixels.data(), &bitmapInfo, DIB_RGB_COLORS, SRCCOPY);
-    }
-    else if (!allTransparent)
-    {
-        StretchDIBits(_hdcMemoryContext, x, y, dstWidth, dstHeight, 0, 0, srcWidth, srcHeight, _imageMask.data(), &bitmapInfo, DIB_RGB_COLORS, SRCAND);
-        StretchDIBits(_hdcMemoryContext, x, y, dstWidth, dstHeight, 0, 0, srcWidth, srcHeight, imagePixels.data(), &bitmapInfo, DIB_RGB_COLORS, SRCPAINT);
+        RETURN_LAST_ERROR_IF(SetTextColor(_hdcMemoryContext, replay.foreground) == CLR_INVALID);
+        const auto previousFont = SelectObject(_hdcMemoryContext, replay.font);
+        RETURN_LAST_ERROR_IF(previousFont == nullptr || previousFont == HGDI_ERROR);
+        _fontHasWesternScript = replay.fontHasWesternScript;
+
+        auto& text = _pPolyText[0];
+        text.x = replay.x;
+        text.y = replay.y;
+        text.n = gsl::narrow_cast<UINT>(replay.text.size());
+        text.lpstr = replay.text.data();
+        text.uiFlags = replay.flags & ~ETO_OPAQUE;
+        text.rcl = replay.clip;
+        text.pdx = replay.widths.data();
+        _cPolyText = 1;
+        const auto result = _FlushBufferLines();
+        SelectObject(_hdcMemoryContext, previousFont);
+        RETURN_IF_FAILED(result);
     }
 
+    return S_OK;
+}
+CATCH_RETURN();
+
+[[nodiscard]] HRESULT GdiEngine::EndImageSliceRow() noexcept
+try
+{
+    LOG_IF_FAILED(_FlushBufferLines());
+    _recordImageRow = false;
+
+    if (_imageTransformSaved)
+    {
+        LOG_IF_FAILED(PrepareLineTransform(_imageReplayRendition, _imageReplayTargetRow, _imageReplayViewportLeft));
+    }
+    LOG_IF_FAILED(_ReplayImageText());
+    for (const auto& replay : _imageGridlineReplay)
+    {
+        LOG_IF_FAILED(PaintBufferGridLines(replay.lines, replay.gridlineColor, replay.underlineColor, replay.cellCount, replay.target));
+    }
+
+    _imageTextReplay.clear();
+    _imageGridlineReplay.clear();
     return S_OK;
 }
 CATCH_RETURN();

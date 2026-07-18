@@ -1099,14 +1099,46 @@ void Renderer::_PaintBufferOutput(_In_ IRenderEngine* const pEngine)
             // Prepare the appropriate line transform for the current row and viewport offset.
             LOG_IF_FAILED(pEngine->PrepareLineTransform(lineRendition, screenPosition.y, _viewport.Left()));
 
+            const auto imageSlice = buffer.GetRowByOffset(row).GetImageSlice();
+            const auto hasBehindBackground = imageSlice && imageSlice->HasPixels(ImageSlice::RenderPosition::BehindBackground);
+            const auto hasBehindText = imageSlice && imageSlice->HasPixels(ImageSlice::RenderPosition::BehindText);
+            const auto hasUnderTextImage = hasBehindBackground || hasBehindText;
+            if (hasUnderTextImage)
+            {
+                LOG_IF_FAILED(pEngine->BeginImageSliceRow());
+            }
+
             // Ask the helper to paint through this specific line.
             _PaintBufferOutputHelper(pEngine, it, screenPosition);
 
-            // Paint any image content on top of the text.
-            const auto imageSlice = buffer.GetRowByOffset(row).GetImageSlice();
             if (imageSlice) [[unlikely]]
             {
-                LOG_IF_FAILED(pEngine->PaintImageSlice(*imageSlice, screenPosition.y, _viewport.Left()));
+                if (hasBehindBackground)
+                {
+                    const auto columnCount = imageSlice->PixelWidth() / std::max(1, imageSlice->CellSize().width);
+                    std::vector<uint8_t> backgroundMask(static_cast<size_t>(columnCount), 1);
+                    for (auto column = 0; column < columnCount; ++column)
+                    {
+                        const auto bufferColumn = imageSlice->ColumnOffset() + column;
+                        if (bufferColumn >= 0 && bufferColumn < r.GetReadableColumnCount())
+                        {
+                            til::at(backgroundMask, column) = r.GetAttrByColumn(bufferColumn).GetBackground().IsDefault() ? 1 : 0;
+                        }
+                    }
+                    LOG_IF_FAILED(pEngine->PaintImageSlice(*imageSlice, ImageSlice::RenderPosition::BehindBackground, screenPosition.y, _viewport.Left(), backgroundMask));
+                }
+                if (hasBehindText)
+                {
+                    LOG_IF_FAILED(pEngine->PaintImageSlice(*imageSlice, ImageSlice::RenderPosition::BehindText, screenPosition.y, _viewport.Left(), {}));
+                }
+                if (hasUnderTextImage)
+                {
+                    LOG_IF_FAILED(pEngine->EndImageSliceRow());
+                }
+                if (imageSlice->HasPixels(ImageSlice::RenderPosition::AboveText))
+                {
+                    LOG_IF_FAILED(pEngine->PaintImageSlice(*imageSlice, ImageSlice::RenderPosition::AboveText, screenPosition.y, _viewport.Left(), {}));
+                }
             }
         }
     }
