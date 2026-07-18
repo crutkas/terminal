@@ -278,6 +278,21 @@ public:
         return til::read_image_result::ok;
     }
 
+    til::read_shared_memory_result ReadKittySharedMemory(const std::wstring_view name, uint64_t offset, uint64_t size, std::vector<uint8_t>& out) noexcept override
+    {
+        Log::Comment(L"ReadKittySharedMemory MOCK called...");
+        _readKittySharedMemoryCallCount++;
+        _lastKittySharedMemoryName = std::wstring{ name };
+        _lastKittySharedMemoryOffset = offset;
+        _lastKittySharedMemorySize = size;
+        if (!_readKittySharedMemorySucceeds)
+        {
+            return _readKittySharedMemoryResult;
+        }
+        out = _kittySharedMemoryBytes;
+        return til::read_shared_memory_result::ok;
+    }
+
     void PrepData()
     {
         PrepData(CursorDirection::UP); // if called like this, the cursor direction doesn't matter.
@@ -453,6 +468,15 @@ public:
     uint64_t _lastKittyFileSize = 0;
     bool _lastKittyFileDeleteAfter = false;
     std::vector<uint8_t> _kittyFileBytes{ 255, 0, 0 }; // default: 1x1 red RGB (f=24,s=1,v=1)
+
+    // Kitty shared-memory transmission (t=s) mock state.
+    bool _readKittySharedMemorySucceeds = true;
+    til::read_shared_memory_result _readKittySharedMemoryResult{ til::read_shared_memory_result::read_error };
+    int _readKittySharedMemoryCallCount = 0;
+    std::wstring _lastKittySharedMemoryName;
+    uint64_t _lastKittySharedMemoryOffset = 0;
+    uint64_t _lastKittySharedMemorySize = 0;
+    std::vector<uint8_t> _kittySharedMemoryBytes{ 255, 0, 0 };
 
     til::enumset<Mode> _systemMode{ Mode::AutoWrap };
 
@@ -5347,13 +5371,81 @@ public:
         _testGetSet->ValidateInputEvent(L"\x1b_Gi=1;EINVAL:missing dimensions\x1b\\");
     }
 
-    // Direct (t=d), file (t=f) and temporary-file (t=t) media are supported; shared
-    // memory (t=s) is deferred and still rejected, as is any other unknown medium.
+    // Direct (t=d), file (t=f), temporary-file (t=t), and shared-memory (t=s)
+    // media are supported; any other medium is rejected.
     TEST_METHOD(KittyGraphicsUnsupportedMediumIsEinval)
     {
         _testGetSet->PrepData();
-        _stateMachine->ProcessString(L"\x1b_Ga=t,i=1,f=24,s=1,v=1,t=s;AAAA\x1b\\");
+        _stateMachine->ProcessString(L"\x1b_Ga=t,i=1,f=24,s=1,v=1,t=x;AAAA\x1b\\");
         _testGetSet->ValidateInputEvent(L"\x1b_Gi=1;EINVAL:unsupported transmission medium\x1b\\");
+    }
+
+    // Shared-memory transmission decodes the mapping name, forwards O=/S= to the
+    // host, and processes the copied bytes through the normal pixel path.
+    TEST_METHOD(KittyGraphicsSharedMemoryTransmitRenders)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_kittySharedMemoryBytes = { 255, 0, 0 };
+        // Base64 of "Local\\kitty-shm-test".
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=20,f=24,s=1,v=1,t=s,O=10,S=3;TG9jYWxca2l0dHktc2htLXRlc3Q=\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=20;OK\x1b\\");
+        VERIFY_ARE_EQUAL(1, _testGetSet->_readKittySharedMemoryCallCount);
+        VERIFY_IS_TRUE(_testGetSet->_lastKittySharedMemoryName == L"Local\\kitty-shm-test");
+        VERIFY_ARE_EQUAL(static_cast<uint64_t>(10), _testGetSet->_lastKittySharedMemoryOffset);
+        VERIFY_ARE_EQUAL(static_cast<uint64_t>(3), _testGetSet->_lastKittySharedMemorySize);
+        VERIFY_IS_TRUE(BufferContainsColor(*_testGetSet->_textBuffer, 255, 0, 0));
+    }
+
+    // Windows rounds named mappings to pages. Without S=, raw dimensions provide the
+    // exact byte count and prevent page padding from becoming image data.
+    TEST_METHOD(KittyGraphicsSharedMemoryInfersRawSize)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_kittySharedMemoryBytes.assign(12, 0);
+        _stateMachine->ProcessString(L"\x1b_Ga=t,i=21,f=24,s=2,v=2,t=s;TG9jYWxca2l0dHktc2htLXRlc3Q=\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=21;OK\x1b\\");
+        VERIFY_ARE_EQUAL(static_cast<uint64_t>(12), _testGetSet->_lastKittySharedMemorySize);
+
+        // S defaults to zero, so explicit S=0 is equivalent to omission. Both use the
+        // raw format's expected byte extent rather than page-rounded mapping padding.
+        _stateMachine->ProcessString(L"\x1b_Ga=t,i=22,f=24,s=2,v=2,t=s,S=0;TG9jYWxca2l0dHktc2htLXRlc3Q=\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=22;OK\x1b\\");
+        VERIFY_ARE_EQUAL(static_cast<uint64_t>(12), _testGetSet->_lastKittySharedMemorySize);
+    }
+
+    // The protocol defines m= chunking only for direct payload data. Local media carry
+    // a resource name, so m=1 must be ignored rather than delaying the read forever.
+    TEST_METHOD(KittyGraphicsSharedMemoryIgnoresMoreChunks)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_kittySharedMemoryBytes = { 255, 0, 0 };
+        _stateMachine->ProcessString(L"\x1b_Ga=t,i=23,f=24,s=1,v=1,t=s,S=3,m=1;TG9jYWxca2l0dHktc2htLXRlc3Q=\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=23;OK\x1b\\");
+        VERIFY_ARE_EQUAL(1, _testGetSet->_readKittySharedMemoryCallCount);
+    }
+
+    // The adapter rejects malformed or NUL-truncated mapping names before any host
+    // IPC call, so Win32 never opens a different object than the client named.
+    TEST_METHOD(KittyGraphicsSharedMemoryRejectsInvalidNameEncoding)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1b_Ga=t,i=24,f=24,s=1,v=1,t=s;//79\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=24;EINVAL:invalid shared memory request\x1b\\");
+        _stateMachine->ProcessString(L"\x1b_Ga=t,i=25,f=24,s=1,v=1,t=s;QQBC\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=25;EINVAL:invalid shared memory request\x1b\\");
+        VERIFY_ARE_EQUAL(0, _testGetSet->_readKittySharedMemoryCallCount);
+    }
+
+    // Host failures retain their protocol distinction and never register an image.
+    TEST_METHOD(KittyGraphicsSharedMemoryMissingIsEnoent)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_readKittySharedMemorySucceeds = false;
+        _testGetSet->_readKittySharedMemoryResult = til::read_shared_memory_result::not_found;
+        _stateMachine->ProcessString(L"\x1b_Ga=t,i=26,f=24,s=1,v=1,t=s;TG9jYWxca2l0dHktc2htLXRlc3Q=\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=26;ENOENT:shared memory not found\x1b\\");
+        _stateMachine->ProcessString(L"\x1b_Ga=p,i=26;\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=26;ENOENT:image not found\x1b\\");
     }
 
     // File transmission (t=f): the base64 payload is the file PATH; the host reads the

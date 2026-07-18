@@ -121,6 +121,14 @@ namespace Microsoft::Console::VirtualTerminal
             return til::read_image_result::read_error;
         }
 
+        // Copies bytes from a named, session-local Windows file mapping for Kitty
+        // graphics shared-memory transmission (t=s). The host opens it read-only,
+        // bounds the copy, and closes it before returning.
+        virtual til::read_shared_memory_result ReadKittySharedMemory(const std::wstring_view /*name*/, uint64_t /*offset*/, uint64_t /*size*/, std::vector<uint8_t>& /*out*/) noexcept
+        {
+            return til::read_shared_memory_result::read_error;
+        }
+
         // Returns the pixel size of a text cell, used to lay out graphics images.
         // The default is a reasonable fallback; hosts with real font metrics override.
         virtual til::size GetCellSize() const noexcept

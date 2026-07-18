@@ -487,6 +487,11 @@ til::read_image_result Terminal::ReadKittyImageFile(const std::wstring_view path
     return til::read_image_file(path, offset, size, deleteAfter, out);
 }
 
+til::read_shared_memory_result Terminal::ReadKittySharedMemory(const std::wstring_view name, uint64_t offset, uint64_t size, std::vector<uint8_t>& out) noexcept
+{
+    return til::read_shared_memory(name, offset, size, out);
+}
+
 void Terminal::NotifyBufferRotation(const int delta)
 {
     // Update our selection, so it doesn't move as the buffer is cycled

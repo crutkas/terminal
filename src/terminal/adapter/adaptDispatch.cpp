@@ -5069,17 +5069,20 @@ AdaptDispatch::KittyControl AdaptDispatch::_ParseKittyControl(const std::wstring
 void AdaptDispatch::_HandleKittyGraphics(const std::wstring_view control, const std::string_view payload, const bool payloadValid, const bool payloadTooLarge)
 {
     const auto command = _ParseKittyControl(control);
+    const auto isLocalMedium = command.medium == L'f' || command.medium == L't' || command.medium == L's';
 
     // Only a bare 'm='-prefixed sequence continues an in-progress transfer. Any other
     // command starts fresh, so if a transfer is already active it was orphaned (e.g.
     // its APC was aborted mid-stream) and its stale state must be discarded first.
-    const auto isContinuation = command.mPresent && !command.hasNonChunkKey;
+    // Per the protocol, m= applies only to direct transmission and is ignored for
+    // file/shared-memory media, whose payload is already just a local resource name.
+    const auto isContinuation = command.mPresent && !command.hasNonChunkKey && !isLocalMedium;
     if (_kittyChunkActive && !isContinuation)
     {
         _clearKittyChunk();
     }
 
-    if (_kittyChunkActive || command.moreChunks)
+    if (_kittyChunkActive || (command.moreChunks && !isLocalMedium))
     {
         if (!_kittyChunkActive)
         {
@@ -5176,12 +5179,10 @@ void AdaptDispatch::_ProcessKittyCommand(const KittyControl& command, const std:
                 code = L"EINVAL:unsupported format";
                 break;
             }
-            if (medium != L'd' && medium != L'f' && medium != L't')
+            if (medium != L'd' && medium != L'f' && medium != L't' && medium != L's')
             {
-                // t=d (direct), t=f (file) and t=t (temporary file) are supported.
-                // t=s (shared memory) is deferred and rejected here, as is any other
-                // unrecognized medium. (Shared-memory support would require mapping a
-                // named shm object, which is intentionally not linked yet.)
+                // t=d (direct), t=f (file), t=t (temporary file), and t=s (shared
+                // memory) are supported. Reject every unrecognized medium.
                 success = false;
                 code = L"EINVAL:unsupported transmission medium";
                 break;
@@ -5208,6 +5209,34 @@ void AdaptDispatch::_ProcessKittyCommand(const KittyControl& command, const std:
                 }
                 break;
             }
+
+            // File and shared-memory payloads carry a UTF-8 resource name rather than
+            // image bytes. Decode strictly and reject embedded NULs so Win32 cannot
+            // silently open a truncated name.
+            const auto decodeResourceName = [](const std::vector<uint8_t>& encodedName, const size_t maxBytes, std::wstring& result) {
+                if (encodedName.empty() || encodedName.size() > maxBytes ||
+                    std::find(encodedName.begin(), encodedName.end(), uint8_t{ 0 }) != encodedName.end())
+                {
+                    return false;
+                }
+
+                const std::string utf8(encodedName.begin(), encodedName.end());
+                const auto length = static_cast<int>(utf8.size());
+                const auto needed = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, utf8.data(), length, nullptr, 0);
+                if (needed <= 0)
+                {
+                    return false;
+                }
+
+                result.resize(static_cast<size_t>(needed));
+                if (MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, utf8.data(), length, result.data(), needed) != needed)
+                {
+                    result.clear();
+                    return false;
+                }
+                return true;
+            };
+
             if (medium == L'f' || medium == L't')
             {
                 // For file/temporary transmission the decoded payload is not image
@@ -5230,20 +5259,7 @@ void AdaptDispatch::_ProcessKittyCommand(const KittyControl& command, const std:
                 // mangled into U+FFFD substitutions: unlike til::u8u16, which uses no
                 // flags and substitutes, this rejects invalid input deterministically.
                 std::wstring path;
-                if (!bytes.empty() && bytes.size() <= static_cast<size_t>(INT_MAX))
-                {
-                    const std::string pathUtf8(bytes.begin(), bytes.end());
-                    const auto len8 = static_cast<int>(pathUtf8.size());
-                    const auto needed = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, pathUtf8.data(), len8, nullptr, 0);
-                    if (needed > 0)
-                    {
-                        path.resize(static_cast<size_t>(needed));
-                        if (MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, pathUtf8.data(), len8, path.data(), needed) != needed)
-                        {
-                            path.clear();
-                        }
-                    }
-                }
+                std::ignore = decodeResourceName(bytes, static_cast<size_t>(INT_MAX), path);
                 const auto deleteAfter = (medium == L't') && (action != L'q');
                 std::vector<uint8_t> fileBytes;
                 // An empty path is a malformed request (EINVAL); otherwise the host reports
@@ -5270,6 +5286,53 @@ void AdaptDispatch::_ProcessKittyCommand(const KittyControl& command, const std:
                     break;
                 }
                 bytes = std::move(fileBytes);
+            }
+            else if (medium == L's')
+            {
+                // The payload names a Windows file mapping. The host accepts only the
+                // current-session namespace, opens FILE_MAP_READ, copies at most 32 MiB,
+                // and closes the view/handle before returning. Per the Kitty spec there
+                // is no unlink operation on Windows.
+                std::wstring name;
+                constexpr size_t maxMappingNameBytes = 32767;
+                if (!decodeResourceName(bytes, maxMappingNameBytes, name))
+                {
+                    success = false;
+                    code = L"EINVAL:invalid shared memory request";
+                    break;
+                }
+
+                auto readSize = command.fileSize;
+                if (readSize == 0 && (format == 24 || format == 32) && width != 0 && height != 0)
+                {
+                    // CreateFileMapping rounds section sizes to whole pages, so a mapping
+                    // has no discoverable byte-exact tail. For raw pixels the protocol's
+                    // dimensions provide that exact length when S= is omitted.
+                    const auto depth = format == 24 ? 3ull : 4ull;
+                    const auto area = static_cast<uint64_t>(width) * height;
+                    readSize = area <= UINT64_MAX / depth ? area * depth : UINT64_MAX;
+                }
+
+                std::vector<uint8_t> sharedBytes;
+                const auto readResult = _api.ReadKittySharedMemory(name, command.fileOffset, readSize, sharedBytes);
+                if (readResult != til::read_shared_memory_result::ok)
+                {
+                    success = false;
+                    switch (readResult)
+                    {
+                    case til::read_shared_memory_result::not_found:
+                        code = L"ENOENT:shared memory not found";
+                        break;
+                    case til::read_shared_memory_result::invalid:
+                        code = L"EINVAL:invalid shared memory request";
+                        break;
+                    default:
+                        code = L"EBADF:could not read shared memory";
+                        break;
+                    }
+                    break;
+                }
+                bytes = std::move(sharedBytes);
             }
             // Raw pixel formats (f=24/32) require positive dimensions and an exact
             // payload of width * height * depth bytes; compare via division so hostile
