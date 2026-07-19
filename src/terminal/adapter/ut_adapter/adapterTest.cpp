@@ -5528,12 +5528,11 @@ public:
         _testGetSet->ValidateInputEvent(L"\x1b_Gi=1;EINVAL:unsupported transmission medium\x1b\\");
     }
 
-    // A spec delete target not yet implemented -- z-index (d=z, needs #21) -- is rejected, not
-    // acted on. (The positional selectors d=c/p/x/y/r are now implemented; z/q/f remain gated.)
+    // Animation deletion remains gated on #22.
     TEST_METHOD(KittyGraphicsDeleteUnsupportedTargetIsEinval)
     {
         _testGetSet->PrepData();
-        _stateMachine->ProcessString(L"\x1b_Ga=d,d=z,i=5;\x1b\\");
+        _stateMachine->ProcessString(L"\x1b_Ga=d,d=f,i=5;\x1b\\");
         _testGetSet->ValidateInputEvent(L"\x1b_Gi=5;EINVAL:unsupported delete target\x1b\\");
     }
 
@@ -7878,6 +7877,148 @@ public:
         VERIFY_IS_NOT_NULL(slice);
         const auto pixel = SlicePixelAt(slice, ImageSlice::RenderPosition::AboveText, origin.x - slice->ColumnOffset(), 0);
         VERIFY_IS_TRUE(pixel.rgbRed == 255 && pixel.rgbGreen == 0 && pixel.rgbBlue == 0, L"deleting the top layer must reveal the lower layer");
+    }
+
+    TEST_METHOD(KittyGraphicsDeleteByZRemovesOnlyExactZAndKeepsData)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        const auto origin = _testGetSet->_textBuffer->GetCursor().GetPosition();
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,z=-1,f=24,s=1,v=1,C=1;/wAA\x1b\\");
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=2,z=2,f=24,s=1,v=1,C=1;AP8A\x1b\\");
+        _stateMachine->ProcessString(L"\x1b_Ga=d,d=z,z=2;\x1b\\");
+
+        const auto* slice = _testGetSet->_textBuffer->GetRowByOffset(origin.y).GetImageSlice();
+        VERIFY_IS_NOT_NULL(slice);
+        const auto x = origin.x - slice->ColumnOffset();
+        VERIFY_ARE_EQUAL(static_cast<BYTE>(255), SlicePixelAt(slice, ImageSlice::RenderPosition::BehindText, x, 0).rgbRed);
+        VERIFY_IS_FALSE(slice->HasPixels(ImageSlice::RenderPosition::AboveText), L"d=z must not leave the selected z layer");
+        VERIFY_ARE_EQUAL(static_cast<size_t>(1), _pDispatch->_kittyImages.count(2), L"lowercase d=z must retain image data");
+    }
+
+    TEST_METHOD(KittyGraphicsDeleteByUppercaseZFreesOnlyAfterLastPlacement)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,p=1,z=1,f=24,s=1,v=1,C=1;/wAA\x1b\\");
+        _stateMachine->ProcessString(L"\x1b_Ga=p,i=1,p=2,z=2,C=1;\x1b\\");
+
+        _stateMachine->ProcessString(L"\x1b_Ga=d,d=Z,z=1;\x1b\\");
+        VERIFY_ARE_EQUAL(static_cast<size_t>(1), _pDispatch->_kittyImages.count(1), L"a surviving placement must retain its shared image data");
+        VERIFY_ARE_EQUAL(static_cast<size_t>(0), _pDispatch->_kittyPlacements.count({ 1u, 1u }));
+        VERIFY_ARE_EQUAL(static_cast<size_t>(1), _pDispatch->_kittyPlacements.count({ 1u, 2u }));
+
+        _stateMachine->ProcessString(L"\x1b_Ga=d,d=Z,z=2;\x1b\\");
+        VERIFY_ARE_EQUAL(static_cast<size_t>(0), _pDispatch->_kittyImages.count(1), L"uppercase d=Z must free data after the final placement");
+        VERIFY_ARE_EQUAL(static_cast<size_t>(0), _pDispatch->_kittyPlacements.count({ 1u, 2u }));
+    }
+
+    TEST_METHOD(KittyGraphicsDeleteByQMatchesViewportCellAndZ)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        auto page = _pDispatch->_pages.ActivePage();
+        auto& buffer = page.Buffer();
+        const auto row = page.Top();
+        buffer.GetCursor().SetPosition({ 0, row });
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,z=3,f=24,s=1,v=1,C=1;/wAA\x1b\\");
+        buffer.GetCursor().SetPosition({ 3, row });
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=2,z=3,f=24,s=1,v=1,C=1;AP8A\x1b\\");
+        buffer.GetCursor().SetPosition({ 0, row });
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=3,z=4,f=24,s=1,v=1,C=1;AAD/\x1b\\");
+
+        _stateMachine->ProcessString(L"\x1b_Ga=d,d=q,x=1,y=1,z=3;\x1b\\");
+
+        const auto* slice = buffer.GetRowByOffset(row).GetImageSlice();
+        VERIFY_IS_NOT_NULL(slice);
+        VERIFY_IS_FALSE(slice->HasOwner(1), L"d=q must delete the matching image/z placement");
+        VERIFY_IS_TRUE(slice->HasOwner(2), L"d=q must preserve the same z at another cell");
+        VERIFY_IS_TRUE(slice->HasOwner(3), L"d=q must preserve another z at the selected cell");
+        VERIFY_ARE_EQUAL(static_cast<size_t>(1), _pDispatch->_kittyImages.count(1), L"lowercase d=q must retain image data");
+    }
+
+    TEST_METHOD(KittyGraphicsDeleteByUppercaseQFreesData)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        auto page = _pDispatch->_pages.ActivePage();
+        auto& buffer = page.Buffer();
+        buffer.GetCursor().SetPosition({ 0, page.Top() });
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,z=-3,f=24,s=1,v=1,C=1;/wAA\x1b\\");
+        _stateMachine->ProcessString(L"\x1b_Ga=d,d=Q,x=1,y=1,z=-3;\x1b\\");
+
+        VERIFY_ARE_EQUAL(static_cast<size_t>(0), _pDispatch->_kittyImages.count(1));
+    }
+
+    TEST_METHOD(KittyGraphicsDeleteByZAndQIgnoreVirtualPlacements)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        const auto origin = _testGetSet->_textBuffer->GetCursor().GetPosition();
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,p=1,z=5,f=24,s=1,v=1;/wAA\x1b\\");
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m");
+        _stateMachine->ProcessString(Placeholder() + L"\x0305" + L"\x0305");
+        auto page = _pDispatch->_pages.ActivePage();
+        const auto x = origin.x + 1;
+        const auto y = origin.y - page.Top() + 1;
+
+        _stateMachine->ProcessString(L"\x1b_Ga=d,d=z,z=5;\x1b\\");
+        _stateMachine->ProcessString(L"\x1b_Ga=d,d=Q,x=" + std::to_wstring(x) + L",y=" + std::to_wstring(y) + L",z=5;\x1b\\");
+
+        const auto* slice = _testGetSet->_textBuffer->GetRowByOffset(origin.y).GetImageSlice();
+        VERIFY_IS_NOT_NULL(slice);
+        VERIFY_IS_TRUE(slice->HasOwner(1), L"z-based selectors must not affect virtual placements");
+        VERIFY_ARE_EQUAL(static_cast<size_t>(1), _pDispatch->_kittyVirtualIds.count(1));
+        VERIFY_ARE_EQUAL(static_cast<size_t>(1), _pDispatch->_kittyImages.count(1), L"uppercase d=Q must not free virtual image data");
+    }
+
+    TEST_METHOD(KittyGraphicsDeleteByZPreservesCoexistingVirtualPlacement)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        auto& buffer = *_testGetSet->_textBuffer;
+        const auto origin = buffer.GetCursor().GetPosition();
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,p=1,z=3,f=24,s=1,v=1,C=1;/wAA\x1b\\");
+        _stateMachine->ProcessString(L"\x1b_Ga=p,U=1,i=1,z=5;\x1b\\");
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m");
+        buffer.GetCursor().SetPosition({ origin.x + 2, origin.y });
+        _stateMachine->ProcessString(Placeholder() + L"\x0305" + L"\x0305");
+
+        _stateMachine->ProcessString(L"\x1b_Ga=d,d=Z,z=3;\x1b\\");
+
+        const auto* slice = buffer.GetRowByOffset(origin.y).GetImageSlice();
+        VERIFY_IS_NOT_NULL(slice);
+        VERIFY_IS_TRUE(slice->ColumnOwner(origin.x) != 1, L"the physical z=3 placement must be deleted");
+        VERIFY_IS_TRUE(slice->ColumnOwner(origin.x + 2) == 1, L"the coexisting virtual z=5 placement must survive");
+        VERIFY_ARE_EQUAL(static_cast<size_t>(1), _pDispatch->_kittyVirtualIds.count(1));
+        VERIFY_ARE_EQUAL(static_cast<size_t>(1), _pDispatch->_kittyImages.count(1), L"the surviving virtual placement must retain shared data");
+    }
+
+    TEST_METHOD(KittyGraphicsDeleteByZCascadesRelativeChildren)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,p=1,z=7,f=24,s=1,v=1,C=1;/wAA\x1b\\");
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=2,p=1,P=1,Q=1,H=1,z=8,f=24,s=1,v=1,C=1;AP8A\x1b\\");
+        _stateMachine->ProcessString(L"\x1b_Ga=d,d=z,z=7;\x1b\\");
+
+        VERIFY_ARE_EQUAL(static_cast<size_t>(0), _pDispatch->_kittyPlacements.count({ 1u, 1u }));
+        VERIFY_ARE_EQUAL(static_cast<size_t>(0), _pDispatch->_kittyPlacements.count({ 2u, 1u }));
+        VERIFY_ARE_EQUAL(static_cast<size_t>(1), _pDispatch->_kittyImages.count(1), L"lowercase d=z keeps the selected parent's data");
+        VERIFY_ARE_EQUAL(static_cast<size_t>(0), _pDispatch->_kittyImages.count(2), L"relative children are deleted with the selected parent");
+    }
+
+    TEST_METHOD(KittyGraphicsDeleteByZCascadesSameZChildBeforeLowerKey)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=2,p=1,z=7,f=24,s=1,v=1,C=1;/wAA\x1b\\");
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,p=1,P=2,Q=1,H=1,z=7,f=24,s=1,v=1,C=1;AP8A\x1b\\");
+        _stateMachine->ProcessString(L"\x1b_Ga=d,d=z,z=7;\x1b\\");
+
+        VERIFY_IS_TRUE(_pDispatch->_kittyPlacements.empty());
+        VERIFY_ARE_EQUAL(static_cast<size_t>(1), _pDispatch->_kittyImages.count(2), L"lowercase d=z keeps the selected parent's data");
+        VERIFY_ARE_EQUAL(static_cast<size_t>(0), _pDispatch->_kittyImages.count(1), L"the lower-keyed same-z child must still be cascade-freed");
     }
 
     TEST_METHOD(KittyGraphicsZLayersSurviveScrollAndCellCopy)
