@@ -6,6 +6,7 @@
 #include "../../buffer/out/textBuffer.hpp"
 #include "../inc/IRenderEngine.hpp"
 #include "../inc/RenderSettings.hpp"
+#include <memory>
 
 namespace Microsoft::Console::Render
 {
@@ -24,7 +25,7 @@ namespace Microsoft::Console::Render
 
         IRenderData* GetRenderData() const noexcept;
 
-        TimerHandle RegisterTimer(const char* description, TimerCallback routine);
+        TimerHandle RegisterTimer(const char* description, TimerCallback routine, std::weak_ptr<void> lifetime = {});
         bool IsTimerRunning(TimerHandle handle) const;
         TimerDuration GetTimerInterval(TimerHandle handle) const;
         void StartTimer(TimerHandle handle, TimerDuration delay);
@@ -80,9 +81,11 @@ namespace Microsoft::Console::Render
         struct TimerRoutine
         {
             const char* description = nullptr;
-            TimerRepr interval = 0; // Timers with a 0 interval are marked for deletion.
+            TimerRepr interval = 0;
             TimerRepr next = 0;
-            TimerCallback routine;
+            std::shared_ptr<TimerCallback> routine;
+            std::weak_ptr<void> lifetime;
+            bool lifetimeBound = false;
         };
 
         // Caches some essential information about the active composition.
@@ -149,8 +152,8 @@ namespace Microsoft::Console::Render
         std::atomic<bool> _redraw;
         std::atomic<bool> _threadKeepRunning{ false };
         til::small_vector<IRenderEngine*, 2> _engines;
+        mutable wil::srwlock _timerMutex;
         til::small_vector<TimerRoutine, 4> _timers;
-        size_t _nextTimerId = 0;
 
         static constexpr size_t _firstSoftFontChar = 0xEF20;
         size_t _lastSoftFontChar = 0;

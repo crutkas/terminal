@@ -20,12 +20,15 @@ Author(s):
 #include "MacroBuffer.hpp"
 #include "PageManager.hpp"
 #include "terminalOutput.hpp"
+#include "../../renderer/inc/IRenderData.hpp"
 
 #include <unordered_map>
 #include <map>
 #include <deque>
 #include <optional>
 #include <algorithm>
+#include <memory>
+#include <mutex>
 #include "../input/terminalInput.hpp"
 #include "../../types/inc/sgrStack.hpp"
 
@@ -43,6 +46,7 @@ namespace Microsoft::Console::VirtualTerminal
 
     public:
         AdaptDispatch(ITerminalApi& api, Renderer* renderer, RenderSettings& renderSettings, TerminalInput& terminalInput) noexcept;
+        ~AdaptDispatch() override;
 
         void UnknownSequence() noexcept override;
         void Print(const wchar_t wchPrintable) override;
@@ -326,17 +330,20 @@ namespace Microsoft::Console::VirtualTerminal
             uint32_t height = 0;
             uint32_t cols = 0;    // c=: scale the placement to this many cell columns
             uint32_t rows = 0;    // r=: scale the placement to this many cell rows
-            uint32_t srcX = 0;    // x=: source crop left edge in pixels
-            uint32_t srcY = 0;    // y=: source crop top edge in pixels
+            uint32_t srcX = 0;    // x=: source/update x, or composition destination x
+            uint32_t srcY = 0;    // y=: source/update y, or composition destination y
             uint32_t srcW = 0;    // w=: source crop width in pixels (0 = to right edge)
             uint32_t srcH = 0;    // h=: source crop height in pixels (0 = to bottom edge)
+            uint32_t upperX = 0;  // X=: animation replacement mode or composition source x
+            uint32_t upperY = 0;  // Y=: animation background RGBA or composition source y
             bool moreChunks = false;
             bool mPresent = false;
             bool haveId = false;
             bool haveNumber = false;
             wchar_t medium = L'd';          // t=: transmission medium (only d=direct in MVP)
             bool noCursorMovement = false;  // C=1: leave the cursor in place after a placement
-            bool hasNonChunkKey = false;    // true if any key other than 'm' was present
+            bool hasNonChunkKey = false;    // true if any key other than m/q was present
+            bool hasNonChunkKeyOtherThanAction = false; // permits required a=f on frame continuations
             bool virtualPlacement = false;  // U=1: virtual placement (store only; drawn later via Unicode placeholders)
             // Relative placements (https://sw.kovidgoyal.net/kitty/graphics-protocol/#relative-placements).
             uint32_t placementId = 0;        // p=: placement id (one display of an image); ignored when imageId==0
@@ -345,17 +352,41 @@ namespace Microsoft::Console::VirtualTerminal
             int32_t offsetH = 0;             // H=: signed horizontal cell offset from the parent anchor (+right)
             int32_t offsetV = 0;             // V=: signed vertical cell offset from the parent anchor (+down)
             int32_t zIndex = 0;              // z=: signed stacking order; negative values render under text
+            bool haveZ = false;
             bool havePlacementId = false;    // true if p= was present (so p= is echoed in the ack)
             bool haveParent = false;         // true if P= was present (a relative placement was requested)
         };
-        // A stored Kitty image: the client image number (0 = none), the pixel
-        // dimensions, and the decoded BGRA pixels (empty if not yet decodable).
+        struct KittyAnimationFrame
+        {
+            std::vector<RGBQUAD> pixels;
+            int32_t gapMilliseconds = 0;
+        };
+        // A stored Kitty image. Frame 1 is the root pixel vector; additional
+        // full-canvas frames share its dimensions and carry their own next-frame gap.
         struct KittyImage
         {
             uint32_t number = 0;
             uint32_t width = 0;
             uint32_t height = 0;
             std::vector<RGBQUAD> pixels;
+            int32_t rootGapMilliseconds = 0;
+            std::vector<KittyAnimationFrame> animationFrames;
+            uint32_t currentFrame = 1;
+            uint32_t animationState = 1;
+            uint32_t loopCount = 1;
+            uint32_t loopsRemaining = UINT32_MAX;
+            bool waitingForFrames = false;
+            std::chrono::steady_clock::time_point nextFrameTime{};
+
+            size_t PixelBytes() const noexcept
+            {
+                auto bytes = pixels.size() * sizeof(RGBQUAD);
+                for (const auto& frame : animationFrames)
+                {
+                    bytes += frame.pixels.size() * sizeof(RGBQUAD);
+                }
+                return bytes;
+            }
         };
         // The target pixel size a c=/r= request maps to (one axis preserves aspect). Shared
         // by the cursor-anchored and virtual paths so a U=1 grid matches an equivalent draw.
@@ -421,6 +452,21 @@ namespace Microsoft::Console::VirtualTerminal
         static int32_t _ParseKittyInt(const std::wstring_view value) noexcept;
         static bool _DecodeKittyBase64(const std::string_view input, std::vector<uint8_t>& output) noexcept;
         static std::vector<RGBQUAD> _decodeKittyPixels(const uint32_t format, const std::vector<uint8_t>& bytes);
+        static RGBQUAD _kittyRgbaColor(uint32_t rgba) noexcept;
+        static void _kittyCompositePixels(std::span<RGBQUAD> destination, std::span<const RGBQUAD> source, bool replace) noexcept;
+        static size_t _kittyFrameCount(const KittyImage& image) noexcept;
+        static std::vector<RGBQUAD>* _kittyFramePixels(KittyImage& image, uint32_t frameNumber) noexcept;
+        static const std::vector<RGBQUAD>* _kittyFramePixels(const KittyImage& image, uint32_t frameNumber) noexcept;
+        static int32_t* _kittyFrameGap(KittyImage& image, uint32_t frameNumber) noexcept;
+        void _updateKittyImageLayers(uint32_t imageId, std::span<const RGBQUAD> pixels);
+        void _scheduleKittyAnimation(uint32_t imageId, KittyImage& image, std::chrono::steady_clock::time_point now);
+        void _scheduleKittyAnimationTimer();
+        void _advanceKittyAnimations(std::chrono::steady_clock::time_point now);
+        bool _advanceKittyImage(uint32_t imageId, KittyImage& image, std::chrono::steady_clock::time_point now);
+        bool _processKittyAnimationFrame(const KittyControl& command, const std::string_view payload, bool payloadValid, bool payloadTooLarge, uint32_t imageId, std::wstring_view& code);
+        bool _processKittyAnimationControl(const KittyControl& command, uint32_t imageId, std::wstring_view& code);
+        bool _processKittyFrameComposition(const KittyControl& command, uint32_t imageId, std::wstring_view& code);
+        void _deleteKittyAnimationFrames(uint32_t imageId, uint32_t frameNumber, bool freeData);
         uint32_t _kittyAssignImageId();
         void _registerKittyImage(const uint32_t id, KittyImage&& image);
         void _eraseKittyImage(const uint32_t id);
@@ -488,6 +534,7 @@ namespace Microsoft::Console::VirtualTerminal
         static constexpr size_t MaxKittyImages = 4096;
         static constexpr size_t MaxKittyPayload = 32 * 1024 * 1024;
         static constexpr size_t MaxKittyTotalBytes = 320 * 1024 * 1024;
+        static constexpr size_t MaxKittyFramesPerImage = 4096;
         // The kitty Unicode placeholder code point. A cell holding this glyph, with a
         // 24-bit RGB foreground giving the image id, draws a sub-rect of a virtual
         // (U=1) image rather than the cursor-anchored placement.
@@ -498,6 +545,13 @@ namespace Microsoft::Console::VirtualTerminal
         std::unordered_map<uint32_t, KittyImage> _kittyImages;
         std::unordered_map<uint32_t, uint32_t> _kittyImageNumbers;
         std::deque<uint32_t> _kittyImageOrder;
+        struct KittyAnimationTimerTarget
+        {
+            std::mutex mutex;
+            AdaptDispatch* dispatch = nullptr;
+        };
+        std::shared_ptr<KittyAnimationTimerTarget> _kittyAnimationTimerTarget;
+        std::optional<Microsoft::Console::Render::TimerHandle> _kittyAnimationTimer;
         // Ids placed virtually (U=1): only these may be drawn by U+10EEEE placeholders, so a
         // plain colored placeholder glyph can't false-overlay an ordinary image. The value is
         // the placement's fixed grid geometry and source sampling state (KittyVirtualPlacement).
