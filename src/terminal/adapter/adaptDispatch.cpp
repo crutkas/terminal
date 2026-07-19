@@ -5711,7 +5711,21 @@ void AdaptDispatch::_ProcessKittyCommand(const KittyControl& command, const std:
             case L'R':
                 _deleteKittyImagesInIdRange(command.srcX, command.srcY, freeData);
                 break;
-            default: // z-index (d=z/q, need #21) and animation (d=f, need #22) selectors are not yet supported
+            case L'z': // physical placements with the exact z-index
+            case L'Z':
+                _deleteKittyPlacementsByZ(command.zIndex, freeData);
+                break;
+            case L'q': // physical placements with the exact z-index intersecting cell (x, y)
+            case L'Q':
+                if (command.srcX != 0 && command.srcY != 0)
+                {
+                    auto page = _pages.ActivePage();
+                    const auto x = static_cast<til::CoordType>(std::min<int64_t>(static_cast<int64_t>(command.srcX) - 1, page.Width()));
+                    const auto y = static_cast<til::CoordType>(std::min<int64_t>(static_cast<int64_t>(page.Top()) + command.srcY - 1, page.Bottom()));
+                    _deleteKittyPlacementsByZ(command.zIndex, freeData, til::point{ x, y });
+                }
+                break;
+            default: // animation selector d=f needs #22
                 success = false;
                 code = L"EINVAL:unsupported delete target";
                 break;
@@ -6616,6 +6630,174 @@ void AdaptDispatch::_deleteKittyImagesInIdRange(const uint32_t lo, const uint32_
             _eraseKittyImage(id);
         }
         _eraseKittyImageRows(id);
+    }
+}
+
+// Deletes physical placements selected by an exact z-index. d=q/Q first selects
+// the image/z layers intersecting one viewport-relative cell. Virtual placements
+// are excluded by the protocol. ImageSlice owns the scroll/reflow-safe layer
+// geometry; the registries supply relative-anchor cleanup and child cascades.
+void AdaptDispatch::_deleteKittyPlacementsByZ(const int32_t zIndex, const bool freeData, const std::optional<til::point> cell)
+{
+    auto page = _pages.ActivePage();
+    auto& buffer = page.Buffer();
+    std::vector<uint32_t> imageIds;
+    const auto rememberImageId = [&](const uint32_t imageId) {
+        const auto virtualIt = _kittyVirtualIds.find(imageId);
+        // A virtual put can coexist with an earlier physical placement of the
+        // same image. Exclude only its own z layer, not every physical layer
+        // sharing the image id. Same-id/same-z ownership remains #39.
+        const auto isVirtualLayer = virtualIt != _kittyVirtualIds.end() && virtualIt->second.zIndex == zIndex;
+        if (!isVirtualLayer && std::find(imageIds.begin(), imageIds.end(), imageId) == imageIds.end())
+        {
+            imageIds.push_back(imageId);
+        }
+    };
+
+    if (cell)
+    {
+        if (cell->x >= 0 && cell->x < page.Width() && cell->y >= 0 && cell->y < page.Bottom())
+        {
+            const auto* slice = buffer.GetRowByOffset(cell->y).GetImageSlice();
+            if (slice)
+            {
+                for (const auto imageId : slice->ImageIdsAtZ(zIndex, cell->x))
+                {
+                    rememberImageId(imageId);
+                }
+            }
+        }
+    }
+    else
+    {
+        for (auto row = 0; row < page.Bottom(); ++row)
+        {
+            const auto* slice = buffer.GetRowByOffset(row).GetImageSlice();
+            if (slice)
+            {
+                for (const auto imageId : slice->ImageIdsAtZ(zIndex))
+                {
+                    rememberImageId(imageId);
+                }
+            }
+        }
+        for (const auto& [key, placement] : _kittyPlacements)
+        {
+            if (!placement.isVirtual && placement.zIndex == zIndex)
+            {
+                rememberImageId(key.first);
+            }
+        }
+        for (const auto& placement : _kittyAnonymousPlacements)
+        {
+            if (!placement.isVirtual && placement.zIndex == zIndex)
+            {
+                rememberImageId(placement.imageId);
+            }
+        }
+    }
+
+    if (imageIds.empty())
+    {
+        return;
+    }
+
+    const auto selected = [&](const uint32_t imageId, const int32_t placementZ) {
+        return placementZ == zIndex && std::find(imageIds.begin(), imageIds.end(), imageId) != imageIds.end();
+    };
+
+    std::vector<std::pair<uint32_t, uint32_t>> selectedPlacements;
+    for (const auto& [key, placement] : _kittyPlacements)
+    {
+        if (!placement.isVirtual && selected(key.first, placement.zIndex))
+        {
+            selectedPlacements.push_back(key);
+        }
+    }
+    std::vector<std::pair<uint32_t, uint32_t>> selectedRoots;
+    for (const auto& key : selectedPlacements)
+    {
+        const auto& placement = _kittyPlacements.at(key);
+        const std::pair<uint32_t, uint32_t> parentKey{ placement.parentImageId, placement.parentPlacementId };
+        const auto parentIsSelected = placement.hasParent &&
+                                      std::find(selectedPlacements.begin(), selectedPlacements.end(), parentKey) != selectedPlacements.end();
+        if (!parentIsSelected)
+        {
+            selectedRoots.push_back(key);
+        }
+    }
+    for (const auto& key : selectedRoots)
+    {
+        // A prior selected parent may already have cascade-deleted this placement.
+        if (_kittyPlacements.erase(key) != 0)
+        {
+            // Protect the selected root's data here. Uppercase selectors free it
+            // below only after all surviving physical placements are considered;
+            // relative children retain the existing group-delete behavior.
+            std::deque<std::pair<uint32_t, uint32_t>> removed{ key };
+            _cascadeKittyPlacementChildren(removed, key.first);
+        }
+    }
+    std::erase_if(_kittyAnonymousPlacements, [&](const auto& placement) {
+        return !placement.isVirtual && selected(placement.imageId, placement.zIndex);
+    });
+
+    auto firstRow = page.Bottom();
+    auto lastRow = 0;
+    for (auto row = 0; row < page.Bottom(); ++row)
+    {
+        auto& dstRow = buffer.GetMutableRowByOffset(row);
+        auto* slice = dstRow.GetMutableImageSlice();
+        if (!slice)
+        {
+            continue;
+        }
+
+        const auto rowImageIds = slice->ImageIdsAtZ(zIndex);
+        auto changed = false;
+        for (const auto imageId : imageIds)
+        {
+            if (std::find(rowImageIds.begin(), rowImageIds.end(), imageId) != rowImageIds.end())
+            {
+                changed = true;
+                if (slice->EraseByZ(zIndex, imageId))
+                {
+                    dstRow.SetImageSlice(nullptr);
+                    break;
+                }
+            }
+        }
+        if (changed)
+        {
+            firstRow = std::min(firstRow, row);
+            lastRow = std::max(lastRow, row);
+        }
+    }
+
+    if (firstRow <= lastRow)
+    {
+        buffer.TriggerRedraw(Viewport::FromExclusive({ 0, firstRow, page.Width(), lastRow + 1 }));
+    }
+
+    if (freeData)
+    {
+        for (const auto imageId : imageIds)
+        {
+            if (_kittyVirtualIds.find(imageId) != _kittyVirtualIds.end() || _kittyImageHasPlacements(imageId))
+            {
+                continue;
+            }
+            auto hasPixels = false;
+            for (auto row = 0; row < page.Bottom() && !hasPixels; ++row)
+            {
+                const auto* slice = buffer.GetRowByOffset(row).GetImageSlice();
+                hasPixels = slice && slice->HasOwner(imageId);
+            }
+            if (!hasPixels)
+            {
+                _eraseKittyImage(imageId);
+            }
+        }
     }
 }
 
