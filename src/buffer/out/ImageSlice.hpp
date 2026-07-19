@@ -58,8 +58,11 @@ public:
     void SetColumnOwner(const til::CoordType columnBegin, const til::CoordType columnEnd, const uint32_t id);
     bool HasOwner(const uint32_t id) const noexcept;
     std::vector<uint32_t> ColumnOwners(const til::CoordType column) const;
+    std::vector<uint32_t> ImageIdsAtZ(const int32_t zIndex) const;
+    std::vector<uint32_t> ImageIdsAtZ(const int32_t zIndex, const til::CoordType column) const;
     bool EraseByOwner(const uint32_t id);
     bool EraseByOwner(const uint32_t id, const til::CoordType columnBegin, const til::CoordType columnEnd);
+    bool EraseByZ(const int32_t zIndex, const uint32_t imageId);
     void ClearForeignColumns(const til::CoordType columnBegin, const til::CoordType columnEnd);
 
     std::span<const RGBQUAD> Pixels() const noexcept;

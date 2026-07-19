@@ -199,6 +199,39 @@ std::vector<uint32_t> ImageSlice::ColumnOwners(const til::CoordType column) cons
     return owners;
 }
 
+std::vector<uint32_t> ImageSlice::ImageIdsAtZ(const int32_t zIndex) const
+{
+    std::vector<uint32_t> imageIds;
+    for (const auto& layer : _kittyLayers)
+    {
+        if (layer.zIndex == zIndex &&
+            std::find(layer.columns.begin(), layer.columns.end(), uint8_t{ 1 }) != layer.columns.end())
+        {
+            imageIds.push_back(layer.imageId);
+        }
+    }
+    return imageIds;
+}
+
+std::vector<uint32_t> ImageSlice::ImageIdsAtZ(const int32_t zIndex, const til::CoordType column) const
+{
+    std::vector<uint32_t> imageIds;
+    if (column < _columnBegin || column >= _columnEnd)
+    {
+        return imageIds;
+    }
+
+    const auto index = static_cast<size_t>(column - _columnBegin);
+    for (const auto& layer : _kittyLayers)
+    {
+        if (layer.zIndex == zIndex && index < layer.columns.size() && til::at(layer.columns, index) != 0)
+        {
+            imageIds.push_back(layer.imageId);
+        }
+    }
+    return imageIds;
+}
+
 // Clears pixels and ownership for any column in [columnBegin,columnEnd) owned by
 // another image (nonzero id), so content claiming the cells leaves no ownerless
 // pixels behind. Untagged columns (owner 0, e.g. existing Sixel) are left alone.
@@ -275,6 +308,27 @@ bool ImageSlice::EraseByOwner(const uint32_t id, const til::CoordType columnBegi
         }
     }
     _removeEmptyKittyLayers();
+    return !_hasContent();
+}
+
+bool ImageSlice::EraseByZ(const int32_t zIndex, const uint32_t imageId)
+{
+    auto released = size_t{ 0 };
+    for (const auto& layer : _kittyLayers)
+    {
+        if (layer.zIndex == zIndex && layer.imageId == imageId)
+        {
+            released += _layerStorageBytes(layer);
+        }
+    }
+    std::erase_if(_kittyLayers, [&](const auto& layer) {
+        return layer.zIndex == zIndex && layer.imageId == imageId;
+    });
+    if (released != 0)
+    {
+        _releaseKittyBytes(released);
+        BumpRevision();
+    }
     return !_hasContent();
 }
 
