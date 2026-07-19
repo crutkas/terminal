@@ -34,6 +34,7 @@ public:
     static constexpr int32_t BackgroundZThreshold = INT32_MIN / 2;
     static constexpr size_t MaxKittyLayerBytes = 320ull * 1024ull * 1024ull;
     static constexpr size_t MaxKittyLayersPerSlice = 4096;
+    static constexpr uint32_t NoSourceIndex = UINT32_MAX;
     static size_t KittyLayerBytesAvailable() noexcept;
 
     ImageSlice(const ImageSlice& rhs);
@@ -63,6 +64,7 @@ public:
     bool EraseByOwner(const uint32_t id);
     bool EraseByOwner(const uint32_t id, const til::CoordType columnBegin, const til::CoordType columnEnd);
     bool EraseByZ(const int32_t zIndex, const uint32_t imageId);
+    bool UpdateKittyImage(const uint32_t imageId, const std::span<const RGBQUAD> pixels);
     void ClearForeignColumns(const til::CoordType columnBegin, const til::CoordType columnEnd);
 
     std::span<const RGBQUAD> Pixels() const noexcept;
@@ -72,6 +74,7 @@ public:
     const RGBQUAD* Pixels(const til::CoordType columnBegin) const noexcept;
     RGBQUAD* MutablePixels(const til::CoordType columnBegin, const til::CoordType columnEnd);
     RGBQUAD* MutablePixels(const til::CoordType columnBegin, const til::CoordType columnEnd, int32_t zIndex, uint32_t imageId);
+    uint32_t* MutableSourceIndices(const til::CoordType columnBegin, const til::CoordType columnEnd, int32_t zIndex, uint32_t imageId);
 
     static void CopyBlock(const TextBuffer& srcBuffer, const til::rect srcRect, TextBuffer& dstBuffer, const til::rect dstRect);
     static void CopyRow(const ROW& srcRow, ROW& dstRow);
@@ -89,6 +92,7 @@ private:
         int32_t zIndex = 0;
         uint32_t imageId = 0;
         std::vector<RGBQUAD> pixels;
+        std::vector<uint32_t> sourceIndices;
         std::vector<uint8_t> columns;
     };
 

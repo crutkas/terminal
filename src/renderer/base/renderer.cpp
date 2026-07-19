@@ -158,31 +158,46 @@ void Renderer::_waitUntilCanRender() noexcept
     }
 }
 
-TimerHandle Renderer::RegisterTimer(const char* description, TimerCallback routine)
+TimerHandle Renderer::RegisterTimer(const char* description, TimerCallback routine, std::weak_ptr<void> lifetime)
 {
     // If it doesn't crash now, it would crash later.
     WI_ASSERT(routine != nullptr);
 
-    const auto id = _nextTimerId++;
-
-    _timers.push_back(TimerRoutine{
+    auto storedRoutine = std::make_shared<TimerCallback>(std::move(routine));
+    const auto lifetimeBound = !lifetime.expired();
+    const auto guard = _timerMutex.lock_exclusive();
+    const auto reusable = std::find_if(_timers.begin(), _timers.end(), [](const auto& timer) {
+        return !timer.routine || (timer.lifetimeBound && timer.lifetime.expired());
+    });
+    TimerRoutine timer{
         .description = description,
         .interval = TimerReprMax,
         .next = TimerReprMax,
-        .routine = std::move(routine),
-    });
+        .routine = std::move(storedRoutine),
+        .lifetime = std::move(lifetime),
+        .lifetimeBound = lifetimeBound,
+    };
+    if (reusable != _timers.end())
+    {
+        const auto id = gsl::narrow_cast<size_t>(std::distance(_timers.begin(), reusable));
+        *reusable = std::move(timer);
+        return TimerHandle{ id };
+    }
 
-    return TimerHandle{ id };
+    _timers.push_back(std::move(timer));
+    return TimerHandle{ _timers.size() - 1 };
 }
 
 bool Renderer::IsTimerRunning(TimerHandle handle) const
 {
+    const auto guard = _timerMutex.lock_shared();
     const auto& timer = _timers.at(handle.id);
-    return timer.next != TimerReprMax;
+    return timer.routine && timer.next != TimerReprMax;
 }
 
 TimerDuration Renderer::GetTimerInterval(TimerHandle handle) const
 {
+    const auto guard = _timerMutex.lock_shared();
     const auto& timer = _timers.at(handle.id);
     return TimerDuration{ timer.interval };
 }
@@ -209,24 +224,32 @@ void Renderer::_startTimer(TimerHandle handle, TimerRepr delay, TimerRepr interv
     assert(interval > 0 && (interval < one_min_in_100ns || interval == TimerReprMax));
 #endif
 
-    auto& timer = _timers.at(handle.id);
-    timer.interval = interval;
-    timer.next = _timerSaturatingAdd(_timerInstant(), delay);
+    {
+        const auto guard = _timerMutex.lock_exclusive();
+        auto& timer = _timers.at(handle.id);
+        timer.interval = interval;
+        timer.next = _timerSaturatingAdd(_timerInstant(), delay);
+    }
 
-    // Tickle _waitUntilCanRender() into calling _calculateTimerMaxWait() again.
-    // WaitOnAddress() will return with TRUE, even if the atomic didn't change.
-    til::atomic_notify_one(_redraw);
+    // Set the predicate as well as notifying, so a start racing the render
+    // thread's wait cannot lose the wake-up and sleep past the new deadline.
+    NotifyPaintFrame();
 }
 
 void Renderer::StopTimer(TimerHandle handle)
 {
-    auto& timer = _timers.at(handle.id);
-    timer.interval = TimerReprMax;
-    timer.next = TimerReprMax;
+    {
+        const auto guard = _timerMutex.lock_exclusive();
+        auto& timer = _timers.at(handle.id);
+        timer.interval = TimerReprMax;
+        timer.next = TimerReprMax;
+    }
+    NotifyPaintFrame();
 }
 
 DWORD Renderer::_calculateTimerMaxWait() noexcept
 {
+    const auto guard = _timerMutex.lock_exclusive();
     if (_timers.empty())
     {
         return INFINITE;
@@ -235,8 +258,13 @@ DWORD Renderer::_calculateTimerMaxWait() noexcept
     const auto now = _timerInstant();
     auto wait = TimerReprMax;
 
-    for (const auto& timer : _timers)
+    for (auto& timer : _timers)
     {
+        if (!timer.routine || (timer.lifetimeBound && timer.lifetime.expired()))
+        {
+            timer = {};
+            continue;
+        }
         wait = std::min(wait, _timerSaturatingSub(timer.next, now));
     }
 
@@ -275,12 +303,35 @@ void Renderer::_waitUntilTimerOrRedraw() noexcept
 void Renderer::_tickTimers() noexcept
 {
     const auto now = _timerInstant();
-    size_t id = 0;
-
-    for (auto& timer : _timers)
+    for (size_t id = 0;; ++id)
     {
-        if (now >= timer.next)
+        std::shared_ptr<TimerCallback> routine;
+        std::shared_ptr<void> lifetime;
         {
+            const auto guard = _timerMutex.lock_exclusive();
+            if (id >= _timers.size())
+            {
+                break;
+            }
+            auto& timer = _timers.at(id);
+            if (!timer.routine || (timer.lifetimeBound && timer.lifetime.expired()))
+            {
+                timer = {};
+                continue;
+            }
+            if (timer.lifetimeBound)
+            {
+                lifetime = timer.lifetime.lock();
+                if (!lifetime)
+                {
+                    timer = {};
+                    continue;
+                }
+            }
+            if (now < timer.next)
+            {
+                continue;
+            }
             // Prevent clock drift by incrementing the originally scheduled time.
             timer.next = _timerSaturatingAdd(timer.next, timer.interval);
             // ...but still take care to not schedule in the past.
@@ -288,15 +339,14 @@ void Renderer::_tickTimers() noexcept
             {
                 timer.next = now + timer.interval;
             }
-
-            try
-            {
-                timer.routine(*this, TimerHandle{ id });
-            }
-            CATCH_LOG();
+            routine = timer.routine;
         }
 
-        id++;
+        try
+        {
+            (*routine)(*this, TimerHandle{ id });
+        }
+        CATCH_LOG();
     }
 }
 
