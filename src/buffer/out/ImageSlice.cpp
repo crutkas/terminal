@@ -233,6 +233,39 @@ std::vector<uint32_t> ImageSlice::ImageIdsAtZ(const int32_t zIndex, const til::C
     return imageIds;
 }
 
+std::vector<ImageSlice::KittyLayerIdentity> ImageSlice::KittyLayersAtZ(const int32_t zIndex) const
+{
+    std::vector<KittyLayerIdentity> identities;
+    for (const auto& layer : _kittyLayers)
+    {
+        if (layer.zIndex == zIndex &&
+            std::find(layer.columns.begin(), layer.columns.end(), uint8_t{ 1 }) != layer.columns.end())
+        {
+            identities.push_back({ layer.imageId, layer.placementId });
+        }
+    }
+    return identities;
+}
+
+std::vector<ImageSlice::KittyLayerIdentity> ImageSlice::KittyLayersAtZ(const int32_t zIndex, const til::CoordType column) const
+{
+    std::vector<KittyLayerIdentity> identities;
+    if (column < _columnBegin || column >= _columnEnd)
+    {
+        return identities;
+    }
+
+    const auto index = static_cast<size_t>(column - _columnBegin);
+    for (const auto& layer : _kittyLayers)
+    {
+        if (layer.zIndex == zIndex && index < layer.columns.size() && til::at(layer.columns, index) != 0)
+        {
+            identities.push_back({ layer.imageId, layer.placementId });
+        }
+    }
+    return identities;
+}
+
 // Clears pixels and ownership for any column in [columnBegin,columnEnd) owned by
 // another image (nonzero id), so content claiming the cells leaves no ownerless
 // pixels behind. Untagged columns (owner 0, e.g. existing Sixel) are left alone.
@@ -331,6 +364,51 @@ bool ImageSlice::EraseByZ(const int32_t zIndex, const uint32_t imageId)
         BumpRevision();
     }
     return !_hasContent();
+}
+
+bool ImageSlice::EraseByPlacement(const uint64_t placementId)
+{
+    if (placementId == 0)
+    {
+        return !_hasContent();
+    }
+    auto released = size_t{ 0 };
+    for (const auto& layer : _kittyLayers)
+    {
+        if (layer.placementId == placementId)
+        {
+            released += _layerStorageBytes(layer);
+        }
+    }
+    std::erase_if(_kittyLayers, [&](const auto& layer) {
+        return layer.placementId == placementId;
+    });
+    if (released != 0)
+    {
+        _releaseKittyBytes(released);
+        BumpRevision();
+    }
+    return !_hasContent();
+}
+
+bool ImageSlice::HasPlacement(const uint64_t placementId) const noexcept
+{
+    return placementId != 0 && std::any_of(_kittyLayers.begin(), _kittyLayers.end(), [&](const auto& layer) {
+        return layer.placementId == placementId &&
+               std::find(layer.columns.begin(), layer.columns.end(), uint8_t{ 1 }) != layer.columns.end();
+    });
+}
+
+bool ImageSlice::PlacementCoversColumn(const uint64_t placementId, const til::CoordType column) const noexcept
+{
+    if (placementId == 0 || column < _columnBegin || column >= _columnEnd)
+    {
+        return false;
+    }
+    const auto index = static_cast<size_t>(column - _columnBegin);
+    return std::any_of(_kittyLayers.begin(), _kittyLayers.end(), [&](const auto& layer) {
+        return layer.placementId == placementId && index < layer.columns.size() && til::at(layer.columns, index) != 0;
+    });
 }
 
 bool ImageSlice::UpdateKittyImage(const uint32_t imageId, const std::span<const RGBQUAD> pixels)
@@ -445,7 +523,7 @@ bool ImageSlice::HasPixels(const RenderPosition position) const noexcept
     return _composite(position).hasPixels;
 }
 
-size_t ImageSlice::KittyWriteMemoryUpperBound(const til::CoordType columnBegin, const til::CoordType columnEnd, const int32_t zIndex, const uint32_t imageId) const noexcept
+size_t ImageSlice::KittyWriteMemoryUpperBound(const til::CoordType columnBegin, const til::CoordType columnEnd, const int32_t zIndex, const uint32_t imageId, const uint64_t placementId) const noexcept
 {
     const auto hadRange = _columnBegin < _columnEnd;
     const auto newColumnBegin = hadRange ? std::min(_columnBegin, columnBegin) : columnBegin;
@@ -458,7 +536,7 @@ size_t ImageSlice::KittyWriteMemoryUpperBound(const til::CoordType columnBegin, 
                             pixelCount * sizeof(uint32_t) +
                             columnCount * sizeof(uint8_t);
     const auto hasLayer = std::any_of(_kittyLayers.begin(), _kittyLayers.end(), [&](const auto& layer) {
-        return layer.zIndex == zIndex && layer.imageId == imageId;
+        return layer.zIndex == zIndex && layer.imageId == imageId && layer.placementId == placementId;
     });
     if (!hasLayer && _kittyLayers.size() >= MaxKittyLayersPerSlice)
     {
@@ -480,10 +558,10 @@ RGBQUAD* ImageSlice::MutablePixels(const til::CoordType columnBegin, const til::
     return &til::at(_pixelBuffer, pixelOffset);
 }
 
-RGBQUAD* ImageSlice::MutablePixels(const til::CoordType columnBegin, const til::CoordType columnEnd, const int32_t zIndex, const uint32_t imageId)
+RGBQUAD* ImageSlice::MutablePixels(const til::CoordType columnBegin, const til::CoordType columnEnd, const int32_t zIndex, const uint32_t imageId, const uint64_t placementId)
 {
     _ensureRange(columnBegin, columnEnd);
-    auto& layer = _getKittyLayer(zIndex, imageId);
+    auto& layer = _getKittyLayer(zIndex, imageId, placementId);
     const auto ownerBegin = static_cast<size_t>(columnBegin - _columnBegin);
     const auto ownerEnd = static_cast<size_t>(columnEnd - _columnBegin);
     std::fill(layer.columns.begin() + ownerBegin, layer.columns.begin() + ownerEnd, uint8_t{ 1 });
@@ -491,10 +569,10 @@ RGBQUAD* ImageSlice::MutablePixels(const til::CoordType columnBegin, const til::
     return &til::at(layer.pixels, pixelOffset);
 }
 
-uint32_t* ImageSlice::MutableSourceIndices(const til::CoordType columnBegin, const til::CoordType columnEnd, const int32_t zIndex, const uint32_t imageId)
+uint32_t* ImageSlice::MutableSourceIndices(const til::CoordType columnBegin, const til::CoordType columnEnd, const int32_t zIndex, const uint32_t imageId, const uint64_t placementId)
 {
     _ensureRange(columnBegin, columnEnd);
-    auto& layer = _getKittyLayer(zIndex, imageId);
+    auto& layer = _getKittyLayer(zIndex, imageId, placementId);
     const auto pixelOffset = (columnBegin - _columnBegin) * _cellSize.width;
     return &til::at(layer.sourceIndices, pixelOffset);
 }
@@ -584,6 +662,7 @@ void ImageSlice::_ensureRange(const til::CoordType columnBegin, const til::Coord
         KittyLayer resizedLayer;
         resizedLayer.zIndex = layer.zIndex;
         resizedLayer.imageId = layer.imageId;
+        resizedLayer.placementId = layer.placementId;
         resizedLayer.pixels = resizePixels(layer.pixels);
         resizedLayer.sourceIndices = resizeSourceIndices(layer.sourceIndices);
         resizedLayer.columns = resizeColumns(layer.columns);
@@ -600,13 +679,13 @@ void ImageSlice::_ensureRange(const til::CoordType columnBegin, const til::Coord
     rollback.release();
 }
 
-ImageSlice::KittyLayer& ImageSlice::_getKittyLayer(const int32_t zIndex, const uint32_t imageId)
+ImageSlice::KittyLayer& ImageSlice::_getKittyLayer(const int32_t zIndex, const uint32_t imageId, const uint64_t placementId)
 {
-    const auto key = std::pair{ zIndex, imageId };
+    const auto key = std::tuple{ zIndex, imageId, placementId };
     const auto it = std::lower_bound(_kittyLayers.begin(), _kittyLayers.end(), key, [](const auto& layer, const auto& value) {
-        return std::pair{ layer.zIndex, layer.imageId } < value;
+        return std::tuple{ layer.zIndex, layer.imageId, layer.placementId } < value;
     });
-    if (it != _kittyLayers.end() && it->zIndex == zIndex && it->imageId == imageId)
+    if (it != _kittyLayers.end() && it->zIndex == zIndex && it->imageId == imageId && it->placementId == placementId)
     {
         return *it;
     }
@@ -617,6 +696,7 @@ ImageSlice::KittyLayer& ImageSlice::_getKittyLayer(const int32_t zIndex, const u
     KittyLayer layer;
     layer.zIndex = zIndex;
     layer.imageId = imageId;
+    layer.placementId = placementId;
     const auto layerBytes = sizeof(KittyLayer) + KittyLayerAllocationOverhead +
                             _pixelBuffer.size() * sizeof(RGBQUAD) +
                             _pixelBuffer.size() * sizeof(uint32_t) +
@@ -846,7 +926,7 @@ bool ImageSlice::_copyCellsInPlace(const ImageSlice& srcSlice, const til::CoordT
         auto available = KittyLayerBytesAvailable();
         for (const auto& srcLayer : srcSlice._kittyLayers)
         {
-            const auto required = KittyWriteMemoryUpperBound(dstWriteBegin, dstWriteEnd, srcLayer.zIndex, srcLayer.imageId);
+            const auto required = KittyWriteMemoryUpperBound(dstWriteBegin, dstWriteEnd, srcLayer.zIndex, srcLayer.imageId, srcLayer.placementId);
             if (required > available)
             {
                 LOG_HR(E_OUTOFMEMORY);
@@ -859,6 +939,7 @@ bool ImageSlice::_copyCellsInPlace(const ImageSlice& srcSlice, const til::CoordT
         {
             int32_t zIndex = 0;
             uint32_t imageId = 0;
+            uint64_t placementId = 0;
             std::vector<RGBQUAD> pixels;
             std::vector<uint32_t> sourceIndices;
             std::vector<uint8_t> columns;
@@ -873,6 +954,7 @@ bool ImageSlice::_copyCellsInPlace(const ImageSlice& srcSlice, const til::CoordT
             LayerSnapshot snapshot;
             snapshot.zIndex = srcLayer.zIndex;
             snapshot.imageId = srcLayer.imageId;
+            snapshot.placementId = srcLayer.placementId;
             snapshot.pixels.resize(static_cast<size_t>(writePixelWidth) * _cellSize.height);
             snapshot.sourceIndices.resize(static_cast<size_t>(writePixelWidth) * _cellSize.height, NoSourceIndex);
             snapshot.columns.resize(static_cast<size_t>(writeCellCount));
@@ -938,7 +1020,7 @@ bool ImageSlice::_copyCellsInPlace(const ImageSlice& srcSlice, const til::CoordT
         }
         for (const auto& snapshot : layerSnapshots)
         {
-            auto& dstLayer = _getKittyLayer(snapshot.zIndex, snapshot.imageId);
+            auto& dstLayer = _getKittyLayer(snapshot.zIndex, snapshot.imageId, snapshot.placementId);
             const auto dstOwnerOffset = static_cast<size_t>(dstWriteBegin - _columnBegin);
             std::copy(snapshot.columns.begin(), snapshot.columns.end(), dstLayer.columns.begin() + dstOwnerOffset);
 
