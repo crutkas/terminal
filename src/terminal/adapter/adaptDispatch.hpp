@@ -472,6 +472,7 @@ namespace Microsoft::Console::VirtualTerminal
         static const std::vector<RGBQUAD>* _kittyFramePixels(const KittyImage& image, uint32_t frameNumber) noexcept;
         static int32_t* _kittyFrameGap(KittyImage& image, uint32_t frameNumber) noexcept;
         void _updateKittyImageLayers(uint32_t imageId, std::span<const RGBQUAD> pixels);
+        void _refreshKittyImageLayers();
         void _scheduleKittyAnimation(uint32_t imageId, KittyImage& image, std::chrono::steady_clock::time_point now);
         void _scheduleKittyAnimationTimer();
         void _advanceKittyAnimations(std::chrono::steady_clock::time_point now);
@@ -513,6 +514,7 @@ namespace Microsoft::Console::VirtualTerminal
         void _deleteKittyImagesInIdRange(const uint32_t lo, const uint32_t hi, const bool freeData);
         void _deleteKittyPlacementsByZ(const int32_t zIndex, const bool freeData, const std::optional<til::point> cell = std::nullopt);
         std::optional<til::point> _resolveKittyPlacementAnchor(const uint32_t parentImageId, const uint32_t parentPlacementId, const std::pair<uint32_t, uint32_t> origin, std::wstring_view& code) const;
+        std::optional<til::point> _deriveKittyPlacementAnchor(const KittyPlacement& placement) const;
         std::optional<til::point> _deriveVirtualPlacementAnchor(uint32_t imageId, uint32_t placementId) const;
         void _renderKittyPlaceholders(const std::wstring_view segment, const til::CoordType screenRow, const til::CoordType startColumn);
         // Returns true if a placeholder tile was drawn (the caller batches one redraw per segment).

@@ -7490,6 +7490,54 @@ public:
         VERIFY_ARE_EQUAL(1u, slice->ColumnOwner(newChild.x), L"the same-image child must move after the restored parent");
     }
 
+    TEST_METHOD(KittyParentRePutMovesChildAfterScroll)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        auto& buffer = *_testGetSet->_textBuffer;
+
+        _pDispatch->CursorPosition(4, 4);
+        const auto originalParent = buffer.GetCursor().GetPosition();
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,p=1,f=24,s=1,v=1,C=1;/wAA\x1b\\");
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=2,p=1,P=1,Q=1,H=1,V=1,f=24,s=1,v=1,C=1;AP8A\x1b\\");
+        const auto childLayer = _pDispatch->_kittyPlacements.at({ 2u, 1u }).layerId;
+        buffer.ScrollRows(originalParent.y, 2, 1);
+        buffer.GetMutableRowByOffset(originalParent.y).SetImageSlice(nullptr);
+        VERIFY_IS_TRUE(buffer.GetRowByOffset(originalParent.y + 2).GetImageSlice()->HasPlacement(childLayer));
+
+        // The registry still contains the creation-time anchor. Re-put at that same coordinate
+        // must compare against the retained layer's scrolled position and move the child back.
+        buffer.GetCursor().SetPosition(originalParent);
+        _stateMachine->ProcessString(L"\x1b_Ga=p,i=1,p=1,C=1;\x1b\\");
+        const til::point expectedChild{ originalParent.x + 1, originalParent.y + 1 };
+
+        const auto* oldSlice = buffer.GetRowByOffset(originalParent.y + 2).GetImageSlice();
+        VERIFY_IS_TRUE(oldSlice == nullptr || !oldSlice->HasPlacement(childLayer));
+        const auto* newSlice = buffer.GetRowByOffset(expectedChild.y).GetImageSlice();
+        VERIFY_IS_NOT_NULL(newSlice);
+        VERIFY_IS_TRUE(newSlice->PlacementCoversColumn(childLayer, expectedChild.x));
+    }
+
+    TEST_METHOD(KittyRelativeChildUsesScrolledParentAnchor)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        auto& buffer = *_testGetSet->_textBuffer;
+
+        _pDispatch->CursorPosition(4, 4);
+        const auto originalParent = buffer.GetCursor().GetPosition();
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,p=1,f=24,s=1,v=1,C=1;/wAA\x1b\\");
+        buffer.ScrollRows(originalParent.y, 1, 1);
+        buffer.GetMutableRowByOffset(originalParent.y).SetImageSlice(nullptr);
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=2,p=1,P=1,Q=1,H=1,V=1,f=24,s=1,v=1,C=1;AP8A\x1b\\");
+
+        const til::point expectedChild{ originalParent.x + 1, originalParent.y + 2 };
+        const auto childLayer = _pDispatch->_kittyPlacements.at({ 2u, 1u }).layerId;
+        const auto* slice = buffer.GetRowByOffset(expectedChild.y).GetImageSlice();
+        VERIFY_IS_NOT_NULL(slice);
+        VERIFY_IS_TRUE(slice->PlacementCoversColumn(childLayer, expectedChild.x), L"relative resolution must use the parent's retained scrolled layer");
+    }
+
     // The retained redraw parameters must preserve sub-cell offsets, scaling, crop, and z rather
     // than changing the child's appearance when only its parent anchor changes.
     TEST_METHOD(KittyParentRePutPreservesRelativeChildGeometry)
@@ -8760,6 +8808,26 @@ public:
         const auto pixel = SlicePixelAt(slice, ImageSlice::RenderPosition::AboveText, origin.x - slice->ColumnOffset(), 0);
         VERIFY_ARE_EQUAL(static_cast<BYTE>(255), pixel.rgbBlue, L"editing the displayed frame refreshes retained placements");
         VERIFY_ARE_EQUAL(static_cast<BYTE>(0), pixel.rgbGreen);
+    }
+
+    TEST_METHOD(KittyAnimationRefreshesPageWhenItBecomesActive)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        auto& firstPageBuffer = *_testGetSet->_textBuffer;
+        const auto origin = firstPageBuffer.GetCursor().GetPosition();
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,f=24,s=1,v=1,C=1;/wAA\x1b\\");
+        _stateMachine->ProcessString(L"\x1b_Ga=f,i=1,f=24,s=1,v=1;AP8A\x1b\\");
+
+        _pDispatch->PagePositionAbsolute(2);
+        _stateMachine->ProcessString(L"\x1b_Ga=a,i=1,c=2,s=1;\x1b\\");
+        _pDispatch->PagePositionAbsolute(1);
+
+        const auto* slice = firstPageBuffer.GetRowByOffset(origin.y).GetImageSlice();
+        VERIFY_IS_NOT_NULL(slice);
+        const auto pixel = SlicePixelAt(slice, ImageSlice::RenderPosition::AboveText, origin.x - slice->ColumnOffset(), 0);
+        VERIFY_ARE_EQUAL(static_cast<BYTE>(255), pixel.rgbGreen, L"reactivating a page must refresh it to the animation's current frame");
+        VERIFY_ARE_EQUAL(static_cast<BYTE>(0), pixel.rgbRed);
     }
 
     TEST_METHOD(KittyAnimationNewPlacementsUseCurrentFrame)

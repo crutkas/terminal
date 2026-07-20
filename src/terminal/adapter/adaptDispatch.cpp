@@ -1744,6 +1744,7 @@ void AdaptDispatch::PrecedingPage(const VTInt pageCount)
 void AdaptDispatch::PagePositionAbsolute(const VTInt page)
 {
     _pages.MoveTo(page, _modes.test(Mode::PageCursorCoupling));
+    _refreshKittyImageLayers();
 }
 
 // Routine Description:
@@ -1754,6 +1755,7 @@ void AdaptDispatch::PagePositionAbsolute(const VTInt page)
 void AdaptDispatch::PagePositionRelative(const VTInt pageCount)
 {
     _pages.MoveRelative(pageCount, _modes.test(Mode::PageCursorCoupling));
+    _refreshKittyImageLayers();
 }
 
 // Routine Description:
@@ -1764,6 +1766,7 @@ void AdaptDispatch::PagePositionRelative(const VTInt pageCount)
 void AdaptDispatch::PagePositionBack(const VTInt pageCount)
 {
     _pages.MoveRelative(-pageCount, _modes.test(Mode::PageCursorCoupling));
+    _refreshKittyImageLayers();
 }
 
 // Routine Description:
@@ -1821,12 +1824,14 @@ void AdaptDispatch::_SetAlternateScreenBufferMode(const bool enable)
         const auto page = _pages.ActivePage();
         _api.UseAlternateScreenBuffer(_GetEraseAttributes(page));
         _usingAltBuffer = true;
+        _refreshKittyImageLayers();
     }
     else
     {
         _api.UseMainScreenBuffer();
         _usingAltBuffer = false;
         CursorRestoreState();
+        _refreshKittyImageLayers();
     }
 }
 
@@ -5297,6 +5302,11 @@ void AdaptDispatch::_ProcessKittyCommand(const KittyControl& command, const std:
                 priorPlacement = *existing;
             }
         }
+        const auto priorAnchor = priorPlacement ?
+                                     (priorPlacement->isVirtual ?
+                                          _deriveVirtualPlacementAnchor(targetImageId, placementId) :
+                                          _deriveKittyPlacementAnchor(*priorPlacement)) :
+                                     std::nullopt;
         const auto removePriorPlacement = [&]() {
             if (priorPlacement)
             {
@@ -5305,11 +5315,7 @@ void AdaptDispatch::_ProcessKittyCommand(const KittyControl& command, const std:
                 {
                     _kittyVirtualIds.erase({ targetImageId, placementId });
                 }
-                if (placementId != 0)
-                {
-                    _kittyPlacements.erase({ targetImageId, placementId });
-                }
-                else
+                if (placementId == 0)
                 {
                     _kittyVirtualIds.erase({ targetImageId, 0u });
                     std::erase_if(_kittyAnonymousPlacements, [&](const auto& placement) {
@@ -5360,7 +5366,7 @@ void AdaptDispatch::_ProcessKittyCommand(const KittyControl& command, const std:
                 static_cast<til::CoordType>(std::clamp<int64_t>(static_cast<int64_t>(parentAnchor->y) + command.offsetV, 0, maxRow)),
             };
             const auto movesChildren = priorPlacement &&
-                                       (priorPlacement->anchorCol != childAnchor.x || priorPlacement->anchorRow != childAnchor.y);
+                                       (!priorAnchor || priorAnchor->x != childAnchor.x || priorAnchor->y != childAnchor.y);
             if (movesChildren &&
                 !_moveKittyPlacementChildren({ targetImageId, placementId }, childAnchor, false, code))
             {
@@ -5389,7 +5395,6 @@ void AdaptDispatch::_ProcessKittyCommand(const KittyControl& command, const std:
             {
                 return;
             }
-            removePriorPlacement();
             KittyPlacement placement;
             placement.imageId = targetImageId;
             placement.placementId = placementId;
@@ -5417,14 +5422,18 @@ void AdaptDispatch::_ProcessKittyCommand(const KittyControl& command, const std:
             if (placementId != 0 && movesChildren &&
                 !_moveKittyPlacementChildren({ targetImageId, placementId }, childAnchor, true, code))
             {
+                _eraseKittyPlacementCells(placement);
+                _kittyPlacements[{ targetImageId, placementId }] = *priorPlacement;
                 success = false;
+                return;
             }
+            removePriorPlacement();
             return;
         }
         // Normal (non-relative) placement: anchor at the cursor, honoring C.
         const auto cursorPos = _pages.ActivePage().Cursor().GetPosition();
         const auto movesChildren = priorPlacement &&
-                                   (priorPlacement->anchorCol != cursorPos.x || priorPlacement->anchorRow != cursorPos.y);
+                                   (!priorAnchor || priorAnchor->x != cursorPos.x || priorAnchor->y != cursorPos.y);
         if (movesChildren &&
             !_moveKittyPlacementChildren({ targetImageId, placementId }, cursorPos, false, code))
         {
@@ -5452,7 +5461,6 @@ void AdaptDispatch::_ProcessKittyCommand(const KittyControl& command, const std:
         {
             return;
         }
-        removePriorPlacement();
         KittyPlacement placement;
         placement.imageId = targetImageId;
         placement.placementId = placementId;
@@ -5476,8 +5484,12 @@ void AdaptDispatch::_ProcessKittyCommand(const KittyControl& command, const std:
         if (placementId != 0 && movesChildren &&
             !_moveKittyPlacementChildren({ targetImageId, placementId }, cursorPos, true, code))
         {
+            _eraseKittyPlacementCells(placement);
+            _kittyPlacements[{ targetImageId, placementId }] = *priorPlacement;
             success = false;
+            return;
         }
+        removePriorPlacement();
     };
     const auto storeKittyVirtualPlacement = [&](const uint32_t targetImageId, const KittyImage& image) {
         const auto placementId = command.havePlacementId ? command.placementId : 0u;
@@ -6330,6 +6342,21 @@ void AdaptDispatch::_updateKittyImageLayers(const uint32_t imageId, const std::s
     if (firstRow <= lastRow)
     {
         buffer.TriggerRedraw(Viewport::FromExclusive({ 0, firstRow, page.Width(), lastRow + 1 }));
+    }
+}
+
+void AdaptDispatch::_refreshKittyImageLayers()
+{
+    for (const auto& [imageId, image] : _kittyImages)
+    {
+        if (image.animationFrames.empty())
+        {
+            continue;
+        }
+        if (const auto pixels = _kittyFramePixels(image, image.currentFrame))
+        {
+            _updateKittyImageLayers(imageId, *pixels);
+        }
     }
 }
 
@@ -7291,6 +7318,7 @@ bool AdaptDispatch::_moveKittyPlacementChildren(const std::pair<uint32_t, uint32
         std::optional<PlacementKey> key;
         size_t anonymousIndex = 0;
         KittyPlacement previous;
+        std::optional<til::point> oldAnchor;
         til::point anchor;
     };
 
@@ -7349,9 +7377,10 @@ bool AdaptDispatch::_moveKittyPlacementChildren(const std::pair<uint32_t, uint32
                 }
                 const auto& child = childIt->second;
                 const auto anchor = childAnchorFor(child, current.anchor);
-                if (child.anchorCol != anchor.x || child.anchorRow != anchor.y)
+                const auto oldAnchor = _deriveKittyPlacementAnchor(child);
+                if (!oldAnchor || *oldAnchor != anchor)
                 {
-                    plan.push_back({ childKey, 0, child, anchor });
+                    plan.push_back({ childKey, 0, child, oldAnchor, anchor });
                 }
                 pending.push_back({ childKey, anchor, current.depth + 1 });
             }
@@ -7363,9 +7392,10 @@ bool AdaptDispatch::_moveKittyPlacementChildren(const std::pair<uint32_t, uint32
             {
                 const auto& child = _kittyAnonymousPlacements[childIndex];
                 const auto anchor = childAnchorFor(child, current.anchor);
-                if (child.anchorCol != anchor.x || child.anchorRow != anchor.y)
+                const auto oldAnchor = _deriveKittyPlacementAnchor(child);
+                if (!oldAnchor || *oldAnchor != anchor)
                 {
-                    plan.push_back({ std::nullopt, childIndex, child, anchor });
+                    plan.push_back({ std::nullopt, childIndex, child, oldAnchor, anchor });
                 }
             }
         }
@@ -7454,7 +7484,52 @@ bool AdaptDispatch::_moveKittyPlacementChildren(const std::pair<uint32_t, uint32
         child->cols = drawn.width;
         child->rows = drawn.height;
     }
-    return succeeded;
+    if (succeeded)
+    {
+        return true;
+    }
+
+    // Restore the complete descendant set if an allocation failed after the parent replacement
+    // was committed. Exact layer identities let us remove any partially redrawn destination
+    // layers without disturbing siblings, then recreate the prior layers at their live anchors.
+    for (const auto& move : plan)
+    {
+        _eraseKittyPlacementCells(move.previous);
+    }
+    for (const auto& move : plan)
+    {
+        auto* child = move.key ?
+                          &_kittyPlacements.at(*move.key) :
+                          &_kittyAnonymousPlacements.at(move.anonymousIndex);
+        *child = move.previous;
+        if (!move.oldAnchor)
+        {
+            continue;
+        }
+        const auto image = _kittyImages.find(move.previous.imageId);
+        try
+        {
+            _placeKittyImage(image->second,
+                             false,
+                             move.previous.imageId,
+                             move.previous.layerId,
+                             move.previous.displayCols,
+                             move.previous.displayRows,
+                             move.previous.srcX,
+                             move.previous.srcY,
+                             move.previous.srcW,
+                             move.previous.srcH,
+                             move.previous.cellOffsetX,
+                             move.previous.cellOffsetY,
+                             move.previous.zIndex,
+                             *move.oldAnchor);
+        }
+        catch (const std::bad_alloc&)
+        {
+            // Preserve the original ENOMEM response; restoration is best-effort under true OOM.
+        }
+    }
+    return false;
 }
 
 // Removes every placement of an image and cascade-deletes any relative children: when a
@@ -7846,6 +7921,42 @@ void AdaptDispatch::_deleteKittyPlacementsByZ(const int32_t zIndex, const bool f
     }
 }
 
+// Finds a physical placement by its retained internal layer identity. Unlike the registry's
+// creation-time anchor, this position follows scroll, reflow, insertion, and block copies.
+std::optional<til::point> AdaptDispatch::_deriveKittyPlacementAnchor(const KittyPlacement& placement) const
+{
+    if (placement.layerId == 0 || placement.isVirtual)
+    {
+        return std::nullopt;
+    }
+    auto page = _pages.ActivePage();
+    auto& buffer = page.Buffer();
+    auto minRow = page.Bottom();
+    auto minCol = page.Width();
+    auto found = false;
+    for (auto row = 0; row < page.Bottom(); ++row)
+    {
+        const auto* slice = buffer.GetRowByOffset(row).GetImageSlice();
+        if (!slice || !slice->HasPlacement(placement.layerId))
+        {
+            continue;
+        }
+        const auto cellWidth = std::max(1, slice->CellSize().width);
+        const auto columnBegin = slice->ColumnOffset();
+        const auto columnEnd = std::min(columnBegin + slice->PixelWidth() / cellWidth, page.Width());
+        for (auto column = columnBegin; column < columnEnd; ++column)
+        {
+            if (slice->PlacementCoversColumn(placement.layerId, column))
+            {
+                minRow = std::min(minRow, row);
+                minCol = std::min(minCol, column);
+                found = true;
+            }
+        }
+    }
+    return found ? std::optional<til::point>{ til::point{ minCol, minRow } } : std::nullopt;
+}
+
 // Derives the on-screen anchor of a virtual (U=1) parent from its Unicode-placeholder cells:
 // the top-left is the minimum x over all cells whose ImageSlice owners include imageId and the
 // minimum y over the rows that contain such a cell. Returns nullopt if no placeholder cell for
@@ -7893,12 +8004,11 @@ std::optional<til::point> AdaptDispatch::_deriveVirtualPlacementAnchor(const uin
 }
 
 // Resolves the on-screen top-left anchor that a relative child (whose own key is `origin`)
-// should be positioned against: the IMMEDIATE parent's already-resolved, clamped anchor (a
-// normal placement stores its absolute top-left; a relative one stored the clamped anchor it
-// was drawn at; a virtual one derives it from its placeholder cells). Anchoring off the parent's
-// actual drawn position -- rather than re-deriving it from the chain root -- means a parent that
-// was itself clamped to a screen edge anchors its children correctly. The rest of the ancestry is
-// still walked, purely to validate it. On failure sets `code` and returns nullopt:
+// should be positioned against: the IMMEDIATE parent's current retained-layer anchor (or, for a
+// virtual placement, its placeholder cells). Deriving physical anchors from the internal layer
+// identity makes relative placement follow scroll/reflow instead of using creation-time registry
+// coordinates. The rest of the ancestry is still walked purely to validate it. On failure sets
+// `code` and returns nullopt:
 //   ENOPARENT  - a referenced parent does not exist (and is not a virtual image on screen)
 //   ECYCLE     - the chain loops back to an already-visited placement (including `origin`)
 //   ETOODEEP   - the chain exceeds MaxKittyPlacementDepth links
@@ -7988,7 +8098,7 @@ std::optional<til::point> AdaptDispatch::_resolveKittyPlacementAnchor(const uint
         if (depth == 1)
         {
             // The child's position comes from this immediate parent's actual anchor.
-            immediateAnchor = p.isVirtual ? _deriveVirtualPlacementAnchor(key.first, key.second) : std::optional<til::point>{ til::point{ p.anchorCol, p.anchorRow } };
+            immediateAnchor = p.isVirtual ? _deriveVirtualPlacementAnchor(key.first, key.second) : _deriveKittyPlacementAnchor(p);
             if (!immediateAnchor)
             {
                 code = L"ENOPARENT:relative parent not found"; // virtual parent with no on-screen cells
