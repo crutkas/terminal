@@ -49,13 +49,21 @@ public:
     static void CopyBlock(const TextBuffer& srcBuffer, const til::rect srcRect, TextBuffer& dstBuffer, const til::rect dstRect);
     static void CopyRow(const ROW& srcRow, ROW& dstRow);
     static void CopyCells(const ROW& srcRow, const til::CoordType srcColumn, ROW& dstRow, const til::CoordType dstColumnBegin, const til::CoordType dstColumnEnd);
+    static void CopyKittyCells(const ROW& srcRow, const til::CoordType srcColumn, ROW& dstRow, const til::CoordType dstColumnBegin, const til::CoordType dstColumnEnd);
+    static void MergeLegacyCells(const ImageSlice& srcSlice, ROW& dstRow);
     static void EraseBlock(TextBuffer& buffer, const til::rect rect);
     static void EraseCells(TextBuffer& buffer, const til::point at, const til::CoordType distance);
     static void EraseCells(ROW& row, const til::CoordType columnBegin, const til::CoordType columnEnd);
+    static void EraseKittyCells(ROW& row, const til::CoordType columnBegin, const til::CoordType columnEnd);
 
 private:
     bool _copyCells(const ImageSlice& srcSlice, const til::CoordType srcColumn, const til::CoordType dstColumnBegin, const til::CoordType dstColumnEnd);
+    bool _copyKittyCells(const ImageSlice& srcSlice, const til::CoordType srcColumn, const til::CoordType dstColumnBegin, const til::CoordType dstColumnEnd);
     bool _eraseCells(const til::CoordType columnBegin, const til::CoordType columnEnd);
+    bool _eraseKittyCells(const til::CoordType columnBegin, const til::CoordType columnEnd);
+    void _mergeLegacyCells(const ImageSlice& srcSlice);
+    bool _cellHasPixels(til::CoordType column) const noexcept;
+    bool _hasContent() const noexcept;
 
     uint64_t _revision = 0;
     til::size _cellSize;

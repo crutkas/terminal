@@ -111,23 +111,7 @@ bool ImageSlice::EraseByOwner(const uint32_t id)
             std::advance(eraseIterator, _pixelWidth);
         }
     }
-    // Anything left with an owner is another image, so the slice survives.
-    for (const auto owner : _columnOwners)
-    {
-        if (owner != 0)
-        {
-            return false;
-        }
-    }
-    // Otherwise keep the slice only if untagged (Sixel) pixels remain opaque.
-    for (const auto& px : _pixelBuffer)
-    {
-        if (px.rgbReserved != 0 || px.rgbRed != 0 || px.rgbGreen != 0 || px.rgbBlue != 0)
-        {
-            return false;
-        }
-    }
-    return true;
+    return !_hasContent();
 }
 
 til::CoordType ImageSlice::ColumnOffset() const noexcept
@@ -264,6 +248,38 @@ void ImageSlice::CopyCells(const ROW& srcRow, const til::CoordType srcColumn, RO
     }
 }
 
+void ImageSlice::CopyKittyCells(const ROW& srcRow, const til::CoordType srcColumn, ROW& dstRow, const til::CoordType dstColumnBegin, const til::CoordType dstColumnEnd)
+{
+    const auto srcSlice = srcRow.GetImageSlice();
+    if (!srcSlice || srcRow.GetLineRendition() != dstRow.GetLineRendition()) [[unlikely]]
+    {
+        EraseKittyCells(dstRow, dstColumnBegin, dstColumnEnd);
+        return;
+    }
+
+    auto dstSlice = dstRow.GetMutableImageSlice();
+    if (dstSlice && dstSlice->CellSize() != srcSlice->CellSize()) [[unlikely]]
+    {
+        EraseKittyCells(dstRow, dstColumnBegin, dstColumnEnd);
+        dstSlice = dstRow.GetMutableImageSlice();
+        if (dstSlice)
+        {
+            return;
+        }
+    }
+    if (!dstSlice)
+    {
+        dstSlice = dstRow.SetImageSlice(std::make_unique<ImageSlice>(srcSlice->CellSize()));
+        __assume(dstSlice != nullptr);
+    }
+
+    const auto scale = srcRow.GetLineRendition() != LineRendition::SingleWidth ? 1 : 0;
+    if (dstSlice->_copyKittyCells(*srcSlice, srcColumn << scale, dstColumnBegin << scale, dstColumnEnd << scale))
+    {
+        dstRow.SetImageSlice(nullptr);
+    }
+}
+
 bool ImageSlice::_copyCells(const ImageSlice& srcSlice, const til::CoordType srcColumn, const til::CoordType dstColumnBegin, const til::CoordType dstColumnEnd)
 {
     const auto srcColumnEnd = srcColumn + dstColumnEnd - dstColumnBegin;
@@ -323,6 +339,107 @@ bool ImageSlice::_copyCells(const ImageSlice& srcSlice, const til::CoordType src
     return _columnBegin >= _columnEnd;
 }
 
+bool ImageSlice::_copyKittyCells(const ImageSlice& srcSlice, const til::CoordType srcColumn, const til::CoordType dstColumnBegin, const til::CoordType dstColumnEnd)
+{
+    if (_cellSize != srcSlice._cellSize)
+    {
+        return _eraseKittyCells(dstColumnBegin, dstColumnEnd);
+    }
+
+    const auto cellCount = dstColumnEnd - dstColumnBegin;
+    const auto pixelsPerCell = static_cast<size_t>(_cellSize.width) * _cellSize.height;
+    std::vector<uint32_t> owners(cellCount);
+    std::vector<RGBQUAD> pixels(static_cast<size_t>(cellCount) * pixelsPerCell);
+
+    for (auto i = 0; i < cellCount; ++i)
+    {
+        const auto sourceColumn = srcColumn + i;
+        const auto owner = srcSlice.ColumnOwner(sourceColumn);
+        til::at(owners, i) = owner;
+        if (owner == 0)
+        {
+            continue;
+        }
+
+        auto source = srcSlice.Pixels(sourceColumn);
+        auto destination = pixels.data() + static_cast<size_t>(i) * pixelsPerCell;
+        const auto rowByteCount = static_cast<size_t>(_cellSize.width) * sizeof(RGBQUAD);
+        for (auto y = 0; y < _cellSize.height; ++y)
+        {
+            std::memcpy(destination, source, rowByteCount);
+            std::advance(source, srcSlice._pixelWidth);
+            std::advance(destination, _cellSize.width);
+        }
+    }
+
+    _eraseKittyCells(dstColumnBegin, dstColumnEnd);
+    for (auto i = 0; i < cellCount; ++i)
+    {
+        const auto owner = til::at(owners, i);
+        if (owner == 0)
+        {
+            continue;
+        }
+
+        const auto destinationColumn = dstColumnBegin + i;
+        auto destination = MutablePixels(destinationColumn, destinationColumn + 1);
+        auto source = pixels.data() + static_cast<size_t>(i) * pixelsPerCell;
+        const auto rowByteCount = static_cast<size_t>(_cellSize.width) * sizeof(RGBQUAD);
+        for (auto y = 0; y < _cellSize.height; ++y)
+        {
+            std::memcpy(destination, source, rowByteCount);
+            std::advance(source, _cellSize.width);
+            std::advance(destination, _pixelWidth);
+        }
+        SetColumnOwner(destinationColumn, destinationColumn + 1, owner);
+    }
+
+    return !_hasContent();
+}
+
+void ImageSlice::MergeLegacyCells(const ImageSlice& srcSlice, ROW& dstRow)
+{
+    auto dstSlice = dstRow.GetMutableImageSlice();
+    if (dstSlice && dstSlice->CellSize() != srcSlice.CellSize()) [[unlikely]]
+    {
+        return;
+    }
+    if (!dstSlice)
+    {
+        dstSlice = dstRow.SetImageSlice(std::make_unique<ImageSlice>(srcSlice.CellSize()));
+        __assume(dstSlice != nullptr);
+    }
+    dstSlice->_mergeLegacyCells(srcSlice);
+    if (!dstSlice->_hasContent())
+    {
+        dstRow.SetImageSlice(nullptr);
+    }
+}
+
+void ImageSlice::_mergeLegacyCells(const ImageSlice& srcSlice)
+{
+    for (auto column = srcSlice._columnBegin; column < srcSlice._columnEnd; ++column)
+    {
+        if (srcSlice.ColumnOwner(column) != 0 ||
+            !srcSlice._cellHasPixels(column) ||
+            ColumnOwner(column) != 0 ||
+            _cellHasPixels(column))
+        {
+            continue;
+        }
+
+        auto source = srcSlice.Pixels(column);
+        auto destination = MutablePixels(column, column + 1);
+        const auto rowByteCount = static_cast<size_t>(_cellSize.width) * sizeof(RGBQUAD);
+        for (auto y = 0; y < _cellSize.height; ++y)
+        {
+            std::memcpy(destination, source, rowByteCount);
+            std::advance(source, srcSlice._pixelWidth);
+            std::advance(destination, _pixelWidth);
+        }
+    }
+}
+
 void ImageSlice::EraseBlock(TextBuffer& buffer, const til::rect rect)
 {
     for (auto y = rect.top; y < rect.bottom; y++)
@@ -362,6 +479,19 @@ void ImageSlice::EraseCells(ROW& row, const til::CoordType columnBegin, const ti
     }
 }
 
+void ImageSlice::EraseKittyCells(ROW& row, const til::CoordType columnBegin, const til::CoordType columnEnd)
+{
+    const auto imageSlice = row.GetMutableImageSlice();
+    if (imageSlice) [[unlikely]]
+    {
+        const auto scale = row.GetLineRendition() != LineRendition::SingleWidth ? 1 : 0;
+        if (imageSlice->_eraseKittyCells(columnBegin << scale, columnEnd << scale))
+        {
+            row.SetImageSlice(nullptr);
+        }
+    }
+}
+
 bool ImageSlice::_eraseCells(const til::CoordType columnBegin, const til::CoordType columnEnd)
 {
     if (columnBegin <= _columnBegin && columnEnd >= _columnEnd)
@@ -390,4 +520,57 @@ bool ImageSlice::_eraseCells(const til::CoordType columnBegin, const til::CoordT
         }
         return false;
     }
+}
+
+bool ImageSlice::_eraseKittyCells(const til::CoordType columnBegin, const til::CoordType columnEnd)
+{
+    const auto eraseBegin = std::max(columnBegin, _columnBegin);
+    const auto eraseEnd = std::min(columnEnd, _columnEnd);
+    for (auto column = eraseBegin; column < eraseEnd; ++column)
+    {
+        if (ColumnOwner(column) == 0)
+        {
+            continue;
+        }
+
+        const auto index = static_cast<size_t>(column - _columnBegin);
+        til::at(_columnOwners, index) = 0;
+        auto iterator = std::next(_pixelBuffer.data(), gsl::narrow_cast<til::CoordType>(index) * _cellSize.width);
+        for (auto y = 0; y < _cellSize.height; ++y)
+        {
+            std::memset(iterator, 0, _cellSize.width * sizeof(RGBQUAD));
+            std::advance(iterator, _pixelWidth);
+        }
+    }
+    return !_hasContent();
+}
+
+bool ImageSlice::_cellHasPixels(const til::CoordType column) const noexcept
+{
+    if (column < _columnBegin || column >= _columnEnd)
+    {
+        return false;
+    }
+
+    auto pixel = Pixels(column);
+    for (auto y = 0; y < _cellSize.height; ++y)
+    {
+        for (auto x = 0; x < _cellSize.width; ++x)
+        {
+            if (pixel[x].rgbReserved != 0 || pixel[x].rgbRed != 0 || pixel[x].rgbGreen != 0 || pixel[x].rgbBlue != 0)
+            {
+                return true;
+            }
+        }
+        std::advance(pixel, _pixelWidth);
+    }
+    return false;
+}
+
+bool ImageSlice::_hasContent() const noexcept
+{
+    return std::ranges::any_of(_columnOwners, [](const auto owner) { return owner != 0; }) ||
+           std::ranges::any_of(_pixelBuffer, [](const auto& pixel) {
+               return pixel.rgbReserved != 0 || pixel.rgbRed != 0 || pixel.rgbGreen != 0 || pixel.rgbBlue != 0;
+           });
 }

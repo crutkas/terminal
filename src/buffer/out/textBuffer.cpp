@@ -2748,6 +2748,13 @@ void TextBuffer::Reflow(TextBuffer& oldBuffer, TextBuffer& newBuffer, const View
     const auto newHeight = newBuffer.GetSize().Height();
     const auto newWidthU16 = gsl::narrow_cast<uint16_t>(newWidth);
 
+    struct KittyImageMove
+    {
+        til::point source;
+        til::point destination;
+    };
+    std::vector<KittyImageMove> kittyImageMoves;
+
     // Copy oldBuffer into newBuffer until oldBuffer has been fully consumed.
     for (; oldY < oldHeight && newY < newYLimit; ++oldY)
     {
@@ -2867,7 +2874,32 @@ void TextBuffer::Reflow(TextBuffer& oldBuffer, TextBuffer& newBuffer, const View
             // If we're at the start of the old row, copy its image content.
             if (oldX == 0)
             {
+                const auto preservedSlice = state.columnBegin != 0 && newRow.GetImageSlice() ?
+                                                std::make_unique<ImageSlice>(*newRow.GetImageSlice()) :
+                                                nullptr;
                 ImageSlice::CopyRow(oldRow, newRow);
+                for (auto column = 0; column < oldRowLimit; ++column)
+                {
+                    if (oldRow.GetKittyPlaceholderCell(column))
+                    {
+                        ImageSlice::EraseKittyCells(newRow, column, column + 1);
+                    }
+                }
+                if (preservedSlice)
+                {
+                    ImageSlice::MergeLegacyCells(*preservedSlice, newRow);
+                }
+            }
+
+            for (auto sourceColumn = oldX; sourceColumn < state.sourceColumnEnd; ++sourceColumn)
+            {
+                if (oldRow.GetKittyPlaceholderCell(sourceColumn))
+                {
+                    kittyImageMoves.push_back({
+                        .source = { sourceColumn, oldY },
+                        .destination = { newX + sourceColumn - oldX, newY },
+                    });
+                }
             }
 
             const auto& oldAttr = oldRow.Attributes();
@@ -2933,6 +2965,18 @@ void TextBuffer::Reflow(TextBuffer& oldBuffer, TextBuffer& newBuffer, const View
         auto& newAttr = newRow.Attributes();
         newAttr = oldRow.Attributes();
         newAttr.resize_trailing_extent(newWidthU16);
+    }
+
+    // Relocate Kitty pixels only after every whole-row clone so wrapped rows
+    // joining cannot overwrite an earlier move.
+    for (const auto& move : kittyImageMoves)
+    {
+        auto& destinationRow = newBuffer.GetMutableRowByOffset(move.destination.y);
+        if (destinationRow.GetKittyPlaceholderCell(move.destination.x))
+        {
+            const auto& sourceRow = oldBuffer.GetRowByOffset(move.source.y);
+            ImageSlice::CopyKittyCells(sourceRow, move.source.x, destinationRow, move.destination.x, move.destination.x + 1);
+        }
     }
 
     // Since we didn't use IncrementCircularBuffer() we need to compute the proper

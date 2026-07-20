@@ -46,6 +46,7 @@ public:
     const OutputCellView& operator*() const noexcept;
     const OutputCellView* operator->() const noexcept;
 
+    bool IsKittyPlaceholder() const noexcept;
     til::point Pos() const noexcept;
 
 protected:

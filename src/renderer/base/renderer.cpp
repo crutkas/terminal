@@ -1219,6 +1219,13 @@ static bool _IsAllSpaces(const std::wstring_view v)
     return v.find_first_not_of(L' ') == decltype(v)::npos;
 }
 
+static std::wstring_view _GetForegroundRenderText(const TextBufferCellIterator& it) noexcept
+{
+    // KGP placeholders use their grapheme and colors as image coordinates. Keep
+    // the cell and attributes, but expose only a blank cell to glyph renderers.
+    return it.IsKittyPlaceholder() ? std::wstring_view{ L" " } : it->Chars();
+}
+
 void Renderer::_PaintBufferOutputHelper(_In_ IRenderEngine* const pEngine,
                                         TextBufferCellIterator it,
                                         const til::point target)
@@ -1239,7 +1246,7 @@ void Renderer::_PaintBufferOutputHelper(_In_ IRenderEngine* const pEngine,
         // Retrieve the first pattern id
         auto patternIds = _pData->GetPatternId(target);
         // Determine whether we're using a soft font.
-        auto usingSoftFont = s_IsSoftFontChar(it->Chars(), _firstSoftFontChar, _lastSoftFontChar);
+        auto usingSoftFont = s_IsSoftFontChar(_GetForegroundRenderText(it), _firstSoftFontChar, _lastSoftFontChar);
 
         // And hold the point where we should start drawing.
         auto screenPoint = target;
@@ -1286,14 +1293,15 @@ void Renderer::_PaintBufferOutputHelper(_In_ IRenderEngine* const pEngine,
             {
                 til::point thisPoint{ screenPoint.x + cols, screenPoint.y };
                 const auto thisPointPatterns = _pData->GetPatternId(thisPoint);
-                const auto thisUsingSoftFont = s_IsSoftFontChar(it->Chars(), _firstSoftFontChar, _lastSoftFontChar);
+                const auto renderText = _GetForegroundRenderText(it);
+                const auto thisUsingSoftFont = s_IsSoftFontChar(renderText, _firstSoftFontChar, _lastSoftFontChar);
                 const auto changedPatternOrFont = patternIds != thisPointPatterns || usingSoftFont != thisUsingSoftFont;
                 if (color != it->TextAttr() || changedPatternOrFont)
                 {
                     auto newAttr{ it->TextAttr() };
                     // foreground doesn't matter for runs of spaces (!)
                     // if we trick it . . . we call Paint far fewer times for cmatrix
-                    if (!_IsAllSpaces(it->Chars()) || !newAttr.HasIdenticalVisualRepresentationForBlankSpace(color, globalInvert) || changedPatternOrFont)
+                    if (!_IsAllSpaces(renderText) || !newAttr.HasIdenticalVisualRepresentationForBlankSpace(color, globalInvert) || changedPatternOrFont)
                     {
                         color = newAttr;
                         patternIds = thisPointPatterns;
@@ -1324,7 +1332,7 @@ void Renderer::_PaintBufferOutputHelper(_In_ IRenderEngine* const pEngine,
                 }
 
                 // Advance the cluster and column counts.
-                _clusterBuffer.emplace_back(it->Chars(), columnCount);
+                _clusterBuffer.emplace_back(renderText, columnCount);
                 it += std::max(it->Columns(), 1); // prevent infinite loop for no visible columns
                 cols += columnCount;
 

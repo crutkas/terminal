@@ -352,6 +352,11 @@ const OutputCellView* TextBufferCellIterator::operator->() const noexcept
     return &_view;
 }
 
+bool TextBufferCellIterator::IsKittyPlaceholder() const noexcept
+{
+    return _pRow->GetKittyPlaceholderCell(_pos.x) != nullptr;
+}
+
 til::point TextBufferCellIterator::Pos() const noexcept
 {
     return _pos;
