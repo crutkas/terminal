@@ -407,6 +407,16 @@ namespace Microsoft::Console::VirtualTerminal
             // clamping so a re-put or cascade can erase exactly this placement's cells by rect.
             til::CoordType cols = 0;
             til::CoordType rows = 0;
+            // Original display parameters are retained so moving a parent can redraw this
+            // relative placement at its new anchor without changing its sampled geometry.
+            uint32_t displayCols = 0;
+            uint32_t displayRows = 0;
+            uint32_t srcX = 0;
+            uint32_t srcY = 0;
+            uint32_t srcW = 0;
+            uint32_t srcH = 0;
+            uint32_t cellOffsetX = 0;
+            uint32_t cellOffsetY = 0;
             uint32_t parentImageId = 0;
             uint32_t parentPlacementId = 0;
             int32_t offsetH = 0;
@@ -435,6 +445,8 @@ namespace Microsoft::Console::VirtualTerminal
         // Relative placement registry helpers.
         // Protocol: https://sw.kovidgoyal.net/kitty/graphics-protocol/#relative-placements
         void _registerKittyPlacement(const KittyPlacement& placement);
+        // Re-anchor and redraw every relative descendant after a registered parent moves.
+        bool _moveKittyPlacementChildren(const std::pair<uint32_t, uint32_t>& parent, til::point parentAnchor, bool apply, std::wstring_view& code);
         // Erases just one placement's drawn cells (by its tracked extent rect), leaving text and
         // co-resident images untouched -- a per-placement erase for a re-put (move/resize) or a
         // precise cascade delete, since image cells are owned by image id only, not (id, p).

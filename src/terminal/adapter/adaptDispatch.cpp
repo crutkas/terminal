@@ -5271,6 +5271,14 @@ void AdaptDispatch::_ProcessKittyCommand(const KittyControl& command, const std:
                 static_cast<til::CoordType>(std::clamp<int64_t>(static_cast<int64_t>(parentAnchor->x) + command.offsetH, 0, maxCol)),
                 static_cast<til::CoordType>(std::clamp<int64_t>(static_cast<int64_t>(parentAnchor->y) + command.offsetV, 0, maxRow)),
             };
+            const auto movesChildren = priorPlacement &&
+                                       (priorPlacement->anchorCol != childAnchor.x || priorPlacement->anchorRow != childAnchor.y);
+            if (movesChildren &&
+                !_moveKittyPlacementChildren({ targetImageId, placementId }, childAnchor, false, code))
+            {
+                success = false;
+                return;
+            }
             if (!_kittyPlacementFitsMemory(image, targetImageId, command.cols, command.rows, command.srcX, command.srcY, command.srcW, command.srcH, command.zIndex, childAnchor))
             {
                 success = false;
@@ -5303,6 +5311,14 @@ void AdaptDispatch::_ProcessKittyCommand(const KittyControl& command, const std:
             placement.anchorRow = childAnchor.y;
             placement.cols = drawn.width;
             placement.rows = drawn.height;
+            placement.displayCols = command.cols;
+            placement.displayRows = command.rows;
+            placement.srcX = command.srcX;
+            placement.srcY = command.srcY;
+            placement.srcW = command.srcW;
+            placement.srcH = command.srcH;
+            placement.cellOffsetX = command.cellOffsetX;
+            placement.cellOffsetY = command.cellOffsetY;
             placement.parentImageId = command.parentImageId;
             placement.parentPlacementId = command.parentPlacementId;
             placement.offsetH = command.offsetH;
@@ -5313,6 +5329,11 @@ void AdaptDispatch::_ProcessKittyCommand(const KittyControl& command, const std:
             if (placementId != 0)
             {
                 _registerKittyPlacement(placement);
+                if (movesChildren &&
+                    !_moveKittyPlacementChildren({ targetImageId, placementId }, childAnchor, true, code))
+                {
+                    success = false;
+                }
             }
             else
             {
@@ -5334,8 +5355,16 @@ void AdaptDispatch::_ProcessKittyCommand(const KittyControl& command, const std:
             return;
         }
         // Normal (non-relative) placement: anchor at the cursor, honoring C. This branch cannot
-        // fail, so erase-prior-then-draw-then-register is safe.
+        // fail validation after its parent and descendants have been preflighted.
         const auto cursorPos = _pages.ActivePage().Cursor().GetPosition();
+        const auto movesChildren = priorPlacement &&
+                                   (priorPlacement->anchorCol != cursorPos.x || priorPlacement->anchorRow != cursorPos.y);
+        if (movesChildren &&
+            !_moveKittyPlacementChildren({ targetImageId, placementId }, cursorPos, false, code))
+        {
+            success = false;
+            return;
+        }
         if (!_kittyPlacementFitsMemory(image, targetImageId, command.cols, command.rows, command.srcX, command.srcY, command.srcW, command.srcH, command.zIndex))
         {
             success = false;
@@ -5368,10 +5397,23 @@ void AdaptDispatch::_ProcessKittyCommand(const KittyControl& command, const std:
             placement.anchorRow = cursorPos.y;
             placement.cols = drawn.width;
             placement.rows = drawn.height;
+            placement.displayCols = command.cols;
+            placement.displayRows = command.rows;
+            placement.srcX = command.srcX;
+            placement.srcY = command.srcY;
+            placement.srcW = command.srcW;
+            placement.srcH = command.srcH;
+            placement.cellOffsetX = command.cellOffsetX;
+            placement.cellOffsetY = command.cellOffsetY;
             placement.zIndex = command.zIndex;
             placement.hasParent = false;
             placement.isVirtual = false;
             _registerKittyPlacement(placement);
+            if (movesChildren &&
+                !_moveKittyPlacementChildren({ targetImageId, placementId }, cursorPos, true, code))
+            {
+                success = false;
+            }
         }
     };
 
@@ -6358,6 +6400,234 @@ void AdaptDispatch::_registerKittyPlacement(const KittyPlacement& placement)
     }
 }
 
+// A registered placement is the root of a bounded tree: every relative child has one parent,
+// anonymous children are leaves, and creation-time validation rejects cycles/depth overflow.
+// Build the tree index and complete movement plan once, then preflight it before the parent is
+// changed. The apply pass erases every old child before drawing any new child; that two-phase
+// ordering prevents one same-image sibling's old rectangle from erasing another sibling that
+// has already moved into it.
+// Protocol: https://sw.kovidgoyal.net/kitty/graphics-protocol/#relative-placements
+bool AdaptDispatch::_moveKittyPlacementChildren(const std::pair<uint32_t, uint32_t>& parent, const til::point parentAnchor, const bool apply, std::wstring_view& code)
+{
+    using PlacementKey = std::pair<uint32_t, uint32_t>;
+    struct PendingParent
+    {
+        PlacementKey key;
+        til::point anchor;
+        int depth = 0;
+    };
+    struct MovePlan
+    {
+        std::optional<PlacementKey> key;
+        size_t anonymousIndex = 0;
+        KittyPlacement previous;
+        til::point anchor;
+    };
+
+    std::map<PlacementKey, std::vector<PlacementKey>> registeredChildren;
+    for (const auto& entry : _kittyPlacements)
+    {
+        const auto& child = entry.second;
+        if (child.hasParent)
+        {
+            registeredChildren[{ child.parentImageId, child.parentPlacementId }].push_back(entry.first);
+        }
+    }
+    std::map<PlacementKey, std::vector<size_t>> anonymousChildren;
+    for (size_t i = 0; i < _kittyAnonymousPlacements.size(); ++i)
+    {
+        const auto& child = _kittyAnonymousPlacements[i];
+        if (child.hasParent)
+        {
+            anonymousChildren[{ child.parentImageId, child.parentPlacementId }].push_back(i);
+        }
+    }
+
+    auto page = _pages.ActivePage();
+    const auto maxCol = std::max(0, page.Width() - 1);
+    const auto maxRow = std::max(0, page.Bottom() - 1);
+    const auto childAnchorFor = [&](const KittyPlacement& child, const til::point anchor) {
+        return til::point{
+            static_cast<til::CoordType>(std::clamp<int64_t>(static_cast<int64_t>(anchor.x) + child.offsetH, 0, maxCol)),
+            static_cast<til::CoordType>(std::clamp<int64_t>(static_cast<int64_t>(anchor.y) + child.offsetV, 0, maxRow)),
+        };
+    };
+
+    std::deque<PendingParent> pending{ { parent, parentAnchor, 0 } };
+    std::set<PlacementKey> visited;
+    std::vector<MovePlan> plan;
+    while (!pending.empty())
+    {
+        const auto current = pending.front();
+        pending.pop_front();
+        if (current.depth > MaxKittyPlacementDepth || !visited.emplace(current.key).second)
+        {
+            code = current.depth > MaxKittyPlacementDepth ?
+                       L"ETOODEEP:relative placement chain too deep" :
+                       L"ECYCLE:relative placement cycle";
+            return false;
+        }
+        if (const auto children = registeredChildren.find(current.key); children != registeredChildren.end())
+        {
+            for (const auto& childKey : children->second)
+            {
+                const auto childIt = _kittyPlacements.find(childKey);
+                if (childIt == _kittyPlacements.end())
+                {
+                    code = L"ENOPARENT:relative child not found";
+                    return false;
+                }
+                const auto& child = childIt->second;
+                const auto anchor = childAnchorFor(child, current.anchor);
+                if (child.anchorCol != anchor.x || child.anchorRow != anchor.y)
+                {
+                    plan.push_back({ childKey, 0, child, anchor });
+                }
+                pending.push_back({ childKey, anchor, current.depth + 1 });
+            }
+        }
+
+        if (const auto children = anonymousChildren.find(current.key); children != anonymousChildren.end())
+        {
+            for (const auto childIndex : children->second)
+            {
+                const auto& child = _kittyAnonymousPlacements[childIndex];
+                const auto anchor = childAnchorFor(child, current.anchor);
+                if (child.anchorCol != anchor.x || child.anchorRow != anchor.y)
+                {
+                    plan.push_back({ std::nullopt, childIndex, child, anchor });
+                }
+            }
+        }
+    }
+
+    if (!apply)
+    {
+        for (const auto& move : plan)
+        {
+            const auto image = _kittyImages.find(move.previous.imageId);
+            if (image == _kittyImages.end())
+            {
+                code = L"ENOENT:relative child image not found";
+                return false;
+            }
+            if (!_kittyPlacementFitsMemory(image->second,
+                                           move.previous.imageId,
+                                           move.previous.displayCols,
+                                           move.previous.displayRows,
+                                           move.previous.srcX,
+                                           move.previous.srcY,
+                                           move.previous.srcW,
+                                           move.previous.srcH,
+                                           move.previous.zIndex,
+                                           move.anchor))
+            {
+                code = L"ENOMEM:image layer memory limit exceeded";
+                return false;
+            }
+        }
+        return true;
+    }
+
+    for (const auto& move : plan)
+    {
+        _eraseKittyPlacementCells(move.previous);
+    }
+
+    auto succeeded = true;
+    // A child's stale rectangle is owner-scoped by image id, so it can overlap and erase the
+    // parent's freshly drawn cells when parent and child display the same image. Reassert the
+    // parent after all stale child rectangles are gone, before drawing descendants parent-first.
+    const auto parentIt = _kittyPlacements.find(parent);
+    if (parentIt == _kittyPlacements.end())
+    {
+        code = L"ENOPARENT:relative parent not found";
+        return false;
+    }
+    const auto& parentPlacement = parentIt->second;
+    const auto parentImage = _kittyImages.find(parentPlacement.imageId);
+    if (parentImage == _kittyImages.end())
+    {
+        code = L"ENOENT:relative parent image not found";
+        return false;
+    }
+    try
+    {
+        const auto drawn = _placeKittyImage(parentImage->second,
+                                            false,
+                                            parentPlacement.imageId,
+                                            parentPlacement.displayCols,
+                                            parentPlacement.displayRows,
+                                            parentPlacement.srcX,
+                                            parentPlacement.srcY,
+                                            parentPlacement.srcW,
+                                            parentPlacement.srcH,
+                                            parentPlacement.cellOffsetX,
+                                            parentPlacement.cellOffsetY,
+                                            parentPlacement.zIndex,
+                                            parentAnchor);
+        if (drawn.width <= 0 || drawn.height <= 0)
+        {
+            code = L"EINVAL:relative parent has empty geometry";
+            succeeded = false;
+        }
+    }
+    catch (const std::bad_alloc&)
+    {
+        code = L"ENOMEM:image layer memory limit exceeded";
+        succeeded = false;
+    }
+
+    for (const auto& move : plan)
+    {
+        const auto image = _kittyImages.find(move.previous.imageId);
+        til::size drawn;
+        try
+        {
+            drawn = _placeKittyImage(image->second,
+                                     false,
+                                     move.previous.imageId,
+                                     move.previous.displayCols,
+                                     move.previous.displayRows,
+                                     move.previous.srcX,
+                                     move.previous.srcY,
+                                     move.previous.srcW,
+                                     move.previous.srcH,
+                                     move.previous.cellOffsetX,
+                                     move.previous.cellOffsetY,
+                                     move.previous.zIndex,
+                                     move.anchor);
+        }
+        catch (const std::bad_alloc&)
+        {
+            if (succeeded)
+            {
+                code = L"ENOMEM:image layer memory limit exceeded";
+            }
+            succeeded = false;
+            continue;
+        }
+        if (drawn.width <= 0 || drawn.height <= 0)
+        {
+            if (succeeded)
+            {
+                code = L"EINVAL:relative child has empty geometry";
+            }
+            succeeded = false;
+            continue;
+        }
+
+        auto* child = move.key ?
+                          &_kittyPlacements.at(*move.key) :
+                          &_kittyAnonymousPlacements.at(move.anonymousIndex);
+        child->anchorCol = move.anchor.x;
+        child->anchorRow = move.anchor.y;
+        child->cols = drawn.width;
+        child->rows = drawn.height;
+    }
+    return succeeded;
+}
+
 // Removes every placement of an image and cascade-deletes any relative children: when a
 // placement is removed, placements positioned relative to it are removed too; if a child's
 // image then has no remaining placements, that image is deleted as well (the parent + its
@@ -6699,6 +6969,41 @@ std::optional<til::point> AdaptDispatch::_resolveKittyPlacementAnchor(const uint
     std::vector<std::pair<uint32_t, uint32_t>> visited{ origin };
     std::pair<uint32_t, uint32_t> key{ parentImageId, parentPlacementId };
     std::optional<til::point> immediateAnchor; // captured at depth 1; the child anchors off this
+    const auto descendantsFit = [&](const int ancestorDepth) {
+        if (_kittyPlacements.find(origin) == _kittyPlacements.end())
+        {
+            return true;
+        }
+        std::map<std::pair<uint32_t, uint32_t>, std::vector<std::pair<uint32_t, uint32_t>>> children;
+        for (const auto& entry : _kittyPlacements)
+        {
+            const auto& placement = entry.second;
+            if (placement.hasParent)
+            {
+                children[{ placement.parentImageId, placement.parentPlacementId }].push_back(entry.first);
+            }
+        }
+
+        std::deque<std::pair<std::pair<uint32_t, uint32_t>, int>> pending{ { origin, 0 } };
+        std::set<std::pair<uint32_t, uint32_t>> seen;
+        while (!pending.empty())
+        {
+            const auto [current, descendantDepth] = pending.front();
+            pending.pop_front();
+            if (!seen.emplace(current).second || ancestorDepth + descendantDepth > MaxKittyPlacementDepth)
+            {
+                return false;
+            }
+            if (const auto found = children.find(current); found != children.end())
+            {
+                for (const auto& child : found->second)
+                {
+                    pending.push_back({ child, descendantDepth + 1 });
+                }
+            }
+        }
+        return true;
+    };
     for (auto depth = 1; depth <= MaxKittyPlacementDepth; ++depth)
     {
         if (std::find(visited.begin(), visited.end(), key) != visited.end())
@@ -6727,6 +7032,11 @@ std::optional<til::point> AdaptDispatch::_resolveKittyPlacementAnchor(const uint
                 {
                     immediateAnchor = derived;
                 }
+                if (!descendantsFit(depth))
+                {
+                    code = L"ETOODEEP:relative placement chain too deep";
+                    return std::nullopt;
+                }
                 return immediateAnchor; // a virtual image is always a chain leaf
             }
             code = L"ENOPARENT:relative parent not found";
@@ -6746,6 +7056,11 @@ std::optional<til::point> AdaptDispatch::_resolveKittyPlacementAnchor(const uint
         }
         if (p.isVirtual || !p.hasParent)
         {
+            if (!descendantsFit(depth))
+            {
+                code = L"ETOODEEP:relative placement chain too deep";
+                return std::nullopt;
+            }
             return immediateAnchor; // reached a leaf (virtual or a normal root); chain is valid
         }
         key = { p.parentImageId, p.parentPlacementId }; // keep walking to validate the ancestry
