@@ -5,6 +5,7 @@
 
 #include <aclapi.h>
 #include <sddl.h>
+#include <winternl.h>
 #include <wil/token_helpers.h>
 
 namespace til // Terminal Implementation Library. Also: "Today I Learned"
@@ -347,30 +348,141 @@ namespace til // Terminal Implementation Library. Also: "Today I Learned"
         }
 
         std::wstring pathStr;
+        const auto isReservedDosDevice = [](const std::wstring_view candidate) noexcept {
+            auto leaf = candidate.substr(candidate.find_last_of(L'\\') + 1);
+            while (!leaf.empty() && (leaf.back() == L' ' || leaf.back() == L'.'))
+            {
+                leaf.remove_suffix(1);
+            }
+            if (const auto suffix = leaf.find_first_of(L".:"); suffix != std::wstring_view::npos)
+            {
+                leaf = leaf.substr(0, suffix);
+            }
+            while (!leaf.empty() && leaf.back() == L' ')
+            {
+                leaf.remove_suffix(1);
+            }
+            const auto equalsLeaf = [&](const std::wstring_view value) noexcept {
+                return leaf.size() == value.size() &&
+                       CompareStringOrdinal(leaf.data(), static_cast<int>(leaf.size()), value.data(), static_cast<int>(value.size()), TRUE) == CSTR_EQUAL;
+            };
+            const auto isNumberedDevice = [&](const std::wstring_view prefix) noexcept {
+                if (leaf.size() != prefix.size() + 1)
+                {
+                    return false;
+                }
+                const auto suffix = leaf.back();
+                return ((suffix >= L'1' && suffix <= L'9') || suffix == L'\u00B9' || suffix == L'\u00B2' || suffix == L'\u00B3') &&
+                       CompareStringOrdinal(leaf.data(), static_cast<int>(prefix.size()), prefix.data(), static_cast<int>(prefix.size()), TRUE) == CSTR_EQUAL;
+            };
+            return equalsLeaf(L"CON") || equalsLeaf(L"PRN") || equalsLeaf(L"AUX") || equalsLeaf(L"NUL") ||
+                   equalsLeaf(L"CLOCK$") || equalsLeaf(L"CONIN$") || equalsLeaf(L"CONOUT$") ||
+                   isNumberedDevice(L"COM") || isNumberedDevice(L"LPT");
+        };
         try
         {
             pathStr.assign(path);
+            std::replace(pathStr.begin(), pathStr.end(), L'/', L'\\');
+            if (isReservedDosDevice(pathStr))
+            {
+                return read_image_result::read_error;
+            }
+
+            // Apply the same lexical normalization as CreateFileW without touching the
+            // filesystem. This collapses ".", "..", duplicate separators, and trailing
+            // spaces/periods before the normalized path is opened relative to the drive.
+            const auto needed = GetFullPathNameW(pathStr.c_str(), 0, nullptr, nullptr);
+            if (needed == 0)
+            {
+                return read_image_result::invalid;
+            }
+            std::wstring normalized(needed, L'\0');
+            const auto written = GetFullPathNameW(pathStr.c_str(), needed, normalized.data(), nullptr);
+            if (written == 0 || written >= needed)
+            {
+                return read_image_result::invalid;
+            }
+            normalized.resize(written);
+            pathStr.swap(normalized);
         }
         catch (...)
         {
             return read_image_result::read_error;
         }
 
-        // Open read-only; request DELETE only when we might remove a temp file so a plain
-        // t=f read never needs delete rights. FILE_SHARE_DELETE lets the file be unlinked
-        // (by us or the client) while the handle is open.
-        const DWORD access = GENERIC_READ | (deleteAfter ? static_cast<DWORD>(DELETE) : 0ul);
-        wil::unique_hfile file{ CreateFileW(pathStr.c_str(), access, FILE_SHARE_READ | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr) };
-        if (!file && deleteAfter)
+        if (pathStr.size() < 3 ||
+            CompareStringOrdinal(pathStr.data(), 1, &driveLetter, 1, TRUE) != CSTR_EQUAL ||
+            pathStr[1] != L':' || pathStr[2] != L'\\')
+        {
+            return read_image_result::invalid;
+        }
+
+        const auto relativePath = std::wstring_view{ pathStr }.substr(3);
+        if (relativePath.empty() || relativePath.size() > USHRT_MAX / sizeof(wchar_t))
+        {
+            return read_image_result::invalid;
+        }
+
+        // Resolve only the already-validated fixed drive root through Win32. The remaining
+        // untrusted path is opened relative to this handle so OBJ_DONT_REPARSE does not
+        // reject the Object Manager's normal \??\C: drive-letter symbolic link.
+        wil::unique_hfile drive{ CreateFileW(driveRoot,
+                                             FILE_READ_ATTRIBUTES,
+                                             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                             nullptr,
+                                             OPEN_EXISTING,
+                                             FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+                                             nullptr) };
+        if (!drive)
+        {
+            return read_image_result::read_error;
+        }
+
+        UNICODE_STRING objectName{
+            .Length = static_cast<USHORT>(relativePath.size() * sizeof(wchar_t)),
+            .MaximumLength = static_cast<USHORT>(relativePath.size() * sizeof(wchar_t)),
+            .Buffer = const_cast<wchar_t*>(relativePath.data()),
+        };
+        OBJECT_ATTRIBUTES objectAttributes{
+            .Length = sizeof(OBJECT_ATTRIBUTES),
+            .RootDirectory = drive.get(),
+            .ObjectName = &objectName,
+            .Attributes = OBJ_CASE_INSENSITIVE | OBJ_DONT_REPARSE,
+        };
+
+        // Open without following any reparse point in the path. The post-open canonical
+        // checks below are too late to prevent an intermediate junction or symlink from
+        // initiating an SMB/NTLM handshake, so this intentionally rejects all reparse
+        // traversal before the target is touched.
+        const auto openFile = [&](const ACCESS_MASK access, wil::unique_hfile& file) noexcept {
+            IO_STATUS_BLOCK status{};
+            return NtCreateFile(file.addressof(),
+                                access | SYNCHRONIZE,
+                                &objectAttributes,
+                                &status,
+                                nullptr,
+                                FILE_ATTRIBUTE_NORMAL,
+                                FILE_SHARE_READ | FILE_SHARE_DELETE,
+                                FILE_OPEN,
+                                FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT | FILE_OPEN_REPARSE_POINT,
+                                nullptr,
+                                0);
+        };
+
+        // Request DELETE only when we might remove a temp file so a plain t=f read never
+        // needs delete rights. FILE_SHARE_DELETE lets the file be unlinked while open.
+        wil::unique_hfile file;
+        auto status = openFile(GENERIC_READ | (deleteAfter ? static_cast<ACCESS_MASK>(DELETE) : 0ul), file);
+        if (status < 0 && deleteAfter)
         {
             // The file may not grant DELETE (e.g. a read-only ACL); fall back to a pure
             // read so rendering still works. We then simply cannot delete it.
             deleteAfter = false;
-            file.reset(CreateFileW(pathStr.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr));
+            status = openFile(GENERIC_READ, file);
         }
-        if (!file)
+        if (status < 0)
         {
-            const auto err = GetLastError();
+            const auto err = RtlNtStatusToDosError(status);
             return (err == ERROR_FILE_NOT_FOUND || err == ERROR_PATH_NOT_FOUND)
                        ? read_image_result::not_found
                        : read_image_result::read_error;
@@ -534,8 +646,10 @@ namespace til // Terminal Implementation Library. Also: "Today I Learned"
             // marker (case-insensitively) so we only ever auto-delete files this protocol
             // created, never an arbitrary file the client happened to place under temp.
             static constexpr std::wstring_view marker{ L"tty-graphics-protocol" };
+            const auto separator = canonical.find_last_of(L'\\');
+            const auto filenameOffset = separator == std::wstring::npos ? 0 : separator + 1;
             auto hasMarker = false;
-            for (size_t i = 0; !hasMarker && i + marker.size() <= canonical.size(); ++i)
+            for (auto i = filenameOffset; !hasMarker && i + marker.size() <= canonical.size(); ++i)
             {
                 hasMarker = CompareStringOrdinal(canonical.c_str() + i, static_cast<int>(marker.size()), marker.data(), static_cast<int>(marker.size()), TRUE) == CSTR_EQUAL;
             }

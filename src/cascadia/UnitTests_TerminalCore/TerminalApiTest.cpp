@@ -451,10 +451,13 @@ namespace TerminalCoreUnitTests
         TEST_METHOD(ReadKittyImageFileDeletesTempWithMarker);
         TEST_METHOD(ReadKittyImageFileOutsideTempNotDeleted);
         TEST_METHOD(ReadKittyImageFileNoMarkerNotDeleted);
+        TEST_METHOD(ReadKittyImageFileParentMarkerNotDeleted);
         TEST_METHOD(ReadKittyImageFileOffsetAndSizeSlice);
         TEST_METHOD(ReadKittyImageFileOversizeSizeClampsToEof);
         TEST_METHOD(ReadKittyImageFileRejectsUncPath);
         TEST_METHOD(ReadKittyImageFileRejectsRelativePath);
+        TEST_METHOD(ReadKittyImageFileNormalizesWin32Path);
+        TEST_METHOD(ReadKittyImageFileRejectsIntermediateJunction);
         TEST_METHOD(ReadKittyImageFileNonexistentFails);
         TEST_METHOD(ReadKittyImageFileRejectsCharDevice);
         TEST_METHOD(ReadKittyImageFileRejectsDirectory);
@@ -945,6 +948,62 @@ namespace
     {
         return GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES;
     }
+
+    struct KittyMountPointReparseBuffer
+    {
+        ULONG reparseTag;
+        USHORT reparseDataLength;
+        USHORT reserved;
+        USHORT substituteNameOffset;
+        USHORT substituteNameLength;
+        USHORT printNameOffset;
+        USHORT printNameLength;
+        WCHAR pathBuffer[MAX_PATH * 2];
+    };
+
+    bool KittyCreateJunction(const std::wstring& junctionPath, const std::wstring& targetPath)
+    {
+        static constexpr DWORD fsctlSetReparsePoint{ 0x000900A4 };
+
+        if (!CreateDirectoryW(junctionPath.c_str(), nullptr))
+        {
+            return false;
+        }
+
+        wil::unique_hfile junction{ CreateFileW(junctionPath.c_str(),
+                                                GENERIC_WRITE,
+                                                0,
+                                                nullptr,
+                                                OPEN_EXISTING,
+                                                FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS,
+                                                nullptr) };
+        if (!junction)
+        {
+            return false;
+        }
+
+        const auto substituteName = L"\\??\\" + targetPath;
+        const auto substituteBytes = substituteName.size() * sizeof(wchar_t);
+        const auto printBytes = targetPath.size() * sizeof(wchar_t);
+        KittyMountPointReparseBuffer buffer{};
+        if (substituteBytes + printBytes + 2 * sizeof(wchar_t) > sizeof(buffer.pathBuffer))
+        {
+            return false;
+        }
+
+        buffer.reparseTag = IO_REPARSE_TAG_MOUNT_POINT;
+        buffer.substituteNameLength = static_cast<USHORT>(substituteBytes);
+        buffer.printNameOffset = static_cast<USHORT>(substituteBytes + sizeof(wchar_t));
+        buffer.printNameLength = static_cast<USHORT>(printBytes);
+        memcpy(buffer.pathBuffer, substituteName.c_str(), substituteBytes);
+        memcpy(reinterpret_cast<std::byte*>(buffer.pathBuffer) + buffer.printNameOffset, targetPath.c_str(), printBytes);
+
+        const auto pathBytes = buffer.printNameOffset + buffer.printNameLength + sizeof(wchar_t);
+        buffer.reparseDataLength = static_cast<USHORT>(8 + pathBytes);
+        const auto inputBytes = static_cast<DWORD>(FIELD_OFFSET(KittyMountPointReparseBuffer, pathBuffer) + pathBytes);
+        DWORD returned{};
+        return DeviceIoControl(junction.get(), fsctlSetReparsePoint, &buffer, inputBytes, nullptr, 0, &returned, nullptr) != FALSE;
+    }
 }
 
 void TerminalApiTest::ReadKittyImageFileReadsFromTemp()
@@ -1029,6 +1088,27 @@ void TerminalApiTest::ReadKittyImageFileNoMarkerNotDeleted()
     DeleteFileW(path.c_str());
 }
 
+void TerminalApiTest::ReadKittyImageFileParentMarkerNotDeleted()
+{
+    Terminal term{ Terminal::TestDummyMarker{} };
+    DummyRenderer renderer{ &term };
+    term.Create({ 100, 100 }, 0, renderer);
+
+    const auto dir = KittyTempDir();
+    VERIFY_IS_FALSE(dir.empty());
+    const auto subdir = KittyUniquePath(dir, L"tty-graphics-protocol-parent-");
+    VERIFY_IS_TRUE(CreateDirectoryW(subdir.c_str(), nullptr) != FALSE, L"failed to create the marked parent directory");
+    const auto path = KittyUniquePath(subdir + L"\\", L"unrelated-");
+    VERIFY_IS_TRUE(KittyWriteAllBytes(path, { 1, 2, 3 }));
+
+    std::vector<uint8_t> out;
+    VERIFY_IS_TRUE(til::read_image_result::ok == term.ReadKittyImageFile(path, 0, 0, true, out), L"the read should succeed");
+    VERIFY_IS_TRUE(KittyFileExists(path), L"a marker in a parent directory must not authorize deleting an unrelated file");
+
+    DeleteFileW(path.c_str());
+    RemoveDirectoryW(subdir.c_str());
+}
+
 void TerminalApiTest::ReadKittyImageFileOffsetAndSizeSlice()
 {
     Terminal term{ Terminal::TestDummyMarker{} };
@@ -1096,6 +1176,54 @@ void TerminalApiTest::ReadKittyImageFileRejectsRelativePath()
     VERIFY_ARE_EQUAL(static_cast<size_t>(0), out.size());
 }
 
+void TerminalApiTest::ReadKittyImageFileNormalizesWin32Path()
+{
+    Terminal term{ Terminal::TestDummyMarker{} };
+    DummyRenderer renderer{ &term };
+    term.Create({ 100, 100 }, 0, renderer);
+
+    const auto dir = KittyTempDir();
+    VERIFY_IS_FALSE(dir.empty());
+    const auto path = KittyUniquePath(dir, L"tty-graphics-protocol-normalize-");
+    const auto filename = path.substr(path.find_last_of(L'\\') + 1);
+    const std::vector<uint8_t> content{ 1, 2, 3 };
+    VERIFY_IS_TRUE(KittyWriteAllBytes(path, content));
+
+    const auto equivalentPath = dir + L".\\unused\\..\\\\" + filename + L".";
+    std::vector<uint8_t> out;
+    VERIFY_IS_TRUE(til::read_image_result::ok == term.ReadKittyImageFile(equivalentPath, 0, 0, false, out), L"Win32-equivalent dot segments, duplicate separators, and a trailing period must resolve to the same file");
+    VERIFY_IS_TRUE(out == content);
+
+    DeleteFileW(path.c_str());
+}
+
+void TerminalApiTest::ReadKittyImageFileRejectsIntermediateJunction()
+{
+    Terminal term{ Terminal::TestDummyMarker{} };
+    DummyRenderer renderer{ &term };
+    term.Create({ 100, 100 }, 0, renderer);
+
+    const auto dir = KittyTempDir();
+    VERIFY_IS_FALSE(dir.empty());
+    const auto targetDir = KittyUniquePath(dir, L"kitty-junction-target-");
+    const auto junctionPath = KittyUniquePath(dir, L"kitty-junction-link-");
+    const auto targetFile = targetDir + L"\\payload.bin";
+    const auto junctionFile = junctionPath + L"\\payload.bin";
+    auto cleanup = wil::scope_exit([&]() {
+        DeleteFileW(targetFile.c_str());
+        RemoveDirectoryW(junctionPath.c_str());
+        RemoveDirectoryW(targetDir.c_str());
+    });
+
+    VERIFY_IS_TRUE(CreateDirectoryW(targetDir.c_str(), nullptr) != FALSE, L"failed to create the junction target directory");
+    VERIFY_IS_TRUE(KittyWriteAllBytes(targetFile, { 1, 2, 3 }), L"failed to create the junction target file");
+    VERIFY_IS_TRUE(KittyCreateJunction(junctionPath, targetDir), L"failed to create the test junction");
+
+    std::vector<uint8_t> out{ 7, 7, 7 };
+    VERIFY_IS_TRUE(til::read_image_result::read_error == term.ReadKittyImageFile(junctionFile, 0, 0, false, out), L"an intermediate reparse point must be rejected before its target is opened");
+    VERIFY_ARE_EQUAL(static_cast<size_t>(0), out.size());
+}
+
 void TerminalApiTest::ReadKittyImageFileNonexistentFails()
 {
     Terminal term{ Terminal::TestDummyMarker{} };
@@ -1120,16 +1248,15 @@ void TerminalApiTest::ReadKittyImageFileRejectsCharDevice()
 
     const auto dir = KittyTempDir();
     VERIFY_IS_FALSE(dir.empty());
-    // A drive-absolute path to the NUL character device on the temp dir's (fixed) drive. NUL is a
-    // reserved name that resolves to a device in any directory, so this passes the drive/namespace
-    // checks and opens successfully -- but it is NOT a regular file. The spec's "only regular files
-    // may be read" rule (GetFileType == FILE_TYPE_DISK) must refuse it, so a client cannot make the
-    // terminal read from a device.
-    const auto devicePath = dir.substr(0, 3) + L"NUL"; // e.g. "C:\\NUL"
-
-    std::vector<uint8_t> out{ 1, 2, 3 };
-    VERIFY_IS_TRUE(til::read_image_result::read_error == term.ReadKittyImageFile(devicePath, 0, 0, false, out), L"a character device (NUL) must be refused as unreadable (EBADF): only regular files may be read");
-    VERIFY_ARE_EQUAL(static_cast<size_t>(0), out.size(), L"a rejected read must leave the output empty");
+    // DOS device aliases resolve in any directory, with optional extensions and legacy
+    // superscript digits. They must retain EBADF semantics after switching to native opens.
+    for (const auto deviceName : { L"NUL", L"NUL.txt", L"COM\u00B9", L"LPT\u00B3.txt" })
+    {
+        const auto devicePath = dir.substr(0, 3) + deviceName; // e.g. "C:\\NUL"
+        std::vector<uint8_t> out{ 1, 2, 3 };
+        VERIFY_IS_TRUE(til::read_image_result::read_error == term.ReadKittyImageFile(devicePath, 0, 0, false, out), L"a DOS character device must be refused as unreadable (EBADF): only regular files may be read");
+        VERIFY_ARE_EQUAL(static_cast<size_t>(0), out.size(), L"a rejected read must leave the output empty");
+    }
 }
 
 void TerminalApiTest::ReadKittyImageFileRejectsDirectory()
@@ -1140,12 +1267,8 @@ void TerminalApiTest::ReadKittyImageFileRejectsDirectory()
 
     const auto dir = KittyTempDir();
     VERIFY_IS_FALSE(dir.empty());
-    // A real, drive-absolute directory passes every pre-open path check (fixed local drive,
-    // not UNC, not relative) but must NOT be readable as an image. The helper opens with
-    // FILE_ATTRIBUTE_NORMAL and no FILE_FLAG_BACKUP_SEMANTICS, so CreateFileW on a directory
-    // fails with ERROR_ACCESS_DENIED -- NOT a not-found error -- and is reported as
-    // read_error (EBADF). Because a junction is itself a directory reparse point, this also
-    // covers the reparse-directory case: a client cannot point t=f/t=t at a folder.
+    // A real, drive-absolute directory passes every pre-open path check but must not be
+    // readable as an image. FILE_NON_DIRECTORY_FILE reports it as read_error (EBADF).
     const auto subdir = KittyUniquePath(dir, L"tty-graphics-protocol-dir-");
     VERIFY_IS_TRUE(CreateDirectoryW(subdir.c_str(), nullptr) != FALSE, L"failed to create the test directory");
 
