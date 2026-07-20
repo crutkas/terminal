@@ -5766,6 +5766,26 @@ public:
         VERIFY_IS_TRUE(_testGetSet->_lastKittyFileDeleteAfter, L"t=t must request deletion.");
     }
 
+    // o=z also composes with shared memory: S= describes the compressed resource size,
+    // then format validation runs on the inflated bytes.
+    TEST_METHOD(KittyGraphicsZlibSharedMemoryInflates)
+    {
+        const std::vector<uint8_t> c12{ 0x78, 0xda, 0x63, 0x64, 0x62, 0x66, 0x61, 0x65, 0x63, 0xe7, 0xe0, 0xe4, 0xe2, 0xe6, 0x01, 0x00, 0x01, 0x78, 0x00, 0x4f };
+
+        _testGetSet->PrepData();
+        _testGetSet->_kittySharedMemoryBytes = c12;
+        _stateMachine->ProcessString(L"\x1b_Ga=t,i=18,f=24,s=2,v=2,t=s,S=20,o=z;TG9jYWxca2l0dHktc2htLXRlc3Q=\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=18;OK\x1b\\");
+        VERIFY_ARE_EQUAL(1, _testGetSet->_readKittySharedMemoryCallCount);
+        VERIFY_ARE_EQUAL(static_cast<uint64_t>(c12.size()), _testGetSet->_lastKittySharedMemorySize);
+
+        const auto it = _pDispatch->_kittyImages.find(18);
+        VERIFY_IS_TRUE(it != _pDispatch->_kittyImages.end());
+        VERIFY_ARE_EQUAL(static_cast<size_t>(4), it->second.pixels.size());
+        VERIFY_ARE_EQUAL(1, static_cast<int>(it->second.pixels[0].rgbRed));
+        VERIFY_ARE_EQUAL(12, static_cast<int>(it->second.pixels[3].rgbBlue));
+    }
+
     // o=z that inflates SUCCESSFULLY but to the WRONG size for the declared geometry is
     // rejected by the post-inflate size check -- proving a compressed payload cannot smuggle
     // a wrong-sized image past validation (the size check runs on the INFLATED bytes, not the
