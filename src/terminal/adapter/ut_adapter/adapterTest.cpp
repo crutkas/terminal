@@ -4855,18 +4855,38 @@ public:
         VERIFY_ARE_EQUAL(static_cast<size_t>(1), _pDispatch->_kittyVirtualIds.count({ 2u, 0u }));
     }
 
-    // Delete-all (a=d,d=a) clears every registered image.
-    TEST_METHOD(KittyGraphicsDeleteAllClearsRegistry)
+    TEST_METHOD(KittyAnonymousPhysicalPlacementKeepsVirtualPrototype)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,f=24,s=1,v=1;/wAA\x1b\\");
+        VERIFY_ARE_EQUAL(static_cast<size_t>(1), _pDispatch->_kittyAnonymousPlacements.size());
+        VERIFY_IS_TRUE(_pDispatch->_kittyAnonymousPlacements.front().isVirtual);
+        VERIFY_ARE_EQUAL(static_cast<size_t>(1), _pDispatch->_kittyVirtualIds.count({ 1u, 0u }));
+
+        _stateMachine->ProcessString(L"\x1b_Ga=p,i=1,C=1;\x1b\\");
+        VERIFY_ARE_EQUAL(static_cast<size_t>(2), _pDispatch->_kittyAnonymousPlacements.size());
+        VERIFY_ARE_EQUAL(static_cast<size_t>(1), static_cast<size_t>(std::count_if(_pDispatch->_kittyAnonymousPlacements.begin(), _pDispatch->_kittyAnonymousPlacements.end(), [](const auto& placement) {
+                             return placement.isVirtual;
+                         })));
+        VERIFY_ARE_EQUAL(static_cast<size_t>(1), _pDispatch->_kittyVirtualIds.count({ 1u, 0u }),
+                         L"an anonymous physical put must not replace the image's anonymous virtual prototype");
+    }
+
+    // Lowercase delete-all keeps reusable image data; uppercase also frees it.
+    TEST_METHOD(KittyGraphicsDeleteAllHonorsCase)
     {
         _testGetSet->PrepData();
         _stateMachine->ProcessString(L"\x1b_Ga=t,i=8,f=24,s=1,v=1;AAAA\x1b\\");
         _stateMachine->ProcessString(L"\x1b_Ga=t,i=9,f=24,s=1,v=1;AAAA\x1b\\");
         _stateMachine->ProcessString(L"\x1b_Ga=d,d=a;\x1b\\");
-        _testGetSet->_response.clear();
-        _stateMachine->ProcessString(L"\x1b_Ga=p,i=8;\x1b\\");
-        _testGetSet->ValidateInputEvent(L"\x1b_Gi=8;ENOENT:image not found\x1b\\");
-        _stateMachine->ProcessString(L"\x1b_Ga=p,i=9;\x1b\\");
-        _testGetSet->ValidateInputEvent(L"\x1b_Gi=9;ENOENT:image not found\x1b\\");
+        VERIFY_ARE_EQUAL(static_cast<size_t>(1), _pDispatch->_kittyImages.count(8));
+        VERIFY_ARE_EQUAL(static_cast<size_t>(1), _pDispatch->_kittyImages.count(9));
+
+        _stateMachine->ProcessString(L"\x1b_Ga=p,i=8,C=1;\x1b\\");
+        _stateMachine->ProcessString(L"\x1b_Ga=p,i=9,C=1;\x1b\\");
+        _stateMachine->ProcessString(L"\x1b_Ga=d,d=A;\x1b\\");
+        VERIFY_ARE_EQUAL(static_cast<size_t>(0), _pDispatch->_kittyImages.count(8));
+        VERIFY_ARE_EQUAL(static_cast<size_t>(0), _pDispatch->_kittyImages.count(9));
     }
 
     // Specifying both an id and a number is invalid (EINVAL).
@@ -5593,6 +5613,38 @@ public:
         VERIFY_IS_FALSE(BufferContainsColor(*_testGetSet->_textBuffer, 255, 0, 0), L"the image at viewport cell (3,7) must be deleted");
     }
 
+    TEST_METHOD(KittyGraphicsDeleteAtCellPreservesCoexistingVirtualPlacement)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        auto& buffer = *_testGetSet->_textBuffer;
+        _stateMachine->ProcessString(L"\x1b_Ga=t,U=1,i=1,f=24,s=1,v=1;/wAA\x1b\\");
+        const auto virtualLayer = _pDispatch->_kittyAnonymousPlacements.front().layerId;
+
+        const til::point physicalPosition{ 2, 26 };
+        buffer.GetCursor().SetPosition(physicalPosition);
+        _stateMachine->ProcessString(L"\x1b_Ga=p,i=1,C=1;\x1b\\");
+        const auto physicalLayer = _pDispatch->_kittyAnonymousPlacements.back().layerId;
+
+        const til::point placeholderPosition{ 5, 26 };
+        buffer.GetCursor().SetPosition(placeholderPosition);
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m");
+        _stateMachine->ProcessString(Placeholder());
+        const auto* placeholderSlice = buffer.GetRowByOffset(placeholderPosition.y).GetImageSlice();
+        VERIFY_IS_NOT_NULL(placeholderSlice);
+        VERIFY_IS_TRUE(placeholderSlice->HasPlacement(virtualLayer));
+
+        _stateMachine->ProcessString(L"\x1b_Ga=d,d=p,x=3,y=7;\x1b\\");
+
+        const auto* physicalSlice = buffer.GetRowByOffset(physicalPosition.y).GetImageSlice();
+        VERIFY_IS_TRUE(physicalSlice == nullptr || !physicalSlice->HasPlacement(physicalLayer));
+        placeholderSlice = buffer.GetRowByOffset(placeholderPosition.y).GetImageSlice();
+        VERIFY_IS_NOT_NULL(placeholderSlice);
+        VERIFY_IS_TRUE(placeholderSlice->HasPlacement(virtualLayer), L"positional deletion must preserve a coexisting virtual placement");
+        VERIFY_ARE_EQUAL(static_cast<size_t>(1), _pDispatch->_kittyVirtualIds.count({ 1u, 0u }));
+        VERIFY_ARE_EQUAL(static_cast<size_t>(1), _pDispatch->_kittyImages.count(1));
+    }
+
     // d=x deletes placements intersecting column x (1-based) within the viewport; an image in
     // another column survives. Images sit at buffer row 25 (inside the top=20 viewport).
     TEST_METHOD(KittyGraphicsDeleteByColumn)
@@ -6162,8 +6214,8 @@ public:
         VERIFY_IS_TRUE(SlicePixelIs(slice, 1, 0, 0, 255, 0), L"row-1 cell = bottom tile (green) only");
     }
 
-    // delete-all (d=a) erases placeholder-rendered cells too.
-    TEST_METHOD(KittyPlaceholderDeleteAllErases)
+    // Placeholder-rendered images are text, not physical placements, so d=a does not erase them.
+    TEST_METHOD(KittyPlaceholderDeleteAllPreservesVirtualPlacement)
     {
         _testGetSet->PrepData();
         _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,f=24,s=1,v=1;/wAA\x1b\\");
@@ -6171,7 +6223,7 @@ public:
         _stateMachine->ProcessString(Placeholder());
         VERIFY_IS_TRUE(BufferContainsColor(*_testGetSet->_textBuffer, 255, 0, 0));
         _stateMachine->ProcessString(L"\x1b_Ga=d,d=a;\x1b\\");
-        VERIFY_ARE_EQUAL(0, CountImageRows(*_testGetSet->_textBuffer), L"delete-all must erase placeholder pixels");
+        VERIFY_IS_TRUE(BufferContainsColor(*_testGetSet->_textBuffer, 255, 0, 0), L"delete-all must not erase Unicode-placeholder pixels");
     }
 
     // A line mixing text and a placeholder keeps the glyphs and overlays the image.
@@ -6773,9 +6825,9 @@ public:
         VERIFY_ARE_EQUAL(0, CountImageRows(*_testGetSet->_textBuffer), L"a non-virtual id must not overlay via placeholders");
     }
 
-    // A non-virtual PUT (a=p without U=1) of a previously-virtual id cancels placeholder
-    // eligibility through the put path, so a placeholder on a fresh row gains no image slice.
-    TEST_METHOD(KittyPlaceholderNonVirtualPutStopsOverlay)
+    // An anonymous non-virtual PUT creates a separate physical placement and leaves the
+    // previously registered anonymous virtual prototype available to later placeholders.
+    TEST_METHOD(KittyPlaceholderNonVirtualPutKeepsOverlay)
     {
         _testGetSet->PrepData();
         const auto origin = _testGetSet->_textBuffer->GetCursor().GetPosition();
@@ -6784,19 +6836,18 @@ public:
         _stateMachine->ProcessString(Placeholder());
         VERIFY_IS_TRUE(BufferContainsColor(*_testGetSet->_textBuffer, 255, 0, 0), L"virtual id overlays red before the put");
 
-        // Non-virtual put cancels eligibility (and draws once at the cursor).
+        // The non-virtual put draws once at the cursor without replacing the virtual prototype.
         _stateMachine->ProcessString(L"\x1b_Ga=p,i=1;\x1b\\");
 
-        // A placeholder on a fresh empty row must NOT gain an image slice.
+        // A placeholder on a fresh empty row still resolves through the virtual prototype.
         const auto freshRow = origin.y + 10;
         _testGetSet->_textBuffer->GetCursor().SetPosition({ 0, freshRow });
         _stateMachine->ProcessString(Placeholder());
-        VERIFY_IS_NULL(_testGetSet->_textBuffer->GetRowByOffset(freshRow).GetImageSlice(), L"non-virtual put dropped placeholder eligibility");
+        VERIFY_IS_NOT_NULL(_testGetSet->_textBuffer->GetRowByOffset(freshRow).GetImageSlice(), L"non-virtual put preserves placeholder eligibility");
     }
 
-    // Delete-all (a=d, d=a) clears the virtual placement map, so a placeholder printed after a
-    // delete-all is inert even though the same fg id is still selected.
-    TEST_METHOD(KittyPlaceholderDeleteAllClearsVirtualMap)
+    // Delete-all does not affect virtual placements, so later placeholder text can reuse the grid.
+    TEST_METHOD(KittyPlaceholderDeleteAllKeepsVirtualMap)
     {
         _testGetSet->PrepData();
         _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,f=24,s=1,v=1;/wAA\x1b\\"); // virtual red
@@ -6806,7 +6857,8 @@ public:
 
         _stateMachine->ProcessString(L"\x1b_Ga=d,d=a;\x1b\\"); // delete all
         _stateMachine->ProcessString(Placeholder());
-        VERIFY_ARE_EQUAL(0, CountImageRows(*_testGetSet->_textBuffer), L"delete-all cleared the virtual map; re-print is inert");
+        VERIFY_ARE_EQUAL(static_cast<size_t>(1), _pDispatch->_kittyVirtualIds.count({ 1u, 0u }));
+        VERIFY_IS_TRUE(BufferContainsColor(*_testGetSet->_textBuffer, 255, 0, 0), L"the preserved virtual map renders later placeholder text");
     }
 
     // Delete-by-id is targeted: removing image 1 must erase only its pixels and leave a
@@ -8664,21 +8716,38 @@ public:
 
         _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,p=1,z=-1,f=24,s=1,v=1;/wAA\x1b\\");
         _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m");
+        _stateMachine->ProcessString(L"\x1b[58:2::0:0:1m");
         buffer.GetCursor().SetPosition(placeholderPosition);
         _stateMachine->ProcessString(Placeholder() + L"\x0305" + L"\x0305");
+        const auto virtualLayer = _pDispatch->_kittyPlacements.at({ 1u, 1u }).layerId;
+        const auto* placeholderSlice = buffer.GetRowByOffset(placeholderPosition.y).GetImageSlice();
+        VERIFY_IS_NOT_NULL(placeholderSlice);
+        VERIFY_IS_TRUE(placeholderSlice->HasOwner(1));
+        VERIFY_IS_TRUE(placeholderSlice->HasPlacement(virtualLayer));
         buffer.GetCursor().SetPosition(placeholderPosition);
-        _stateMachine->ProcessString(L"\x1b_Ga=T,i=2,p=1,z=1,f=24,s=1,v=1,C=1;AP8A\x1b\\");
+        _stateMachine->ProcessString(L"\x1b_Ga=p,i=1,p=2,z=1,C=1;\x1b\\");
+        const auto physicalLayer = _pDispatch->_kittyPlacements.at({ 1u, 2u }).layerId;
+        buffer.GetCursor().SetPosition(placeholderPosition);
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=2,p=1,z=2,f=24,s=1,v=1,C=1;AP8A\x1b\\");
+        const auto* sourceSlice = buffer.GetRowByOffset(placeholderPosition.y).GetImageSlice();
+        VERIFY_IS_NOT_NULL(sourceSlice);
+        VERIFY_IS_TRUE(sourceSlice->HasOwner(1));
+        VERIFY_IS_TRUE(sourceSlice->HasOwner(2));
+        VERIFY_IS_TRUE(sourceSlice->HasPlacement(virtualLayer));
+        VERIFY_IS_TRUE(sourceSlice->HasPlacement(physicalLayer));
 
         auto reflowed = std::make_unique<TextBuffer>(til::size{ 5, 600 }, TextAttribute{}, 0, false, &_testGetSet->_renderer);
         TextBuffer::Reflow(buffer, *reflowed);
 
         auto foundPlaceholder = false;
         auto foundOverlappingImage = false;
+        auto foundOverlappingPlacement = false;
         for (auto y = 0; y < reflowed->GetSize().Height(); ++y)
         {
             const auto& row = reflowed->GetRowByOffset(y);
             const auto* slice = row.GetImageSlice();
             foundOverlappingImage |= slice && slice->HasOwner(2);
+            foundOverlappingPlacement |= slice && slice->HasPlacement(physicalLayer);
             for (auto x = 0; x < reflowed->GetSize().Width(); ++x)
             {
                 if (!row.GetKittyPlaceholderCell(x))
@@ -8687,8 +8756,13 @@ public:
                 }
 
                 foundPlaceholder = true;
+                const auto foreground = row.GetAttrByColumn(x).GetForeground();
+                VERIFY_IS_TRUE(foreground.IsRgb());
+                VERIFY_ARE_EQUAL(RGB(0, 0, 1), foreground.GetRGB());
                 VERIFY_IS_NOT_NULL(slice);
                 VERIFY_IS_TRUE(slice->HasOwner(1), L"the placeholder's image follows its reflowed text cell");
+                VERIFY_IS_TRUE(slice->HasPlacement(virtualLayer), L"the placeholder's exact placement follows its reflowed text cell");
+                VERIFY_IS_FALSE(slice->HasPlacement(physicalLayer), L"another placement of the same image must not follow the placeholder");
                 VERIFY_IS_FALSE(slice->HasOwner(2), L"an unrelated overlapping layer must not follow the placeholder");
                 const auto pixel = SlicePixelAt(slice, ImageSlice::RenderPosition::BehindText, x - slice->ColumnOffset(), 0);
                 VERIFY_ARE_EQUAL(static_cast<BYTE>(255), pixel.rgbRed);
@@ -8696,7 +8770,55 @@ public:
         }
 
         VERIFY_IS_TRUE(foundPlaceholder);
+        VERIFY_IS_TRUE(foundOverlappingPlacement, L"the same image's unrelated placement remains attached to the cloned source row");
         VERIFY_IS_TRUE(foundOverlappingImage, L"the unrelated layer remains attached to the cloned source row");
+    }
+
+    TEST_METHOD(KittyGraphicsUnresolvedPlaceholderDoesNotMoveOverlappingLayer)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        auto& buffer = *_testGetSet->_textBuffer;
+        const auto origin = buffer.GetCursor().GetPosition();
+        const til::point placeholderPosition{ 10, origin.y };
+
+        _stateMachine->ProcessString(L"\x1b_Ga=t,i=1,f=24,s=1,v=1;/wAA\x1b\\");
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m");
+        _stateMachine->ProcessString(L"\x1b[58:2::0:0:99m");
+        buffer.GetCursor().SetPosition(placeholderPosition);
+        _stateMachine->ProcessString(Placeholder() + L"\x0305" + L"\x0305");
+        const auto metadata = buffer.GetRowByOffset(placeholderPosition.y).GetKittyPlaceholderCell(placeholderPosition.x);
+        VERIFY_IS_NOT_NULL(metadata);
+        VERIFY_ARE_EQUAL(0u, metadata->layerId, L"an unresolved placement has no retained-layer identity");
+
+        buffer.GetCursor().SetPosition(placeholderPosition);
+        _stateMachine->ProcessString(L"\x1b_Ga=p,i=1,p=1,z=1,C=1;\x1b\\");
+        const auto physicalLayer = _pDispatch->_kittyPlacements.at({ 1u, 1u }).layerId;
+
+        auto reflowed = std::make_unique<TextBuffer>(til::size{ 5, 600 }, TextAttribute{}, 0, false, &_testGetSet->_renderer);
+        TextBuffer::Reflow(buffer, *reflowed);
+
+        auto foundPlaceholder = false;
+        auto foundPhysicalLayer = false;
+        for (auto y = 0; y < reflowed->GetSize().Height(); ++y)
+        {
+            const auto& row = reflowed->GetRowByOffset(y);
+            const auto* slice = row.GetImageSlice();
+            foundPhysicalLayer |= slice && slice->HasPlacement(physicalLayer);
+            for (auto x = 0; x < reflowed->GetSize().Width(); ++x)
+            {
+                if (const auto* reflowedMetadata = row.GetKittyPlaceholderCell(x))
+                {
+                    foundPlaceholder = true;
+                    VERIFY_ARE_EQUAL(0u, reflowedMetadata->layerId);
+                    VERIFY_IS_TRUE(slice == nullptr || !slice->HasPlacement(physicalLayer),
+                                   L"an unresolved placeholder must not wildcard-move another layer of the same image");
+                }
+            }
+        }
+
+        VERIFY_IS_TRUE(foundPlaceholder);
+        VERIFY_IS_TRUE(foundPhysicalLayer, L"the overlapping physical layer remains on the cloned source row");
     }
 
     TEST_METHOD(KittyGraphicsWideningReflowPreservesJoinedRowLayers)
@@ -8819,15 +8941,133 @@ public:
         _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,f=24,s=1,v=1,C=1;/wAA\x1b\\");
         _stateMachine->ProcessString(L"\x1b_Ga=f,i=1,f=24,s=1,v=1;AP8A\x1b\\");
 
+        _pDispatch->ResetMode(DispatchTypes::ModeParams::DECPCCM_PageCursorCouplingMode);
         _pDispatch->PagePositionAbsolute(2);
         _stateMachine->ProcessString(L"\x1b_Ga=a,i=1,c=2,s=1;\x1b\\");
+        auto* slice = firstPageBuffer.GetRowByOffset(origin.y).GetImageSlice();
+        VERIFY_IS_NOT_NULL(slice);
+        auto pixel = SlicePixelAt(slice, ImageSlice::RenderPosition::AboveText, origin.x - slice->ColumnOffset(), 0);
+        VERIFY_ARE_EQUAL(static_cast<BYTE>(255), pixel.rgbGreen, L"the visible page must animate while a decoupled background page is active");
+        VERIFY_ARE_EQUAL(static_cast<BYTE>(0), pixel.rgbRed);
         _pDispatch->PagePositionAbsolute(1);
 
-        const auto* slice = firstPageBuffer.GetRowByOffset(origin.y).GetImageSlice();
+        slice = firstPageBuffer.GetRowByOffset(origin.y).GetImageSlice();
         VERIFY_IS_NOT_NULL(slice);
-        const auto pixel = SlicePixelAt(slice, ImageSlice::RenderPosition::AboveText, origin.x - slice->ColumnOffset(), 0);
+        pixel = SlicePixelAt(slice, ImageSlice::RenderPosition::AboveText, origin.x - slice->ColumnOffset(), 0);
         VERIFY_ARE_EQUAL(static_cast<BYTE>(255), pixel.rgbGreen, L"reactivating a page must refresh it to the animation's current frame");
         VERIFY_ARE_EQUAL(static_cast<BYTE>(0), pixel.rgbRed);
+    }
+
+    TEST_METHOD(KittyAnimationStateIsIsolatedFromAlternateBuffer)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1b_Ga=t,i=1,f=24,s=1,v=1;/wAA\x1b\\");
+        _stateMachine->ProcessString(L"\x1b_Ga=f,i=1,f=24,s=1,v=1;AP8A\x1b\\");
+        _stateMachine->ProcessString(L"\x1b_Ga=a,i=1,c=2,s=1;\x1b\\");
+        VERIFY_ARE_EQUAL(static_cast<size_t>(1), _pDispatch->_kittyImages.at(1).animationFrames.size());
+        VERIFY_ARE_EQUAL(2u, _pDispatch->_kittyImages.at(1).presentedFrame);
+
+        _pDispatch->_SetAlternateScreenBufferMode(true);
+        VERIFY_IS_TRUE(_pDispatch->_kittyImages.empty(), L"the alternate buffer starts with isolated graphics state");
+        _stateMachine->ProcessString(L"\x1b_Ga=t,i=1,f=24,s=1,v=1;AAD/\x1b\\");
+        VERIFY_ARE_EQUAL(static_cast<size_t>(0), _pDispatch->_kittyImages.at(1).animationFrames.size());
+        VERIFY_ARE_EQUAL(static_cast<BYTE>(255), _pDispatch->_kittyImages.at(1).pixels.front().rgbBlue);
+
+        _pDispatch->_SetAlternateScreenBufferMode(false);
+        const auto& restored = _pDispatch->_kittyImages.at(1);
+        VERIFY_ARE_EQUAL(static_cast<size_t>(1), restored.animationFrames.size());
+        VERIFY_ARE_EQUAL(2u, restored.currentFrame);
+        VERIFY_ARE_EQUAL(2u, restored.presentedFrame);
+        VERIFY_ARE_EQUAL(static_cast<BYTE>(255), restored.animationFrames.front().pixels.front().rgbGreen);
+    }
+
+    TEST_METHOD(KittyGraphicsImageAdmissionIsTransactionalAcrossBuffers)
+    {
+        _testGetSet->PrepData();
+        _pDispatch->_kittyMainBufferState.emplace();
+        _pDispatch->_kittyMainBufferState->totalPixelBytes = AdaptDispatch::MaxKittyTotalBytes - sizeof(RGBQUAD);
+
+        AdaptDispatch::KittyImage existing;
+        existing.pixels.resize(1);
+        VERIFY_IS_TRUE(_pDispatch->_registerKittyImage(1, std::move(existing)));
+
+        AdaptDispatch::KittyImage rejected;
+        rejected.pixels.resize(2);
+        VERIFY_IS_FALSE(_pDispatch->_registerKittyImage(2, std::move(rejected)));
+        VERIFY_ARE_EQUAL(static_cast<size_t>(1), _pDispatch->_kittyImages.size());
+        VERIFY_IS_TRUE(_pDispatch->_kittyImages.contains(1), L"a rejected image must not evict an existing alternate-buffer image");
+        VERIFY_ARE_EQUAL(sizeof(RGBQUAD), _pDispatch->_kittyTotalPixelBytes);
+    }
+
+    TEST_METHOD(KittyAnimationUnplacedImageDoesNotInvalidateRetainedLayers)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        auto& buffer = *_testGetSet->_textBuffer;
+        const auto origin = buffer.GetCursor().GetPosition();
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,f=24,s=1,v=1,C=1;/wAA\x1b\\");
+        const auto* slice = buffer.GetRowByOffset(origin.y).GetImageSlice();
+        VERIFY_IS_NOT_NULL(slice);
+        const auto revision = slice->Revision();
+
+        _stateMachine->ProcessString(L"\x1b_Ga=t,i=2,f=24,s=1,v=1;/wAA\x1b\\");
+        _stateMachine->ProcessString(L"\x1b_Ga=f,i=2,f=24,s=1,v=1,z=1;AP8A\x1b\\");
+        _stateMachine->ProcessString(L"\x1b_Ga=a,i=2,r=1,z=1,c=1,s=3;\x1b\\");
+        auto& image = _pDispatch->_kittyImages.at(2);
+        VERIFY_IS_TRUE(_pDispatch->_advanceKittyImage(2, image, std::chrono::steady_clock::now()));
+
+        slice = buffer.GetRowByOffset(origin.y).GetImageSlice();
+        VERIFY_IS_NOT_NULL(slice);
+        VERIFY_ARE_EQUAL(revision, slice->Revision(), L"an animation with no rendered placements must not scan or invalidate unrelated retained layers");
+    }
+
+    TEST_METHOD(KittyAnimationClearsRenderedHintAfterLastLayerIsErased)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        auto& buffer = *_testGetSet->_textBuffer;
+        const auto origin = buffer.GetCursor().GetPosition();
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,f=24,s=1,v=1,C=1;/wAA\x1b\\");
+        _stateMachine->ProcessString(L"\x1b_Ga=f,i=1,f=24,s=1,v=1,z=1;AP8A\x1b\\");
+        _stateMachine->ProcessString(L"\x1b_Ga=a,i=1,r=1,z=1,c=1,s=3;\x1b\\");
+        auto& image = _pDispatch->_kittyImages.at(1);
+        VERIFY_IS_TRUE(image.hasRenderedPlacements);
+
+        buffer.GetMutableRowByOffset(origin.y).SetImageSlice(nullptr);
+        VERIFY_IS_TRUE(_pDispatch->_advanceKittyImage(1, image, std::chrono::steady_clock::now()));
+        VERIFY_IS_FALSE(image.hasRenderedPlacements, L"the first empty scan must disable future full-page animation scans");
+    }
+
+    TEST_METHOD(KittyAnimationRefreshKeepsLastPresentedGaplessFrame)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        auto& buffer = *_testGetSet->_textBuffer;
+        const auto origin = buffer.GetCursor().GetPosition();
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,f=24,s=1,v=1,C=1;/wAA\x1b\\");
+        _stateMachine->ProcessString(L"\x1b_Ga=f,i=1,f=24,s=1,v=1,z=-1;AP8A\x1b\\");
+        _stateMachine->ProcessString(L"\x1b_Ga=a,i=1,r=1,z=1,c=1,s=2;\x1b\\");
+
+        auto& image = _pDispatch->_kittyImages.at(1);
+        VERIFY_IS_FALSE(_pDispatch->_advanceKittyImage(1, image, std::chrono::steady_clock::now()));
+        VERIFY_IS_TRUE(image.waitingForFrames);
+        VERIFY_ARE_EQUAL(2u, image.currentFrame);
+        VERIFY_ARE_EQUAL(1u, image.presentedFrame);
+        _pDispatch->RefreshKittyImageLayers();
+
+        const auto* slice = buffer.GetRowByOffset(origin.y).GetImageSlice();
+        VERIFY_IS_NOT_NULL(slice);
+        const auto pixel = SlicePixelAt(slice, ImageSlice::RenderPosition::AboveText, origin.x - slice->ColumnOffset(), 0);
+        VERIFY_ARE_EQUAL(static_cast<BYTE>(255), pixel.rgbRed, L"lifecycle refresh must restore the last presented frame");
+        VERIFY_ARE_EQUAL(static_cast<BYTE>(0), pixel.rgbGreen, L"a skipped gapless frame must remain hidden");
+
+        _stateMachine->ProcessString(L"\x1b_Ga=a,i=1,r=2,z=20;\x1b\\");
+        VERIFY_ARE_EQUAL(2u, image.presentedFrame, L"giving the skipped current frame a duration must present it before scheduling");
+        slice = buffer.GetRowByOffset(origin.y).GetImageSlice();
+        VERIFY_IS_NOT_NULL(slice);
+        const auto resumedPixel = SlicePixelAt(slice, ImageSlice::RenderPosition::AboveText, origin.x - slice->ColumnOffset(), 0);
+        VERIFY_ARE_EQUAL(static_cast<BYTE>(255), resumedPixel.rgbGreen);
+        VERIFY_ARE_EQUAL(static_cast<BYTE>(0), resumedPixel.rgbRed);
     }
 
     TEST_METHOD(KittyAnimationNewPlacementsUseCurrentFrame)
@@ -9183,6 +9423,26 @@ public:
         VERIFY_ARE_EQUAL(static_cast<size_t>(0), _pDispatch->_kittyImages.count(2), L"its relative child cascades instead of becoming orphaned");
         VERIFY_IS_TRUE(_pDispatch->_kittyPlacements.empty());
         _pDispatch->_kittyTotalPixelBytes = _pDispatch->_kittyImages.at(3).PixelBytes();
+    }
+
+    TEST_METHOD(KittyGraphicsQuotaEvictionCascadesRelativeChildren)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,p=1,f=24,s=1,v=1,C=1;/wAA\x1b\\");
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=2,p=1,P=1,Q=1,H=1,f=24,s=1,v=1,C=1;AP8A\x1b\\");
+        for (auto id = 3u; id <= AdaptDispatch::MaxKittyImages; ++id)
+        {
+            _pDispatch->_kittyImages.emplace(id, AdaptDispatch::KittyImage{});
+            _pDispatch->_kittyImageOrder.push_back(id);
+        }
+        VERIFY_ARE_EQUAL(AdaptDispatch::MaxKittyImages, _pDispatch->_kittyImages.size());
+
+        VERIFY_IS_TRUE(_pDispatch->_registerKittyImage(AdaptDispatch::MaxKittyImages + 1, AdaptDispatch::KittyImage{}));
+        VERIFY_ARE_EQUAL(static_cast<size_t>(0), _pDispatch->_kittyImages.count(1), L"the oldest parent is evicted");
+        VERIFY_ARE_EQUAL(static_cast<size_t>(0), _pDispatch->_kittyImages.count(2), L"normal admission cascades its relative child");
+        VERIFY_IS_TRUE(_pDispatch->_kittyPlacements.empty());
+        VERIFY_ARE_EQUAL(AdaptDispatch::MaxKittyImages - 1, _pDispatch->_kittyImages.size());
     }
 
     TEST_METHOD(KittyAnimationFailedAppendDoesNotEvictTargetAncestor)

@@ -1744,7 +1744,7 @@ void AdaptDispatch::PrecedingPage(const VTInt pageCount)
 void AdaptDispatch::PagePositionAbsolute(const VTInt page)
 {
     _pages.MoveTo(page, _modes.test(Mode::PageCursorCoupling));
-    _refreshKittyImageLayers();
+    RefreshKittyImageLayers();
 }
 
 // Routine Description:
@@ -1755,7 +1755,7 @@ void AdaptDispatch::PagePositionAbsolute(const VTInt page)
 void AdaptDispatch::PagePositionRelative(const VTInt pageCount)
 {
     _pages.MoveRelative(pageCount, _modes.test(Mode::PageCursorCoupling));
-    _refreshKittyImageLayers();
+    RefreshKittyImageLayers();
 }
 
 // Routine Description:
@@ -1766,7 +1766,7 @@ void AdaptDispatch::PagePositionRelative(const VTInt pageCount)
 void AdaptDispatch::PagePositionBack(const VTInt pageCount)
 {
     _pages.MoveRelative(-pageCount, _modes.test(Mode::PageCursorCoupling));
-    _refreshKittyImageLayers();
+    RefreshKittyImageLayers();
 }
 
 // Routine Description:
@@ -1818,20 +1818,35 @@ void AdaptDispatch::_SetColumnMode(const bool enable)
 // - <none>
 void AdaptDispatch::_SetAlternateScreenBufferMode(const bool enable)
 {
+    if (enable == _usingAltBuffer)
+    {
+        return;
+    }
+
     if (enable)
     {
         CursorSaveState();
+        _kittyMainBufferState.emplace(_takeKittyBufferState());
+        _clearKittyChunk();
         const auto page = _pages.ActivePage();
         _api.UseAlternateScreenBuffer(_GetEraseAttributes(page));
         _usingAltBuffer = true;
-        _refreshKittyImageLayers();
+        _scheduleKittyAnimationTimer();
     }
     else
     {
+        _clearKittyImages();
+        _clearKittyChunk();
         _api.UseMainScreenBuffer();
         _usingAltBuffer = false;
+        if (_kittyMainBufferState)
+        {
+            auto state = std::move(*_kittyMainBufferState);
+            _kittyMainBufferState.reset();
+            _restoreKittyBufferState(std::move(state));
+        }
         CursorRestoreState();
-        _refreshKittyImageLayers();
+        RefreshKittyImageLayers();
     }
 }
 
@@ -3124,8 +3139,7 @@ void AdaptDispatch::HardReset(bool erase)
     // If in the alt buffer, switch back to main before doing anything else.
     if (_usingAltBuffer)
     {
-        _api.UseMainScreenBuffer();
-        _usingAltBuffer = false;
+        _SetAlternateScreenBufferMode(false);
     }
 
     // Reset all page buffers.
@@ -3136,6 +3150,7 @@ void AdaptDispatch::HardReset(bool erase)
 
     // Reset the Kitty graphics image registry.
     _clearKittyImages();
+    _kittyMainBufferState.reset();
     _clearKittyChunk();
 
     // Completely reset the TerminalOutput state.
@@ -5292,16 +5307,6 @@ void AdaptDispatch::_ProcessKittyCommand(const KittyControl& command, const std:
                 priorPlacement = existing->second;
             }
         }
-        else
-        {
-            const auto existing = std::find_if(_kittyAnonymousPlacements.begin(), _kittyAnonymousPlacements.end(), [&](const auto& placement) {
-                return placement.isVirtual && placement.imageId == targetImageId;
-            });
-            if (existing != _kittyAnonymousPlacements.end())
-            {
-                priorPlacement = *existing;
-            }
-        }
         const auto priorAnchor = priorPlacement ?
                                      (priorPlacement->isVirtual ?
                                           _deriveVirtualPlacementAnchor(targetImageId, placementId) :
@@ -5674,11 +5679,12 @@ void AdaptDispatch::_ProcessKittyCommand(const KittyControl& command, const std:
                     }
                 }
                 assignedId = haveId ? imageId : _kittyAssignImageId();
-                _eraseKittyImageRows(assignedId);
-                // Re-transmitting an id replaces its pixels, so its prior placements are stale:
-                // drop them (and cascade to any relative children) before re-registering.
-                _eraseKittyPlacementsForImage(assignedId);
-                _registerKittyImage(assignedId, std::move(image));
+                if (!_registerKittyImage(assignedId, std::move(image)))
+                {
+                    success = false;
+                    code = L"ENOSPC:image storage limit exceeded";
+                    break;
+                }
                 if (command.virtualPlacement)
                 {
                     if (command.haveParent)
@@ -5808,14 +5814,13 @@ void AdaptDispatch::_ProcessKittyCommand(const KittyControl& command, const std:
         {
             // Lowercase d= selectors delete placements + on-screen pixels but KEEP the image data
             // (so a later a=p re-displays without re-transmitting); the UPPERCASE variant also frees
-            // the image data once the image has no placements left. (d=a/d=A keep the current
-            // clear-all behavior regardless; their virtual-placement nuances are tracked separately.)
+            // the image data once the image has no placements left.
             const auto freeData = (deleteTarget >= L'A' && deleteTarget <= L'Z');
             switch (deleteTarget)
             {
             case L'a': // all images (the default when d= is omitted)
             case L'A':
-                _clearKittyImages();
+                _deleteAllKittyPlacements(freeData);
                 break;
             case L'i': // by image id
             case L'I':
@@ -6076,12 +6081,49 @@ uint32_t AdaptDispatch::_kittyAssignImageId()
 // Registers (or replaces) an image id, optionally cross-referenced by number.
 // The registry is bounded; the oldest entry is evicted past MaxKittyImages. The
 // reverse number->id map is kept consistent when an id's number changes.
-void AdaptDispatch::_registerKittyImage(const uint32_t id, KittyImage&& image)
+bool AdaptDispatch::_registerKittyImage(const uint32_t id, KittyImage&& image)
 {
     const auto number = image.number;
     const auto newBytes = image.PixelBytes();
-    // Replacing an existing id: erase it first so the byte total, reverse number map,
-    // and LRU order stay consistent, then re-add it at the most-recent position.
+    const auto existing = _kittyImages.find(id);
+    const auto existingBytes = existing != _kittyImages.end() ? existing->second.PixelBytes() : size_t{ 0 };
+    const auto retainedBytes = _kittyMainBufferState ? _kittyMainBufferState->totalPixelBytes : size_t{ 0 };
+    auto projectedBytes = retainedBytes + (_kittyTotalPixelBytes - existingBytes) + newBytes;
+    auto projectedCount = _kittyImages.size() - (existing != _kittyImages.end() ? 1 : 0) + 1;
+    std::vector<uint32_t> victims;
+    for (const auto candidateId : _kittyImageOrder)
+    {
+        if (projectedBytes <= MaxKittyTotalBytes && projectedCount <= MaxKittyImages)
+        {
+            break;
+        }
+        if (candidateId == id)
+        {
+            continue;
+        }
+        const auto candidate = _kittyImages.find(candidateId);
+        if (candidate != _kittyImages.end())
+        {
+            projectedBytes -= candidate->second.PixelBytes();
+            --projectedCount;
+            victims.push_back(candidateId);
+        }
+    }
+    if (projectedBytes > MaxKittyTotalBytes || projectedCount > MaxKittyImages)
+    {
+        return false;
+    }
+
+    for (const auto victimId : victims)
+    {
+        _eraseKittyPlacementsForImage(victimId);
+        _eraseKittyImageRows(victimId);
+        _eraseKittyImage(victimId);
+    }
+
+    // Re-transmitting an id replaces its pixels and invalidates all prior placements.
+    _eraseKittyImageRows(id);
+    _eraseKittyPlacementsForImage(id);
     _eraseKittyImage(id);
     _kittyImageOrder.push_back(id);
     _kittyImages[id] = std::move(image);
@@ -6091,15 +6133,7 @@ void AdaptDispatch::_registerKittyImage(const uint32_t id, KittyImage&& image)
         _kittyImageNumbers[number] = id;
     }
 
-    // Evict the oldest images until within both the count and memory budgets,
-    // always keeping the image we just added.
-    while (_kittyImageOrder.size() > 1 &&
-           (_kittyImageOrder.size() > MaxKittyImages || _kittyTotalPixelBytes > MaxKittyTotalBytes))
-    {
-        const auto evictedId = _kittyImageOrder.front();
-        _eraseKittyImageRows(evictedId); // un-draw the evicted image's on-screen pixels (no orphaned ghost)
-        _eraseKittyImage(evictedId);
-    }
+    return true;
 }
 
 // Removes an image id and any number/order references to it.
@@ -6208,6 +6242,46 @@ try
 }
 catch (...)
 {
+}
+
+AdaptDispatch::KittyBufferState AdaptDispatch::_takeKittyBufferState() noexcept
+{
+    KittyBufferState state;
+    state.nextImageId = std::exchange(_kittyNextImageId, 1);
+    state.nextLayerId = std::exchange(_kittyNextLayerId, 1);
+    state.totalPixelBytes = std::exchange(_kittyTotalPixelBytes, 0);
+    state.images = std::move(_kittyImages);
+    state.imageNumbers = std::move(_kittyImageNumbers);
+    state.imageOrder = std::move(_kittyImageOrder);
+    state.virtualIds = std::move(_kittyVirtualIds);
+    state.placements = std::move(_kittyPlacements);
+    state.anonymousPlacements = std::move(_kittyAnonymousPlacements);
+    _kittyImages.clear();
+    _kittyImageNumbers.clear();
+    _kittyImageOrder.clear();
+    _kittyVirtualIds.clear();
+    _kittyPlacements.clear();
+    _kittyAnonymousPlacements.clear();
+    return state;
+}
+
+void AdaptDispatch::_restoreKittyBufferState(KittyBufferState&& state) noexcept
+{
+    _kittyNextImageId = state.nextImageId;
+    _kittyNextLayerId = state.nextLayerId;
+    _kittyTotalPixelBytes = state.totalPixelBytes;
+    _kittyImages = std::move(state.images);
+    _kittyImageNumbers = std::move(state.imageNumbers);
+    _kittyImageOrder = std::move(state.imageOrder);
+    _kittyVirtualIds = std::move(state.virtualIds);
+    _kittyPlacements = std::move(state.placements);
+    _kittyAnonymousPlacements = std::move(state.anonymousPlacements);
+}
+
+size_t AdaptDispatch::_kittyRetainedPixelBytes() const noexcept
+{
+    const auto retained = _kittyMainBufferState ? _kittyMainBufferState->totalPixelBytes : size_t{ 0 };
+    return _kittyTotalPixelBytes > SIZE_MAX - retained ? SIZE_MAX : _kittyTotalPixelBytes + retained;
 }
 
 // Discards any in-progress chunked transmission, releasing its payload buffer.
@@ -6326,26 +6400,44 @@ int32_t* AdaptDispatch::_kittyFrameGap(KittyImage& image, const uint32_t frameNu
 
 void AdaptDispatch::_updateKittyImageLayers(const uint32_t imageId, const std::span<const RGBQUAD> pixels)
 {
-    auto page = _pages.ActivePage();
-    auto& buffer = page.Buffer();
-    auto firstRow = page.Bottom();
-    auto lastRow = 0;
-    for (auto row = 0; row < page.Bottom(); ++row)
+    const auto image = _kittyImages.find(imageId);
+    if (image == _kittyImages.end() || !image->second.hasRenderedPlacements)
     {
-        auto* slice = buffer.GetMutableRowByOffset(row).GetMutableImageSlice();
-        if (slice && slice->UpdateKittyImage(imageId, pixels))
-        {
-            firstRow = std::min(firstRow, row);
-            lastRow = std::max(lastRow, row);
-        }
+        return;
     }
-    if (firstRow <= lastRow)
+
+    const auto visiblePageNumber = _pages.VisiblePage().Number();
+    auto foundLayer = false;
+    _pages.ForEachPage([&](const Page page) {
+        auto& buffer = page.Buffer();
+        auto firstRow = page.Bottom();
+        auto lastRow = 0;
+        for (auto row = 0; row < page.Bottom(); ++row)
+        {
+            const auto* slice = buffer.GetRowByOffset(row).GetImageSlice();
+            if (slice && slice->HasOwner(imageId))
+            {
+                foundLayer = true;
+                auto* mutableSlice = buffer.GetMutableRowByOffset(row).GetMutableImageSlice();
+                if (mutableSlice->UpdateKittyImage(imageId, pixels))
+                {
+                    firstRow = std::min(firstRow, row);
+                    lastRow = std::max(lastRow, row);
+                }
+            }
+        }
+        if (page.Number() == visiblePageNumber && firstRow <= lastRow)
+        {
+            buffer.TriggerRedraw(Viewport::FromExclusive({ 0, firstRow, page.Width(), lastRow + 1 }));
+        }
+    });
+    if (!foundLayer)
     {
-        buffer.TriggerRedraw(Viewport::FromExclusive({ 0, firstRow, page.Width(), lastRow + 1 }));
+        image->second.hasRenderedPlacements = false;
     }
 }
 
-void AdaptDispatch::_refreshKittyImageLayers()
+void AdaptDispatch::RefreshKittyImageLayers()
 {
     for (const auto& [imageId, image] : _kittyImages)
     {
@@ -6353,11 +6445,12 @@ void AdaptDispatch::_refreshKittyImageLayers()
         {
             continue;
         }
-        if (const auto pixels = _kittyFramePixels(image, image.currentFrame))
+        if (const auto pixels = _kittyFramePixels(image, image.presentedFrame))
         {
             _updateKittyImageLayers(imageId, *pixels);
         }
     }
+    _scheduleKittyAnimationTimer();
 }
 
 bool AdaptDispatch::_processKittyAnimationFrame(const KittyControl& command, const std::string_view payload, const bool payloadValid, const bool payloadTooLarge, const uint32_t imageId, std::wstring_view& code)
@@ -6497,8 +6590,9 @@ try
             }
         }
 
-        const auto requiredBytes = _kittyTotalPixelBytes > MaxKittyTotalBytes - frameBytes ?
-                                       _kittyTotalPixelBytes - (MaxKittyTotalBytes - frameBytes) :
+        const auto retainedBytes = _kittyRetainedPixelBytes();
+        const auto requiredBytes = retainedBytes > MaxKittyTotalBytes - frameBytes ?
+                                       retainedBytes - (MaxKittyTotalBytes - frameBytes) :
                                        size_t{ 0 };
         auto reclaimableBytes = size_t{ 0 };
         if (requiredBytes != 0)
@@ -6592,7 +6686,7 @@ try
         changedFrame = gsl::narrow_cast<uint32_t>(_kittyFrameCount(storedImage));
     }
 
-    if (storedImage.currentFrame == changedFrame)
+    if (storedImage.presentedFrame == changedFrame)
     {
         _updateKittyImageLayers(imageId, *_kittyFramePixels(storedImage, changedFrame));
     }
@@ -6646,6 +6740,7 @@ bool AdaptDispatch::_processKittyAnimationControl(const KittyControl& command, c
     if (command.cols != 0)
     {
         image.currentFrame = command.cols;
+        image.presentedFrame = image.currentFrame;
         _updateKittyImageLayers(imageId, *_kittyFramePixels(image, image.currentFrame));
         reschedule = true;
     }
@@ -6748,7 +6843,7 @@ try
                               std::span{ sourcePixels }.subspan(static_cast<size_t>(row) * width, width),
                               command.noCursorMovement);
     }
-    if (image.currentFrame == destinationFrame)
+    if (image.presentedFrame == destinationFrame)
     {
         _updateKittyImageLayers(imageId, *destination);
     }
@@ -6777,6 +6872,11 @@ void AdaptDispatch::_scheduleKittyAnimation(const uint32_t imageId, KittyImage& 
     if (*gap > 0)
     {
         image.waitingForFrames = false;
+        if (image.presentedFrame != image.currentFrame)
+        {
+            image.presentedFrame = image.currentFrame;
+            _updateKittyImageLayers(imageId, *_kittyFramePixels(image, image.presentedFrame));
+        }
         image.nextFrameTime = now + std::chrono::milliseconds(*gap);
     }
     else
@@ -6835,6 +6935,7 @@ bool AdaptDispatch::_advanceKittyImage(const uint32_t imageId, KittyImage& image
         if (gap && *gap > 0)
         {
             image.waitingForFrames = false;
+            image.presentedFrame = image.currentFrame;
             _updateKittyImageLayers(imageId, *_kittyFramePixels(image, image.currentFrame));
             image.nextFrameTime = now + std::chrono::milliseconds(*gap);
             return true;
@@ -6938,6 +7039,14 @@ void AdaptDispatch::_deleteKittyAnimationFrames(const uint32_t imageId, const ui
     {
         image.currentFrame = std::min(frameNumber, remaining);
     }
+    if (image.presentedFrame > frameNumber)
+    {
+        --image.presentedFrame;
+    }
+    else if (image.presentedFrame == frameNumber)
+    {
+        image.presentedFrame = std::min(frameNumber, remaining);
+    }
 
     if (remaining == 1)
     {
@@ -6945,7 +7054,7 @@ void AdaptDispatch::_deleteKittyAnimationFrames(const uint32_t imageId, const ui
         image.waitingForFrames = false;
         image.nextFrameTime = {};
     }
-    _updateKittyImageLayers(imageId, *_kittyFramePixels(image, image.currentFrame));
+    _updateKittyImageLayers(imageId, *_kittyFramePixels(image, image.presentedFrame));
 
     if (freeData && remaining == 1)
     {
@@ -7026,7 +7135,7 @@ bool AdaptDispatch::_kittyPlacementFitsMemory(const KittyImage& image, const uin
 // Protocol: https://sw.kovidgoyal.net/kitty/graphics-protocol/#controlling-displayed-image-layout
 til::size AdaptDispatch::_placeKittyImage(const KittyImage& image, const bool moveCursor, const uint32_t imageId, const uint64_t layerId, const uint32_t cols, const uint32_t rows, const uint32_t srcX, const uint32_t srcY, const uint32_t srcW, const uint32_t srcH, const uint32_t cellOffsetX, const uint32_t cellOffsetY, const int32_t zIndex, const std::optional<til::point> anchor)
 {
-    const auto framePixels = _kittyFramePixels(image, image.currentFrame);
+    const auto framePixels = _kittyFramePixels(image, image.presentedFrame);
     if (!framePixels || framePixels->empty() || image.width == 0 || image.height == 0)
     {
         return {};
@@ -7180,6 +7289,10 @@ til::size AdaptDispatch::_placeKittyImage(const KittyImage& image, const bool mo
     // placement's extent and later erase exactly these cells by rectangle.
     const auto drawnColumns = columnEnd - columnBegin;
     const auto drawnRows = std::max(0, std::min(origin.y + rowSpan, page.Bottom()) - origin.y);
+    if (drawnColumns > 0 && drawnRows > 0)
+    {
+        _kittyImages.at(imageId).hasRenderedPlacements = true;
+    }
     return { drawnColumns, drawnRows };
 }
 
@@ -7600,6 +7713,28 @@ bool AdaptDispatch::_kittyImageHasPlacements(const uint32_t id) const noexcept
     return false;
 }
 
+bool AdaptDispatch::_kittyImageHasRenderedLayers(const uint32_t id) const
+{
+    auto found = false;
+    _pages.ForEachPage([&](const Page page) {
+        if (found)
+        {
+            return;
+        }
+        const auto& buffer = page.Buffer();
+        for (auto row = 0; row < page.Bottom(); ++row)
+        {
+            const auto* slice = buffer.GetRowByOffset(row).GetImageSlice();
+            if (slice && slice->HasOwner(id))
+            {
+                found = true;
+                return;
+            }
+        }
+    });
+    return found;
+}
+
 // Cascade-deletes the relative children of every placement key in `removed`, iterating to a
 // fixed point. For each removed (imageId, placementId): registered children positioned relative
 // to it are erased (own cells + registry entry) and themselves enqueued; anonymous (id-less,
@@ -7692,14 +7827,73 @@ void AdaptDispatch::_deleteKittyPlacement(const uint32_t imageId, const uint32_t
     _cascadeKittyPlacementChildren(removed, freeData ? 0 : imageId);
 }
 
-// Deletes every NON-VIRTUAL image with at least one on-screen cell inside the half-open cell
-// rect [left,right) x [top,bottom): erases all of the image's pixels, drops its placements
-// (cascading to relative children), and frees its data -- matching delete-by-id (d=i). Backs the
-// positional selectors d=c (cursor cell), d=p (cell x,y), d=x (column), d=y (row). Uses the
-// on-screen column-owner tags (the authoritative record: a plain a=T placement carries no tracked
-// extent, only owner tags). Per the kitty spec these selectors never affect virtual (U=1)
-// placeholder images -- those are manipulated as text -- so ids present in _kittyVirtualIds are
-// skipped.
+// Deletes every physical placement while leaving virtual placements (and the images rendered
+// through Unicode placeholder text) untouched. Lowercase d=a keeps reusable image data; uppercase
+// d=A additionally frees every image that no surviving virtual placement references.
+void AdaptDispatch::_deleteAllKittyPlacements(const bool freeData)
+{
+    std::vector<std::pair<uint32_t, uint32_t>> selectedPlacements;
+    for (const auto& [key, placement] : _kittyPlacements)
+    {
+        if (!placement.isVirtual)
+        {
+            selectedPlacements.push_back(key);
+        }
+    }
+
+    std::vector<std::pair<uint32_t, uint32_t>> selectedRoots;
+    for (const auto& key : selectedPlacements)
+    {
+        const auto& placement = _kittyPlacements.at(key);
+        const std::pair<uint32_t, uint32_t> parentKey{ placement.parentImageId, placement.parentPlacementId };
+        const auto parentIsSelected = placement.hasParent &&
+                                      std::find(selectedPlacements.begin(), selectedPlacements.end(), parentKey) != selectedPlacements.end();
+        if (!parentIsSelected)
+        {
+            selectedRoots.push_back(key);
+        }
+    }
+    for (const auto& key : selectedRoots)
+    {
+        _deleteKittyPlacement(key.first, key.second, false);
+    }
+
+    for (auto it = _kittyAnonymousPlacements.begin(); it != _kittyAnonymousPlacements.end();)
+    {
+        if (!it->isVirtual)
+        {
+            _eraseKittyPlacementCells(*it);
+            it = _kittyAnonymousPlacements.erase(it);
+        }
+        else
+        {
+            ++it;
+        }
+    }
+
+    if (freeData)
+    {
+        std::vector<uint32_t> unreferencedImages;
+        for (const auto& [imageId, image] : _kittyImages)
+        {
+            static_cast<void>(image);
+            if (!_kittyImageHasPlacements(imageId))
+            {
+                unreferencedImages.push_back(imageId);
+            }
+        }
+        for (const auto imageId : unreferencedImages)
+        {
+            _eraseKittyImage(imageId);
+            _eraseKittyImageRows(imageId);
+        }
+    }
+    _scheduleKittyAnimationTimer();
+}
+
+// Deletes every NON-VIRTUAL image with at least one physical placement inside the half-open cell
+// rect [left,right) x [top,bottom). Virtual placements of an affected image remain available to
+// placeholder text. Backs d=c (cursor cell), d=p (cell x,y), d=x (column), and d=y (row).
 // Protocol: https://sw.kovidgoyal.net/kitty/graphics-protocol/#deleting-images
 void AdaptDispatch::_deleteKittyImagesIntersecting(const til::CoordType left, const til::CoordType top, const til::CoordType right, const til::CoordType bottom, const bool freeData)
 {
@@ -7727,10 +7921,13 @@ void AdaptDispatch::_deleteKittyImagesIntersecting(const til::CoordType left, co
         {
             for (const auto id : slice->ColumnOwners(col))
             {
-                const auto hasVirtualPlacement = std::any_of(_kittyVirtualIds.begin(), _kittyVirtualIds.end(), [&](const auto& entry) {
-                    return entry.first.first == id;
+                const auto namedPhysicalPlacement = std::any_of(_kittyPlacements.begin(), _kittyPlacements.end(), [&](const auto& entry) {
+                    return entry.first.first == id && !entry.second.isVirtual && slice->PlacementCoversColumn(entry.second.layerId, col);
                 });
-                if (!hasVirtualPlacement && std::find(affected.begin(), affected.end(), id) == affected.end())
+                const auto anonymousPhysicalPlacement = std::any_of(_kittyAnonymousPlacements.begin(), _kittyAnonymousPlacements.end(), [&](const auto& placement) {
+                    return placement.imageId == id && !placement.isVirtual && slice->PlacementCoversColumn(placement.layerId, col);
+                });
+                if ((namedPhysicalPlacement || anonymousPhysicalPlacement) && std::find(affected.begin(), affected.end(), id) == affected.end())
                 {
                     affected.push_back(id);
                 }
@@ -7739,12 +7936,34 @@ void AdaptDispatch::_deleteKittyImagesIntersecting(const til::CoordType left, co
     }
     for (const auto id : affected)
     {
-        _eraseKittyPlacementsForImage(id);
-        if (freeData)
+        std::vector<std::pair<uint32_t, uint32_t>> namedPlacements;
+        for (const auto& [key, placement] : _kittyPlacements)
+        {
+            if (key.first == id && !placement.isVirtual)
+            {
+                namedPlacements.push_back(key);
+            }
+        }
+        for (const auto& key : namedPlacements)
+        {
+            _deleteKittyPlacement(key.first, key.second, false);
+        }
+        for (auto placement = _kittyAnonymousPlacements.begin(); placement != _kittyAnonymousPlacements.end();)
+        {
+            if (placement->imageId == id && !placement->isVirtual)
+            {
+                _eraseKittyPlacementCells(*placement);
+                placement = _kittyAnonymousPlacements.erase(placement);
+            }
+            else
+            {
+                ++placement;
+            }
+        }
+        if (freeData && !_kittyImageHasPlacements(id))
         {
             _eraseKittyImage(id);
         }
-        _eraseKittyImageRows(id);
     }
 }
 
@@ -8187,7 +8406,7 @@ int AdaptDispatch::_KittyPlaceholderDiacriticIndex(const char32_t ch) noexcept
 // redraw (the caller batches one bounded redraw per segment). Returns true if a tile was drawn.
 bool AdaptDispatch::_placeKittyPlaceholderCell(const KittyImage& image, const uint32_t imageId, const til::CoordType column, const til::CoordType row, const uint32_t cellRow, const uint32_t cellCol, const KittyVirtualPlacement& place)
 {
-    const auto framePixels = _kittyFramePixels(image, image.currentFrame);
+    const auto framePixels = _kittyFramePixels(image, image.presentedFrame);
     if (!framePixels || framePixels->empty() || image.width == 0 || image.height == 0)
     {
         return false;
@@ -8384,13 +8603,6 @@ void AdaptDispatch::_renderKittyPlaceholders(const std::wstring_view segment, co
                     }
                 }
 
-                row.SetKittyPlaceholderCell(column, KittyPlaceholderCell{
-                                                           .column = cellCol,
-                                                           .row = gsl::narrow_cast<uint16_t>(cellRow),
-                                                           .imageIdHighByte = highByte,
-                                                           .valid = true,
-                                                       });
-
                 // Compose the effective id only after resolving an omitted high byte from the
                 // left cell. A non-zero byte selects a >24-bit image; a missing image/placement
                 // draws nothing but the resolved cell metadata remains available to its right.
@@ -8398,11 +8610,20 @@ void AdaptDispatch::_renderKittyPlaceholders(const std::wstring_view segment, co
                 const auto placementId = colorId(attributes.GetUnderlineColor());
                 const auto placement = _kittyVirtualIds.find({ imageId, placementId });
                 const auto imageEntry = _kittyImages.find(imageId);
+                const auto layerId = placement != _kittyVirtualIds.end() ? placement->second.layerId : 0;
+                row.SetKittyPlaceholderCell(column, KittyPlaceholderCell{
+                                                           .column = cellCol,
+                                                           .layerId = layerId,
+                                                           .row = gsl::narrow_cast<uint16_t>(cellRow),
+                                                           .imageIdHighByte = highByte,
+                                                           .valid = true,
+                                                       });
                 if (placement != _kittyVirtualIds.end() && imageEntry != _kittyImages.end())
                 {
                     const auto& place = placement->second;
                     if (_placeKittyPlaceholderCell(imageEntry->second, imageId, column, screenRow, cellRow, cellCol, place))
                     {
+                        imageEntry->second.hasRenderedPlacements = true;
                         firstDrawnCol = std::min(firstDrawnCol, column);
                         lastDrawnCol = std::max(lastDrawnCol, column);
                     }
@@ -8433,28 +8654,35 @@ void AdaptDispatch::_eraseKittyImageRows(const uint32_t imageId)
     {
         return;
     }
-    auto page = _pages.ActivePage();
-    auto& buffer = page.Buffer();
-    auto firstRow = page.Bottom();
-    auto lastRow = 0;
-    for (auto row = 0; row < page.Bottom(); ++row)
-    {
-        auto& dstRow = buffer.GetMutableRowByOffset(row);
-        const auto slice = dstRow.GetMutableImageSlice();
-        if (slice && slice->HasOwner(imageId))
+    const auto visiblePageNumber = _pages.VisiblePage().Number();
+    _pages.ForEachPage([&](const Page page) {
+        auto& buffer = page.Buffer();
+        auto firstRow = page.Bottom();
+        auto lastRow = 0;
+        for (auto row = 0; row < page.Bottom(); ++row)
         {
-            // Clear only the columns this image owns; co-resident pixels stay put.
-            if (slice->EraseByOwner(imageId))
+            const auto* slice = buffer.GetRowByOffset(row).GetImageSlice();
+            if (slice && slice->HasOwner(imageId))
             {
-                dstRow.SetImageSlice(nullptr);
+                auto& dstRow = buffer.GetMutableRowByOffset(row);
+                auto* mutableSlice = dstRow.GetMutableImageSlice();
+                // Clear only the columns this image owns; co-resident pixels stay put.
+                if (mutableSlice->EraseByOwner(imageId))
+                {
+                    dstRow.SetImageSlice(nullptr);
+                }
+                firstRow = std::min(firstRow, row);
+                lastRow = std::max(lastRow, row);
             }
-            firstRow = std::min(firstRow, row);
-            lastRow = std::max(lastRow, row);
         }
-    }
-    if (firstRow <= lastRow)
+        if (page.Number() == visiblePageNumber && firstRow <= lastRow)
+        {
+            buffer.TriggerRedraw(Viewport::FromExclusive({ 0, firstRow, page.Width(), lastRow + 1 }));
+        }
+    });
+    if (const auto image = _kittyImages.find(imageId); image != _kittyImages.end())
     {
-        buffer.TriggerRedraw(Viewport::FromExclusive({ 0, firstRow, page.Width(), lastRow + 1 }));
+        image->second.hasRenderedPlacements = false;
     }
 }
 
@@ -8467,27 +8695,34 @@ void AdaptDispatch::_eraseKittyPlacementCells(const KittyPlacement& placement)
     {
         return;
     }
-    auto page = _pages.ActivePage();
-    auto& buffer = page.Buffer();
-    auto firstRow = page.Bottom();
-    auto lastRow = 0;
-    for (auto row = 0; row < page.Bottom(); ++row)
-    {
-        auto& dstRow = buffer.GetMutableRowByOffset(row);
-        const auto slice = dstRow.GetMutableImageSlice();
-        if (slice && slice->HasPlacement(placement.layerId))
+    const auto visiblePageNumber = _pages.VisiblePage().Number();
+    _pages.ForEachPage([&](const Page page) {
+        auto& buffer = page.Buffer();
+        auto firstRow = page.Bottom();
+        auto lastRow = 0;
+        for (auto row = 0; row < page.Bottom(); ++row)
         {
-            if (slice->EraseByPlacement(placement.layerId))
+            const auto* slice = buffer.GetRowByOffset(row).GetImageSlice();
+            if (slice && slice->HasPlacement(placement.layerId))
             {
-                dstRow.SetImageSlice(nullptr);
+                auto& dstRow = buffer.GetMutableRowByOffset(row);
+                auto* mutableSlice = dstRow.GetMutableImageSlice();
+                if (mutableSlice->EraseByPlacement(placement.layerId))
+                {
+                    dstRow.SetImageSlice(nullptr);
+                }
+                firstRow = std::min(firstRow, row);
+                lastRow = std::max(lastRow, row);
             }
-            firstRow = std::min(firstRow, row);
-            lastRow = std::max(lastRow, row);
         }
-    }
-    if (firstRow <= lastRow)
+        if (page.Number() == visiblePageNumber && firstRow <= lastRow)
+        {
+            buffer.TriggerRedraw(Viewport::FromExclusive({ 0, firstRow, page.Width(), lastRow + 1 }));
+        }
+    });
+    if (const auto image = _kittyImages.find(placement.imageId); image != _kittyImages.end())
     {
-        buffer.TriggerRedraw(Viewport::FromExclusive({ 0, firstRow, page.Width(), lastRow + 1 }));
+        image->second.hasRenderedPlacements = _kittyImageHasRenderedLayers(placement.imageId);
     }
 }
 

@@ -52,6 +52,12 @@ static uint32_t kittyPlaceholderImageId(const ROW& row, const til::CoordType col
     return low | (static_cast<uint32_t>(metadata->imageIdHighByte) << 24);
 }
 
+static uint64_t kittyPlaceholderLayerId(const ROW& row, const til::CoordType column) noexcept
+{
+    const auto metadata = row.GetKittyPlaceholderCell(column);
+    return metadata ? metadata->layerId : 0;
+}
+
 static std::atomic<uint64_t> s_lastMutationIdInitialValue;
 
 // Routine Description:
@@ -2771,6 +2777,7 @@ void TextBuffer::Reflow(TextBuffer& oldBuffer, TextBuffer& newBuffer, const View
         til::point source;
         til::point destination;
         uint32_t imageId = 0;
+        uint64_t layerId = 0;
     };
     std::vector<KittyImageMove> kittyImageMoves;
 
@@ -2906,7 +2913,11 @@ void TextBuffer::Reflow(TextBuffer& oldBuffer, TextBuffer& newBuffer, const View
                 {
                     if (oldRow.GetKittyPlaceholderCell(column))
                     {
-                        ImageSlice::EraseKittyCells(newRow, column, column + 1, kittyPlaceholderImageId(oldRow, column));
+                        const auto layerId = kittyPlaceholderLayerId(oldRow, column);
+                        if (layerId != 0)
+                        {
+                            ImageSlice::EraseKittyCells(newRow, column, column + 1, kittyPlaceholderImageId(oldRow, column), layerId);
+                        }
                     }
                 }
                 if (preservedSlice)
@@ -2919,11 +2930,16 @@ void TextBuffer::Reflow(TextBuffer& oldBuffer, TextBuffer& newBuffer, const View
             {
                 if (oldRow.GetKittyPlaceholderCell(sourceColumn))
                 {
-                    kittyImageMoves.push_back({
-                        .source = { sourceColumn, oldY },
-                        .destination = { newX + sourceColumn - oldX, newY },
-                        .imageId = kittyPlaceholderImageId(oldRow, sourceColumn),
-                    });
+                    const auto layerId = kittyPlaceholderLayerId(oldRow, sourceColumn);
+                    if (layerId != 0)
+                    {
+                        kittyImageMoves.push_back({
+                            .source = { sourceColumn, oldY },
+                            .destination = { newX + sourceColumn - oldX, newY },
+                            .imageId = kittyPlaceholderImageId(oldRow, sourceColumn),
+                            .layerId = layerId,
+                        });
+                    }
                 }
             }
 
@@ -2998,10 +3014,11 @@ void TextBuffer::Reflow(TextBuffer& oldBuffer, TextBuffer& newBuffer, const View
     {
         auto& destinationRow = newBuffer.GetMutableRowByOffset(move.destination.y);
         if (destinationRow.GetKittyPlaceholderCell(move.destination.x) &&
-            kittyPlaceholderImageId(destinationRow, move.destination.x) == move.imageId)
+            kittyPlaceholderImageId(destinationRow, move.destination.x) == move.imageId &&
+            kittyPlaceholderLayerId(destinationRow, move.destination.x) == move.layerId)
         {
             const auto& sourceRow = oldBuffer.GetRowByOffset(move.source.y);
-            ImageSlice::CopyKittyCells(sourceRow, move.source.x, destinationRow, move.destination.x, move.destination.x + 1, move.imageId);
+            ImageSlice::CopyKittyCells(sourceRow, move.source.x, destinationRow, move.destination.x, move.destination.x + 1, move.imageId, move.layerId);
         }
     }
 

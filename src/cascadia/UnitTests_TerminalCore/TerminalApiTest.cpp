@@ -33,6 +33,7 @@ namespace
         til::CoordType columnOffset;
         std::vector<uint32_t> columnOwners;
         std::vector<bool> columnsContainRed;
+        std::vector<bool> columnsContainGreen;
     };
 
     struct PaintedFrame
@@ -148,19 +149,24 @@ namespace
                 image.columnOwners.emplace_back(imageSlice.ColumnOwner(column));
                 auto pixel = std::next(pixels.data(), i * imageSlice.CellSize().width);
                 auto containsRed = false;
-                for (auto y = 0; y < imageSlice.CellSize().height && !containsRed; ++y)
+                auto containsGreen = false;
+                for (auto y = 0; y < imageSlice.CellSize().height && !(containsRed && containsGreen); ++y)
                 {
                     for (auto x = 0; x < imageSlice.CellSize().width; ++x)
                     {
                         if (pixel[x].rgbRed == 255 && pixel[x].rgbGreen == 0 && pixel[x].rgbBlue == 0)
                         {
                             containsRed = true;
-                            break;
+                        }
+                        if (pixel[x].rgbRed == 0 && pixel[x].rgbGreen == 255 && pixel[x].rgbBlue == 0)
+                        {
+                            containsGreen = true;
                         }
                     }
                     std::advance(pixel, imageSlice.PixelWidth());
                 }
                 image.columnsContainRed.emplace_back(containsRed);
+                image.columnsContainGreen.emplace_back(containsGreen);
             }
 
             const auto guard = _lock.lock_exclusive();
@@ -386,6 +392,21 @@ namespace
         }
         VERIFY_IS_TRUE(imageAtPlaceholder, L"the KGP image must remain painted at the placeholder cell");
     }
+
+    bool FrameContainsKittyColor(const PaintedFrame& frame, const uint32_t imageId, const bool green)
+    {
+        return std::ranges::any_of(frame.images, [&](const auto& image) {
+            for (size_t column = 0; column < image.columnOwners.size(); ++column)
+            {
+                if (til::at(image.columnOwners, column) == imageId &&
+                    til::at(green ? image.columnsContainGreen : image.columnsContainRed, column))
+                {
+                    return true;
+                }
+            }
+            return false;
+        });
+    }
 }
 
 namespace TerminalCoreUnitTests
@@ -415,6 +436,7 @@ namespace TerminalCoreUnitTests
 
         TEST_METHOD(GetCellSizeFallsBackWhenFontUnset);
 
+        TEST_METHOD(KittyAnimationSurvivesFontAndRendererRefresh);
         TEST_METHOD(KittyPlaceholderRendersInRealTerminal);
         TEST_METHOD(KittyPlaceholderSuppressesGlyphOnPaintAndRepaint);
         TEST_METHOD(KittyPlaceholderLeavesUnrecognizedTextUntouched);
@@ -785,6 +807,60 @@ void TerminalApiTest::GetCellSizeFallsBackWhenFontUnset()
     const auto cellSize = term.GetCellSize();
     VERIFY_IS_GREATER_THAN(cellSize.width, 1, L"cell width must not be a degenerate 1px");
     VERIFY_IS_GREATER_THAN(cellSize.height, 1, L"cell height must not be a degenerate 1px");
+}
+
+void TerminalApiTest::KittyAnimationSurvivesFontAndRendererRefresh()
+{
+    KittyRenderFixture fixture{ { 6, 3 }, 0 };
+    auto& buffer = *fixture.terminal._mainBuffer;
+    auto& stateMachine = *fixture.terminal._stateMachine;
+
+    stateMachine.ProcessString(L"\x1b_Ga=T,i=7,f=24,s=1,v=1,c=1,r=1,C=1,z=5000,q=2;/wAA\x1b\\");
+    stateMachine.ProcessString(L"\x1b_Ga=f,i=7,f=24,s=1,v=1,z=1000,q=2;AP8A\x1b\\");
+    stateMachine.ProcessString(L"\x1b_Ga=a,i=7,c=1,r=1,z=5000,s=3,v=1,q=2;\x1b\\");
+    fixture.StartPainting();
+    VERIFY_IS_TRUE(FrameContainsKittyColor(fixture.engine.Snapshot(), 7, false), L"frame 1 must be visible before the lifecycle transition");
+
+    // Reproduce the stale retained-layer state observed after renderer recreation:
+    // the animation source of truth is frame 1 (red), while the retained pixels
+    // contain the wrong frame (green).
+    const std::array stalePixels{ RGBQUAD{ 0, 255, 0, 0 } };
+    fixture.terminal.LockConsole();
+    auto unlockAfterStaleLayer = wil::scope_exit([&fixture]() {
+        fixture.terminal.UnlockConsole();
+    });
+    auto* slice = buffer.GetMutableRowByOffset(0).GetMutableImageSlice();
+    VERIFY_IS_NOT_NULL(slice);
+    VERIFY_IS_TRUE(slice && slice->UpdateKittyImage(7, stalePixels));
+    unlockAfterStaleLayer.reset();
+    fixture.Repaint();
+    VERIFY_IS_TRUE(FrameContainsKittyColor(fixture.engine.Snapshot(), 7, true), L"the test must reproduce a stale retained animation layer");
+
+    fixture.terminal.LockConsole();
+    auto unlockAfterFontChange = wil::scope_exit([&fixture]() {
+        fixture.terminal.UnlockConsole();
+    });
+    fixture.terminal.SetFontInfo(FontInfo{ DEFAULT_FONT_FACE, TMPF_TRUETYPE, 10, { 12, 24 }, CP_UTF8, false });
+    unlockAfterFontChange.reset();
+    fixture.Repaint();
+    VERIFY_IS_TRUE(FrameContainsKittyColor(fixture.engine.Snapshot(), 7, false), L"font/DPI recreation must restore the current animation frame");
+
+    fixture.terminal.LockConsole();
+    stateMachine.ProcessString(L"\x1b_Ga=a,i=7,r=1,z=20,q=2;\x1b\\");
+    fixture.terminal.UnlockConsole();
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    auto advanced = FrameContainsKittyColor(fixture.engine.Snapshot(), 7, true);
+    for (auto attempt = 0; attempt < 10 && !advanced; ++attempt)
+    {
+        const auto previousFrame = fixture.engine.PrepareForNextFrame();
+        fixture.renderer.NotifyPaintFrame();
+        if (!fixture.engine.WaitForFrameAfter(previousFrame))
+        {
+            break;
+        }
+        advanced = FrameContainsKittyColor(fixture.engine.Snapshot(), 7, true);
+    }
+    VERIFY_IS_TRUE(advanced, L"animation playback must continue to the next frame after recreation");
 }
 
 void TerminalApiTest::KittyPlaceholderRendersInRealTerminal()

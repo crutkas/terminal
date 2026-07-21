@@ -78,6 +78,7 @@ struct RowCopyTextFromState
 struct KittyPlaceholderCell
 {
     uint32_t column = 0;
+    uint64_t layerId = 0;
     uint16_t row = 0;
     uint8_t imageIdHighByte = 0;
     bool valid = false;

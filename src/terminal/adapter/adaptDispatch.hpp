@@ -48,6 +48,8 @@ namespace Microsoft::Console::VirtualTerminal
         AdaptDispatch(ITerminalApi& api, Renderer* renderer, RenderSettings& renderSettings, TerminalInput& terminalInput) noexcept;
         ~AdaptDispatch() override;
 
+        void RefreshKittyImageLayers();
+
         void UnknownSequence() noexcept override;
         void Print(const wchar_t wchPrintable) override;
         void PrintString(const std::wstring_view string) override;
@@ -377,7 +379,9 @@ namespace Microsoft::Console::VirtualTerminal
             uint32_t animationState = 1;
             uint32_t loopCount = 1;
             uint32_t loopsRemaining = UINT32_MAX;
+            uint32_t presentedFrame = 1;
             bool waitingForFrames = false;
+            bool hasRenderedPlacements = false;
             std::chrono::steady_clock::time_point nextFrameTime{};
 
             size_t PixelBytes() const noexcept
@@ -457,6 +461,18 @@ namespace Microsoft::Console::VirtualTerminal
             bool hasParent = false;
             bool isVirtual = false;
         };
+        struct KittyBufferState
+        {
+            uint32_t nextImageId = 1;
+            uint64_t nextLayerId = 1;
+            size_t totalPixelBytes = 0;
+            std::unordered_map<uint32_t, KittyImage> images;
+            std::unordered_map<uint32_t, uint32_t> imageNumbers;
+            std::deque<uint32_t> imageOrder;
+            std::map<std::pair<uint32_t, uint32_t>, KittyVirtualPlacement> virtualIds;
+            std::map<std::pair<uint32_t, uint32_t>, KittyPlacement> placements;
+            std::vector<KittyPlacement> anonymousPlacements;
+        };
         static KittyControl _ParseKittyControl(const std::wstring_view control) noexcept;
         void _HandleKittyGraphics(const std::wstring_view control, const std::string_view payload, const bool payloadValid, const bool payloadTooLarge);
         void _ProcessKittyCommand(const KittyControl& command, const std::string_view payload, const bool payloadValid, const bool payloadTooLarge);
@@ -472,7 +488,6 @@ namespace Microsoft::Console::VirtualTerminal
         static const std::vector<RGBQUAD>* _kittyFramePixels(const KittyImage& image, uint32_t frameNumber) noexcept;
         static int32_t* _kittyFrameGap(KittyImage& image, uint32_t frameNumber) noexcept;
         void _updateKittyImageLayers(uint32_t imageId, std::span<const RGBQUAD> pixels);
-        void _refreshKittyImageLayers();
         void _scheduleKittyAnimation(uint32_t imageId, KittyImage& image, std::chrono::steady_clock::time_point now);
         void _scheduleKittyAnimationTimer();
         void _advanceKittyAnimations(std::chrono::steady_clock::time_point now);
@@ -482,10 +497,13 @@ namespace Microsoft::Console::VirtualTerminal
         bool _processKittyFrameComposition(const KittyControl& command, uint32_t imageId, std::wstring_view& code);
         void _deleteKittyAnimationFrames(uint32_t imageId, uint32_t frameNumber, bool freeData);
         uint32_t _kittyAssignImageId();
-        void _registerKittyImage(const uint32_t id, KittyImage&& image);
+        bool _registerKittyImage(const uint32_t id, KittyImage&& image);
         void _eraseKittyImage(const uint32_t id);
         void _eraseKittyImageRows(const uint32_t imageId);
         void _clearKittyImages() noexcept;
+        KittyBufferState _takeKittyBufferState() noexcept;
+        void _restoreKittyBufferState(KittyBufferState&& state) noexcept;
+        size_t _kittyRetainedPixelBytes() const noexcept;
         void _storeKittyVirtualPlacement(const uint32_t id, uint32_t placementId, const KittyImage& image, const uint32_t cols, const uint32_t rows, const uint32_t srcX, const uint32_t srcY, const uint32_t srcW, const uint32_t srcH, const int32_t zIndex, uint64_t layerId);
         static KittyTargetSize _kittyTargetPixels(const int64_t cropW, const int64_t cropH, const uint32_t cols, const uint32_t rows, const int64_t cellWidth, const int64_t cellHeight) noexcept;
         bool _kittyPlacementFitsMemory(const KittyImage& image, uint32_t imageId, uint64_t layerId, uint32_t cols, uint32_t rows, uint32_t srcX, uint32_t srcY, uint32_t srcW, uint32_t srcH, int32_t zIndex, std::optional<til::point> anchor = std::nullopt) const noexcept;
@@ -502,6 +520,7 @@ namespace Microsoft::Console::VirtualTerminal
         void _eraseKittyPlacementsForImage(const uint32_t imageId);
         // True if any tracked placement (registered or anonymous) still references this image id.
         bool _kittyImageHasPlacements(const uint32_t id) const noexcept;
+        bool _kittyImageHasRenderedLayers(uint32_t id) const;
         // Cascade-deletes the relative children of each removed placement key (registered +
         // anonymous), deleting any orphaned image except `keepImageId`, which the caller deletes.
         void _cascadeKittyPlacementChildren(std::deque<std::pair<uint32_t, uint32_t>>& removed, const uint32_t keepImageId);
@@ -510,6 +529,7 @@ namespace Microsoft::Console::VirtualTerminal
         // placement; when false (lowercase) the image data is kept for a later a=p.
         // Protocol: https://sw.kovidgoyal.net/kitty/graphics-protocol/#deleting-images
         void _deleteKittyPlacement(const uint32_t imageId, const uint32_t placementId, const bool freeData);
+        void _deleteAllKittyPlacements(bool freeData);
         void _deleteKittyImagesIntersecting(const til::CoordType left, const til::CoordType top, const til::CoordType right, const til::CoordType bottom, const bool freeData);
         void _deleteKittyImagesInIdRange(const uint32_t lo, const uint32_t hi, const bool freeData);
         void _deleteKittyPlacementsByZ(const int32_t zIndex, const bool freeData, const std::optional<til::point> cell = std::nullopt);
@@ -580,6 +600,7 @@ namespace Microsoft::Console::VirtualTerminal
         // placements can still cascade with their parent. Anonymous placements are always leaves.
         // Protocol: https://sw.kovidgoyal.net/kitty/graphics-protocol/#relative-placements
         std::vector<KittyPlacement> _kittyAnonymousPlacements;
+        std::optional<KittyBufferState> _kittyMainBufferState;
 
         // Chunked transmission (m=): accumulates the base64 payload across sequences;
         // only one transfer runs at a time, processed on the final chunk (m=0).

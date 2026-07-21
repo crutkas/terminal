@@ -92,12 +92,12 @@ public:
     static void CopyBlock(const TextBuffer& srcBuffer, const til::rect srcRect, TextBuffer& dstBuffer, const til::rect dstRect);
     static void CopyRow(const ROW& srcRow, ROW& dstRow);
     static void CopyCells(const ROW& srcRow, const til::CoordType srcColumn, ROW& dstRow, const til::CoordType dstColumnBegin, const til::CoordType dstColumnEnd);
-    static void CopyKittyCells(const ROW& srcRow, til::CoordType srcColumn, ROW& dstRow, til::CoordType dstColumnBegin, til::CoordType dstColumnEnd, uint32_t imageId);
+    static void CopyKittyCells(const ROW& srcRow, til::CoordType srcColumn, ROW& dstRow, til::CoordType dstColumnBegin, til::CoordType dstColumnEnd, uint32_t imageId, uint64_t placementId);
     static void MergePreservedCells(Pointer srcSlice, ROW& dstRow);
     static void EraseBlock(TextBuffer& buffer, const til::rect rect);
     static void EraseCells(TextBuffer& buffer, const til::point at, const til::CoordType distance);
     static void EraseCells(ROW& row, const til::CoordType columnBegin, const til::CoordType columnEnd);
-    static void EraseKittyCells(ROW& row, til::CoordType columnBegin, til::CoordType columnEnd, uint32_t imageId);
+    static void EraseKittyCells(ROW& row, til::CoordType columnBegin, til::CoordType columnEnd, uint32_t imageId, uint64_t placementId);
 
 private:
     struct KittyLayer
@@ -128,11 +128,11 @@ private:
     void _removeEmptyKittyLayers();
     bool _hasContent() const noexcept;
     bool _copyCells(const ImageSlice& srcSlice, const til::CoordType srcColumn, const til::CoordType dstColumnBegin, const til::CoordType dstColumnEnd);
-    bool _copyKittyCells(const ImageSlice& srcSlice, til::CoordType srcColumn, til::CoordType dstColumnBegin, til::CoordType dstColumnEnd, uint32_t imageId);
-    bool _copyKittyCellsInPlace(const ImageSlice& srcSlice, til::CoordType srcColumn, til::CoordType dstColumnBegin, til::CoordType dstColumnEnd, uint32_t imageId);
+    bool _copyKittyCells(const ImageSlice& srcSlice, til::CoordType srcColumn, til::CoordType dstColumnBegin, til::CoordType dstColumnEnd, uint32_t imageId, uint64_t placementId);
+    bool _copyKittyCellsInPlace(const ImageSlice& srcSlice, til::CoordType srcColumn, til::CoordType dstColumnBegin, til::CoordType dstColumnEnd, uint32_t imageId, uint64_t placementId);
     bool _copyCellsInPlace(const ImageSlice& srcSlice, til::CoordType srcColumn, til::CoordType dstColumnBegin, til::CoordType dstColumnEnd);
     bool _eraseCells(const til::CoordType columnBegin, const til::CoordType columnEnd);
-    bool _eraseKittyCells(til::CoordType columnBegin, til::CoordType columnEnd, uint32_t imageId);
+    bool _eraseKittyCells(til::CoordType columnBegin, til::CoordType columnEnd, uint32_t imageId, uint64_t placementId);
     void _mergePreservedCells(const ImageSlice& srcSlice);
     bool _legacyCellHasPixels(til::CoordType column) const noexcept;
     void _swap(ImageSlice& other) noexcept;
