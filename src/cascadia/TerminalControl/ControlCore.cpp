@@ -1119,8 +1119,6 @@ namespace winrt::Microsoft::Terminal::Control::implementation
     {
         const auto newDpi = static_cast<int>(lrint(_compositionScale * USER_DEFAULT_SCREEN_DPI));
 
-        _terminal->SetFontInfo(_actualFont);
-
         if (_renderEngine)
         {
             static constexpr auto cloneMap = [](const auto& map) {
@@ -1146,6 +1144,8 @@ namespace winrt::Microsoft::Terminal::Control::implementation
             LOG_IF_FAILED(_renderEngine->UpdateDpi(newDpi));
             LOG_IF_FAILED(_renderEngine->UpdateFont(_desiredFont, _actualFont, featureMap, axesMap));
         }
+
+        _terminal->SetFontInfo(_actualFont);
 
         const auto actualNewSize = _actualFont.GetSize();
         FontSizeChanged.raise(*this, winrt::make<FontSizeChangedArgs>(actualNewSize.width, actualNewSize.height));
