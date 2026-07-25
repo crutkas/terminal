@@ -1099,17 +1099,70 @@ void Renderer::_PaintBufferOutput(_In_ IRenderEngine* const pEngine)
             // Prepare the appropriate line transform for the current row and viewport offset.
             LOG_IF_FAILED(pEngine->PrepareLineTransform(lineRendition, screenPosition.y, _viewport.Left()));
 
+            // Image content is painted around the text so that it can sit below
+            // it. The engine decides how; all we do is bracket the text.
+            const auto imageSlice = r.GetImageSlice();
+            const auto hasImages = imageSlice && (imageSlice->HasPixels(ImageSlice::RenderPosition::BehindBackground) ||
+                                                  imageSlice->HasPixels(ImageSlice::RenderPosition::BehindText) ||
+                                                  imageSlice->HasPixels(ImageSlice::RenderPosition::AboveText));
+            if (hasImages) [[unlikely]]
+            {
+                LOG_IF_FAILED(pEngine->BeginRowImages(*imageSlice, screenPosition.y, _viewport.Left(), _buildDefaultBackgroundMask(r, *imageSlice)));
+            }
+
+            // Painting text can throw, and an engine left mid-row would keep
+            // suppressing cell backgrounds on every row after it.
+            const auto endRowImages = wil::scope_exit([&]() noexcept {
+                if (hasImages)
+                {
+                    LOG_IF_FAILED(pEngine->EndRowImages());
+                }
+            });
+
             // Ask the helper to paint through this specific line.
             _PaintBufferOutputHelper(pEngine, it, screenPosition);
-
-            // Paint any image content on top of the text.
-            const auto imageSlice = buffer.GetRowByOffset(row).GetImageSlice();
-            if (imageSlice) [[unlikely]]
-            {
-                LOG_IF_FAILED(pEngine->PaintImageSlice(*imageSlice, screenPosition.y, _viewport.Left()));
-            }
         }
     }
+}
+
+// Marks the columns of `imageSlice` whose cell background is the default one,
+// and where content below the background can therefore show through. Returns an
+// empty span when the slice has nothing below the background, which is the case
+// for every image that predates layering.
+std::span<const uint8_t> Renderer::_buildDefaultBackgroundMask(const ROW& r, const ImageSlice& imageSlice)
+{
+    if (!imageSlice.HasPixels(ImageSlice::RenderPosition::BehindBackground))
+    {
+        return {};
+    }
+
+    const auto cellWidth = imageSlice.CellSize().width;
+    if (cellWidth <= 0)
+    {
+        return {};
+    }
+
+    const auto columnCount = gsl::narrow_cast<size_t>(imageSlice.PixelWidth() / cellWidth);
+    // Reused across rows and frames; painting is hot and this would otherwise
+    // be a heap allocation per row per frame. Columns we can't resolve stay 0,
+    // which hides the image rather than letting it bleed through.
+    _backgroundMask.assign(columnCount, uint8_t{ 0 });
+
+    // A slice indexes screen columns, which a non-single-width rendition
+    // doubles; the row's attributes are indexed by buffer column.
+    const auto scale = r.GetLineRendition() != LineRendition::SingleWidth ? 1 : 0;
+    const auto readableColumns = r.GetReadableColumnCount();
+    for (size_t column = 0; column < columnCount; column++)
+    {
+        const auto sliceColumn = imageSlice.ColumnOffset() + gsl::narrow_cast<til::CoordType>(column);
+        const auto bufferColumn = sliceColumn >> scale;
+        if (bufferColumn >= 0 && bufferColumn < readableColumns)
+        {
+            til::at(_backgroundMask, column) = r.GetAttrByColumn(bufferColumn).GetBackground().IsDefault() ? 1 : 0;
+        }
+    }
+
+    return _backgroundMask;
 }
 
 ROW* Renderer::_PaintBufferOutputComposition(TextBuffer& buffer, const ROW& r, const Composition& activeComposition)

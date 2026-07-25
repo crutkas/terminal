@@ -80,7 +80,16 @@ namespace Microsoft::Console::Render
         [[nodiscard]] virtual HRESULT PaintBackground() noexcept = 0;
         [[nodiscard]] virtual HRESULT PaintBufferLine(std::span<const Cluster> clusters, til::point coord, bool fTrimLeft) noexcept = 0;
         [[nodiscard]] virtual HRESULT PaintBufferGridLines(GridLineSet lines, COLORREF gridlineColor, COLORREF underlineColor, size_t cchLine, til::point coordTarget) noexcept = 0;
-        [[nodiscard]] virtual HRESULT PaintImageSlice(const ImageSlice& imageSlice, til::CoordType targetRow, til::CoordType viewportLeft) noexcept = 0;
+        // A row's image content is painted around its text so that it can appear
+        // beneath it. Text painted between these two calls must end up above
+        // anything BeginRowImages drew and below anything EndRowImages draws.
+        //
+        // defaultBackgroundMask holds one byte per column of the slice, non-zero
+        // where the cell's background is default and content sitting below the
+        // background may therefore show through. It is empty when the slice has
+        // nothing below the background to draw.
+        [[nodiscard]] virtual HRESULT BeginRowImages(const ImageSlice& imageSlice, til::CoordType targetRow, til::CoordType viewportLeft, std::span<const uint8_t> defaultBackgroundMask) noexcept = 0;
+        [[nodiscard]] virtual HRESULT EndRowImages() noexcept = 0;
         [[nodiscard]] virtual HRESULT PaintSelection(const til::rect& rect) noexcept = 0;
         [[nodiscard]] virtual HRESULT PaintCursor(const CursorOptions& options) noexcept = 0;
         [[nodiscard]] virtual HRESULT UpdateDrawingBrushes(const TextAttribute& textAttributes, const RenderSettings& renderSettings, gsl::not_null<IRenderData*> pData, bool usingSoftFont, bool isSettingDefaultBrushes) noexcept = 0;
