@@ -789,6 +789,30 @@ public:
         _testGetSet->ValidateExpectedAttributes();
     }
 
+    // A hard reset must not restore the cursor that entering the alt buffer saved.
+    // RIS resets state; it does not roll back to a checkpoint. Routing the exit
+    // through the DECRST 1049 helper looks tidy, but that helper restores the
+    // cursor as part of its ordinary job, which is exactly what a reset must not do.
+    TEST_METHOD(HardResetFromAltBufferDoesNotRestoreTheSavedCursor)
+    {
+        _testGetSet->PrepData(CursorX::XCENTER, CursorY::YCENTER);
+        const auto savedPos = _testGetSet->_textBuffer->GetCursor().GetPosition();
+
+        // Entering the alt buffer saves the cursor.
+        _pDispatch->SetMode(DispatchTypes::ModeParams::ASB_AlternateScreenBuffer);
+
+        // Move somewhere else, so that a restore would be visible.
+        const til::point altPos{ savedPos.x - 1, savedPos.y - 1 };
+        VERIFY_ARE_NOT_EQUAL(savedPos, altPos, L"sanity: the two positions differ");
+        _testGetSet->_textBuffer->GetCursor().SetPosition(altPos);
+
+        // erase=false, so the reset leaves the cursor alone rather than homing it.
+        _pDispatch->HardReset(false);
+
+        const auto finalPos = _testGetSet->_textBuffer->GetCursor().GetPosition();
+        VERIFY_ARE_NOT_EQUAL(savedPos, finalPos, L"a reset must not restore the saved cursor");
+        VERIFY_ARE_EQUAL(altPos, finalPos, L"a reset should leave the cursor where it was");
+    }
     TEST_METHOD(CursorHideShowTest)
     {
         BEGIN_TEST_METHOD_PROPERTIES()

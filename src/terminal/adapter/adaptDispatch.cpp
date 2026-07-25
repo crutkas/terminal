@@ -3109,9 +3109,14 @@ void AdaptDispatch::SoftReset()
 void AdaptDispatch::HardReset(bool erase)
 {
     // If in the alt buffer, switch back to main before doing anything else.
+    // This deliberately does not go through _SetAlternateScreenBufferMode: that
+    // helper also restores the saved cursor state, which a hard reset must not
+    // do, and its Kitty save/discard work is redundant here because the whole
+    // point of this function is to throw everything away, which it does below.
     if (_usingAltBuffer)
     {
-        _SetAlternateScreenBufferMode(false);
+        _api.UseMainScreenBuffer();
+        _usingAltBuffer = false;
     }
 
     // Reset all page buffers.
