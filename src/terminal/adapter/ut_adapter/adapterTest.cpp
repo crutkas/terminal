@@ -5585,6 +5585,68 @@ public:
         VERIFY_ARE_EQUAL(64u, out.size());
     }
 
+    // Every other inflate test here produces at most 64 bytes, which all fits in the
+    // very first output chunk. Real images do not: the inflate grows its buffer
+    // geometrically (8 KiB, then doubling), so this drives a payload across two of those
+    // growth boundaries and byte-verifies the result. A wrong write offset or a dropped/
+    // duplicated run at a chunk seam would corrupt every real compressed transmission
+    // while leaving all the small-payload tests green.
+    //
+    // Regenerate with:
+    //   $p=[byte[]](0xDE,0xAD,0xBE,0xEF); $n=20000; $raw=New-Object byte[] $n
+    //   for($i=0;$i -lt $n;$i++){$raw[$i]=$p[$i%4]}
+    //   $ms=New-Object System.IO.MemoryStream
+    //   $z=New-Object System.IO.Compression.ZLibStream($ms,[System.IO.Compression.CompressionLevel]::Optimal)
+    //   $z.Write($raw,0,$n); $z.Dispose(); $ms.ToArray()
+    TEST_METHOD(KittyInflateZlibRoundTripsAcrossOutputGrowth)
+    {
+        // 130 compressed bytes -> 20000 bytes of the repeating pattern DE AD BE EF.
+        const std::vector<uint8_t> big{
+            0x78, 0x9c, 0xed, 0xd2, 0x31, 0x11, 0x00, 0x00, 0x08, 0x03, 0x31, 0xff,
+            0x62, 0xb0, 0x80, 0x94, 0x5a, 0xa8, 0x05, 0x64, 0xb0, 0x64, 0x78, 0x03,
+            0x7f, 0xc9, 0x6c, 0x23, 0x0f, 0x18, 0x60, 0x80, 0x01, 0x06, 0x18, 0x60,
+            0x80, 0x01, 0x06, 0x18, 0x60, 0x80, 0x01, 0x06, 0x18, 0x60, 0x80, 0x01,
+            0x06, 0x18, 0x60, 0x80, 0x01, 0x06, 0x18, 0x60, 0x80, 0x01, 0x06, 0x18,
+            0x60, 0x80, 0x01, 0x06, 0x18, 0x60, 0x80, 0x01, 0x06, 0x18, 0x60, 0x80,
+            0x01, 0x06, 0x18, 0x60, 0x80, 0x01, 0x06, 0x18, 0x60, 0x80, 0x01, 0x06,
+            0x18, 0x60, 0x80, 0x01, 0x06, 0x18, 0x60, 0x80, 0x01, 0x06, 0x18, 0x60,
+            0x80, 0x01, 0x06, 0x18, 0x60, 0x80, 0x01, 0x06, 0x18, 0x60, 0x80, 0x01,
+            0x06, 0x18, 0x60, 0x80, 0x01, 0x06, 0x18, 0x60, 0x80, 0x01, 0x06, 0x18,
+            0x60, 0x80, 0x81, 0x7e, 0x3f, 0x38, 0x2e, 0xbd, 0xe1, 0x63
+        };
+        constexpr size_t expectedSize = 20000;
+        static constexpr uint8_t pattern[]{ 0xDE, 0xAD, 0xBE, 0xEF };
+
+        std::vector<uint8_t> out;
+        VERIFY_IS_TRUE(AdaptDispatch::_inflateKittyZlib(big, out, 32 * 1024 * 1024));
+        VERIFY_ARE_EQUAL(expectedSize, out.size());
+        // Byte-verify positionally: a uniform payload would hide an offset error, a
+        // 4-byte repeating one does not.
+        auto positionsCorrect = true;
+        for (size_t i = 0; i < out.size(); ++i)
+        {
+            if (out[i] != pattern[i % 4])
+            {
+                positionsCorrect = false;
+                break;
+            }
+        }
+        VERIFY_IS_TRUE(positionsCorrect);
+
+        // The same stream must be rejected when the cap falls *between* growth rounds,
+        // which exercises the bomb guard breaking mid-growth rather than at the first
+        // chunk (10000 lands after the 8 KiB chunk but before the payload ends).
+        out.clear();
+        VERIFY_IS_FALSE(AdaptDispatch::_inflateKittyZlib(big, out, 10000));
+        VERIFY_IS_TRUE(out.empty());
+        // ...and at a cap one byte short of the real size, the tightest rejection.
+        VERIFY_IS_FALSE(AdaptDispatch::_inflateKittyZlib(big, out, expectedSize - 1));
+        VERIFY_IS_TRUE(out.empty());
+        // Exactly the real size is accepted, pinning the off-by-one at the cap boundary.
+        VERIFY_IS_TRUE(AdaptDispatch::_inflateKittyZlib(big, out, expectedSize));
+        VERIFY_ARE_EQUAL(expectedSize, out.size());
+    }
+
     // Raw DEFLATE (no RFC 1950 zlib header/trailer) is rejected: kitty o=z is
     // zlib-wrapped, not raw deflate.
     TEST_METHOD(KittyInflateZlibRejectsRawDeflate)
