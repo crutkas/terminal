@@ -920,11 +920,20 @@ void SixelParser::_maybeFlushImageBuffer(const bool endOfSequence)
                 {
                     auto& dstRow = page.Buffer().GetMutableRowByOffset(rowOffset);
                     auto dstSlice = dstRow.GetMutableImageSlice();
-                    if (!dstSlice)
+                    // Only reuse an existing slice if it shares our cell size. Another
+                    // image protocol (e.g. Kitty graphics) can place a slice with a
+                    // different cell geometry on this row; writing it with our cell
+                    // stride would overflow the slice buffer, so replace it instead.
+                    if (!dstSlice || dstSlice->CellSize() != _cellSize)
                     {
                         dstSlice = dstRow.SetImageSlice(std::make_unique<ImageSlice>(_cellSize));
                         __assume(dstSlice != nullptr);
                     }
+                    // These cells become Sixel content. Clear any foreign (Kitty)
+                    // pixels+ownership so a transparent Sixel hole can't leave ownerless
+                    // Kitty pixels that a later Kitty delete would skip. Existing Sixel
+                    // (owner 0) overlay is preserved.
+                    dstSlice->ClearLayers(columnBegin, columnEnd);
                     auto dstIterator = dstSlice->MutablePixels(columnBegin, columnEnd);
                     for (auto pixelRow = 0; pixelRow < _cellSize.height; pixelRow++)
                     {
