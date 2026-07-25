@@ -281,8 +281,19 @@ void ImageSlice::CopyCells(const ROW& srcRow, const til::CoordType srcColumn, RO
     // a blank image into the destination, which is the same thing as an erase.
     // Also if the line renditions are different, there's no meaningful way to
     // copy the image content, so we also just treat that as an erase.
+    //
+    // The same is true when the two rows disagree about cell geometry. Now that
+    // image cell size comes from the font rather than being a constant, two rows
+    // can legitimately hold slices at different scales -- a placement made before
+    // the real font was reported, or before the user changed its size, keeps the
+    // cell it was created with. The copy walks the source planes with the
+    // destination's stride, so a taller or wider destination cell would read past
+    // the end of the source. Rescaling is not something a copy can do, so this is
+    // an erase as well.
     const auto srcSlice = srcRow.GetImageSlice();
-    if (!srcSlice || srcRow.GetLineRendition() != dstRow.GetLineRendition()) [[likely]]
+    const auto dstExisting = dstRow.GetImageSlice();
+    if (!srcSlice || srcRow.GetLineRendition() != dstRow.GetLineRendition() ||
+        (dstExisting && dstExisting->CellSize() != srcSlice->CellSize())) [[likely]]
     {
         ImageSlice::EraseCells(dstRow, dstColumnBegin, dstColumnEnd);
     }
@@ -304,6 +315,10 @@ void ImageSlice::CopyCells(const ROW& srcRow, const til::CoordType srcColumn, RO
     }
 }
 
+// Requires that the source shares this slice's cell size. Both this and
+// _copyLayers walk the source planes using our own _cellSize as the stride, so a
+// mismatch would read outside the source. CopyCells is the only caller, and it
+// erases instead of copying when the two rows disagree.
 bool ImageSlice::_copyCells(const ImageSlice& srcSlice, const til::CoordType srcColumn, const til::CoordType dstColumnBegin, const til::CoordType dstColumnEnd)
 {
     const auto srcColumnEnd = srcColumn + dstColumnEnd - dstColumnBegin;

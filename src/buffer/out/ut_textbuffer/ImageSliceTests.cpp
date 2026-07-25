@@ -39,6 +39,7 @@ class ImageSliceTests
     TEST_METHOD(CopyingFromAnUnlayeredSourceClearsDestinationLayers);
     TEST_METHOD(CopyingFromALayerOnlySourceClearsDestinationBasePlane);
     TEST_METHOD(CopyingACellOutsideTheSourceLayerCopiesNothing);
+    TEST_METHOD(CopyingBetweenRowsOfDifferentCellSizesErases);
 
     static constexpr til::size CellSize{ 4, 2 };
     static constexpr RGBQUAD Red{ 0, 0, 255, 255 };
@@ -75,27 +76,27 @@ class ImageSliceTests
         return Packed(plane[offset]);
     }
 
-    static ImageSlice& SliceFor(ROW& row)
+    static ImageSlice& SliceFor(ROW& row, const til::size cellSize = CellSize)
     {
         auto slice = row.GetMutableImageSlice();
         if (!slice)
         {
-            slice = row.SetImageSlice(std::make_unique<ImageSlice>(CellSize));
+            slice = row.SetImageSlice(std::make_unique<ImageSlice>(cellSize));
         }
         return *slice;
     }
 
-    static void FillLayer(ROW& row, const ImageSlice::LayerKey key, const til::CoordType columns, const RGBQUAD color)
+    static void FillLayer(ROW& row, const ImageSlice::LayerKey key, const til::CoordType columns, const RGBQUAD color, const til::size cellSize = CellSize)
     {
-        auto& slice = SliceFor(row);
+        auto& slice = SliceFor(row, cellSize);
         const auto pixels = slice.MutablePixels(0, columns, key, 0);
         VERIFY_IS_NOT_NULL(pixels);
         Fill(slice, pixels, columns, color);
     }
 
-    static void FillBase(ROW& row, const til::CoordType columns, const RGBQUAD color)
+    static void FillBase(ROW& row, const til::CoordType columns, const RGBQUAD color, const til::size cellSize = CellSize)
     {
-        auto& slice = SliceFor(row);
+        auto& slice = SliceFor(row, cellSize);
         const auto pixels = slice.MutablePixels(0, columns);
         VERIFY_IS_NOT_NULL(pixels);
         Fill(slice, pixels, columns, color);
@@ -496,4 +497,52 @@ void ImageSliceTests::CopyingACellOutsideTheSourceLayerCopiesNothing()
     // And the in-range case still works, so the guard has not simply disabled the copy.
     ImageSlice::CopyLayerCells(buffer.GetRowByOffset(0), 0, buffer.GetMutableRowByOffset(1), 2, 3, key);
     VERIFY_ARE_EQUAL(Packed(Red), PixelAt(buffer.GetRowByOffset(1).GetImageSlice()->Pixels(ImageSlice::RenderPosition::AboveText), *buffer.GetRowByOffset(1).GetImageSlice(), 2), L"a covered source column still copies");
+}
+
+// Image cell size comes from the font, so it is not constant for the lifetime of
+// a buffer: a placement made before the renderer reported the real font, or before
+// the user changed its size, keeps the cell it was created with. Two rows can
+// therefore hold slices at different scales, and an ordinary scroll will copy one
+// onto the other. The copy walks the source planes with the destination's stride,
+// so a larger destination cell would read past the end of the source and splice
+// unrelated heap into pixels that are about to be composited and painted.
+void ImageSliceTests::CopyingBetweenRowsOfDifferentCellSizesErases()
+{
+    static constexpr til::size LargeCell{ CellSize.width * 2, CellSize.height * 2 };
+    DummyRenderer renderer;
+    TextBuffer buffer{ til::size{ 8, 3 }, TextAttribute{}, 0, false, &renderer };
+
+    // Row 0 is the small-cell source. Its base plane is only
+    // (2 * 4) * 2 == 16 pixels, and the destination below wants to read 4 rows of
+    // 16 from it.
+    FillBase(buffer.GetMutableRowByOffset(0), 2, Red);
+    // Row 1 is the large-cell destination, with content past the copy range so we
+    // can tell an erase of the range apart from an erase of the row.
+    FillBase(buffer.GetMutableRowByOffset(1), 4, Blue, LargeCell);
+    VERIFY_ARE_EQUAL(CellSize, buffer.GetRowByOffset(0).GetImageSlice()->CellSize());
+    VERIFY_ARE_EQUAL(LargeCell, buffer.GetRowByOffset(1).GetImageSlice()->CellSize());
+
+    ImageSlice::CopyCells(buffer.GetRowByOffset(0), 0, buffer.GetMutableRowByOffset(1), 0, 2);
+
+    const auto destination = buffer.GetRowByOffset(1).GetImageSlice();
+    VERIFY_IS_NOT_NULL(destination);
+    VERIFY_ARE_EQUAL(LargeCell, destination->CellSize(), L"the destination keeps its own geometry");
+    // Without the guard the first source row is copied verbatim, so column 0 would
+    // read back Red -- and the last would be read from past the source allocation.
+    VERIFY_ARE_EQUAL(Packed(Clear), PixelAt(destination->Pixels(), *destination, 0), L"a mismatched copy must erase, not rescale");
+    VERIFY_ARE_EQUAL(Packed(Blue), PixelAt(destination->Pixels(), *destination, 2), L"only the copied range should have been erased");
+
+    // The other direction stays in bounds but is just as meaningless, and is
+    // handled the same way.
+    FillBase(buffer.GetMutableRowByOffset(2), 4, Red);
+    ImageSlice::CopyCells(buffer.GetRowByOffset(1), 0, buffer.GetMutableRowByOffset(2), 0, 2);
+    const auto narrowSlice = buffer.GetRowByOffset(2).GetImageSlice();
+    VERIFY_IS_NOT_NULL(narrowSlice);
+    VERIFY_ARE_EQUAL(Packed(Clear), PixelAt(narrowSlice->Pixels(), *narrowSlice, 0), L"a smaller destination must not take a larger source's pixels either");
+    VERIFY_ARE_EQUAL(Packed(Red), PixelAt(narrowSlice->Pixels(), *narrowSlice, 2), L"and again, only the copied range should have gone");
+
+    // And a copy between rows that do agree still works, so the guard has not
+    // simply disabled copying.
+    ImageSlice::CopyCells(buffer.GetRowByOffset(0), 0, buffer.GetMutableRowByOffset(2), 0, 2);
+    VERIFY_ARE_EQUAL(Packed(Red), PixelAt(buffer.GetRowByOffset(2).GetImageSlice()->Pixels(), *buffer.GetRowByOffset(2).GetImageSlice(), 0), L"matching cell sizes still copy");
 }
