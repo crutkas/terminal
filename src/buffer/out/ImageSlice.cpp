@@ -71,9 +71,63 @@ size_t ImageSlice::LayerBytesAvailable() noexcept
     return used >= MaxLayerBytes ? 0 : MaxLayerBytes - used;
 }
 
+ImageSlice::BudgetCharge::~BudgetCharge() noexcept
+{
+    Release(_bytes);
+}
+
+ImageSlice::BudgetCharge::BudgetCharge(const BudgetCharge& other) noexcept
+{
+    // The copying slice carries the same layers, so it owes the same amount.
+    Reserve(other._bytes);
+}
+
+ImageSlice::BudgetCharge::BudgetCharge(BudgetCharge&& other) noexcept :
+    _bytes{ std::exchange(other._bytes, 0) }
+{
+}
+
+ImageSlice::BudgetCharge& ImageSlice::BudgetCharge::operator=(BudgetCharge&& other) noexcept
+{
+    if (this != &other)
+    {
+        Release(_bytes);
+        _bytes = std::exchange(other._bytes, 0);
+    }
+    return *this;
+}
+
+void ImageSlice::BudgetCharge::Reserve(const size_t bytes) noexcept
+{
+    if (bytes != 0)
+    {
+        _bytes += bytes;
+        s_layerBytes.fetch_add(bytes, std::memory_order_relaxed);
+    }
+}
+
+void ImageSlice::BudgetCharge::Release(const size_t bytes) noexcept
+{
+    if (bytes != 0)
+    {
+        _bytes -= bytes;
+        s_layerBytes.fetch_sub(bytes, std::memory_order_relaxed);
+    }
+}
+
+size_t ImageSlice::BudgetCharge::Bytes() const noexcept
+{
+    return _bytes;
+}
+
 // A copy is made whenever a row is cloned, which happens during scrolling and
 // reflow. That must not be allowed to fail, so the budget is charged for the
-// copy but is deliberately not enforced here.
+// copy but is deliberately not enforced here. This is the one special member
+// that cannot be defaulted: the composite caches are per-slice scratch and are
+// deliberately not carried across, so the copy starts with them empty.
+// Everything but `_composites`, which is a scratch cache of flattened planes.
+// A copy starts with them empty rather than inheriting the original's, so this
+// one member is why the copy constructor is written out rather than defaulted.
 ImageSlice::ImageSlice(const ImageSlice& rhs) :
     _revision{ rhs._revision },
     _cellSize{ rhs._cellSize },
@@ -81,21 +135,9 @@ ImageSlice::ImageSlice(const ImageSlice& rhs) :
     _columnBegin{ rhs._columnBegin },
     _columnEnd{ rhs._columnEnd },
     _pixelWidth{ rhs._pixelWidth },
-    _layers{ rhs._layers }
+    _layers{ rhs._layers },
+    _charge{ rhs._charge }
 {
-    for (const auto& layer : _layers)
-    {
-        _accountedBytes += _layerBytes(layer);
-    }
-    s_layerBytes.fetch_add(_accountedBytes, std::memory_order_relaxed);
-}
-
-ImageSlice::~ImageSlice() noexcept
-{
-    if (_accountedBytes != 0)
-    {
-        s_layerBytes.fetch_sub(_accountedBytes, std::memory_order_relaxed);
-    }
 }
 
 ImageSlice::ImageSlice(const til::size cellSize) noexcept :
@@ -184,7 +226,7 @@ void ImageSlice::_ensureRange(const til::CoordType columnBegin, const til::Coord
         RelocateColumns(layer.columns, newColumnCount, newColumnOffset);
         // This growth is forced by geometry rather than requested by a write,
         // so it is charged to the budget but not refused.
-        _reserveLayerBytes(_layerBytes(layer) - before);
+        _charge.Reserve(_layerBytes(layer) - before);
     }
 }
 
@@ -421,24 +463,6 @@ size_t ImageSlice::_layerBytes(const Layer& layer) noexcept
     return layer.pixels.size() * sizeof(RGBQUAD) + layer.columns.size();
 }
 
-void ImageSlice::_reserveLayerBytes(const size_t bytes)
-{
-    if (bytes != 0)
-    {
-        _accountedBytes += bytes;
-        s_layerBytes.fetch_add(bytes, std::memory_order_relaxed);
-    }
-}
-
-void ImageSlice::_releaseLayerBytes(const size_t bytes) noexcept
-{
-    if (bytes != 0)
-    {
-        _accountedBytes -= bytes;
-        s_layerBytes.fetch_sub(bytes, std::memory_order_relaxed);
-    }
-}
-
 // A revision of 0 is never handed out by BumpRevision, so it doubles as the
 // "this composite is stale" marker.
 void ImageSlice::_invalidateComposites() noexcept
@@ -500,7 +524,7 @@ bool ImageSlice::_removeEmptyLayers()
         }
         else
         {
-            _releaseLayerBytes(_layerBytes(*it));
+            _charge.Release(_layerBytes(*it));
             it = _layers.erase(it);
             removed = true;
         }
@@ -652,7 +676,7 @@ RGBQUAD* ImageSlice::TryMutablePixels(const til::CoordType columnBegin, const ti
     {
         til::at(layer.columns, static_cast<size_t>(column - _columnBegin)) = 1;
     }
-    _reserveLayerBytes(_layerBytes(layer) - before);
+    _charge.Reserve(_layerBytes(layer) - before);
     _invalidateComposites();
 
     const auto pixelOffset = (columnBegin - _columnBegin) * _cellSize.width;
@@ -721,7 +745,7 @@ bool ImageSlice::EraseLayer(const uint32_t imageId)
     {
         if (it->key.imageId == imageId)
         {
-            _releaseLayerBytes(_layerBytes(*it));
+            _charge.Release(_layerBytes(*it));
             it = _layers.erase(it);
             erased = true;
         }
@@ -744,7 +768,7 @@ bool ImageSlice::EraseLayer(const LayerKey key)
     {
         if (it->key == key)
         {
-            _releaseLayerBytes(_layerBytes(*it));
+            _charge.Release(_layerBytes(*it));
             it = _layers.erase(it);
             erased = true;
         }

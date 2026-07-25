@@ -58,10 +58,16 @@ public:
     static constexpr size_t MaxLayersPerSlice = 4096;
     static size_t LayerBytesAvailable() noexcept;
 
-    ImageSlice(const ImageSlice& rhs);
+    // The process-wide layer budget has to be kept in step with each slice's
+    // lifetime, and that bookkeeping was the only thing stopping ImageSlice from
+    // using compiler-generated special members. Holding the charge in a member
+    // that knows how to copy, move and release itself hands them back.
     ImageSlice(const til::size cellSize) noexcept;
+    ImageSlice(const ImageSlice& rhs);
     ImageSlice& operator=(const ImageSlice&) = delete;
-    ~ImageSlice() noexcept;
+    ImageSlice(ImageSlice&&) = default;
+    ImageSlice& operator=(ImageSlice&&) = default;
+    ~ImageSlice() = default;
 
     void BumpRevision() noexcept;
     uint64_t Revision() const noexcept;
@@ -127,9 +133,28 @@ private:
     void _ensureRange(const til::CoordType columnBegin, const til::CoordType columnEnd);
     Layer& _getLayer(const LayerKey key, const int32_t zIndex);
     const Composite& _composite(const RenderPosition position) const;
+    // This slice's share of the process-wide layer budget, released automatically
+    // when the slice goes away. A copy owes what the original owed, because it
+    // carries the same layers; a moved-from slice owes nothing.
+    class BudgetCharge
+    {
+    public:
+        BudgetCharge() = default;
+        ~BudgetCharge() noexcept;
+        BudgetCharge(const BudgetCharge& other) noexcept;
+        BudgetCharge& operator=(const BudgetCharge&) = delete;
+        BudgetCharge(BudgetCharge&& other) noexcept;
+        BudgetCharge& operator=(BudgetCharge&& other) noexcept;
+
+        void Reserve(const size_t bytes) noexcept;
+        void Release(const size_t bytes) noexcept;
+        size_t Bytes() const noexcept;
+
+    private:
+        size_t _bytes = 0;
+    };
+
     static size_t _layerBytes(const Layer& layer) noexcept;
-    void _reserveLayerBytes(const size_t bytes);
-    void _releaseLayerBytes(const size_t bytes) noexcept;
     void _invalidateComposites() noexcept;
     void _clearLayerColumns(Layer& layer, const til::CoordType columnBegin, const til::CoordType columnEnd) noexcept;
     bool _removeEmptyLayers();
@@ -149,5 +174,5 @@ private:
     // identity costs exactly what it did before layers existed.
     std::vector<Layer> _layers;
     mutable std::array<Composite, 3> _composites;
-    size_t _accountedBytes = 0;
+    BudgetCharge _charge;
 };

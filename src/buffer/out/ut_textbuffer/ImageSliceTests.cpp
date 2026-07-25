@@ -29,6 +29,8 @@ class ImageSliceTests
     TEST_METHOD(ErasingAColumnRangeSparesTheRest);
     TEST_METHOD(LayerCountIsCapped);
     TEST_METHOD(LayerBudgetIsReturnedOnDestruction);
+    TEST_METHOD(MovingASliceCarriesItsBudgetShareExactlyOnce);
+    TEST_METHOD(CopyingASliceChargesTheBudgetSeparately);
     TEST_METHOD(EqualZOrdersByImageIdNotWriteOrder);
     TEST_METHOD(LayersCompositeSourceOver);
     TEST_METHOD(RenderPositionRevisionsNeverCollide);
@@ -295,6 +297,55 @@ void ImageSliceTests::LayerBudgetIsReturnedOnDestruction()
         VERIFY_IS_LESS_THAN(ImageSlice::LayerBytesAvailable(), before, L"the layer is charged to the budget");
     }
     VERIFY_ARE_EQUAL(before, ImageSlice::LayerBytesAvailable(), L"and returned when the slice dies");
+}
+
+// A slice owns a share of a process-wide budget, which is the only reason its
+// special members are not all compiler-generated. Moving one must hand that
+// share over rather than duplicating it or dropping it on the floor -- a vector
+// of slices reallocating is enough to exercise this.
+void ImageSliceTests::MovingASliceCarriesItsBudgetShareExactlyOnce()
+{
+    const auto before = ImageSlice::LayerBytesAvailable();
+    {
+        ImageSlice source{ CellSize };
+        Fill(source, source.MutablePixels(0, 16, ImageSlice::LayerKey{ 1, 0 }, 0), 16, Red);
+        const auto afterWrite = ImageSlice::LayerBytesAvailable();
+        VERIFY_IS_LESS_THAN(afterWrite, before, L"sanity: the layer is charged");
+
+        ImageSlice moved{ std::move(source) };
+        VERIFY_ARE_EQUAL(afterWrite, ImageSlice::LayerBytesAvailable(), L"a move must not charge the budget a second time");
+
+        // The moved-from slice still has to be destroyed, and must not refund a
+        // share it no longer owns.
+    }
+    VERIFY_ARE_EQUAL(before, ImageSlice::LayerBytesAvailable(), L"the share is refunded exactly once");
+
+    {
+        ImageSlice source{ CellSize };
+        Fill(source, source.MutablePixels(0, 16, ImageSlice::LayerKey{ 1, 0 }, 0), 16, Red);
+        const auto charged = before - ImageSlice::LayerBytesAvailable();
+
+        ImageSlice target{ CellSize };
+        target = std::move(source);
+        VERIFY_ARE_EQUAL(before - charged, ImageSlice::LayerBytesAvailable(), L"move-assignment must not double-charge either");
+    }
+    VERIFY_ARE_EQUAL(before, ImageSlice::LayerBytesAvailable(), L"and move-assignment refunds exactly once");
+}
+
+// A copy carries the same layers, so it must owe the same amount independently.
+void ImageSliceTests::CopyingASliceChargesTheBudgetSeparately()
+{
+    const auto before = ImageSlice::LayerBytesAvailable();
+    {
+        ImageSlice source{ CellSize };
+        Fill(source, source.MutablePixels(0, 16, ImageSlice::LayerKey{ 1, 0 }, 0), 16, Red);
+        const auto charged = before - ImageSlice::LayerBytesAvailable();
+        VERIFY_IS_GREATER_THAN(charged, size_t{ 0 }, L"sanity: the layer costs something");
+
+        ImageSlice copy{ source };
+        VERIFY_ARE_EQUAL(before - charged * 2, ImageSlice::LayerBytesAvailable(), L"a copy owes its own share");
+    }
+    VERIFY_ARE_EQUAL(before, ImageSlice::LayerBytesAvailable(), L"both shares come back");
 }
 
 // A renderer caches uploaded pixels keyed by revision. Each of a slice's three
