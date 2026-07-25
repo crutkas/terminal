@@ -44,6 +44,7 @@ bool GdiEngine::FontHasWesternScript(HDC hdc)
     // state would suppress cell backgrounds on unrelated rows.
     _underlayColumns.clear();
     _rowImageSlice = nullptr;
+    _restoreBkMode = 0;
 
     // Prepare our in-memory bitmap for double-buffered composition.
     RETURN_IF_FAILED(_PrepareMemoryBitmap(_hwndTargetWindow));
@@ -429,18 +430,20 @@ bool GdiEngine::FontHasWesternScript(HDC hdc)
             pPolyTextLine->rcl.left += coordFontSize.width;
         }
 
-        // ETO_OPAQUE fills the cell background, which would paint over image
-        // content this row has sitting below its text. Where the image is
-        // visible under every cell of the run, drop the fill and let the image
-        // be the background. `rcl` is pre-transform, so it is in buffer columns
-        // times the font width; the slice indexes screen columns.
+        // ETO_OPAQUE fills the run's background, which would paint over image
+        // content this row has sitting below its text. It is a single flag for
+        // the whole run, but coverage varies cell by cell, so wherever a run
+        // meets the image at all we drop the flag and fill only the cells the
+        // image does not cover. `rcl` is pre-transform, so it is in buffer
+        // columns times the font width; the slice indexes screen columns.
         if (!_underlayColumns.empty() && coordFontSize.width > 0)
         {
             const auto beginColumn = (pPolyTextLine->rcl.left / coordFontSize.width) << _underlayScale;
             const auto endColumn = (pPolyTextLine->rcl.right / coordFontSize.width) << _underlayScale;
-            if (_UnderlayCoversColumns(beginColumn, endColumn))
+            if (_UnderlayCoversAnyOf(beginColumn, endColumn))
             {
                 WI_ClearFlag(pPolyTextLine->uiFlags, ETO_OPAQUE);
+                LOG_IF_FAILED(_FillUncoveredRunBackground(pPolyTextLine->rcl, coordFontSize.width));
             }
         }
 
@@ -825,6 +828,19 @@ try
     LOG_IF_FAILED(_PaintImagePlane(imageSlice, ImageSlice::RenderPosition::BehindBackground, targetRow, viewportLeft, defaultBackgroundMask, true));
     LOG_IF_FAILED(_PaintImagePlane(imageSlice, ImageSlice::RenderPosition::BehindText, targetRow, viewportLeft, {}, true));
 
+    // Withholding ETO_OPAQUE stops the text filling its background *rectangle*,
+    // but a device context also fills the box behind every individual glyph
+    // when its background mode is OPAQUE, which is GDI's default and is what
+    // the rest of this engine relies on. That fill alone is enough to paint out
+    // everything we just drew, so it has to go too. Runs the image does not
+    // cover keep ETO_OPAQUE, and that fill happens whatever the mode is, so
+    // they are unaffected.
+    if (!_underlayColumns.empty())
+    {
+        const auto previous = SetBkMode(_hdcMemoryContext, TRANSPARENT);
+        _restoreBkMode = previous != TRANSPARENT ? previous : 0;
+    }
+
     LOG_IF_FAILED(PrepareLineTransform(rendition, targetRow, viewportLeft));
 
     _rowImageSlice = &imageSlice;
@@ -835,24 +851,80 @@ try
 }
 CATCH_RETURN();
 
-// Reports whether image content below the text covers every one of these
-// screen columns, in which case the text must not fill its own background.
-bool GdiEngine::_UnderlayCoversColumns(const til::CoordType columnBegin, const til::CoordType columnEnd) const noexcept
+// Reports whether image content below the text covers this screen column.
+bool GdiEngine::_UnderlayCoversColumn(const til::CoordType column) const noexcept
 {
-    if (_underlayColumns.empty() || columnBegin >= columnEnd || columnBegin < _underlayColumnOffset)
+    const auto index = column - _underlayColumnOffset;
+    if (index < 0 || gsl::narrow_cast<size_t>(index) >= _underlayColumns.size())
+    {
+        return false;
+    }
+    return til::at(_underlayColumns, gsl::narrow_cast<size_t>(index)) != 0;
+}
+
+// Reports whether image content covers any part of the buffer cell whose first
+// screen column is this one. Under a double-width rendition one buffer cell
+// spans two screen columns, and a cell only half covered still has to leave the
+// image alone.
+bool GdiEngine::_UnderlayCoversBufferCell(const til::CoordType bufferColumn) const noexcept
+{
+    const auto screenColumn = bufferColumn << _underlayScale;
+    return _UnderlayCoversColumn(screenColumn) ||
+           (_underlayScale != 0 && _UnderlayCoversColumn(screenColumn + 1));
+}
+
+// Reports whether image content below the text covers any of these screen
+// columns, which is what decides whether a run can keep its own background fill.
+bool GdiEngine::_UnderlayCoversAnyOf(const til::CoordType columnBegin, const til::CoordType columnEnd) const noexcept
+{
+    if (_underlayColumns.empty() || columnBegin >= columnEnd)
     {
         return false;
     }
 
     for (auto column = columnBegin; column < columnEnd; column++)
     {
-        const auto index = gsl::narrow_cast<size_t>(column - _underlayColumnOffset);
-        if (index >= _underlayColumns.size() || til::at(_underlayColumns, index) == 0)
+        if (_UnderlayCoversColumn(column))
         {
-            return false;
+            return true;
         }
     }
-    return true;
+    return false;
+}
+
+// Routine Description:
+// - Fills the background of the cells of a run that no image covers, standing in
+//   for the ETO_OPAQUE that had to be dropped so the rest of the run could show
+//   the image through. Uses the device context's current background colour,
+//   which is the one already selected for this run.
+// Arguments:
+// - runRect - the run's rectangle, pre-transform, so measured in buffer columns
+// - fontWidth - the width of one buffer cell in pixels
+// Return Value:
+// - S_OK or E_FAIL if GDI failed.
+[[nodiscard]] HRESULT GdiEngine::_FillUncoveredRunBackground(const RECT& runRect, const til::CoordType fontWidth) noexcept
+{
+    auto spanLeft = runRect.left;
+    for (auto x = runRect.left; x < runRect.right; x += fontWidth)
+    {
+        if (!_UnderlayCoversBufferCell(x / fontWidth))
+        {
+            continue;
+        }
+        if (spanLeft < x)
+        {
+            RECT fill{ spanLeft, runRect.top, x, runRect.bottom };
+            RETURN_HR_IF(E_FAIL, !ExtTextOutW(_hdcMemoryContext, 0, 0, ETO_OPAQUE, &fill, nullptr, 0, nullptr));
+        }
+        spanLeft = x + fontWidth;
+    }
+
+    if (spanLeft < runRect.right)
+    {
+        RECT fill{ spanLeft, runRect.top, runRect.right, runRect.bottom };
+        RETURN_HR_IF(E_FAIL, !ExtTextOutW(_hdcMemoryContext, 0, 0, ETO_OPAQUE, &fill, nullptr, 0, nullptr));
+    }
+    return S_OK;
 }
 
 [[nodiscard]] HRESULT GdiEngine::EndRowImages() noexcept
@@ -861,6 +933,11 @@ try
     // Push the row's text out over whatever was painted below it...
     _underlayColumns.clear();
     LOG_IF_FAILED(_FlushBufferLines());
+    if (_restoreBkMode != 0)
+    {
+        SetBkMode(_hdcMemoryContext, _restoreBkMode);
+        _restoreBkMode = 0;
+    }
 
     // ...and only then put the above-text content on top of all of it.
     if (_rowImageSlice)

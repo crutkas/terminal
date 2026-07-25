@@ -190,6 +190,9 @@ namespace Microsoft::Console::Render
         std::vector<uint8_t> _underlayColumns;
         til::CoordType _underlayColumnOffset = 0;
         int _underlayScale = 0;
+        // The background mode to put back once this row's text has been drawn,
+        // or 0 if we never changed it. See BeginRowImages.
+        int _restoreBkMode = 0;
 
         [[nodiscard]] HRESULT _PaintImagePlane(const ImageSlice& imageSlice,
                                                ImageSlice::RenderPosition position,
@@ -197,7 +200,10 @@ namespace Microsoft::Console::Render
                                                til::CoordType viewportLeft,
                                                std::span<const uint8_t> defaultBackgroundMask,
                                                bool underText) noexcept;
-        bool _UnderlayCoversColumns(til::CoordType columnBegin, til::CoordType columnEnd) const noexcept;
+        bool _UnderlayCoversColumn(til::CoordType column) const noexcept;
+        bool _UnderlayCoversBufferCell(til::CoordType bufferColumn) const noexcept;
+        bool _UnderlayCoversAnyOf(til::CoordType columnBegin, til::CoordType columnEnd) const noexcept;
+        [[nodiscard]] HRESULT _FillUncoveredRunBackground(const RECT& runRect, til::CoordType fontWidth) noexcept;
 
         [[nodiscard]] HRESULT _InvalidCombine(const til::rect* const prc) noexcept;
         [[nodiscard]] HRESULT _InvalidOffset(const til::point* const ppt) noexcept;
