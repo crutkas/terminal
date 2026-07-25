@@ -968,7 +968,7 @@ bool ImageSlice::EraseLayer(const uint32_t imageId, const int32_t zIndex)
     {
         if (it->key.imageId == imageId && it->zIndex == zIndex)
         {
-            _releaseLayerBytes(_layerBytes(*it));
+            _charge.Release(_layerBytes(*it));
             it = _layers.erase(it);
             erased = true;
         }
