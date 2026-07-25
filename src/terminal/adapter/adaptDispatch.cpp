@@ -64,6 +64,35 @@ AdaptDispatch::AdaptDispatch(ITerminalApi& api, Renderer* renderer, RenderSettin
     _termOutput(),
     _pages{ api, renderer }
 {
+    if (_renderer)
+    {
+        try
+        {
+            auto target = std::make_shared<KittyAnimationTimerTarget>();
+            target->dispatch = this;
+            _kittyAnimationTimer = _renderer->RegisterTimer("kitty animation", [weakTarget = std::weak_ptr{ target }](Renderer&, const TimerHandle) {
+                if (const auto target = weakTarget.lock())
+                {
+                    const std::scoped_lock lock{ target->mutex };
+                    if (target->dispatch)
+                    {
+                        target->dispatch->_advanceKittyAnimations(std::chrono::steady_clock::now());
+                    }
+                }
+            }, target);
+            _kittyAnimationTimerTarget = std::move(target);
+        }
+        CATCH_LOG();
+    }
+}
+
+AdaptDispatch::~AdaptDispatch()
+{
+    if (_kittyAnimationTimerTarget)
+    {
+        const std::scoped_lock lock{ _kittyAnimationTimerTarget->mutex };
+        _kittyAnimationTimerTarget->dispatch = nullptr;
+    }
 }
 
 void AdaptDispatch::UnknownSequence() noexcept
@@ -1722,6 +1751,7 @@ void AdaptDispatch::PrecedingPage(const VTInt pageCount)
 void AdaptDispatch::PagePositionAbsolute(const VTInt page)
 {
     _pages.MoveTo(page, _modes.test(Mode::PageCursorCoupling));
+    RefreshKittyImageLayers();
 }
 
 // Routine Description:
@@ -1732,6 +1762,7 @@ void AdaptDispatch::PagePositionAbsolute(const VTInt page)
 void AdaptDispatch::PagePositionRelative(const VTInt pageCount)
 {
     _pages.MoveRelative(pageCount, _modes.test(Mode::PageCursorCoupling));
+    RefreshKittyImageLayers();
 }
 
 // Routine Description:
@@ -1742,6 +1773,7 @@ void AdaptDispatch::PagePositionRelative(const VTInt pageCount)
 void AdaptDispatch::PagePositionBack(const VTInt pageCount)
 {
     _pages.MoveRelative(-pageCount, _modes.test(Mode::PageCursorCoupling));
+    RefreshKittyImageLayers();
 }
 
 // Routine Description:
@@ -1806,6 +1838,7 @@ void AdaptDispatch::_SetAlternateScreenBufferMode(const bool enable)
         const auto page = _pages.ActivePage();
         _api.UseAlternateScreenBuffer(_GetEraseAttributes(page));
         _usingAltBuffer = true;
+        _scheduleKittyAnimationTimer();
     }
     else
     {
@@ -1820,6 +1853,7 @@ void AdaptDispatch::_SetAlternateScreenBufferMode(const bool enable)
             _restoreKittyBufferState(std::move(state));
         }
         CursorRestoreState();
+        RefreshKittyImageLayers();
     }
 }
 
@@ -5797,6 +5831,42 @@ void AdaptDispatch::_ProcessKittyCommand(const KittyControl& command, const std:
             }
             break;
         }
+        case L'f': // transmit animation frame
+        case L'a': // control animation
+        case L'c': // compose animation frames
+        {
+            uint32_t targetId = 0;
+            if (haveId)
+            {
+                targetId = imageId;
+            }
+            else if (haveNumber)
+            {
+                const auto it = _kittyImageNumbers.find(imageNumber);
+                if (it != _kittyImageNumbers.end())
+                {
+                    targetId = it->second;
+                }
+            }
+            if (targetId == 0)
+            {
+                success = false;
+                code = L"ENOENT:image not found";
+            }
+            else if (action == L'f')
+            {
+                success = _processKittyAnimationFrame(command, payload, payloadValid, payloadTooLarge, targetId, code);
+            }
+            else if (action == L'a')
+            {
+                success = _processKittyAnimationControl(command, targetId, code);
+            }
+            else
+            {
+                success = _processKittyFrameComposition(command, targetId, code);
+            }
+            break;
+        }
         case L'd': // delete
         {
             // Lowercase d= selectors delete placements + on-screen pixels but KEEP the image data
@@ -5931,6 +6001,28 @@ void AdaptDispatch::_ProcessKittyCommand(const KittyControl& command, const std:
                     _deleteKittyPlacementsByZ(command.zIndex, freeData, til::point{ x, y });
                 }
                 break;
+            case L'f': // delete animation frame r= (default: root frame)
+            case L'F':
+            {
+                uint32_t targetId = 0;
+                if (haveId)
+                {
+                    targetId = imageId;
+                }
+                else if (haveNumber)
+                {
+                    const auto it = _kittyImageNumbers.find(imageNumber);
+                    if (it != _kittyImageNumbers.end())
+                    {
+                        targetId = it->second;
+                    }
+                }
+                if (targetId != 0)
+                {
+                    _deleteKittyAnimationFrames(targetId, command.rows == 0 ? 1 : command.rows, freeData);
+                }
+                break;
+            }
             default:
                 success = false;
                 code = L"EINVAL:unsupported delete target";
@@ -6162,6 +6254,10 @@ try
     _kittyPlacements.clear();
     _kittyAnonymousPlacements.clear();
     _kittyTotalPixelBytes = 0;
+    if (_renderer && _kittyAnimationTimer)
+    {
+        _renderer->StopTimer(*_kittyAnimationTimer);
+    }
     auto page = _pages.ActivePage();
     auto& buffer = page.Buffer();
     auto erased = false;
@@ -6297,6 +6393,743 @@ std::vector<RGBQUAD> AdaptDispatch::_decodeKittyPixels(const uint32_t format, co
     return pixels;
 }
 
+RGBQUAD AdaptDispatch::_kittyRgbaColor(const uint32_t rgba) noexcept
+{
+    const auto alpha = rgba & 0xffu;
+    RGBQUAD pixel{};
+    pixel.rgbRed = static_cast<BYTE>(((rgba >> 24) & 0xffu) * alpha / 255u);
+    pixel.rgbGreen = static_cast<BYTE>(((rgba >> 16) & 0xffu) * alpha / 255u);
+    pixel.rgbBlue = static_cast<BYTE>(((rgba >> 8) & 0xffu) * alpha / 255u);
+    pixel.rgbReserved = static_cast<BYTE>(alpha);
+    return pixel;
+}
+
+void AdaptDispatch::_kittyCompositePixels(const std::span<RGBQUAD> destination, const std::span<const RGBQUAD> source, const bool replace) noexcept
+{
+    const auto count = std::min(destination.size(), source.size());
+    for (size_t i = 0; i < count; ++i)
+    {
+        const auto& src = source[i];
+        auto& dst = destination[i];
+        if (replace)
+        {
+            dst = src;
+            continue;
+        }
+        const auto inverseAlpha = 255u - src.rgbReserved;
+        dst.rgbRed = static_cast<BYTE>(std::min(255u, static_cast<uint32_t>(src.rgbRed) + (static_cast<uint32_t>(dst.rgbRed) * inverseAlpha + 127u) / 255u));
+        dst.rgbGreen = static_cast<BYTE>(std::min(255u, static_cast<uint32_t>(src.rgbGreen) + (static_cast<uint32_t>(dst.rgbGreen) * inverseAlpha + 127u) / 255u));
+        dst.rgbBlue = static_cast<BYTE>(std::min(255u, static_cast<uint32_t>(src.rgbBlue) + (static_cast<uint32_t>(dst.rgbBlue) * inverseAlpha + 127u) / 255u));
+        dst.rgbReserved = static_cast<BYTE>(std::min(255u, static_cast<uint32_t>(src.rgbReserved) + (static_cast<uint32_t>(dst.rgbReserved) * inverseAlpha + 127u) / 255u));
+    }
+}
+
+size_t AdaptDispatch::_kittyFrameCount(const KittyImage& image) noexcept
+{
+    return image.pixels.empty() ? 0 : image.animationFrames.size() + 1;
+}
+
+std::vector<RGBQUAD>* AdaptDispatch::_kittyFramePixels(KittyImage& image, const uint32_t frameNumber) noexcept
+{
+    if (frameNumber == 1)
+    {
+        return &image.pixels;
+    }
+    const auto index = static_cast<size_t>(frameNumber) - 2;
+    return index < image.animationFrames.size() ? &image.animationFrames[index].pixels : nullptr;
+}
+
+const std::vector<RGBQUAD>* AdaptDispatch::_kittyFramePixels(const KittyImage& image, const uint32_t frameNumber) noexcept
+{
+    if (frameNumber == 1)
+    {
+        return &image.pixels;
+    }
+    const auto index = static_cast<size_t>(frameNumber) - 2;
+    return index < image.animationFrames.size() ? &image.animationFrames[index].pixels : nullptr;
+}
+
+int32_t* AdaptDispatch::_kittyFrameGap(KittyImage& image, const uint32_t frameNumber) noexcept
+{
+    if (frameNumber == 1)
+    {
+        return &image.rootGapMilliseconds;
+    }
+    const auto index = static_cast<size_t>(frameNumber) - 2;
+    return index < image.animationFrames.size() ? &image.animationFrames[index].gapMilliseconds : nullptr;
+}
+
+void AdaptDispatch::_updateKittyImageLayers(const uint32_t imageId, const std::span<const RGBQUAD> pixels)
+{
+    const auto image = _kittyImages.find(imageId);
+    if (image == _kittyImages.end() || !image->second.hasRenderedPlacements)
+    {
+        return;
+    }
+
+    const auto visiblePageNumber = _pages.VisiblePage().Number();
+    auto foundLayer = false;
+    _pages.ForEachPage([&](const Page page) {
+        auto& buffer = page.Buffer();
+        auto firstRow = page.Bottom();
+        auto lastRow = 0;
+        for (auto row = 0; row < page.Bottom(); ++row)
+        {
+            const auto* slice = buffer.GetRowByOffset(row).GetImageSlice();
+            if (slice && slice->Contains(imageId))
+            {
+                foundLayer = true;
+                auto* mutableSlice = buffer.GetMutableRowByOffset(row).GetMutableImageSlice();
+                if (mutableSlice->UpdateImage(imageId, pixels))
+                {
+                    firstRow = std::min(firstRow, row);
+                    lastRow = std::max(lastRow, row);
+                }
+            }
+        }
+        if (page.Number() == visiblePageNumber && firstRow <= lastRow)
+        {
+            buffer.TriggerRedraw(Viewport::FromExclusive({ 0, firstRow, page.Width(), lastRow + 1 }));
+        }
+    });
+    if (!foundLayer)
+    {
+        image->second.hasRenderedPlacements = false;
+    }
+}
+
+void AdaptDispatch::RefreshKittyImageLayers()
+{
+    for (const auto& [imageId, image] : _kittyImages)
+    {
+        if (image.animationFrames.empty())
+        {
+            continue;
+        }
+        if (const auto pixels = _kittyFramePixels(image, image.presentedFrame))
+        {
+            _updateKittyImageLayers(imageId, *pixels);
+        }
+    }
+    _scheduleKittyAnimationTimer();
+}
+
+bool AdaptDispatch::_processKittyAnimationFrame(const KittyControl& command, const std::string_view payload, const bool payloadValid, const bool payloadTooLarge, const uint32_t imageId, std::wstring_view& code)
+try
+{
+    auto imageIt = _kittyImages.find(imageId);
+    if (imageIt == _kittyImages.end())
+    {
+        code = L"ENOENT:image not found";
+        return false;
+    }
+    if (command.medium != L'd' || command.compression != 0)
+    {
+        code = command.medium != L'd' ? L"EINVAL:unsupported transmission medium" : L"EINVAL:unsupported compression";
+        return false;
+    }
+    if (command.format != 24 && command.format != 32 && command.format != 100)
+    {
+        code = L"EINVAL:unsupported format";
+        return false;
+    }
+    if (command.upperX > 1)
+    {
+        code = L"EINVAL:invalid frame composition mode";
+        return false;
+    }
+
+    std::vector<uint8_t> bytes;
+    if (!payloadValid || !_DecodeKittyBase64(payload, bytes))
+    {
+        code = payloadTooLarge ? L"EFBIG:payload exceeds maximum size" : L"EINVAL:bad payload";
+        return false;
+    }
+
+    uint32_t frameWidth = 0;
+    uint32_t frameHeight = 0;
+    std::vector<RGBQUAD> framePixels;
+    if (command.format == 24 || command.format == 32)
+    {
+        const auto depth = command.format == 24 ? 3u : 4u;
+        if (command.width == 0 || command.height == 0)
+        {
+            code = L"EINVAL:missing frame dimensions";
+            return false;
+        }
+        const auto area = static_cast<uint64_t>(command.width) * command.height;
+        if (area > bytes.size() / depth || area * depth != bytes.size())
+        {
+            code = L"EINVAL:payload size mismatch";
+            return false;
+        }
+        frameWidth = command.width;
+        frameHeight = command.height;
+        framePixels = _decodeKittyPixels(command.format, bytes);
+    }
+    else
+    {
+        til::size decodedSize;
+        if (bytes.empty() ||
+            !_api.DecodeImageToBgra(bytes, framePixels, decodedSize) ||
+            decodedSize.width <= 0 || decodedSize.height <= 0 ||
+            framePixels.size() != static_cast<size_t>(decodedSize.width) * decodedSize.height)
+        {
+            code = L"EBADPNG:could not decode frame";
+            return false;
+        }
+        frameWidth = static_cast<uint32_t>(decodedSize.width);
+        frameHeight = static_cast<uint32_t>(decodedSize.height);
+    }
+
+    auto& image = imageIt->second;
+    if (command.srcX > image.width || command.srcY > image.height ||
+        frameWidth > image.width - command.srcX || frameHeight > image.height - command.srcY)
+    {
+        code = L"EINVAL:frame rectangle out of bounds";
+        return false;
+    }
+
+    const auto editFrame = command.rows;
+    const auto backgroundFrame = command.cols;
+    if (editFrame != 0 && backgroundFrame != 0)
+    {
+        code = L"EINVAL:cannot edit and create a frame simultaneously";
+        return false;
+    }
+    if (editFrame == 0 && _kittyFrameCount(image) >= MaxKittyFramesPerImage)
+    {
+        code = L"ENOSPC:frame count limit exceeded";
+        return false;
+    }
+    if (editFrame != 0 && !_kittyFramePixels(image, editFrame))
+    {
+        code = L"ENOENT:frame not found";
+        return false;
+    }
+    if (editFrame == 0 && backgroundFrame != 0 && !_kittyFramePixels(image, backgroundFrame))
+    {
+        code = L"ENOENT:background frame not found";
+        return false;
+    }
+
+    const auto frameBytes = image.pixels.size() * sizeof(RGBQUAD);
+    std::vector<uint32_t> victims;
+    if (editFrame == 0)
+    {
+        // A victim whose placement is an ancestor of the target would cascade-delete
+        // the image we are extending. Build the target's bounded parent ancestry once,
+        // then exclude those image ids from the eviction plan.
+        std::vector<uint32_t> protectedImageIds{ imageId };
+        const auto protectAncestors = [&](std::pair<uint32_t, uint32_t> parent) {
+            for (auto depth = 0; depth < MaxKittyPlacementDepth; ++depth)
+            {
+                if (std::find(protectedImageIds.begin(), protectedImageIds.end(), parent.first) == protectedImageIds.end())
+                {
+                    protectedImageIds.push_back(parent.first);
+                }
+                const auto placement = _kittyPlacements.find(parent);
+                if (placement == _kittyPlacements.end() || !placement->second.hasParent)
+                {
+                    break;
+                }
+                parent = { placement->second.parentImageId, placement->second.parentPlacementId };
+            }
+        };
+        for (const auto& [key, placement] : _kittyPlacements)
+        {
+            if (key.first == imageId && placement.hasParent)
+            {
+                protectAncestors({ placement.parentImageId, placement.parentPlacementId });
+            }
+        }
+        for (const auto& placement : _kittyAnonymousPlacements)
+        {
+            if (placement.imageId == imageId && placement.hasParent)
+            {
+                protectAncestors({ placement.parentImageId, placement.parentPlacementId });
+            }
+        }
+
+        const auto retainedBytes = _kittyRetainedPixelBytes();
+        const auto requiredBytes = retainedBytes > MaxKittyTotalBytes - frameBytes ?
+                                       retainedBytes - (MaxKittyTotalBytes - frameBytes) :
+                                       size_t{ 0 };
+        auto reclaimableBytes = size_t{ 0 };
+        if (requiredBytes != 0)
+        {
+            for (const auto candidateId : _kittyImageOrder)
+            {
+                if (std::find(protectedImageIds.begin(), protectedImageIds.end(), candidateId) != protectedImageIds.end())
+                {
+                    continue;
+                }
+                const auto candidate = _kittyImages.find(candidateId);
+                if (candidate == _kittyImages.end())
+                {
+                    continue;
+                }
+                victims.push_back(candidateId);
+                reclaimableBytes += candidate->second.PixelBytes();
+                if (reclaimableBytes >= requiredBytes)
+                {
+                    break;
+                }
+            }
+        }
+        if (reclaimableBytes < requiredBytes)
+        {
+            code = L"ENOSPC:image storage limit exceeded";
+            return false;
+        }
+    }
+
+    auto canvas = std::vector<RGBQUAD>{};
+    if (editFrame != 0)
+    {
+        canvas = *_kittyFramePixels(imageIt->second, editFrame);
+    }
+    else if (backgroundFrame != 0)
+    {
+        canvas = *_kittyFramePixels(imageIt->second, backgroundFrame);
+    }
+    else
+    {
+        canvas.assign(imageIt->second.pixels.size(), _kittyRgbaColor(command.upperY));
+    }
+
+    for (uint32_t row = 0; row < frameHeight; ++row)
+    {
+        const auto srcOffset = static_cast<size_t>(row) * frameWidth;
+        const auto dstOffset = static_cast<size_t>(command.srcY + row) * imageIt->second.width + command.srcX;
+        _kittyCompositePixels(std::span{ canvas }.subspan(dstOffset, frameWidth),
+                              std::span{ framePixels }.subspan(srcOffset, frameWidth),
+                              command.upperX == 1);
+    }
+
+    if (editFrame == 0)
+    {
+        // Allocate every fallible part of the append before eviction mutates unrelated
+        // images. The subsequent frame move cannot allocate once capacity is reserved.
+        imageIt->second.animationFrames.reserve(imageIt->second.animationFrames.size() + 1);
+        for (const auto victimId : victims)
+        {
+            if (_kittyImages.count(victimId) == 0)
+            {
+                continue;
+            }
+            _eraseKittyPlacementsForImage(victimId);
+            _eraseKittyImageRows(victimId);
+            _eraseKittyImage(victimId);
+        }
+        imageIt = _kittyImages.find(imageId);
+        WI_ASSERT(imageIt != _kittyImages.end());
+    }
+
+    auto& storedImage = imageIt->second;
+    uint32_t changedFrame = 0;
+    if (editFrame != 0)
+    {
+        *_kittyFramePixels(storedImage, editFrame) = std::move(canvas);
+        changedFrame = editFrame;
+        if (command.haveZ && command.zIndex != 0)
+        {
+            *_kittyFrameGap(storedImage, editFrame) = command.zIndex;
+        }
+    }
+    else
+    {
+        KittyAnimationFrame frame;
+        frame.pixels = std::move(canvas);
+        frame.gapMilliseconds = command.haveZ && command.zIndex != 0 ? command.zIndex : 40;
+        storedImage.animationFrames.push_back(std::move(frame));
+        _kittyTotalPixelBytes += frameBytes;
+        changedFrame = gsl::narrow_cast<uint32_t>(_kittyFrameCount(storedImage));
+    }
+
+    if (storedImage.presentedFrame == changedFrame)
+    {
+        _updateKittyImageLayers(imageId, *_kittyFramePixels(storedImage, changedFrame));
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (storedImage.animationState == 2 && storedImage.waitingForFrames)
+    {
+        storedImage.waitingForFrames = false;
+        _advanceKittyImage(imageId, storedImage, now);
+    }
+    else if (storedImage.currentFrame == changedFrame &&
+             command.haveZ && command.zIndex != 0 &&
+             (storedImage.animationState == 2 || storedImage.animationState == 3))
+    {
+        _scheduleKittyAnimation(imageId, storedImage, now);
+    }
+    _scheduleKittyAnimationTimer();
+    return true;
+}
+catch (const std::bad_alloc&)
+{
+    code = L"ENOSPC:could not allocate frame";
+    return false;
+}
+
+bool AdaptDispatch::_processKittyAnimationControl(const KittyControl& command, const uint32_t imageId, std::wstring_view& code)
+{
+    const auto imageIt = _kittyImages.find(imageId);
+    if (imageIt == _kittyImages.end())
+    {
+        code = L"ENOENT:image not found";
+        return false;
+    }
+    auto& image = imageIt->second;
+    if (command.width > 3)
+    {
+        code = L"EINVAL:invalid animation state";
+        return false;
+    }
+    if (command.cols != 0 && !_kittyFramePixels(image, command.cols))
+    {
+        code = L"ENOENT:frame not found";
+        return false;
+    }
+    if (command.rows != 0 && !_kittyFrameGap(image, command.rows))
+    {
+        code = L"ENOENT:frame not found";
+        return false;
+    }
+
+    auto reschedule = false;
+    if (command.cols != 0)
+    {
+        image.currentFrame = command.cols;
+        image.presentedFrame = image.currentFrame;
+        _updateKittyImageLayers(imageId, *_kittyFramePixels(image, image.currentFrame));
+        reschedule = true;
+    }
+    if (command.rows != 0 && command.haveZ && command.zIndex != 0)
+    {
+        *_kittyFrameGap(image, command.rows) = command.zIndex;
+        reschedule |= command.rows == image.currentFrame;
+    }
+    if (command.height != 0)
+    {
+        image.loopCount = command.height;
+        image.loopsRemaining = command.height == 1 ? UINT32_MAX : command.height - 1;
+    }
+    if (command.width != 0)
+    {
+        image.animationState = command.width;
+        image.waitingForFrames = false;
+        image.nextFrameTime = {};
+        image.loopsRemaining = image.loopCount == 1 ? UINT32_MAX : image.loopCount - 1;
+        reschedule = true;
+    }
+
+    if (image.animationState == 1)
+    {
+        image.nextFrameTime = {};
+        image.waitingForFrames = false;
+    }
+    else if (reschedule)
+    {
+        _scheduleKittyAnimation(imageId, image, std::chrono::steady_clock::now());
+    }
+    _scheduleKittyAnimationTimer();
+    return true;
+}
+
+bool AdaptDispatch::_processKittyFrameComposition(const KittyControl& command, const uint32_t imageId, std::wstring_view& code)
+try
+{
+    const auto imageIt = _kittyImages.find(imageId);
+    if (imageIt == _kittyImages.end())
+    {
+        code = L"ENOENT:image not found";
+        return false;
+    }
+    auto& image = imageIt->second;
+    const auto sourceFrame = command.rows;
+    const auto destinationFrame = command.cols;
+    const auto* source = _kittyFramePixels(image, sourceFrame);
+    auto* destination = _kittyFramePixels(image, destinationFrame);
+    if (sourceFrame == 0 || destinationFrame == 0 || !source || !destination)
+    {
+        code = L"ENOENT:frame not found";
+        return false;
+    }
+
+    const auto width = command.srcW == 0 ? image.width : command.srcW;
+    const auto height = command.srcH == 0 ? image.height : command.srcH;
+    if (width == 0 || height == 0 ||
+        command.srcX > image.width || command.srcY > image.height ||
+        command.upperX > image.width || command.upperY > image.height ||
+        width > image.width - command.srcX || height > image.height - command.srcY ||
+        width > image.width - command.upperX || height > image.height - command.upperY)
+    {
+        code = L"EINVAL:composition rectangle out of bounds";
+        return false;
+    }
+
+    const til::rect sourceRect{
+        gsl::narrow_cast<til::CoordType>(command.upperX),
+        gsl::narrow_cast<til::CoordType>(command.upperY),
+        gsl::narrow_cast<til::CoordType>(command.upperX + width),
+        gsl::narrow_cast<til::CoordType>(command.upperY + height),
+    };
+    const til::rect destinationRect{
+        gsl::narrow_cast<til::CoordType>(command.srcX),
+        gsl::narrow_cast<til::CoordType>(command.srcY),
+        gsl::narrow_cast<til::CoordType>(command.srcX + width),
+        gsl::narrow_cast<til::CoordType>(command.srcY + height),
+    };
+    const auto rectanglesOverlap = sourceRect.left < destinationRect.right &&
+                                   destinationRect.left < sourceRect.right &&
+                                   sourceRect.top < destinationRect.bottom &&
+                                   destinationRect.top < sourceRect.bottom;
+    if (sourceFrame == destinationFrame && rectanglesOverlap)
+    {
+        code = L"EINVAL:overlapping self-composition";
+        return false;
+    }
+
+    std::vector<RGBQUAD> sourcePixels(static_cast<size_t>(width) * height);
+    for (uint32_t row = 0; row < height; ++row)
+    {
+        const auto srcOffset = static_cast<size_t>(command.upperY + row) * image.width + command.upperX;
+        std::copy_n(source->begin() + srcOffset, width, sourcePixels.begin() + static_cast<size_t>(row) * width);
+    }
+    for (uint32_t row = 0; row < height; ++row)
+    {
+        const auto dstOffset = static_cast<size_t>(command.srcY + row) * image.width + command.srcX;
+        _kittyCompositePixels(std::span{ *destination }.subspan(dstOffset, width),
+                              std::span{ sourcePixels }.subspan(static_cast<size_t>(row) * width, width),
+                              command.noCursorMovement);
+    }
+    if (image.presentedFrame == destinationFrame)
+    {
+        _updateKittyImageLayers(imageId, *destination);
+    }
+    return true;
+}
+catch (const std::bad_alloc&)
+{
+    code = L"ENOSPC:could not compose frame";
+    return false;
+}
+
+void AdaptDispatch::_scheduleKittyAnimation(const uint32_t imageId, KittyImage& image, const std::chrono::steady_clock::time_point now)
+{
+    if (image.animationState != 2 && image.animationState != 3)
+    {
+        image.nextFrameTime = {};
+        return;
+    }
+    const auto* gap = _kittyFrameGap(image, image.currentFrame);
+    if (!gap)
+    {
+        image.animationState = 1;
+        image.nextFrameTime = {};
+        return;
+    }
+    if (*gap > 0)
+    {
+        image.waitingForFrames = false;
+        if (image.presentedFrame != image.currentFrame)
+        {
+            image.presentedFrame = image.currentFrame;
+            _updateKittyImageLayers(imageId, *_kittyFramePixels(image, image.presentedFrame));
+        }
+        image.nextFrameTime = now + std::chrono::milliseconds(*gap);
+    }
+    else
+    {
+        image.nextFrameTime = now;
+        _advanceKittyImage(imageId, image, now);
+    }
+}
+
+bool AdaptDispatch::_advanceKittyImage(const uint32_t imageId, KittyImage& image, const std::chrono::steady_clock::time_point now)
+{
+    if (image.animationState != 2 && image.animationState != 3)
+    {
+        image.nextFrameTime = {};
+        return false;
+    }
+
+    const auto frameCount = gsl::narrow_cast<uint32_t>(_kittyFrameCount(image));
+    if (frameCount < 2)
+    {
+        image.waitingForFrames = image.animationState == 2;
+        image.nextFrameTime = {};
+        return false;
+    }
+
+    // A full pass is enough to prove that every frame is gapless. Stop rather
+    // than spin forever on an animation that can never present a frame.
+    for (uint32_t skipped = 0; skipped <= frameCount; ++skipped)
+    {
+        if (image.currentFrame < frameCount)
+        {
+            ++image.currentFrame;
+        }
+        else if (image.animationState == 2)
+        {
+            image.waitingForFrames = true;
+            image.nextFrameTime = {};
+            return false;
+        }
+        else
+        {
+            if (image.loopsRemaining != UINT32_MAX)
+            {
+                if (image.loopsRemaining == 0)
+                {
+                    image.animationState = 1;
+                    image.nextFrameTime = {};
+                    return false;
+                }
+                --image.loopsRemaining;
+            }
+            image.currentFrame = 1;
+        }
+
+        const auto* gap = _kittyFrameGap(image, image.currentFrame);
+        if (gap && *gap > 0)
+        {
+            image.waitingForFrames = false;
+            image.presentedFrame = image.currentFrame;
+            _updateKittyImageLayers(imageId, *_kittyFramePixels(image, image.currentFrame));
+            image.nextFrameTime = now + std::chrono::milliseconds(*gap);
+            return true;
+        }
+    }
+
+    image.animationState = 1;
+    image.nextFrameTime = {};
+    return false;
+}
+
+void AdaptDispatch::_advanceKittyAnimations(const std::chrono::steady_clock::time_point now)
+{
+    for (auto& [imageId, image] : _kittyImages)
+    {
+        if ((image.animationState == 2 || image.animationState == 3) &&
+            image.nextFrameTime != std::chrono::steady_clock::time_point{} &&
+            image.nextFrameTime <= now)
+        {
+            _advanceKittyImage(imageId, image, now);
+        }
+    }
+    _scheduleKittyAnimationTimer();
+}
+
+void AdaptDispatch::_scheduleKittyAnimationTimer()
+{
+    if (!_renderer || !_kittyAnimationTimer)
+    {
+        return;
+    }
+
+    auto earliest = std::chrono::steady_clock::time_point::max();
+    for (const auto& [id, image] : _kittyImages)
+    {
+        static_cast<void>(id);
+        if ((image.animationState == 2 || image.animationState == 3) &&
+            image.nextFrameTime != std::chrono::steady_clock::time_point{})
+        {
+            earliest = std::min(earliest, image.nextFrameTime);
+        }
+    }
+    if (earliest == std::chrono::steady_clock::time_point::max())
+    {
+        _renderer->StopTimer(*_kittyAnimationTimer);
+        return;
+    }
+
+    const auto now = std::chrono::steady_clock::now();
+    auto delay = std::max(earliest - now, std::chrono::steady_clock::duration{ std::chrono::milliseconds(1) });
+    // Renderer timers deliberately assert on hour-scale delays. Wake periodically
+    // for hostile/very large gaps, then reschedule until the true deadline.
+    delay = std::min(delay, std::chrono::steady_clock::duration{ std::chrono::seconds(30) });
+    _renderer->StartTimer(*_kittyAnimationTimer, std::chrono::duration_cast<TimerDuration>(delay));
+}
+
+void AdaptDispatch::_deleteKittyAnimationFrames(const uint32_t imageId, const uint32_t frameNumber, const bool freeData)
+{
+    const auto imageIt = _kittyImages.find(imageId);
+    if (imageIt == _kittyImages.end())
+    {
+        return;
+    }
+    auto& image = imageIt->second;
+    const auto frameCount = gsl::narrow_cast<uint32_t>(_kittyFrameCount(image));
+    if (frameNumber == 0 || frameNumber > frameCount)
+    {
+        return;
+    }
+    if (frameCount <= 1)
+    {
+        if (freeData)
+        {
+            _eraseKittyPlacementsForImage(imageId);
+            _eraseKittyImageRows(imageId);
+            _eraseKittyImage(imageId);
+        }
+        _scheduleKittyAnimationTimer();
+        return;
+    }
+    const auto frameBytes = image.pixels.size() * sizeof(RGBQUAD);
+    if (frameNumber == 1)
+    {
+        auto promoted = std::move(image.animationFrames.front());
+        image.animationFrames.erase(image.animationFrames.begin());
+        image.pixels = std::move(promoted.pixels);
+        image.rootGapMilliseconds = promoted.gapMilliseconds;
+    }
+    else
+    {
+        image.animationFrames.erase(image.animationFrames.begin() + (frameNumber - 2));
+    }
+    _kittyTotalPixelBytes -= frameBytes;
+
+    const auto remaining = gsl::narrow_cast<uint32_t>(_kittyFrameCount(image));
+    if (image.currentFrame > frameNumber)
+    {
+        --image.currentFrame;
+    }
+    else if (image.currentFrame == frameNumber)
+    {
+        image.currentFrame = std::min(frameNumber, remaining);
+    }
+    if (image.presentedFrame > frameNumber)
+    {
+        --image.presentedFrame;
+    }
+    else if (image.presentedFrame == frameNumber)
+    {
+        image.presentedFrame = std::min(frameNumber, remaining);
+    }
+
+    if (remaining == 1)
+    {
+        image.animationState = 1;
+        image.waitingForFrames = false;
+        image.nextFrameTime = {};
+    }
+    _updateKittyImageLayers(imageId, *_kittyFramePixels(image, image.presentedFrame));
+
+    if (freeData && remaining == 1)
+    {
+        _eraseKittyPlacementsForImage(imageId);
+        _eraseKittyImageRows(imageId);
+        _eraseKittyImage(imageId);
+    }
+    else if (image.animationState == 2 || image.animationState == 3)
+    {
+        _scheduleKittyAnimation(imageId, image, std::chrono::steady_clock::now());
+    }
+    _scheduleKittyAnimationTimer();
+}
+
 bool AdaptDispatch::_kittyPlacementFitsMemory(const KittyImage& image, const uint32_t imageId, const uint64_t layerId, const uint32_t cols, const uint32_t rows, const uint32_t srcX, const uint32_t srcY, const uint32_t srcW, const uint32_t srcH, const int32_t zIndex, const std::optional<til::point> anchor) const noexcept
 {
     if (image.pixels.empty() || image.width == 0 || image.height == 0)
@@ -6363,7 +7196,7 @@ bool AdaptDispatch::_kittyPlacementFitsMemory(const KittyImage& image, const uin
 // Protocol: https://sw.kovidgoyal.net/kitty/graphics-protocol/#controlling-displayed-image-layout
 til::size AdaptDispatch::_placeKittyImage(const KittyImage& image, const bool moveCursor, const uint32_t imageId, const uint64_t layerId, const uint32_t cols, const uint32_t rows, const uint32_t srcX, const uint32_t srcY, const uint32_t srcW, const uint32_t srcH, const uint32_t cellOffsetX, const uint32_t cellOffsetY, const int32_t zIndex, const std::optional<til::point> anchor)
 {
-    const auto framePixels = &image.pixels;
+    const auto framePixels = _kittyFramePixels(image, image.presentedFrame);
     if (!framePixels || framePixels->empty() || image.width == 0 || image.height == 0)
     {
         return {};
@@ -6464,6 +7297,7 @@ til::size AdaptDispatch::_placeKittyImage(const KittyImage& image, const bool mo
         staged->BumpRevision();
         const auto dstSlice = staged.get();
         auto dstIterator = dstSlice->MutablePixels(columnBegin, columnEnd, { imageId, layerId }, zIndex);
+        auto sourceIterator = dstSlice->MutableSourceIndices(columnBegin, columnEnd, { imageId, layerId }, zIndex);
         for (auto pixelRow = 0; pixelRow < cellHeight; ++pixelRow)
         {
             const auto dstY = row * cellHeight + pixelRow;
@@ -6477,19 +7311,23 @@ til::size AdaptDispatch::_placeKittyImage(const KittyImage& image, const bool mo
             for (auto pixelColumn = 0; pixelColumn < drawWidth; ++pixelColumn)
             {
                 RGBQUAD px{};
+                auto sourceIndex = ImageSlice::NoSourceIndex;
                 if (rowInImage && sampleXMap[pixelColumn] >= 0)
                 {
                     const auto srcIndex = srcRowStart + static_cast<size_t>(sampleXMap[pixelColumn]);
                     if (srcIndex < framePixels->size())
                     {
                         px = til::at(*framePixels, srcIndex);
+                        sourceIndex = gsl::narrow_cast<uint32_t>(srcIndex);
                     }
                 }
                 til::at(dstIterator, pixelColumn) = px;
+                til::at(sourceIterator, pixelColumn) = sourceIndex;
             }
             if (pixelRow + 1 < cellHeight)
             {
                 std::advance(dstIterator, dstSlice->PixelWidth());
+                std::advance(sourceIterator, dstSlice->PixelWidth());
             }
         }
     }
@@ -7130,6 +7968,7 @@ void AdaptDispatch::_deleteAllKittyPlacements(const bool freeData)
             _eraseKittyImageRows(imageId);
         }
     }
+    _scheduleKittyAnimationTimer();
 }
 
 // Deletes every NON-VIRTUAL image with at least one physical placement inside the half-open cell
@@ -7648,7 +8487,7 @@ int AdaptDispatch::_KittyPlaceholderDiacriticIndex(const char32_t ch) noexcept
 // redraw (the caller batches one bounded redraw per segment). Returns true if a tile was drawn.
 bool AdaptDispatch::_placeImageCellRef(const KittyImage& image, const uint32_t imageId, const til::CoordType column, const til::CoordType row, const uint32_t cellRow, const uint32_t cellCol, const KittyVirtualPlacement& place)
 {
-    const auto framePixels = &image.pixels;
+    const auto framePixels = _kittyFramePixels(image, image.presentedFrame);
     if (!framePixels || framePixels->empty() || image.width == 0 || image.height == 0)
     {
         return false;
@@ -7698,6 +8537,7 @@ bool AdaptDispatch::_placeImageCellRef(const KittyImage& image, const uint32_t i
         dstSlice = dstRow.SetImageSlice(std::make_unique<ImageSlice>(clampedCellSize));
     }
     auto dstIterator = dstSlice->MutablePixels(column, column + 1, { imageId, place.layerId }, place.zIndex);
+    auto sourceIterator = dstSlice->MutableSourceIndices(column, column + 1, { imageId, place.layerId }, place.zIndex);
     for (auto pixelRow = 0; pixelRow < cellHeight; ++pixelRow)
     {
         const auto targetY = targetYBase + pixelRow;
@@ -7712,15 +8552,18 @@ bool AdaptDispatch::_placeImageCellRef(const KittyImage& image, const uint32_t i
                 const auto sampleX = cropX + std::min(cropW - 1, static_cast<til::CoordType>(targetX * cropW / targetW));
                 const auto srcIndex = srcRowStart + static_cast<size_t>(sampleX);
                 til::at(dstIterator, pixelColumn) = srcIndex < framePixels->size() ? til::at(*framePixels, srcIndex) : RGBQUAD{};
+                til::at(sourceIterator, pixelColumn) = srcIndex < framePixels->size() ? gsl::narrow_cast<uint32_t>(srcIndex) : ImageSlice::NoSourceIndex;
             }
             else
             {
                 til::at(dstIterator, pixelColumn) = RGBQUAD{}; // aspect padding beyond the scaled target
+                til::at(sourceIterator, pixelColumn) = ImageSlice::NoSourceIndex;
             }
         }
         if (pixelRow + 1 < cellHeight)
         {
             std::advance(dstIterator, dstSlice->PixelWidth());
+            std::advance(sourceIterator, dstSlice->PixelWidth());
         }
     }
     return true;

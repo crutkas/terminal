@@ -36,6 +36,7 @@ void Terminal::SetFontInfo(const FontInfo& fontInfo)
 {
     _assertLocked();
     _fontInfo = fontInfo;
+    _refreshKittyImageLayers();
 }
 
 TimerDuration Terminal::GetBlinkInterval() noexcept

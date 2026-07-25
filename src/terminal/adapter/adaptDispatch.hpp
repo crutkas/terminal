@@ -46,6 +46,9 @@ namespace Microsoft::Console::VirtualTerminal
 
     public:
         AdaptDispatch(ITerminalApi& api, Renderer* renderer, RenderSettings& renderSettings, TerminalInput& terminalInput) noexcept;
+        ~AdaptDispatch() override;
+
+        void RefreshKittyImageLayers();
 
         void UnknownSequence() noexcept override;
         void Print(const wchar_t wchPrintable) override;
@@ -357,18 +360,38 @@ namespace Microsoft::Console::VirtualTerminal
             bool havePlacementId = false;    // true if p= was present (so p= is echoed in the ack)
             bool haveParent = false;         // true if P= was present (a relative placement was requested)
         };
-        // A stored Kitty image: RGBA pixels plus the canvas dimensions they describe.
+        struct KittyAnimationFrame
+        {
+            std::vector<RGBQUAD> pixels;
+            int32_t gapMilliseconds = 0;
+        };
+        // A stored Kitty image. Frame 1 is the root pixel vector; additional
+        // full-canvas frames share its dimensions and carry their own next-frame gap.
         struct KittyImage
         {
             uint32_t number = 0;
             uint32_t width = 0;
             uint32_t height = 0;
             std::vector<RGBQUAD> pixels;
+            int32_t rootGapMilliseconds = 0;
+            std::vector<KittyAnimationFrame> animationFrames;
+            uint32_t currentFrame = 1;
+            uint32_t animationState = 1;
+            uint32_t loopCount = 1;
+            uint32_t loopsRemaining = UINT32_MAX;
+            uint32_t presentedFrame = 1;
+            bool waitingForFrames = false;
             bool hasRenderedPlacements = false;
+            std::chrono::steady_clock::time_point nextFrameTime{};
 
             size_t PixelBytes() const noexcept
             {
-                return pixels.size() * sizeof(RGBQUAD);
+                auto bytes = pixels.size() * sizeof(RGBQUAD);
+                for (const auto& frame : animationFrames)
+                {
+                    bytes += frame.pixels.size() * sizeof(RGBQUAD);
+                }
+                return bytes;
             }
         };
         // The target pixel size a c=/r= request maps to (one axis preserves aspect). Shared
@@ -459,6 +482,21 @@ namespace Microsoft::Console::VirtualTerminal
         static bool _DecodeKittyBase64(const std::string_view input, std::vector<uint8_t>& output) noexcept;
         static bool _inflateKittyZlib(const std::vector<uint8_t>& input, std::vector<uint8_t>& output, size_t cap) noexcept;
         static std::vector<RGBQUAD> _decodeKittyPixels(const uint32_t format, const std::vector<uint8_t>& bytes);
+        static RGBQUAD _kittyRgbaColor(uint32_t rgba) noexcept;
+        static void _kittyCompositePixels(std::span<RGBQUAD> destination, std::span<const RGBQUAD> source, bool replace) noexcept;
+        static size_t _kittyFrameCount(const KittyImage& image) noexcept;
+        static std::vector<RGBQUAD>* _kittyFramePixels(KittyImage& image, uint32_t frameNumber) noexcept;
+        static const std::vector<RGBQUAD>* _kittyFramePixels(const KittyImage& image, uint32_t frameNumber) noexcept;
+        static int32_t* _kittyFrameGap(KittyImage& image, uint32_t frameNumber) noexcept;
+        void _updateKittyImageLayers(uint32_t imageId, std::span<const RGBQUAD> pixels);
+        void _scheduleKittyAnimation(uint32_t imageId, KittyImage& image, std::chrono::steady_clock::time_point now);
+        void _scheduleKittyAnimationTimer();
+        void _advanceKittyAnimations(std::chrono::steady_clock::time_point now);
+        bool _advanceKittyImage(uint32_t imageId, KittyImage& image, std::chrono::steady_clock::time_point now);
+        bool _processKittyAnimationFrame(const KittyControl& command, const std::string_view payload, bool payloadValid, bool payloadTooLarge, uint32_t imageId, std::wstring_view& code);
+        bool _processKittyAnimationControl(const KittyControl& command, uint32_t imageId, std::wstring_view& code);
+        bool _processKittyFrameComposition(const KittyControl& command, uint32_t imageId, std::wstring_view& code);
+        void _deleteKittyAnimationFrames(uint32_t imageId, uint32_t frameNumber, bool freeData);
         uint32_t _kittyAssignImageId();
         bool _registerKittyImage(const uint32_t id, KittyImage&& image);
         void _eraseKittyImage(const uint32_t id);
@@ -541,6 +579,13 @@ namespace Microsoft::Console::VirtualTerminal
         std::unordered_map<uint32_t, KittyImage> _kittyImages;
         std::unordered_map<uint32_t, uint32_t> _kittyImageNumbers;
         std::deque<uint32_t> _kittyImageOrder;
+        struct KittyAnimationTimerTarget
+        {
+            std::mutex mutex;
+            AdaptDispatch* dispatch = nullptr;
+        };
+        std::shared_ptr<KittyAnimationTimerTarget> _kittyAnimationTimerTarget;
+        std::optional<Microsoft::Console::Render::TimerHandle> _kittyAnimationTimer;
         // Virtual placements keyed by the external (image id, placement id). U+10EEEE selects
         // this key through its foreground and underline colors.
         std::map<std::pair<uint32_t, uint32_t>, KittyVirtualPlacement> _kittyVirtualIds;
