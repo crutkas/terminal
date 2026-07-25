@@ -1967,20 +1967,19 @@ void StateMachine::_EventApcEntry(const wchar_t wch)
 void StateMachine::_EventApcPassThrough(const wchar_t wch)
 {
     _trace.TraceOnEvent(L"ApcPassThrough");
-    if (_isC0Code(wch) || _isPassThroughValid(wch))
+    // An APC string is application data: the parser has no idea what encoding
+    // the receiving handler expects, so every character is handed over intact.
+    // Dropping the ones that don't look like text would leave the handler unable
+    // to tell a malformed string from one that was never sent, and it would
+    // report the wrong error. C0 and C1 controls are the only characters with
+    // parser-level meaning, and those are dealt with before we get here.
+    if (!_apcStringHandler(wch))
     {
-        if (!_apcStringHandler(wch))
-        {
-            // The handler has given up on the rest of the string. Drop it,
-            // without reporting it as unknown - it was claimed and processed,
-            // the handler just stopped wanting more of it.
-            _apcStringHandler = nullptr;
-            _EnterApcIgnore();
-        }
-    }
-    else
-    {
-        _ActionIgnore();
+        // The handler has given up on the rest of the string. Drop it,
+        // without reporting it as unknown - it was claimed and processed,
+        // the handler just stopped wanting more of it.
+        _apcStringHandler = nullptr;
+        _EnterApcIgnore();
     }
 }
 
