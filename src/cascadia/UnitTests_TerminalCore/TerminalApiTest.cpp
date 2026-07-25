@@ -470,6 +470,8 @@ namespace TerminalCoreUnitTests
         TEST_METHOD(ReadKittySharedMemoryRejectsUnsafeNames);
         TEST_METHOD(ReadKittySharedMemoryMissingFails);
         TEST_METHOD(ReadKittySharedMemoryRejectsOffsetPastEnd);
+        TEST_METHOD(ReadKittySharedMemoryRejectsReservedPages);
+        TEST_METHOD(ReadKittySharedMemoryRejectsPartiallyCommittedMapping);
     };
 };
 
@@ -1019,11 +1021,14 @@ namespace
                std::to_wstring(GetTickCount64()) + L"-" + std::to_wstring(counter++);
     }
 
-    wil::unique_handle KittyCreateMapping(const std::wstring& name, const uint64_t size, const std::span<const uint8_t> content = {})
+    wil::unique_handle KittyCreateMapping(const std::wstring& name,
+                                          const uint64_t size,
+                                          const std::span<const uint8_t> content = {},
+                                          const DWORD protection = PAGE_READWRITE)
     {
         wil::unique_handle mapping{ CreateFileMappingW(INVALID_HANDLE_VALUE,
                                                        nullptr,
-                                                       PAGE_READWRITE,
+                                                       protection,
                                                        static_cast<DWORD>(size >> 32),
                                                        static_cast<DWORD>(size),
                                                        name.c_str()) };
@@ -1454,6 +1459,45 @@ void TerminalApiTest::ReadKittySharedMemoryRejectsOffsetPastEnd()
 
     std::vector<uint8_t> out{ 1 };
     VERIFY_IS_TRUE(til::read_shared_memory_result::invalid == term.ReadKittySharedMemory(name, 128 * 1024, 1, out));
+    VERIFY_ARE_EQUAL(static_cast<size_t>(0), out.size());
+}
+
+void TerminalApiTest::ReadKittySharedMemoryRejectsReservedPages()
+{
+    Terminal term{ Terminal::TestDummyMarker{} };
+    DummyRenderer renderer{ &term };
+    term.Create({ 100, 100 }, 0, renderer);
+
+    const auto name = KittyUniqueMappingName();
+    auto mapping = KittyCreateMapping(name, 64 * 1024, {}, PAGE_READWRITE | SEC_RESERVE);
+    VERIFY_IS_TRUE(static_cast<bool>(mapping), L"failed to create the reserved shared-memory object");
+
+    std::vector<uint8_t> out{ 1 };
+    VERIFY_IS_TRUE(til::read_shared_memory_result::read_error == term.ReadKittySharedMemory(name, 0, 1, out));
+    VERIFY_ARE_EQUAL(static_cast<size_t>(0), out.size());
+}
+
+void TerminalApiTest::ReadKittySharedMemoryRejectsPartiallyCommittedMapping()
+{
+    Terminal term{ Terminal::TestDummyMarker{} };
+    DummyRenderer renderer{ &term };
+    term.Create({ 100, 100 }, 0, renderer);
+
+    SYSTEM_INFO systemInfo{};
+    GetSystemInfo(&systemInfo);
+    const auto pageSize = static_cast<uint64_t>(systemInfo.dwPageSize);
+    const auto name = KittyUniqueMappingName();
+    auto mapping = KittyCreateMapping(name, pageSize * 2, {}, PAGE_READWRITE | SEC_RESERVE);
+    VERIFY_IS_TRUE(static_cast<bool>(mapping), L"failed to create the reserved shared-memory object");
+
+    const auto view = MapViewOfFile(mapping.get(), FILE_MAP_WRITE, 0, 0, 0);
+    VERIFY_IS_NOT_NULL(view);
+    const auto unmap = wil::scope_exit([&]() noexcept { UnmapViewOfFile(view); });
+    VERIFY_ARE_EQUAL(view, VirtualAlloc(view, gsl::narrow_cast<size_t>(pageSize), MEM_COMMIT, PAGE_READWRITE));
+    *static_cast<uint8_t*>(view) = 42;
+
+    std::vector<uint8_t> out{ 1 };
+    VERIFY_IS_TRUE(til::read_shared_memory_result::read_error == term.ReadKittySharedMemory(name, 0, 0, out));
     VERIFY_ARE_EQUAL(static_cast<size_t>(0), out.size());
 }
 

@@ -291,6 +291,58 @@ namespace til // Terminal Implementation Library. Also: "Today I Learned"
 
     namespace shared_memory_details
     {
+        _TIL_INLINEPREFIX bool is_readable_range(const void* source, const size_t size) noexcept
+        {
+            if (size == 0)
+            {
+                return true;
+            }
+
+            const auto begin = reinterpret_cast<uintptr_t>(source);
+            if (size > UINTPTR_MAX - begin)
+            {
+                return false;
+            }
+
+            const auto end = begin + size;
+            auto current = begin;
+            while (current < end)
+            {
+                MEMORY_BASIC_INFORMATION info{};
+                if (VirtualQuery(reinterpret_cast<const void*>(current), &info, sizeof(info)) != sizeof(info) ||
+                    info.State != MEM_COMMIT)
+                {
+                    return false;
+                }
+
+                const auto protection = info.Protect & 0xff;
+                const auto readable = protection == PAGE_READONLY ||
+                                      protection == PAGE_READWRITE ||
+                                      protection == PAGE_WRITECOPY ||
+                                      protection == PAGE_EXECUTE_READ ||
+                                      protection == PAGE_EXECUTE_READWRITE ||
+                                      protection == PAGE_EXECUTE_WRITECOPY;
+                if (!readable || (info.Protect & PAGE_GUARD) != 0)
+                {
+                    return false;
+                }
+
+                const auto regionBegin = reinterpret_cast<uintptr_t>(info.BaseAddress);
+                if (info.RegionSize > UINTPTR_MAX - regionBegin)
+                {
+                    return false;
+                }
+                const auto regionEnd = regionBegin + info.RegionSize;
+                if (regionEnd <= current)
+                {
+                    return false;
+                }
+                current = std::min(regionEnd, end);
+            }
+
+            return true;
+        }
+
         // A file-backed section can fault after it has been mapped (for example if its
         // backing file is truncated). Keep SEH in a leaf with no C++ objects requiring
         // unwinding, then translate the fault into a normal protocol read error.
@@ -301,7 +353,11 @@ namespace til // Terminal Implementation Library. Also: "Today I Learned"
                 memcpy(destination, source, size);
                 return true;
             }
-            __except (GetExceptionCode() == EXCEPTION_IN_PAGE_ERROR ? EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH)
+            __except (GetExceptionCode() == EXCEPTION_ACCESS_VIOLATION ||
+                          GetExceptionCode() == EXCEPTION_IN_PAGE_ERROR ||
+                          GetExceptionCode() == EXCEPTION_GUARD_PAGE ?
+                      EXCEPTION_EXECUTE_HANDLER :
+                      EXCEPTION_CONTINUE_SEARCH)
             {
                 return false;
             }
@@ -814,13 +870,51 @@ namespace til // Terminal Implementation Library. Also: "Today I Learned"
                     return mapFailure();
                 }
 
-                MEMORY_BASIC_INFORMATION info{};
-                if (VirtualQuery(view, &info, sizeof(info)) != sizeof(info) || info.RegionSize <= delta)
+                const auto viewBegin = reinterpret_cast<uintptr_t>(view);
+                const auto maximumExtent = delta + static_cast<size_t>(maxBytes);
+                if (maximumExtent > UINTPTR_MAX - viewBegin)
                 {
                     UnmapViewOfFile(view);
                     return read_shared_memory_result::read_error;
                 }
-                toRead = std::min(info.RegionSize - delta, static_cast<size_t>(maxBytes));
+
+                const auto limit = viewBegin + maximumExtent;
+                auto current = viewBegin;
+                while (current < limit)
+                {
+                    MEMORY_BASIC_INFORMATION info{};
+                    if (VirtualQuery(reinterpret_cast<const void*>(current), &info, sizeof(info)) != sizeof(info))
+                    {
+                        UnmapViewOfFile(view);
+                        return read_shared_memory_result::read_error;
+                    }
+                    if (info.AllocationBase != view)
+                    {
+                        break;
+                    }
+
+                    const auto regionBegin = reinterpret_cast<uintptr_t>(info.BaseAddress);
+                    if (regionBegin > current || info.RegionSize > UINTPTR_MAX - regionBegin)
+                    {
+                        UnmapViewOfFile(view);
+                        return read_shared_memory_result::read_error;
+                    }
+                    const auto regionEnd = regionBegin + info.RegionSize;
+                    if (regionEnd <= current)
+                    {
+                        UnmapViewOfFile(view);
+                        return read_shared_memory_result::read_error;
+                    }
+                    current = std::min(regionEnd, limit);
+                }
+
+                const auto viewExtent = current - viewBegin;
+                if (viewExtent <= delta)
+                {
+                    UnmapViewOfFile(view);
+                    return read_shared_memory_result::read_error;
+                }
+                toRead = std::min(viewExtent - delta, static_cast<size_t>(maxBytes));
             }
         }
 
@@ -836,6 +930,12 @@ namespace til // Terminal Implementation Library. Also: "Today I Learned"
             }
         } viewGuard{ view };
 
+        const auto first = static_cast<const uint8_t*>(view) + delta;
+        if (!shared_memory_details::is_readable_range(first, toRead))
+        {
+            return read_shared_memory_result::read_error;
+        }
+
         try
         {
             out.resize(toRead);
@@ -845,7 +945,6 @@ namespace til // Terminal Implementation Library. Also: "Today I Learned"
             out.clear();
             return read_shared_memory_result::read_error;
         }
-        const auto first = static_cast<const uint8_t*>(view) + delta;
         if (!shared_memory_details::guarded_copy(out.data(), first, toRead))
         {
             out.clear();

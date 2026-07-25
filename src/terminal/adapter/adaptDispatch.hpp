@@ -483,7 +483,7 @@ namespace Microsoft::Console::VirtualTerminal
         static int32_t _ParseKittyInt(const std::wstring_view value) noexcept;
         static uint64_t _ParseKittyUint64(const std::wstring_view value) noexcept;
         static bool _DecodeKittyBase64(const std::string_view input, std::vector<uint8_t>& output) noexcept;
-        static bool _inflateKittyZlib(const std::vector<uint8_t>& input, std::vector<uint8_t>& output, const size_t cap) noexcept;
+        static bool _inflateKittyZlib(const std::vector<uint8_t>& input, std::vector<uint8_t>& output, size_t cap, bool allowTrailingZeroPadding = false) noexcept;
         static std::vector<RGBQUAD> _decodeKittyPixels(const uint32_t format, const std::vector<uint8_t>& bytes);
         static RGBQUAD _kittyRgbaColor(uint32_t rgba) noexcept;
         static void _kittyCompositePixels(std::span<RGBQUAD> destination, std::span<const RGBQUAD> source, bool replace) noexcept;

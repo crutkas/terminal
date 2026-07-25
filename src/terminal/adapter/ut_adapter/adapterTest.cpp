@@ -289,7 +289,20 @@ public:
         {
             return _readKittySharedMemoryResult;
         }
-        out = _kittySharedMemoryBytes;
+        if (offset > _kittySharedMemoryBytes.size())
+        {
+            out.clear();
+            return til::read_shared_memory_result::invalid;
+        }
+        const auto available = static_cast<uint64_t>(_kittySharedMemoryBytes.size()) - offset;
+        if (size != 0 && size > available)
+        {
+            out.clear();
+            return til::read_shared_memory_result::invalid;
+        }
+        const auto count = gsl::narrow_cast<size_t>(size == 0 ? available : size);
+        const auto begin = _kittySharedMemoryBytes.begin() + gsl::narrow_cast<size_t>(offset);
+        out.assign(begin, begin + count);
         return til::read_shared_memory_result::ok;
     }
 
@@ -5786,6 +5799,39 @@ public:
         VERIFY_ARE_EQUAL(12, static_cast<int>(it->second.pixels[3].rgbBlue));
     }
 
+    // With S omitted, Windows exposes the mapping's page-rounded zero tail. Locate the
+    // complete zlib stream, verify its Adler-32, and ignore only that zero padding.
+    TEST_METHOD(KittyGraphicsZlibSharedMemoryWithoutSizeInflates)
+    {
+        const std::vector<uint8_t> c12{ 0x78, 0xda, 0x63, 0x64, 0x62, 0x66, 0x61, 0x65, 0x63, 0xe7, 0xe0, 0xe4, 0xe2, 0xe6, 0x01, 0x00, 0x01, 0x78, 0x00, 0x4f };
+
+        _testGetSet->PrepData();
+        _testGetSet->_kittySharedMemoryBytes = c12;
+        _testGetSet->_kittySharedMemoryBytes.resize(4096);
+        _stateMachine->ProcessString(L"\x1b_Ga=t,i=19,f=24,s=2,v=2,t=s,o=z;TG9jYWxca2l0dHktc2htLXRlc3Q=\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=19;OK\x1b\\");
+        VERIFY_ARE_EQUAL(1, _testGetSet->_readKittySharedMemoryCallCount);
+        VERIFY_ARE_EQUAL(static_cast<uint64_t>(0), _testGetSet->_lastKittySharedMemorySize);
+
+        const auto it = _pDispatch->_kittyImages.find(19);
+        VERIFY_IS_TRUE(it != _pDispatch->_kittyImages.end());
+        VERIFY_ARE_EQUAL(static_cast<size_t>(4), it->second.pixels.size());
+        VERIFY_ARE_EQUAL(1, static_cast<int>(it->second.pixels[0].rgbRed));
+        VERIFY_ARE_EQUAL(12, static_cast<int>(it->second.pixels[3].rgbBlue));
+    }
+
+    TEST_METHOD(KittyGraphicsZlibSharedMemoryRejectsNonzeroTrailingData)
+    {
+        const std::vector<uint8_t> c12{ 0x78, 0xda, 0x63, 0x64, 0x62, 0x66, 0x61, 0x65, 0x63, 0xe7, 0xe0, 0xe4, 0xe2, 0xe6, 0x01, 0x00, 0x01, 0x78, 0x00, 0x4f };
+
+        _testGetSet->PrepData();
+        _testGetSet->_kittySharedMemoryBytes = c12;
+        _testGetSet->_kittySharedMemoryBytes.push_back(1);
+        _stateMachine->ProcessString(L"\x1b_Ga=t,i=19,f=24,s=2,v=2,t=s,o=z;TG9jYWxca2l0dHktc2htLXRlc3Q=\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=19;EINVAL:invalid compressed data\x1b\\");
+        VERIFY_IS_TRUE(_pDispatch->_kittyImages.find(19) == _pDispatch->_kittyImages.end());
+    }
+
     // o=z that inflates SUCCESSFULLY but to the WRONG size for the declared geometry is
     // rejected by the post-inflate size check -- proving a compressed payload cannot smuggle
     // a wrong-sized image past validation (the size check runs on the INFLATED bytes, not the
@@ -5904,7 +5950,8 @@ public:
     TEST_METHOD(KittyGraphicsSharedMemoryTransmitRenders)
     {
         _testGetSet->PrepData();
-        _testGetSet->_kittySharedMemoryBytes = { 255, 0, 0 };
+        _testGetSet->_kittySharedMemoryBytes.assign(10, 0);
+        _testGetSet->_kittySharedMemoryBytes.insert(_testGetSet->_kittySharedMemoryBytes.end(), { 255, 0, 0 });
         // Base64 of "Local\\kitty-shm-test".
         _stateMachine->ProcessString(L"\x1b_Ga=T,i=20,f=24,s=1,v=1,t=s,O=10,S=3;TG9jYWxca2l0dHktc2htLXRlc3Q=\x1b\\");
         _testGetSet->ValidateInputEvent(L"\x1b_Gi=20;OK\x1b\\");
@@ -5932,8 +5979,8 @@ public:
         VERIFY_ARE_EQUAL(static_cast<uint64_t>(12), _testGetSet->_lastKittySharedMemorySize);
     }
 
-    // The protocol defines m= chunking only for direct payload data. Local media carry
-    // a resource name, so m=1 must be ignored rather than delaying the read forever.
+    // Shared-memory payloads carry one resource name, so m=1 must be ignored rather
+    // than delaying the read forever.
     TEST_METHOD(KittyGraphicsSharedMemoryIgnoresMoreChunks)
     {
         _testGetSet->PrepData();

@@ -5213,7 +5213,7 @@ AdaptDispatch::KittyControl AdaptDispatch::_ParseKittyControl(const std::wstring
 void AdaptDispatch::_HandleKittyGraphics(const std::wstring_view control, const std::string_view payload, const bool payloadValid, const bool payloadTooLarge)
 {
     const auto command = _ParseKittyControl(control);
-    const auto isLocalMedium = command.medium == L'f' || command.medium == L't' || command.medium == L's';
+    const auto isSharedMemory = command.medium == L's';
 
     // Only a bare 'm='-prefixed sequence continues an in-progress transfer. Any other
     // command starts fresh, so if a transfer is already active it was orphaned (e.g.
@@ -5222,14 +5222,14 @@ void AdaptDispatch::_HandleKittyGraphics(const std::wstring_view control, const 
                                      command.action == _kittyChunkControl.action &&
                                      !command.hasNonChunkKeyOtherThanAction;
     // Per the protocol, m= applies only to direct transmission and is ignored for
-    // file/shared-memory media, whose payload is already just a local resource name.
-    const auto isContinuation = command.mPresent && !isLocalMedium && (!command.hasNonChunkKey || repeatsActiveAction);
+    // shared-memory media, whose payload is already just a local resource name.
+    const auto isContinuation = command.mPresent && !isSharedMemory && (!command.hasNonChunkKey || repeatsActiveAction);
     if (_kittyChunkActive && !isContinuation)
     {
         _clearKittyChunk();
     }
 
-    if (_kittyChunkActive || (command.moreChunks && !isLocalMedium))
+    if (_kittyChunkActive || (command.moreChunks && !isSharedMemory))
     {
         if (!_kittyChunkActive)
         {
@@ -5740,7 +5740,7 @@ void AdaptDispatch::_ProcessKittyCommand(const KittyControl& command, const std:
                 }
 
                 auto readSize = command.fileSize;
-                if (readSize == 0 && (format == 24 || format == 32) && width != 0 && height != 0)
+                if (readSize == 0 && compression != L'z' && (format == 24 || format == 32) && width != 0 && height != 0)
                 {
                     // CreateFileMapping rounds section sizes to whole pages, so a mapping
                     // has no discoverable byte-exact tail. For raw pixels the protocol's
@@ -5781,7 +5781,8 @@ void AdaptDispatch::_ProcessKittyCommand(const KittyControl& command, const std:
                 // The inflated size is bounded to MaxKittyPayload, so a decompression
                 // bomb is rejected without ever allocating the expanded buffer.
                 std::vector<uint8_t> inflated;
-                if (!_inflateKittyZlib(bytes, inflated, MaxKittyPayload))
+                const auto allowSharedMemoryPadding = medium == L's' && command.fileSize == 0;
+                if (!_inflateKittyZlib(bytes, inflated, MaxKittyPayload, allowSharedMemoryPadding))
                 {
                     success = false;
                     code = L"EINVAL:invalid compressed data";
@@ -9019,7 +9020,7 @@ bool AdaptDispatch::_DecodeKittyBase64(const std::string_view input, std::vector
 //
 // Protocol: https://sw.kovidgoyal.net/kitty/graphics-protocol/#compression  (o=z)
 // zlib container format: https://www.rfc-editor.org/rfc/rfc1950
-bool AdaptDispatch::_inflateKittyZlib(const std::vector<uint8_t>& input, std::vector<uint8_t>& output, const size_t cap) noexcept
+bool AdaptDispatch::_inflateKittyZlib(const std::vector<uint8_t>& input, std::vector<uint8_t>& output, const size_t cap, const bool allowTrailingZeroPadding) noexcept
 try
 {
     output.clear();
@@ -9106,10 +9107,14 @@ try
     output.resize(produced);
 
     // inflatelib stops at the end of the DEFLATE stream, so whatever it did not consume
-    // is the 4-byte Adler-32. Require the stream to end exactly where that trailer
-    // begins, rejecting trailing garbage and multi-member streams.
+    // is the 4-byte Adler-32 plus any padding. Require the stream to end where that
+    // trailer begins, rejecting trailing garbage and multi-member streams. When an S=0
+    // shared-memory transfer includes page-rounded zero padding, only zeros may follow.
     const auto consumed = deflateAvailable - remainingInput.size();
-    if (2u + consumed + 4u != input.size())
+    const auto streamEnd = 2u + consumed + 4u;
+    if (streamEnd > input.size() ||
+        (!allowTrailingZeroPadding && streamEnd != input.size()) ||
+        (allowTrailingZeroPadding && !std::all_of(input.begin() + streamEnd, input.end(), [](const auto value) noexcept { return value == 0; })))
     {
         output.clear();
         return false;
