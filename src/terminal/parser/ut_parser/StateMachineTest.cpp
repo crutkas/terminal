@@ -38,10 +38,17 @@ public:
         dcsId = 0;
         dcsParams.clear();
         dcsDataString.clear();
+        apcAccepted = true;
+        apcAcceptLimit = SIZE_MAX;
+        apcDispatchCount = 0;
+        apcId = 0;
+        apcDataString.clear();
+        unknownSequenceCount = 0;
     }
 
     void UnknownSequence() noexcept override
     {
+        unknownSequenceCount++;
     }
 
     bool EncounteredWin32InputModeSequence() const noexcept override
@@ -116,6 +123,21 @@ public:
         return [=](const auto ch) { dcsDataString += ch; return true; };
     }
 
+    IStateMachineEngine::StringHandler ActionApcDispatch(const VTID id) override
+    {
+        apcDispatchCount++;
+        apcId = id;
+        apcDataString.clear();
+        if (!apcAccepted)
+        {
+            return nullptr;
+        }
+        return [=](const auto ch) {
+            apcDataString += ch;
+            return apcDataString.size() < apcAcceptLimit;
+        };
+    }
+
     // These will only be populated if ActionCsiDispatch is called.
     uint64_t csiId = 0;
     std::vector<size_t> csiParams;
@@ -136,6 +158,15 @@ public:
     uint64_t dcsId = 0;
     std::vector<size_t> dcsParams;
     std::wstring dcsDataString;
+
+    // Controls how ActionApcDispatch responds, and records what it saw.
+    bool apcAccepted = true;
+    size_t apcAcceptLimit = SIZE_MAX;
+    size_t apcDispatchCount = 0;
+    uint64_t apcId = 0;
+    std::wstring apcDataString;
+
+    size_t unknownSequenceCount = 0;
 };
 
 class Microsoft::Console::VirtualTerminal::StateMachineTest
@@ -160,6 +191,14 @@ class Microsoft::Console::VirtualTerminal::StateMachineTest
     TEST_METHOD(PassThroughUnhandledSplitAcrossWrites);
 
     TEST_METHOD(DcsDataStringsReceivedByHandler);
+
+    TEST_METHOD(ApcDataStringsReceivedByHandler);
+    TEST_METHOD(ApcIdentifiersAreRoutedToTheEngine);
+    TEST_METHOD(ApcDeclinedByEngineIsIgnored);
+    TEST_METHOD(ApcHandlerCanEndTheStringEarly);
+    TEST_METHOD(ApcWithoutAnIdentifierIsIgnored);
+    TEST_METHOD(ApcEntryIgnoresControlCharacters);
+    TEST_METHOD(ApcDataStringSplitAcrossWrites);
 
     TEST_METHOD(VtParameterSubspanTest);
 };
@@ -341,6 +380,195 @@ void StateMachineTest::DcsDataStringsReceivedByHandler()
 
     // Verify the control characters were executed (if expected).
     VERIFY_ARE_EQUAL(expectedExecuted, engine.executed);
+}
+
+void StateMachineTest::ApcDataStringsReceivedByHandler()
+{
+    BEGIN_TEST_METHOD_PROPERTIES()
+        TEST_METHOD_PROPERTY(L"Data:terminatorType", L"{ 0, 1, 2, 3 }")
+    END_TEST_METHOD_PROPERTIES()
+
+    size_t terminatorType;
+    VERIFY_SUCCEEDED(TestData::TryGetValue(L"terminatorType", terminatorType));
+
+    auto enginePtr{ std::make_unique<TestStateMachineEngine>() };
+    // this dance is required because StateMachine presumes to take ownership of its engine.
+    auto& engine{ *enginePtr.get() };
+    StateMachine machine{ std::move(enginePtr) };
+
+    uint64_t expectedCsiId = 0;
+    std::wstring expectedExecuted = L"";
+    // Unlike DCS, an APC handler is told how the string ended, so it can
+    // distinguish "commit what you have" from "throw it away".
+    std::wstring expectedFinalCharacter = L"\033";
+
+    std::wstring terminatorString;
+    switch (terminatorType)
+    {
+    case 0:
+        Log::Comment(L"Data string terminated with ST");
+        terminatorString = L"\033\\";
+        break;
+    case 1:
+        Log::Comment(L"Data string terminated with CSI sequence");
+        terminatorString = L"\033[m";
+        expectedCsiId = VTID(L'm');
+        break;
+    case 2:
+        Log::Comment(L"Data string cancelled with CAN");
+        terminatorString = L"\030";
+        expectedExecuted = L"\030";
+        expectedFinalCharacter = L"\030";
+        break;
+    case 3:
+        Log::Comment(L"Data string cancelled with SUB");
+        terminatorString = L"\032";
+        expectedExecuted = L"\032";
+        expectedFinalCharacter = L"\030";
+        break;
+    }
+
+    // Output an APC sequence terminated with the current test string
+    machine.ProcessString(L"\033_Gdata string");
+    machine.ProcessString(terminatorString);
+    machine.ProcessString(L"printed text");
+
+    // Verify the application identifier is received.
+    VERIFY_ARE_EQUAL(VTID("G"), engine.apcId);
+
+    // Verify that the data string is received, along with the character that
+    // ended it. Note the identifier is not repeated in the data.
+    VERIFY_ARE_EQUAL(L"data string" + expectedFinalCharacter, engine.apcDataString);
+
+    // Verify the characters following the sequence are printed.
+    VERIFY_ARE_EQUAL(L"printed text", engine.printed);
+
+    // Verify the CSI sequence was received (if expected).
+    VERIFY_ARE_EQUAL(expectedCsiId, engine.csiId);
+
+    // Verify the control characters were executed (if expected).
+    VERIFY_ARE_EQUAL(expectedExecuted, engine.executed);
+}
+
+void StateMachineTest::ApcIdentifiersAreRoutedToTheEngine()
+{
+    auto enginePtr{ std::make_unique<TestStateMachineEngine>() };
+    auto& engine{ *enginePtr.get() };
+    StateMachine machine{ std::move(enginePtr) };
+
+    // The character after the APC introducer names the application the string
+    // is addressed to, in the same way a DCS is identified by its final byte.
+    // Two different applications must not be confused for each other.
+    machine.ProcessString(L"\033_Gfirst\033\\");
+    VERIFY_ARE_EQUAL(VTID("G"), engine.apcId);
+    VERIFY_ARE_EQUAL(L"first\033", engine.apcDataString);
+
+    machine.ProcessString(L"\033_Qsecond\033\\");
+    VERIFY_ARE_EQUAL(VTID("Q"), engine.apcId);
+    VERIFY_ARE_EQUAL(L"second\033", engine.apcDataString);
+
+    VERIFY_ARE_EQUAL(size_t{ 2 }, engine.apcDispatchCount);
+    VERIFY_ARE_EQUAL(L"", engine.printed);
+}
+
+void StateMachineTest::ApcDeclinedByEngineIsIgnored()
+{
+    auto enginePtr{ std::make_unique<TestStateMachineEngine>() };
+    auto& engine{ *enginePtr.get() };
+    StateMachine machine{ std::move(enginePtr) };
+
+    // An engine that doesn't recognise the application returns no handler. The
+    // string then behaves exactly as it did before APC was dispatched at all:
+    // swallowed up to its terminator, with nothing printed.
+    engine.apcAccepted = false;
+    machine.ProcessString(L"\033_Zdata string\033\\printed text");
+
+    VERIFY_ARE_EQUAL(VTID("Z"), engine.apcId);
+    VERIFY_ARE_EQUAL(size_t{ 1 }, engine.apcDispatchCount);
+    VERIFY_ARE_EQUAL(L"", engine.apcDataString);
+    VERIFY_ARE_EQUAL(L"printed text", engine.printed);
+    // Nobody claimed it, so it really was an unknown sequence - the same thing
+    // that was reported before APC strings were dispatched at all.
+    VERIFY_ARE_EQUAL(size_t{ 1 }, engine.unknownSequenceCount);
+
+    // And the parser is genuinely back in a good state afterwards.
+    engine.apcAccepted = true;
+    machine.ProcessString(L"\033_Gagain\033\\");
+    VERIFY_ARE_EQUAL(VTID("G"), engine.apcId);
+    VERIFY_ARE_EQUAL(L"again\033", engine.apcDataString);
+}
+
+void StateMachineTest::ApcHandlerCanEndTheStringEarly()
+{
+    auto enginePtr{ std::make_unique<TestStateMachineEngine>() };
+    auto& engine{ *enginePtr.get() };
+    StateMachine machine{ std::move(enginePtr) };
+
+    // A handler that returns false has given up on the rest of the string. It
+    // must not be called again, and the remainder must not reach the screen.
+    engine.apcAcceptLimit = 4;
+    machine.ProcessString(L"\033_Gdata string\033\\printed text");
+
+    VERIFY_ARE_EQUAL(L"data", engine.apcDataString);
+    VERIFY_ARE_EQUAL(L"printed text", engine.printed);
+    // The string was recognised and claimed, so it is not an unknown sequence.
+    // Reporting one would tell conhost its cursor position may be wrong and
+    // force a needless ConPTY resync.
+    VERIFY_ARE_EQUAL(size_t{ 0 }, engine.unknownSequenceCount);
+}
+
+void StateMachineTest::ApcDataStringSplitAcrossWrites()
+{
+    auto enginePtr{ std::make_unique<TestStateMachineEngine>() };
+    auto& engine{ *enginePtr.get() };
+    StateMachine machine{ std::move(enginePtr) };
+
+    // A payload can be arbitrarily long, so it arrives across several writes.
+    // Each one must reach the handler as it is received rather than being
+    // buffered up in the state machine waiting for a terminator.
+    machine.ProcessString(L"\033_Gdata");
+    VERIFY_ARE_EQUAL(VTID("G"), engine.apcId);
+    VERIFY_ARE_EQUAL(L"data", engine.apcDataString);
+
+    machine.ProcessString(L" and more");
+    VERIFY_ARE_EQUAL(L"data and more", engine.apcDataString);
+
+    machine.ProcessString(L"\033\\printed text");
+    VERIFY_ARE_EQUAL(L"data and more\033", engine.apcDataString);
+
+    VERIFY_ARE_EQUAL(size_t{ 1 }, engine.apcDispatchCount);
+    VERIFY_ARE_EQUAL(L"printed text", engine.printed);
+}
+
+void StateMachineTest::ApcWithoutAnIdentifierIsIgnored()
+{
+    auto enginePtr{ std::make_unique<TestStateMachineEngine>() };
+    auto& engine{ *enginePtr.get() };
+    StateMachine machine{ std::move(enginePtr) };
+
+    // There is nothing to route on, so no engine is asked, and the string is
+    // dropped when its terminator arrives.
+    machine.ProcessString(L"\033_\033\\printed text");
+
+    VERIFY_ARE_EQUAL(size_t{ 0 }, engine.apcDispatchCount);
+    VERIFY_ARE_EQUAL(L"printed text", engine.printed);
+}
+
+void StateMachineTest::ApcEntryIgnoresControlCharacters()
+{
+    auto enginePtr{ std::make_unique<TestStateMachineEngine>() };
+    auto& engine{ *enginePtr.get() };
+    StateMachine machine{ std::move(enginePtr) };
+
+    // A control character can't name an application, so it's skipped while we
+    // wait for one that can - the same thing DcsEntry does with them.
+    machine.ProcessString(L"\033_\a\177Gdata string\033\\");
+
+    VERIFY_ARE_EQUAL(VTID("G"), engine.apcId);
+    VERIFY_ARE_EQUAL(size_t{ 1 }, engine.apcDispatchCount);
+    VERIFY_ARE_EQUAL(L"data string\033", engine.apcDataString);
+    VERIFY_ARE_EQUAL(L"", engine.printed);
+    VERIFY_ARE_EQUAL(L"", engine.executed);
 }
 
 void StateMachineTest::VtParameterSubspanTest()
