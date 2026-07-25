@@ -271,6 +271,53 @@ public:
         return _cellSize;
     }
 
+    til::read_file_result ReadLocalFile(const std::wstring_view path, uint64_t offset, uint64_t size, bool deleteAfter, const std::wstring_view deleteNameMarker, std::vector<uint8_t>& out) noexcept override
+    {
+        Log::Comment(L"ReadLocalFile MOCK called...");
+        _readLocalFileCallCount++;
+        _lastKittyFilePath = std::wstring{ path };
+        _lastKittyFileOffset = offset;
+        _lastKittyFileSize = size;
+        _lastKittyFileDeleteAfter = deleteAfter;
+        _lastKittyFileDeleteNameMarker = std::wstring{ deleteNameMarker };
+        if (!_readLocalFileSucceeds)
+        {
+            return _readLocalFileResult;
+        }
+        // Return a synthetic image payload (not the real file contents) so unit tests
+        // never touch the filesystem. Tests set _kittyFileBytes to match their f=/s=/v=.
+        out = _kittyFileBytes;
+        return til::read_file_result::ok;
+    }
+
+    Microsoft::Console::Utils::ReadSharedMemoryResult ReadSharedMemory(const std::wstring_view name, uint64_t offset, uint64_t size, std::vector<uint8_t>& out) noexcept override
+    {
+        Log::Comment(L"ReadSharedMemory MOCK called...");
+        _readSharedMemoryCallCount++;
+        _lastKittySharedMemoryName = std::wstring{ name };
+        _lastKittySharedMemoryOffset = offset;
+        _lastKittySharedMemorySize = size;
+        if (!_readSharedMemorySucceeds)
+        {
+            return _readSharedMemoryResult;
+        }
+        if (offset > _kittySharedMemoryBytes.size())
+        {
+            out.clear();
+            return Microsoft::Console::Utils::ReadSharedMemoryResult::invalid;
+        }
+        const auto available = static_cast<uint64_t>(_kittySharedMemoryBytes.size()) - offset;
+        if (size != 0 && size > available)
+        {
+            out.clear();
+            return Microsoft::Console::Utils::ReadSharedMemoryResult::invalid;
+        }
+        const auto count = gsl::narrow_cast<size_t>(size == 0 ? available : size);
+        const auto begin = _kittySharedMemoryBytes.begin() + gsl::narrow_cast<size_t>(offset);
+        out.assign(begin, begin + count);
+        return Microsoft::Console::Utils::ReadSharedMemoryResult::ok;
+    }
+
     void PrepData()
     {
         PrepData(CursorDirection::UP); // if called like this, the cursor direction doesn't matter.
@@ -434,6 +481,28 @@ public:
     bool _decodeImageMismatched = false;
     int _decodeImageCallCount = 0;
     til::size _cellSize{ 10, 20 };
+
+    // Kitty file-transmission (t=f / t=t) mock state. The mock returns synthetic bytes
+    // instead of reading the filesystem, and records what the adapter requested so
+    // tests can assert path/offset/size/delete plumbing without touching real files.
+    bool _readLocalFileSucceeds = true;
+    til::read_file_result _readLocalFileResult{ til::read_file_result::read_error };
+    int _readLocalFileCallCount = 0;
+    std::wstring _lastKittyFilePath;
+    uint64_t _lastKittyFileOffset = 0;
+    uint64_t _lastKittyFileSize = 0;
+    bool _lastKittyFileDeleteAfter = false;
+    std::wstring _lastKittyFileDeleteNameMarker;
+    std::vector<uint8_t> _kittyFileBytes{ 255, 0, 0 }; // default: 1x1 red RGB (f=24,s=1,v=1)
+
+    // Kitty shared-memory transmission (t=s) mock state.
+    bool _readSharedMemorySucceeds = true;
+    Microsoft::Console::Utils::ReadSharedMemoryResult _readSharedMemoryResult{ Microsoft::Console::Utils::ReadSharedMemoryResult::read_error };
+    int _readSharedMemoryCallCount = 0;
+    std::wstring _lastKittySharedMemoryName;
+    uint64_t _lastKittySharedMemoryOffset = 0;
+    uint64_t _lastKittySharedMemorySize = 0;
+    std::vector<uint8_t> _kittySharedMemoryBytes{ 255, 0, 0 };
 
     til::enumset<Mode> _systemMode{ Mode::AutoWrap };
 
@@ -5714,6 +5783,78 @@ public:
         VERIFY_IS_TRUE(_testGetSet->_decodeImageCallCount > 0, L"o=z + f=100 must reach the host PNG decoder.");
     }
 
+    // o=z composes with file (t=f) and temporary-file (t=t) media: the compressed bytes
+    // come from the file read, then inflate, and t=t still requests deletion.
+    TEST_METHOD(KittyGraphicsZlibFileAndTempMediaInflate)
+    {
+        const std::vector<uint8_t> c12{ 0x78, 0xda, 0x63, 0x64, 0x62, 0x66, 0x61, 0x65, 0x63, 0xe7, 0xe0, 0xe4, 0xe2, 0xe6, 0x01, 0x00, 0x01, 0x78, 0x00, 0x4f };
+
+        _testGetSet->PrepData();
+        _testGetSet->_kittyFileBytes = c12; // a file whose contents are the zlib stream
+        _stateMachine->ProcessString(L"\x1b_Ga=t,i=16,f=24,s=2,v=2,t=f,o=z;L3RtcC94\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=16;OK\x1b\\");
+        VERIFY_IS_FALSE(_testGetSet->_lastKittyFileDeleteAfter, L"t=f must not request deletion.");
+
+        _testGetSet->PrepData();
+        _testGetSet->_kittyFileBytes = c12;
+        _stateMachine->ProcessString(L"\x1b_Ga=t,i=17,f=24,s=2,v=2,t=t,o=z;L3RtcC94\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=17;OK\x1b\\");
+        VERIFY_IS_TRUE(_testGetSet->_lastKittyFileDeleteAfter, L"t=t must request deletion.");
+    }
+
+    // o=z also composes with shared memory: S= describes the compressed resource size,
+    // then format validation runs on the inflated bytes.
+    TEST_METHOD(KittyGraphicsZlibSharedMemoryInflates)
+    {
+        const std::vector<uint8_t> c12{ 0x78, 0xda, 0x63, 0x64, 0x62, 0x66, 0x61, 0x65, 0x63, 0xe7, 0xe0, 0xe4, 0xe2, 0xe6, 0x01, 0x00, 0x01, 0x78, 0x00, 0x4f };
+
+        _testGetSet->PrepData();
+        _testGetSet->_kittySharedMemoryBytes = c12;
+        _stateMachine->ProcessString(L"\x1b_Ga=t,i=18,f=24,s=2,v=2,t=s,S=20,o=z;TG9jYWxca2l0dHktc2htLXRlc3Q=\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=18;OK\x1b\\");
+        VERIFY_ARE_EQUAL(1, _testGetSet->_readSharedMemoryCallCount);
+        VERIFY_ARE_EQUAL(static_cast<uint64_t>(c12.size()), _testGetSet->_lastKittySharedMemorySize);
+
+        const auto it = _kitty()._images.find(18);
+        VERIFY_IS_TRUE(it != _kitty()._images.end());
+        VERIFY_ARE_EQUAL(static_cast<size_t>(4), it->second.pixels.size());
+        VERIFY_ARE_EQUAL(1, static_cast<int>(it->second.pixels[0].rgbRed));
+        VERIFY_ARE_EQUAL(12, static_cast<int>(it->second.pixels[3].rgbBlue));
+    }
+
+    // With S omitted, Windows exposes the mapping's page-rounded zero tail. Locate the
+    // complete zlib stream, verify its Adler-32, and ignore only that zero padding.
+    TEST_METHOD(KittyGraphicsZlibSharedMemoryWithoutSizeInflates)
+    {
+        const std::vector<uint8_t> c12{ 0x78, 0xda, 0x63, 0x64, 0x62, 0x66, 0x61, 0x65, 0x63, 0xe7, 0xe0, 0xe4, 0xe2, 0xe6, 0x01, 0x00, 0x01, 0x78, 0x00, 0x4f };
+
+        _testGetSet->PrepData();
+        _testGetSet->_kittySharedMemoryBytes = c12;
+        _testGetSet->_kittySharedMemoryBytes.resize(4096);
+        _stateMachine->ProcessString(L"\x1b_Ga=t,i=19,f=24,s=2,v=2,t=s,o=z;TG9jYWxca2l0dHktc2htLXRlc3Q=\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=19;OK\x1b\\");
+        VERIFY_ARE_EQUAL(1, _testGetSet->_readSharedMemoryCallCount);
+        VERIFY_ARE_EQUAL(static_cast<uint64_t>(0), _testGetSet->_lastKittySharedMemorySize);
+
+        const auto it = _kitty()._images.find(19);
+        VERIFY_IS_TRUE(it != _kitty()._images.end());
+        VERIFY_ARE_EQUAL(static_cast<size_t>(4), it->second.pixels.size());
+        VERIFY_ARE_EQUAL(1, static_cast<int>(it->second.pixels[0].rgbRed));
+        VERIFY_ARE_EQUAL(12, static_cast<int>(it->second.pixels[3].rgbBlue));
+    }
+
+    TEST_METHOD(KittyGraphicsZlibSharedMemoryRejectsNonzeroTrailingData)
+    {
+        const std::vector<uint8_t> c12{ 0x78, 0xda, 0x63, 0x64, 0x62, 0x66, 0x61, 0x65, 0x63, 0xe7, 0xe0, 0xe4, 0xe2, 0xe6, 0x01, 0x00, 0x01, 0x78, 0x00, 0x4f };
+
+        _testGetSet->PrepData();
+        _testGetSet->_kittySharedMemoryBytes = c12;
+        _testGetSet->_kittySharedMemoryBytes.push_back(1);
+        _stateMachine->ProcessString(L"\x1b_Ga=t,i=19,f=24,s=2,v=2,t=s,o=z;TG9jYWxca2l0dHktc2htLXRlc3Q=\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=19;EINVAL:invalid compressed data\x1b\\");
+        VERIFY_IS_TRUE(_kitty()._images.find(19) == _kitty()._images.end());
+    }
+
     // o=z that inflates SUCCESSFULLY but to the WRONG size for the declared geometry is
     // rejected by the post-inflate size check -- proving a compressed payload cannot smuggle
     // a wrong-sized image past validation (the size check runs on the INFLATED bytes, not the
@@ -5816,6 +5957,236 @@ public:
         _testGetSet->PrepData();
         _stateMachine->ProcessString(L"\x1b_Ga=t,i=1,f=24;AAAA\x1b\\");
         _testGetSet->ValidateInputEvent(L"\x1b_Gi=1;EINVAL:missing dimensions\x1b\\");
+    }
+
+    // Direct (t=d), file (t=f), temporary-file (t=t), and shared-memory (t=s)
+    // media are supported; any other medium is rejected.
+    TEST_METHOD(KittyGraphicsUnsupportedMediumIsEinval)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1b_Ga=t,i=1,f=24,s=1,v=1,t=x;AAAA\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=1;EINVAL:unsupported transmission medium\x1b\\");
+    }
+
+    // Shared-memory transmission decodes the mapping name, forwards O=/S= to the
+    // host, and processes the copied bytes through the normal pixel path.
+    TEST_METHOD(KittyGraphicsSharedMemoryTransmitRenders)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_kittySharedMemoryBytes.assign(10, 0);
+        _testGetSet->_kittySharedMemoryBytes.insert(_testGetSet->_kittySharedMemoryBytes.end(), { 255, 0, 0 });
+        // Base64 of "Local\\kitty-shm-test".
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=20,f=24,s=1,v=1,t=s,O=10,S=3;TG9jYWxca2l0dHktc2htLXRlc3Q=\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=20;OK\x1b\\");
+        VERIFY_ARE_EQUAL(1, _testGetSet->_readSharedMemoryCallCount);
+        VERIFY_IS_TRUE(_testGetSet->_lastKittySharedMemoryName == L"Local\\kitty-shm-test");
+        VERIFY_ARE_EQUAL(static_cast<uint64_t>(10), _testGetSet->_lastKittySharedMemoryOffset);
+        VERIFY_ARE_EQUAL(static_cast<uint64_t>(3), _testGetSet->_lastKittySharedMemorySize);
+        VERIFY_IS_TRUE(BufferContainsColor(*_testGetSet->_textBuffer, 255, 0, 0));
+    }
+
+    // Windows rounds named mappings to pages. Without S=, raw dimensions provide the
+    // exact byte count and prevent page padding from becoming image data.
+    TEST_METHOD(KittyGraphicsSharedMemoryInfersRawSize)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_kittySharedMemoryBytes.assign(12, 0);
+        _stateMachine->ProcessString(L"\x1b_Ga=t,i=21,f=24,s=2,v=2,t=s;TG9jYWxca2l0dHktc2htLXRlc3Q=\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=21;OK\x1b\\");
+        VERIFY_ARE_EQUAL(static_cast<uint64_t>(12), _testGetSet->_lastKittySharedMemorySize);
+
+        // S defaults to zero, so explicit S=0 is equivalent to omission. Both use the
+        // raw format's expected byte extent rather than page-rounded mapping padding.
+        _stateMachine->ProcessString(L"\x1b_Ga=t,i=22,f=24,s=2,v=2,t=s,S=0;TG9jYWxca2l0dHktc2htLXRlc3Q=\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=22;OK\x1b\\");
+        VERIFY_ARE_EQUAL(static_cast<uint64_t>(12), _testGetSet->_lastKittySharedMemorySize);
+    }
+
+    // Shared-memory payloads carry one resource name, so m=1 must be ignored rather
+    // than delaying the read forever.
+    TEST_METHOD(KittyGraphicsSharedMemoryIgnoresMoreChunks)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_kittySharedMemoryBytes = { 255, 0, 0 };
+        _stateMachine->ProcessString(L"\x1b_Ga=t,i=23,f=24,s=1,v=1,t=s,S=3,m=1;TG9jYWxca2l0dHktc2htLXRlc3Q=\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=23;OK\x1b\\");
+        VERIFY_ARE_EQUAL(1, _testGetSet->_readSharedMemoryCallCount);
+    }
+
+    // The adapter rejects malformed or NUL-truncated mapping names before any host
+    // IPC call, so Win32 never opens a different object than the client named.
+    TEST_METHOD(KittyGraphicsSharedMemoryRejectsInvalidNameEncoding)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1b_Ga=t,i=24,f=24,s=1,v=1,t=s;//79\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=24;EINVAL:invalid shared memory request\x1b\\");
+        _stateMachine->ProcessString(L"\x1b_Ga=t,i=25,f=24,s=1,v=1,t=s;QQBC\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=25;EINVAL:invalid shared memory request\x1b\\");
+        VERIFY_ARE_EQUAL(0, _testGetSet->_readSharedMemoryCallCount);
+    }
+
+    // Host failures retain their protocol distinction and never register an image.
+    TEST_METHOD(KittyGraphicsSharedMemoryMissingIsEnoent)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_readSharedMemorySucceeds = false;
+        _testGetSet->_readSharedMemoryResult = Microsoft::Console::Utils::ReadSharedMemoryResult::not_found;
+        _stateMachine->ProcessString(L"\x1b_Ga=t,i=26,f=24,s=1,v=1,t=s;TG9jYWxca2l0dHktc2htLXRlc3Q=\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=26;ENOENT:shared memory not found\x1b\\");
+        _stateMachine->ProcessString(L"\x1b_Ga=p,i=26;\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=26;ENOENT:image not found\x1b\\");
+    }
+
+    // File transmission (t=f): the base64 payload is the file PATH; the host reads the
+    // file and its contents render exactly like a direct payload (here, 1x1 red RGB).
+    TEST_METHOD(KittyGraphicsFileTransmitRendersFromFile)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_kittyFileBytes = { 255, 0, 0 }; // 1x1 red RGB == f=24,s=1,v=1
+        // "L3RtcC94" is base64 of the path "/tmp/x"; the mock ignores the path content.
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,f=24,s=1,v=1,t=f;L3RtcC94\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=1;OK\x1b\\");
+        VERIFY_IS_TRUE(_testGetSet->_readLocalFileCallCount > 0, L"t=f must invoke the host file read.");
+        VERIFY_IS_TRUE(_testGetSet->_lastKittyFilePath == L"/tmp/x", L"the UTF-8 payload path must reach the host as a wstring.");
+        const auto& buffer = *_testGetSet->_textBuffer;
+        til::CoordType imageRow = -1;
+        const auto slice = FindFirstImageSlice(buffer, imageRow);
+        VERIFY_IS_NOT_NULL(slice, L"t=f with a=T should place an image slice.");
+        VERIFY_IS_TRUE(SliceContainsColor(slice, 255, 0, 0), L"the file's pixels should render red.");
+    }
+
+    // Temporary file (t=t): the host is asked to delete the file after reading. The
+    // adapter must pass deleteAfter=true (the host enforces temp-dir containment).
+    TEST_METHOD(KittyGraphicsTempFileTransmitRequestsDelete)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_kittyFileBytes = { 255, 0, 0 };
+        _stateMachine->ProcessString(L"\x1b_Ga=t,i=2,f=24,s=1,v=1,t=t;L3RtcC94\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=2;OK\x1b\\");
+        VERIFY_IS_TRUE(_testGetSet->_lastKittyFileDeleteAfter, L"t=t must request deletion of the temporary file.");
+    }
+
+    // O= (byte offset) and S= (byte count) are forwarded to the host read; t=f must not
+    // request deletion.
+    TEST_METHOD(KittyGraphicsFileTransmitForwardsOffsetAndSize)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_kittyFileBytes = { 255, 0, 0 };
+        _stateMachine->ProcessString(L"\x1b_Ga=t,i=3,f=24,s=1,v=1,t=f,O=10,S=3;L3RtcC94\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=3;OK\x1b\\");
+        VERIFY_ARE_EQUAL(static_cast<uint64_t>(10), _testGetSet->_lastKittyFileOffset, L"O= must pass through as the file offset.");
+        VERIFY_ARE_EQUAL(static_cast<uint64_t>(3), _testGetSet->_lastKittyFileSize, L"S= must pass through as the byte count.");
+        VERIFY_IS_FALSE(_testGetSet->_lastKittyFileDeleteAfter, L"t=f must not request deletion.");
+    }
+
+    // A file that cannot be read (host returns false) reports EBADF and stores nothing.
+    TEST_METHOD(KittyGraphicsFileTransmitReadFailureIsEbadf)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_readLocalFileSucceeds = false;
+        _stateMachine->ProcessString(L"\x1b_Ga=t,i=4,f=24,s=1,v=1,t=f;L3RtcC94\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=4;EBADF:could not read file\x1b\\");
+        // The failed transfer must not register a phantom image.
+        _stateMachine->ProcessString(L"\x1b_Ga=p,i=4;\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=4;ENOENT:image not found\x1b\\");
+    }
+
+    // f=100 (PNG) over a file: the file bytes go through the host PNG decoder, exactly
+    // like a direct PNG payload.
+    TEST_METHOD(KittyGraphicsPngFileTransmitDecodes)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_kittyFileBytes = { 0x89, 0x50, 0x4E, 0x47 }; // arbitrary non-empty "PNG" bytes
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=5,f=100,t=f;L3RtcC94\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=5;OK\x1b\\");
+        VERIFY_IS_TRUE(_testGetSet->_decodeImageCallCount > 0, L"f=100 from a file must use the host PNG decoder.");
+        const auto& buffer = *_testGetSet->_textBuffer;
+        til::CoordType imageRow = -1;
+        const auto slice = FindFirstImageSlice(buffer, imageRow);
+        VERIFY_IS_NOT_NULL(slice, L"the decoded PNG should be placed.");
+        VERIFY_IS_TRUE(SliceContainsColor(slice, 0, 0, 255), L"the mock decoder returns a blue image.");
+    }
+
+    // O=/S= are 64-bit: a real >4 GiB size is preserved end-to-end, not truncated to
+    // 32 bits. The adapter never allocates from S (the host caps the actual read at
+    // 32 MiB), so the transfer still succeeds; only the value forwarded changes.
+    TEST_METHOD(KittyGraphicsFileTransmitLargeSizePassesThrough64Bit)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_kittyFileBytes = { 255, 0, 0 };
+        _stateMachine->ProcessString(L"\x1b_Ga=t,i=6,f=24,s=1,v=1,t=f,S=9999999999;L3RtcC94\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=6;OK\x1b\\");
+        VERIFY_ARE_EQUAL(static_cast<uint64_t>(9999999999ull), _testGetSet->_lastKittyFileSize, L"a >4 GiB S= must pass through as 64-bit, not truncate to 32 bits.");
+    }
+
+    // A digit run that overflows even 64 bits clamps to UINT64_MAX rather than wrapping;
+    // the host rejects such an offset (past EOF) so it fails cleanly, never wraps to a
+    // small in-range value.
+    TEST_METHOD(KittyGraphicsFileOffsetOverflowClampsTo64Max)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_kittyFileBytes = { 255, 0, 0 };
+        _stateMachine->ProcessString(L"\x1b_Ga=t,i=7,f=24,s=1,v=1,t=f,O=99999999999999999999999;L3RtcC94\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=7;OK\x1b\\");
+        VERIFY_ARE_EQUAL(UINT64_MAX, _testGetSet->_lastKittyFileOffset, L"an O= that overflows 64 bits must clamp to UINT64_MAX, not wrap.");
+    }
+
+    // An empty (or non-UTF-8) payload yields an empty path: the adapter reports EINVAL
+    // (a malformed request) WITHOUT ever calling the host (no filesystem access for a
+    // path it cannot form).
+    TEST_METHOD(KittyGraphicsFileTransmitEmptyPathIsEinval)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1b_Ga=t,i=8,f=24,s=1,v=1,t=f;\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=8;EINVAL:invalid image file request\x1b\\");
+        VERIFY_ARE_EQUAL(0, _testGetSet->_readLocalFileCallCount, L"an empty path must not reach the host.");
+    }
+
+    // A payload that base64-decodes to invalid UTF-8 is rejected at conversion time
+    // (MB_ERR_INVALID_CHARS) -> empty path -> EINVAL, again without any host call.
+    TEST_METHOD(KittyGraphicsFileTransmitInvalidUtf8PathIsEinval)
+    {
+        _testGetSet->PrepData();
+        // "//79" is base64 of bytes {0xFF,0xFE,0xFD}, which is not valid UTF-8.
+        _stateMachine->ProcessString(L"\x1b_Ga=t,i=8,f=24,s=1,v=1,t=f;//79\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=8;EINVAL:invalid image file request\x1b\\");
+        VERIFY_ARE_EQUAL(0, _testGetSet->_readLocalFileCallCount, L"an invalid-UTF-8 path must not reach the host.");
+    }
+
+    // The file's contents are validated exactly like a direct payload: a raw size that
+    // does not match s=*v=*depth is EINVAL, after the (successful) host read.
+    TEST_METHOD(KittyGraphicsFileTransmitSizeMismatchIsEinval)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_kittyFileBytes = { 255, 0, 0 }; // 3 bytes, but s=2,v=2,f=24 needs 12
+        _stateMachine->ProcessString(L"\x1b_Ga=t,i=9,f=24,s=2,v=2,t=f;L3RtcC94\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=9;EINVAL:payload size mismatch\x1b\\");
+    }
+
+    // a=q over t=f validates the request (the host IS asked to read) but stores nothing,
+    // so a later put of that id is ENOENT.
+    TEST_METHOD(KittyGraphicsFileTransmitQueryValidatesWithoutStoring)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_kittyFileBytes = { 255, 0, 0 };
+        _stateMachine->ProcessString(L"\x1b_Ga=q,i=10,f=24,s=1,v=1,t=f;L3RtcC94\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=10;OK\x1b\\");
+        VERIFY_IS_TRUE(_testGetSet->_readLocalFileCallCount > 0, L"a=q must still validate by reading the file.");
+        // The query must not have registered an image.
+        _stateMachine->ProcessString(L"\x1b_Ga=p,i=10;\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=10;ENOENT:image not found\x1b\\");
+    }
+
+    // a=q over t=t must NOT request deletion: a query is not a real transmit, so the
+    // temporary file is left intact (only a=t/a=T of a t=t file deletes).
+    TEST_METHOD(KittyGraphicsTempFileQueryDoesNotDelete)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_kittyFileBytes = { 255, 0, 0 };
+        _stateMachine->ProcessString(L"\x1b_Ga=q,i=11,f=24,s=1,v=1,t=t;L3RtcC94\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=11;OK\x1b\\");
+        VERIFY_IS_TRUE(_testGetSet->_readLocalFileCallCount > 0, L"a=q must still read the file to validate.");
+        VERIFY_IS_FALSE(_testGetSet->_lastKittyFileDeleteAfter, L"a=q,t=t must never request deletion.");
     }
 
     // Unknown deletion selectors are rejected.

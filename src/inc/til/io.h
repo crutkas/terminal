@@ -5,6 +5,7 @@
 
 #include <aclapi.h>
 #include <sddl.h>
+#include <winternl.h>
 #include <wil/token_helpers.h>
 
 namespace til // Terminal Implementation Library. Also: "Today I Learned"
@@ -263,4 +264,404 @@ namespace til // Terminal Implementation Library. Also: "Today I Learned"
             }
         }
     } // io
+
+    // Outcome of read_file_as_bytes. not_found: the path named no existing file.
+    // invalid: the request itself was malformed -- an empty path, an unsupported path
+    // form, or a byte range that cannot be satisfied. read_error: the file exists but
+    // could not be read, because it is not a regular file, sits on the wrong kind of
+    // volume, or the read failed. Callers map these onto whatever their own protocol
+    // reports; this says only what happened on disk.
+    enum class read_file_result : uint8_t
+    {
+        ok,
+        not_found,
+        invalid,
+        read_error,
+    };
+
+    // Reads up to a bounded number of bytes of a LOCAL file into 'out', starting at
+    // 'offset'. A caller that has been handed a path by something untrusted -- a
+    // terminal client, say -- wants all of the checks below and should not have to
+    // remember them, so they live here rather than at any one call site.
+    //
+    // Security model:
+    //  * Only LOCAL, FIXED-drive, drive-absolute files are read. A path that is not of
+    //    the form "X:\..." (relative, drive-relative, or rooted) is rejected, as is any
+    //    UNC / Win32-device path ("\\server\share", "\\.\dev", "\\?\..."). After the
+    //    handle is open the canonical path is re-checked: a UNC final path
+    //    ("\\?\UNC\...") or a non-DRIVE_FIXED volume (remote/removable/optical) is
+    //    rejected. This blocks SSRF / NTLM-hash theft via "\\attacker\share" and device
+    //    access, even when a junction or mapped drive is used to disguise the target.
+    //  * The read is hard-bounded to 32 MiB regardless of the caller's 'size', so a
+    //    hostile length can never force a large allocation.
+    //  * When 'deleteAfter' is requested the file is removed via its OPEN handle
+    //    (FILE_DISPOSITION) — never by re-opening a path, closing the TOCTOU window —
+    //    and ONLY when that handle's canonical path is under the system temp directory
+    //    AND its name contains 'deleteNameMarker'. The marker is the caller's, because
+    //    only the caller knows what it named the files it is entitled to remove; an
+    //    empty one deletes nothing, so a caller cannot opt out of the check by omission.
+    // Never throws.
+    _TIL_INLINEPREFIX read_file_result read_file_as_bytes(const std::wstring_view path, uint64_t offset, uint64_t size, bool deleteAfter, const std::wstring_view deleteNameMarker, std::vector<uint8_t>& out) noexcept
+    {
+        out.clear();
+
+        // A hard ceiling no caller can raise, so a bad 'size' cannot turn into a bad
+        // allocation. It also keeps a single ReadFile within DWORD range.
+        constexpr uint64_t maxBytes = 32ull * 1024 * 1024;
+
+        if (path.empty())
+        {
+            return read_file_result::invalid;
+        }
+
+        const auto isSep = [](const wchar_t c) noexcept { return c == L'\\' || c == L'/'; };
+
+        // Reject UNC and device-namespace paths before opening: any path whose first two
+        // characters are separators ("\\server\share", "\\.\dev", "\\?\...", "//host/..").
+        if (path.size() >= 2 && isSep(path[0]) && isSep(path[1]))
+        {
+            return read_file_result::invalid;
+        }
+
+        // Require a drive-absolute local path ("X:\..."): reject relative and drive-
+        // relative paths so a client cannot make the terminal read a file resolved
+        // against the terminal's own working directory.
+        const auto driveLetter = path[0];
+        const auto isAlpha = (driveLetter >= L'a' && driveLetter <= L'z') || (driveLetter >= L'A' && driveLetter <= L'Z');
+        if (path.size() < 3 || !isAlpha || path[1] != L':' || !isSep(path[2]))
+        {
+            return read_file_result::invalid;
+        }
+
+        // Defense in depth: reject a non-fixed drive letter BEFORE opening, so a mapped
+        // network drive (X: -> \\server\share) can't trigger an outbound SMB/NTLM auth
+        // inside CreateFileW. The post-open canonical check still catches junction/symlink
+        // redirects to other volumes; this closes the pre-handshake window for the common case.
+        const wchar_t driveRoot[]{ driveLetter, L':', L'\\', L'\0' };
+        if (GetDriveTypeW(driveRoot) != DRIVE_FIXED)
+        {
+            return read_file_result::invalid;
+        }
+
+        std::wstring pathStr;
+        const auto isReservedDosDevice = [](const std::wstring_view candidate) noexcept {
+            auto leaf = candidate.substr(candidate.find_last_of(L'\\') + 1);
+            while (!leaf.empty() && (leaf.back() == L' ' || leaf.back() == L'.'))
+            {
+                leaf.remove_suffix(1);
+            }
+            if (const auto suffix = leaf.find_first_of(L".:"); suffix != std::wstring_view::npos)
+            {
+                leaf = leaf.substr(0, suffix);
+            }
+            while (!leaf.empty() && leaf.back() == L' ')
+            {
+                leaf.remove_suffix(1);
+            }
+            const auto equalsLeaf = [&](const std::wstring_view value) noexcept {
+                return leaf.size() == value.size() &&
+                       CompareStringOrdinal(leaf.data(), static_cast<int>(leaf.size()), value.data(), static_cast<int>(value.size()), TRUE) == CSTR_EQUAL;
+            };
+            const auto isNumberedDevice = [&](const std::wstring_view prefix) noexcept {
+                if (leaf.size() != prefix.size() + 1)
+                {
+                    return false;
+                }
+                const auto suffix = leaf.back();
+                return ((suffix >= L'1' && suffix <= L'9') || suffix == L'\u00B9' || suffix == L'\u00B2' || suffix == L'\u00B3') &&
+                       CompareStringOrdinal(leaf.data(), static_cast<int>(prefix.size()), prefix.data(), static_cast<int>(prefix.size()), TRUE) == CSTR_EQUAL;
+            };
+            return equalsLeaf(L"CON") || equalsLeaf(L"PRN") || equalsLeaf(L"AUX") || equalsLeaf(L"NUL") ||
+                   equalsLeaf(L"CLOCK$") || equalsLeaf(L"CONIN$") || equalsLeaf(L"CONOUT$") ||
+                   isNumberedDevice(L"COM") || isNumberedDevice(L"LPT");
+        };
+        try
+        {
+            pathStr.assign(path);
+            std::replace(pathStr.begin(), pathStr.end(), L'/', L'\\');
+            if (isReservedDosDevice(pathStr))
+            {
+                return read_file_result::read_error;
+            }
+
+            // Apply the same lexical normalization as CreateFileW without touching the
+            // filesystem. This collapses ".", "..", duplicate separators, and trailing
+            // spaces/periods before the normalized path is opened relative to the drive.
+            const auto needed = GetFullPathNameW(pathStr.c_str(), 0, nullptr, nullptr);
+            if (needed == 0)
+            {
+                return read_file_result::invalid;
+            }
+            std::wstring normalized(needed, L'\0');
+            const auto written = GetFullPathNameW(pathStr.c_str(), needed, normalized.data(), nullptr);
+            if (written == 0 || written >= needed)
+            {
+                return read_file_result::invalid;
+            }
+            normalized.resize(written);
+            pathStr.swap(normalized);
+        }
+        catch (...)
+        {
+            return read_file_result::read_error;
+        }
+
+        if (pathStr.size() < 3 ||
+            CompareStringOrdinal(pathStr.data(), 1, &driveLetter, 1, TRUE) != CSTR_EQUAL ||
+            pathStr[1] != L':' || pathStr[2] != L'\\')
+        {
+            return read_file_result::invalid;
+        }
+
+        const auto relativePath = std::wstring_view{ pathStr }.substr(3);
+        if (relativePath.empty() || relativePath.size() > USHRT_MAX / sizeof(wchar_t))
+        {
+            return read_file_result::invalid;
+        }
+
+        // Resolve only the already-validated fixed drive root through Win32. The remaining
+        // untrusted path is opened relative to this handle so OBJ_DONT_REPARSE does not
+        // reject the Object Manager's normal \??\C: drive-letter symbolic link.
+        wil::unique_hfile drive{ CreateFileW(driveRoot,
+                                             FILE_READ_ATTRIBUTES,
+                                             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                             nullptr,
+                                             OPEN_EXISTING,
+                                             FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+                                             nullptr) };
+        if (!drive)
+        {
+            return read_file_result::read_error;
+        }
+
+        UNICODE_STRING objectName{
+            .Length = static_cast<USHORT>(relativePath.size() * sizeof(wchar_t)),
+            .MaximumLength = static_cast<USHORT>(relativePath.size() * sizeof(wchar_t)),
+            .Buffer = const_cast<wchar_t*>(relativePath.data()),
+        };
+        OBJECT_ATTRIBUTES objectAttributes{
+            .Length = sizeof(OBJECT_ATTRIBUTES),
+            .RootDirectory = drive.get(),
+            .ObjectName = &objectName,
+            .Attributes = OBJ_CASE_INSENSITIVE | OBJ_DONT_REPARSE,
+        };
+
+        // Open without following any reparse point in the path. The post-open canonical
+        // checks below are too late to prevent an intermediate junction or symlink from
+        // initiating an SMB/NTLM handshake, so this intentionally rejects all reparse
+        // traversal before the target is touched.
+        const auto openFile = [&](const ACCESS_MASK access, wil::unique_hfile& file) noexcept {
+            IO_STATUS_BLOCK status{};
+            return NtCreateFile(file.addressof(),
+                                access | SYNCHRONIZE,
+                                &objectAttributes,
+                                &status,
+                                nullptr,
+                                FILE_ATTRIBUTE_NORMAL,
+                                FILE_SHARE_READ | FILE_SHARE_DELETE,
+                                FILE_OPEN,
+                                FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT | FILE_OPEN_REPARSE_POINT,
+                                nullptr,
+                                0);
+        };
+
+        // Request DELETE only when we might actually remove the file, so an ordinary read
+        // never needs delete rights. FILE_SHARE_DELETE lets the file be unlinked while open.
+        wil::unique_hfile file;
+        auto status = openFile(GENERIC_READ | (deleteAfter ? static_cast<ACCESS_MASK>(DELETE) : 0ul), file);
+        if (status < 0 && deleteAfter)
+        {
+            // The file may not grant DELETE (e.g. a read-only ACL); fall back to a pure
+            // read so rendering still works. We then simply cannot delete it.
+            deleteAfter = false;
+            status = openFile(GENERIC_READ, file);
+        }
+        if (status < 0)
+        {
+            const auto err = RtlNtStatusToDosError(status);
+            return (err == ERROR_FILE_NOT_FOUND || err == ERROR_PATH_NOT_FOUND)
+                       ? read_file_result::not_found
+                       : read_file_result::read_error;
+        }
+
+        // Only REGULAR files may be read;
+        // device/pipe/socket "special" files must be refused. GetFileType on the open handle is
+        // FILE_TYPE_DISK only for a real on-disk file; a character device (e.g. a reserved name
+        // like NUL/CON resolved against a drive), a pipe, or an unknown type is rejected. The path
+        // checks above already block the device namespace and non-fixed volumes; this is the
+        // explicit, auditable form of the spec's "regular files only" rule and closes the
+        // reserved-name edge.
+        if (GetFileType(file.get()) != FILE_TYPE_DISK)
+        {
+            return read_file_result::read_error;
+        }
+
+        // Resolves the fully-normalized on-disk path for an open handle (following
+        // symlinks/junctions and 8.3 short names), or empty on failure. With
+        // VOLUME_NAME_DOS every result is prefixed with "\\?\" (e.g. "\\?\C:\dir\file",
+        // or "\\?\UNC\server\share\file" for a UNC target).
+        const auto finalPath = [](HANDLE handle) noexcept -> std::wstring {
+            const auto needed = GetFinalPathNameByHandleW(handle, nullptr, 0, FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
+            if (needed == 0)
+            {
+                return {};
+            }
+            std::wstring resolved;
+            try
+            {
+                resolved.resize(needed);
+            }
+            catch (...)
+            {
+                return {};
+            }
+            const auto written = GetFinalPathNameByHandleW(handle, resolved.data(), needed, FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
+            if (written == 0 || written >= needed)
+            {
+                return {};
+            }
+            resolved.resize(written);
+            return resolved;
+        };
+
+        const auto canonical = finalPath(file.get());
+        if (canonical.empty())
+        {
+            return read_file_result::read_error;
+        }
+
+        // Reject a UNC final path. A drive-absolute client path can still resolve through
+        // a junction/mapped drive to a UNC location, so this must be re-checked here.
+        static constexpr std::wstring_view uncPrefix{ L"\\\\?\\UNC\\" };
+        if (canonical.size() >= uncPrefix.size() &&
+            CompareStringOrdinal(canonical.c_str(), static_cast<int>(uncPrefix.size()), uncPrefix.data(), static_cast<int>(uncPrefix.size()), TRUE) == CSTR_EQUAL)
+        {
+            return read_file_result::read_error;
+        }
+
+        // Require a fixed local volume: reject network/removable/optical drives
+        // (DRIVE_REMOTE/REMOVABLE/CDROM, plus UNKNOWN/NO_ROOT_DIR).
+        wchar_t volumeRoot[MAX_PATH]{};
+        if (!GetVolumePathNameW(canonical.c_str(), volumeRoot, ARRAYSIZE(volumeRoot)) || GetDriveTypeW(volumeRoot) != DRIVE_FIXED)
+        {
+            return read_file_result::read_error;
+        }
+
+        LARGE_INTEGER fileSize{};
+        if (!GetFileSizeEx(file.get(), &fileSize) || fileSize.QuadPart < 0)
+        {
+            return read_file_result::read_error;
+        }
+        const auto total = static_cast<uint64_t>(fileSize.QuadPart);
+        if (offset > total)
+        {
+            return read_file_result::invalid; // offset past end of file
+        }
+
+        // Bytes to read: what remains after the offset, clamped by 'size' when nonzero,
+        // and always by the hard 32 MiB cap.
+        uint64_t toRead = total - offset;
+        if (size != 0)
+        {
+            toRead = std::min(toRead, size);
+        }
+        toRead = std::min(toRead, maxBytes);
+
+        if (offset != 0)
+        {
+            LARGE_INTEGER move{};
+            move.QuadPart = static_cast<LONGLONG>(offset);
+            if (!SetFilePointerEx(file.get(), move, nullptr, FILE_BEGIN))
+            {
+                return read_file_result::read_error;
+            }
+        }
+
+        try
+        {
+            out.resize(static_cast<size_t>(toRead));
+        }
+        catch (...)
+        {
+            out.clear();
+            return read_file_result::read_error;
+        }
+
+        DWORD read = 0;
+        if (toRead != 0 && !ReadFile(file.get(), out.data(), static_cast<DWORD>(toRead), &read, nullptr))
+        {
+            out.clear();
+            return read_file_result::read_error;
+        }
+        out.resize(read);
+
+        // Decide deletion only after a successful read, using the canonical path of the
+        // exact inode behind our handle.
+        if (deleteAfter)
+        {
+            // The canonical system temp directory, normalized through a handle so it is in
+            // the same "\\?\" form as 'canonical', with a trailing backslash. Prefers
+            // GetTempPath2W (Win11, per-process) and falls back to GetTempPathW.
+            const auto tempDir = [&finalPath]() noexcept -> std::wstring {
+                wchar_t raw[MAX_PATH + 2]{};
+                using PfnGetTempPath2W = DWORD(WINAPI*)(DWORD, LPWSTR);
+                static const auto pfnGetTempPath2W = []() noexcept {
+                    const auto k32 = GetModuleHandleW(L"kernel32.dll");
+#pragma warning(suppress : 26490) // Don't use reinterpret_cast (type.1) -- required for GetProcAddress.
+                    return k32 ? reinterpret_cast<PfnGetTempPath2W>(GetProcAddress(k32, "GetTempPath2W")) : nullptr;
+                }();
+                const auto len = pfnGetTempPath2W ? pfnGetTempPath2W(ARRAYSIZE(raw), raw) : GetTempPathW(ARRAYSIZE(raw), raw);
+                if (len == 0 || len >= ARRAYSIZE(raw))
+                {
+                    return {};
+                }
+                wil::unique_hfile dir{ CreateFileW(raw, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr) };
+                if (!dir)
+                {
+                    return {};
+                }
+                auto resolved = finalPath(dir.get());
+                if (!resolved.empty() && resolved.back() != L'\\')
+                {
+                    try
+                    {
+                        resolved.push_back(L'\\');
+                    }
+                    catch (...)
+                    {
+                        return {};
+                    }
+                }
+                return resolved;
+            }();
+
+            const auto underTemp = !tempDir.empty() && canonical.size() >= tempDir.size() &&
+                                   CompareStringOrdinal(canonical.c_str(), static_cast<int>(tempDir.size()), tempDir.c_str(), static_cast<int>(tempDir.size()), TRUE) == CSTR_EQUAL;
+
+            // Require the caller's marker in the file name (case-insensitively), so we
+            // only ever auto-delete files the caller created, never an arbitrary file
+            // something else happened to leave under temp. No marker, no deletion.
+            const auto marker = deleteNameMarker;
+            const auto separator = canonical.find_last_of(L'\\');
+            const auto filenameOffset = separator == std::wstring::npos ? 0 : separator + 1;
+            auto hasMarker = false;
+            for (auto i = filenameOffset; !marker.empty() && !hasMarker && i + marker.size() <= canonical.size(); ++i)
+            {
+                hasMarker = CompareStringOrdinal(canonical.c_str() + i, static_cast<int>(marker.size()), marker.data(), static_cast<int>(marker.size()), TRUE) == CSTR_EQUAL;
+            }
+
+            if (underTemp && hasMarker)
+            {
+                // Delete the exact open inode by setting its disposition, then closing the
+                // handle below. No path is re-resolved, so there is no window for a
+                // junction/symlink swap between validation and deletion (TOCTOU-safe).
+                FILE_DISPOSITION_INFO disposition{};
+                disposition.DeleteFile = TRUE;
+                std::ignore = SetFileInformationByHandle(file.get(), FileDispositionInfo, &disposition, sizeof(disposition));
+            }
+        }
+
+        return read_file_result::ok; // the handle closes here; a set disposition removes the inode.
+    }
+
 } // til

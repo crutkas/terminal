@@ -18,6 +18,7 @@
 
 using namespace Microsoft::Console::Types;
 using namespace Microsoft::Console::VirtualTerminal;
+using Microsoft::Console::Utils::ReadSharedMemoryResult;
 
 KittyParser::KittyParser(AdaptDispatch& dispatcher) noexcept :
     _dispatcher{ dispatcher }
@@ -225,6 +226,17 @@ KittyParser::Control KittyParser::_ParseControl(const std::wstring_view control)
                 c.cellOffsetY = _ParseUint(value);
                 c.upperY = c.cellOffsetY;
                 break;
+            case L'O':
+                // Uppercase O is the byte offset into a transmitted file (t=f / t=t);
+                // lowercase keys s/v are the pixel width/height, so case matters here.
+                // Parsed as 64-bit so a real >4 GiB offset is preserved, not truncated.
+                c.fileOffset = _ParseUint64(value);
+                break;
+            case L'S':
+                // Uppercase S is the number of file bytes to read (0 = to EOF), 64-bit so
+                // a large request is not silently wrapped (the host caps the actual read).
+                c.fileSize = _ParseUint64(value);
+                break;
             case L'o':
                 c.compression = value.front();
                 break;
@@ -287,6 +299,7 @@ KittyParser::Control KittyParser::_ParseControl(const std::wstring_view control)
 void KittyParser::_HandleSequence(const std::wstring_view control, const std::string_view payload, const bool controlValid, const bool payloadValid, const bool payloadTooLarge)
 {
     const auto command = _ParseControl(control);
+    const auto isSharedMemory = command.medium == L's';
 
     // A control block that hit the length bound was truncated, so none of the keys parsed
     // out of it can be trusted -- not the action, not the image id, and not the quiet level.
@@ -309,13 +322,15 @@ void KittyParser::_HandleSequence(const std::wstring_view control, const std::st
     const auto repeatsActiveAction = _chunkActive &&
                                      command.action == _chunkControl.action &&
                                      !command.hasNonChunkKeyOtherThanAction;
-    const auto isContinuation = command.mPresent && (!command.hasNonChunkKey || repeatsActiveAction);
+    // Per the protocol, m= applies only to direct transmission and is ignored for
+    // shared-memory media, whose payload is already just a local resource name.
+    const auto isContinuation = command.mPresent && !isSharedMemory && (!command.hasNonChunkKey || repeatsActiveAction);
     if (_chunkActive && !isContinuation)
     {
         _clearChunk();
     }
 
-    if (_chunkActive || command.moreChunks)
+    if (_chunkActive || (command.moreChunks && !isSharedMemory))
     {
         if (!_chunkActive)
         {
@@ -700,10 +715,10 @@ void KittyParser::_ProcessCommand(const Control& command, const std::string_view
                 code = L"EINVAL:unsupported format";
                 break;
             }
-            if (medium != L'd')
+            if (medium != L'd' && medium != L'f' && medium != L't' && medium != L's')
             {
-                // Only t=d (direct) transmission is supported here; the file and
-                // shared-memory media arrive with the host I/O they require.
+                // t=d (direct), t=f (file), t=t (temporary file), and t=s (shared
+                // memory) are supported. Reject every unrecognized medium.
                 success = false;
                 code = L"EINVAL:unsupported transmission medium";
                 break;
@@ -733,6 +748,133 @@ void KittyParser::_ProcessCommand(const Control& command, const std::string_view
                 break;
             }
 
+            // File and shared-memory payloads carry a UTF-8 resource name rather than
+            // image bytes. Decode strictly and reject embedded NULs so Win32 cannot
+            // silently open a truncated name.
+            const auto decodeResourceName = [](const std::vector<uint8_t>& encodedName, const size_t maxBytes, std::wstring& result) {
+                if (encodedName.empty() || encodedName.size() > maxBytes ||
+                    std::find(encodedName.begin(), encodedName.end(), uint8_t{ 0 }) != encodedName.end())
+                {
+                    return false;
+                }
+
+                const std::string utf8(encodedName.begin(), encodedName.end());
+                const auto length = static_cast<int>(utf8.size());
+                const auto needed = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, utf8.data(), length, nullptr, 0);
+                if (needed <= 0)
+                {
+                    return false;
+                }
+
+                result.resize(static_cast<size_t>(needed));
+                if (MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, utf8.data(), length, result.data(), needed) != needed)
+                {
+                    result.clear();
+                    return false;
+                }
+                return true;
+            };
+
+            if (medium == L'f' || medium == L't')
+            {
+                // For file/temporary transmission the decoded payload is not image
+                // data but the image FILE PATH (UTF-8 bytes). Read the file contents
+                // into `bytes` so the format-specific validation/decode below treats
+                // it exactly like a direct payload. The host bounds the read to a safe
+                // size (MaxPayload), so a hostile S= cannot force a huge alloc, and
+                // restricts reads to local fixed-drive files (see ReadLocalFile).
+                //
+                // A temporary file (t=t) is deleted by the host after a successful read,
+                // but only when it resides under the system temp directory and carries the
+                // marker below. Kitty names its temporary files "tty-graphics-protocol-*",
+                // and this is the only layer that knows that, so this is where the marker
+                // lives. A query (a=q) validates the request without storing, so it must
+                // NOT delete: only a real transmit (a=t / a=T) of a t=t file requests it.
+                //
+                // Protocol (transmission media): https://sw.kovidgoyal.net/kitty/graphics-protocol/#transferring-data
+                //
+                // Convert the UTF-8 path with MB_ERR_INVALID_CHARS so a malformed path is
+                // rejected here (path stays empty -> EBADF below) rather than silently
+                // mangled into U+FFFD substitutions: unlike til::u8u16, which uses no
+                // flags and substitutes, this rejects invalid input deterministically.
+                static constexpr std::wstring_view temporaryFileMarker{ L"tty-graphics-protocol" };
+
+                std::wstring path;
+                std::ignore = decodeResourceName(bytes, static_cast<size_t>(INT_MAX), path);
+                const auto deleteAfter = (medium == L't') && (action != L'q');
+                std::vector<uint8_t> fileBytes;
+                // An empty path is a malformed request (EINVAL); otherwise the host reports
+                // whether the file was missing (ENOENT), the request was invalid (EINVAL), or
+                // it could not be read (EBADF). Map each to the kitty file error codes.
+                const auto readResult = path.empty()
+                                            ? til::read_file_result::invalid
+                                            : _dispatcher._api.ReadLocalFile(path, command.fileOffset, command.fileSize, deleteAfter, temporaryFileMarker, fileBytes);
+                if (readResult != til::read_file_result::ok)
+                {
+                    success = false;
+                    switch (readResult)
+                    {
+                    case til::read_file_result::not_found:
+                        code = L"ENOENT:image file not found";
+                        break;
+                    case til::read_file_result::invalid:
+                        code = L"EINVAL:invalid image file request";
+                        break;
+                    default:
+                        code = L"EBADF:could not read file";
+                        break;
+                    }
+                    break;
+                }
+                bytes = std::move(fileBytes);
+            }
+            else if (medium == L's')
+            {
+                // The payload names a Windows file mapping. The host accepts only the
+                // current-session namespace, opens FILE_MAP_READ, copies at most 32 MiB,
+                // and closes the view/handle before returning. Per the Kitty spec there
+                // is no unlink operation on Windows.
+                std::wstring name;
+                constexpr size_t maxMappingNameBytes = 32767;
+                if (!decodeResourceName(bytes, maxMappingNameBytes, name))
+                {
+                    success = false;
+                    code = L"EINVAL:invalid shared memory request";
+                    break;
+                }
+
+                auto readSize = command.fileSize;
+                if (readSize == 0 && compression != L'z' && (format == 24 || format == 32) && width != 0 && height != 0)
+                {
+                    // CreateFileMapping rounds section sizes to whole pages, so a mapping
+                    // has no discoverable byte-exact tail. For raw pixels the protocol's
+                    // dimensions provide that exact length when S= is omitted.
+                    const auto depth = format == 24 ? 3ull : 4ull;
+                    const auto area = static_cast<uint64_t>(width) * height;
+                    readSize = area <= UINT64_MAX / depth ? area * depth : UINT64_MAX;
+                }
+
+                std::vector<uint8_t> sharedBytes;
+                const auto readResult = _dispatcher._api.ReadSharedMemory(name, command.fileOffset, readSize, sharedBytes);
+                if (readResult != ReadSharedMemoryResult::ok)
+                {
+                    success = false;
+                    switch (readResult)
+                    {
+                    case ReadSharedMemoryResult::not_found:
+                        code = L"ENOENT:shared memory not found";
+                        break;
+                    case ReadSharedMemoryResult::invalid:
+                        code = L"EINVAL:invalid shared memory request";
+                        break;
+                    default:
+                        code = L"EBADF:could not read shared memory";
+                        break;
+                    }
+                    break;
+                }
+                bytes = std::move(sharedBytes);
+            }
             if (compression == L'z')
             {
                 // o=z: the bytes acquired above (from t=d base64, a t=f / t=t file,
@@ -743,7 +885,8 @@ void KittyParser::_ProcessCommand(const Control& command, const std::string_view
                 // The inflated size is bounded to MaxPayload, so a decompression
                 // bomb is rejected without ever allocating the expanded buffer.
                 std::vector<uint8_t> inflated;
-                if (!_inflateZlib(bytes, inflated, MaxPayload))
+                const auto allowSharedMemoryPadding = medium == L's' && command.fileSize == 0;
+                if (!_inflateZlib(bytes, inflated, MaxPayload, allowSharedMemoryPadding))
                 {
                     success = false;
                     code = L"EINVAL:invalid compressed data";
@@ -1199,6 +1342,29 @@ int32_t KittyParser::_ParseInt(const std::wstring_view value) noexcept
     return magnitude > 0x7FFFFFFFu ? INT32_MAX : static_cast<int32_t>(magnitude);
 }
 
+// Like _ParseUint but for the 64-bit file offset/size keys (O=/S=). Clamps to
+// UINT64_MAX on overflow so a hostile run of digits cannot wrap; the host bounds the
+// actual read and rejects an offset past EOF, so a clamped value just fails cleanly.
+uint64_t KittyParser::_ParseUint64(const std::wstring_view value) noexcept
+{
+    uint64_t result = 0;
+    for (const auto ch : value)
+    {
+        if (ch < L'0' || ch > L'9')
+        {
+            break;
+        }
+        const auto digit = static_cast<uint64_t>(ch - L'0');
+        // Detect overflow before it happens: clamp rather than wrap.
+        if (result > (UINT64_MAX - digit) / 10)
+        {
+            result = UINT64_MAX;
+            break;
+        }
+        result = result * 10 + digit;
+    }
+    return result;
+}
 
 // Returns an unused image id, skipping ids that are already registered.
 uint32_t KittyParser::_assignImageId()
@@ -3984,7 +4150,7 @@ bool KittyParser::_DecodeBase64(const std::string_view input, std::vector<uint8_
 //
 // Protocol: https://sw.kovidgoyal.net/kitty/graphics-protocol/#compression  (o=z)
 // zlib container format: https://www.rfc-editor.org/rfc/rfc1950
-bool KittyParser::_inflateZlib(const std::vector<uint8_t>& input, std::vector<uint8_t>& output, const size_t cap) noexcept
+bool KittyParser::_inflateZlib(const std::vector<uint8_t>& input, std::vector<uint8_t>& output, const size_t cap, const bool allowTrailingZeroPadding) noexcept
 try
 {
     output.clear();
@@ -4071,11 +4237,14 @@ try
     output.resize(produced);
 
     // inflatelib stops at the end of the DEFLATE stream, so whatever it did not consume
-    // is the 4-byte Adler-32. Require the stream to end exactly where that trailer ends,
-    // rejecting trailing garbage and multi-member streams.
+    // is the 4-byte Adler-32 plus any padding. Require the stream to end where that
+    // trailer begins, rejecting trailing garbage and multi-member streams. When an S=0
+    // shared-memory transfer includes page-rounded zero padding, only zeros may follow.
     const auto consumed = deflateAvailable - remainingInput.size();
     const auto streamEnd = 2u + consumed + 4u;
-    if (streamEnd != input.size())
+    if (streamEnd > input.size() ||
+        (!allowTrailingZeroPadding && streamEnd != input.size()) ||
+        (allowTrailingZeroPadding && !std::all_of(input.begin() + streamEnd, input.end(), [](const auto value) noexcept { return value == 0; })))
     {
         output.clear();
         return false;
