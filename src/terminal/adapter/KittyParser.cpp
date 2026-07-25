@@ -2971,8 +2971,8 @@ void KittyParser::RenderPlaceholders(const std::wstring_view segment, const til:
                 // way, because the cell to the right resolves its own column and image-id
                 // high byte from them.
                 row.SetImageCellRef(column, ImageCellRef{
-                                                           .column = cellCol,
                                                            .layerId = drawn ? layerId : 0,
+                                                           .column = cellCol,
                                                            .row = gsl::narrow_cast<uint16_t>(cellRow),
                                                            .imageIdHighByte = highByte,
                                                            .valid = true,

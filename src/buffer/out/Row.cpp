@@ -231,7 +231,7 @@ void ROW::Reset(const TextAttribute& attr) noexcept
     // Modifying the existing object is _much_ faster.
     *_attr.runs().unsafe_shrink_to_size(1) = til::rle_pair{ attr, _columnCount };
     _imageSlice = nullptr;
-    _imageCellRefs.clear();
+    _imageCellRefs.reset();
     _lineRendition = LineRendition::SingleWidth;
     _wrapForced = false;
     _doubleBytePadded = false;
@@ -358,7 +358,7 @@ void ROW::CopyFrom(const ROW& source)
 {
     _lineRendition = source._lineRendition;
     _wrapForced = source._wrapForced;
-    _imageCellRefs.clear();
+    _imageCellRefs.reset();
 
     RowCopyTextFromState state{
         .source = source,
@@ -1141,7 +1141,7 @@ std::wstring_view ROW::GetText(til::CoordType columnBegin, til::CoordType column
 
 const ImageCellRef* ROW::GetImageCellRef(const til::CoordType column) const noexcept
 {
-    if (column < 0 || column >= _columnCount || static_cast<size_t>(column) >= _imageCellRefs.size())
+    if (!_imageCellRefs || column < 0 || column >= _columnCount)
     {
         return nullptr;
     }
@@ -1157,23 +1157,23 @@ void ROW::SetImageCellRef(const til::CoordType column, const ImageCellRef& metad
         return;
     }
 
-    if (_imageCellRefs.empty())
+    if (!_imageCellRefs)
     {
-        _imageCellRefs.resize(_columnCount);
+        _imageCellRefs = std::make_unique<ImageCellRef[]>(_columnCount);
     }
     til::at(_imageCellRefs, column) = metadata;
 }
 
 void ROW::_clearImageCellRefs(const til::CoordType columnBegin, const til::CoordType columnEnd) noexcept
 {
-    if (_imageCellRefs.empty())
+    if (!_imageCellRefs)
     {
         return;
     }
 
     const auto begin = std::clamp<til::CoordType>(columnBegin, 0, _columnCount);
     const auto end = std::clamp<til::CoordType>(columnEnd, begin, _columnCount);
-    std::fill(_imageCellRefs.begin() + begin, _imageCellRefs.begin() + end, ImageCellRef{});
+    std::fill_n(_imageCellRefs.get() + begin, end - begin, ImageCellRef{});
 }
 
 void ROW::CopyImageCellRefs(const ROW& source, const til::CoordType sourceColumnBegin, const til::CoordType columnBegin, const til::CoordType columnEnd)
@@ -1184,7 +1184,7 @@ void ROW::CopyImageCellRefs(const ROW& source, const til::CoordType sourceColumn
     const auto count = std::min(destinationEnd - destinationBegin, source._columnCount - sourceBegin);
 
     std::vector<ImageCellRef> copied;
-    if (count > 0 && !source._imageCellRefs.empty())
+    if (count > 0 && source._imageCellRefs)
     {
         copied.reserve(count);
         for (auto i = 0; i < count; ++i)
@@ -1199,11 +1199,11 @@ void ROW::CopyImageCellRefs(const ROW& source, const til::CoordType sourceColumn
         return;
     }
 
-    if (_imageCellRefs.empty())
+    if (!_imageCellRefs)
     {
-        _imageCellRefs.resize(_columnCount);
+        _imageCellRefs = std::make_unique<ImageCellRef[]>(_columnCount);
     }
-    std::copy(copied.begin(), copied.end(), _imageCellRefs.begin() + destinationBegin);
+    std::copy(copied.begin(), copied.end(), _imageCellRefs.get() + destinationBegin);
 }
 
 til::CoordType ROW::GetLeadingColumnAtCharOffset(const ptrdiff_t offset) const noexcept

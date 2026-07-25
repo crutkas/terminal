@@ -77,12 +77,16 @@ struct RowCopyTextFromState
 // after separate writes, scrolling, or reflow.
 struct ImageCellRef
 {
-    uint32_t column = 0;
+    // Ordered widest-first so this packs without padding. There is one of these
+    // per column of a row that stands in for image cells, so the difference
+    // between a packed and an unpacked layout is a third of that allocation.
     uint64_t layerId = 0;
+    uint32_t column = 0;
     uint16_t row = 0;
     uint8_t imageIdHighByte = 0;
     bool valid = false;
 };
+static_assert(sizeof(ImageCellRef) == 16);
 
 // This structure is basically an inverse of ROW::_charOffsets. If you have a pointer
 // into a ROW's text this class can tell you what cell that pointer belongs to.
@@ -335,8 +339,11 @@ private:
     // Stores any image content covering the row.
     ImageSlice::Pointer _imageSlice;
 
-    // Allocated lazily; only rows that stand in for image cells pay for this.
-    std::vector<ImageCellRef> _imageCellRefs;
+    // Allocated lazily, and holds exactly _columnCount entries when it exists,
+    // so like _charOffsets it does not need to carry a size of its own. A vector
+    // here would cost every row in the buffer 24 bytes to describe an allocation
+    // that almost none of them ever make.
+    std::unique_ptr<ImageCellRef[]> _imageCellRefs;
 };
 
 #ifdef UNIT_TESTING
