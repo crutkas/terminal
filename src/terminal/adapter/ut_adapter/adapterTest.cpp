@@ -8,6 +8,7 @@
 #include "../../../renderer/inc/DummyRenderer.hpp"
 
 #include "adaptDispatch.hpp"
+#include "KittyParser.hpp"
 #include "../../../buffer/out/ImageSlice.hpp"
 
 using namespace WEX::Common;
@@ -4694,7 +4695,7 @@ public:
         _testGetSet->PrepData();
         _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,p=1,f=24,s=1,v=1,C=1;/wAA\x1b\\"); // only placement (1,1)
         _stateMachine->ProcessString(L"\x1b_Ga=d,d=i,i=1,p=1;\x1b\\"); // lowercase: delete placement, keep data
-        VERIFY_IS_TRUE(_pDispatch->_kittyPlacements.empty(), L"the placement is removed");
+        VERIFY_IS_TRUE(_kitty()._placements.empty(), L"the placement is removed");
         _testGetSet->_response.clear();
         _stateMachine->ProcessString(L"\x1b_Ga=p,i=1,p=2;\x1b\\"); // image data survived -> new placement OK
         _testGetSet->ValidateInputEvent(L"\x1b_Gi=1,p=2;OK\x1b\\");
@@ -4706,7 +4707,7 @@ public:
         _testGetSet->PrepData();
         _stateMachine->ProcessString(L"\x1b_Ga=t,i=5,f=24,s=1,v=1;AAAA\x1b\\");
         _stateMachine->ProcessString(L"\x1b_Ga=d,d=r,x=5,y=5;\x1b\\"); // lowercase r: keep data
-        VERIFY_ARE_EQUAL(static_cast<size_t>(1), _pDispatch->_kittyImages.count(5), L"lowercase d=r keeps the image data");
+        VERIFY_ARE_EQUAL(static_cast<size_t>(1), _kitty()._images.count(5), L"lowercase d=r keeps the image data");
         _testGetSet->_response.clear();
         _stateMachine->ProcessString(L"\x1b_Ga=p,i=5;\x1b\\");
         _testGetSet->ValidateInputEvent(L"\x1b_Gi=5;OK\x1b\\");
@@ -4749,7 +4750,7 @@ public:
 
     // Lowercase single-placement delete (d=i,i=1,p=1) of a VIRTUAL placement drops the per-image
     // virtual grid (a re-printed placeholder is inert) and keeps the image DATA. A virtual placement
-    // draws no cells of its own, so d=i,p exercises _deleteKittyPlacement's virtual-grid teardown
+    // draws no cells of its own, so d=i,p exercises _deletePlacement's virtual-grid teardown
     // rather than a per-placement cell erase -- without it the grid (and pixels) would survive and
     // the lowercase p= delete would be a no-op.
     TEST_METHOD(KittyGraphicsDeleteLowercaseVirtualPlacementByIdKeepsData)
@@ -4772,7 +4773,7 @@ public:
 
     // Uppercase single-placement delete (d=I,i=1,p=1) of a VIRTUAL placement drops the grid AND
     // frees the image data (the image has no placements left) -- the case-gated other half of the
-    // lowercase test above, proving _deleteKittyPlacement's freeData path reaches virtual images.
+    // lowercase test above, proving _deletePlacement's freeData path reaches virtual images.
     TEST_METHOD(KittyGraphicsDeleteUppercaseVirtualPlacementByIdFreesData)
     {
         _testGetSet->PrepData();
@@ -4817,9 +4818,9 @@ public:
 
         _stateMachine->ProcessString(L"\x1b_Ga=d,d=i,i=1,p=2;\x1b\\"); // lowercase: delete just the virtual placement
 
-        VERIFY_ARE_EQUAL(static_cast<size_t>(0), _pDispatch->_kittyPlacements.count({ 1u, 2u }), L"the virtual placement (1,2) is gone");
-        VERIFY_ARE_EQUAL(static_cast<size_t>(1), _pDispatch->_kittyPlacements.count({ 1u, 1u }), L"the normal placement (1,1) survives");
-        VERIFY_ARE_EQUAL(static_cast<size_t>(1), _pDispatch->_kittyImages.count(1u), L"lowercase kept the image data");
+        VERIFY_ARE_EQUAL(static_cast<size_t>(0), _kitty()._placements.count({ 1u, 2u }), L"the virtual placement (1,2) is gone");
+        VERIFY_ARE_EQUAL(static_cast<size_t>(1), _kitty()._placements.count({ 1u, 1u }), L"the normal placement (1,1) survives");
+        VERIFY_ARE_EQUAL(static_cast<size_t>(1), _kitty()._images.count(1u), L"lowercase kept the image data");
         // The invariant we guarantee: the surviving normal placement (1,1) keeps its pixels.
         const auto* normalAfter = buf.GetRowByOffset(normalPos.y).GetImageSlice();
         VERIFY_IS_NOT_NULL(normalAfter);
@@ -4848,34 +4849,34 @@ public:
     {
         _testGetSet->PrepData();
         _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,f=24,s=1,v=1;/wAA\x1b\\");
-        VERIFY_ARE_EQUAL(static_cast<size_t>(1), _pDispatch->_kittyVirtualIds.count({ 1u, 0u }));
-        _pDispatch->_kittyAnonymousPlacements.resize(AdaptDispatch::MaxKittyPlacements);
+        VERIFY_ARE_EQUAL(static_cast<size_t>(1), _kitty()._virtualIds.count({ 1u, 0u }));
+        _kitty()._anonymousPlacements.resize(KittyParser::MaxPlacements);
         _stateMachine->ProcessString(L"\x1b_Ga=T,i=2,f=24,s=1,v=1,C=1;AP8A\x1b\\");
-        VERIFY_ARE_EQUAL(static_cast<size_t>(0), _pDispatch->_kittyVirtualIds.count({ 1u, 0u }), L"physical insertion evicts the anonymous virtual grid with its placement");
+        VERIFY_ARE_EQUAL(static_cast<size_t>(0), _kitty()._virtualIds.count({ 1u, 0u }), L"physical insertion evicts the anonymous virtual grid with its placement");
 
-        _pDispatch->_clearKittyImages();
+        _kitty()._clearImages();
         _testGetSet->PrepData();
         _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,f=24,s=1,v=1;/wAA\x1b\\");
-        _pDispatch->_kittyAnonymousPlacements.resize(AdaptDispatch::MaxKittyPlacements);
+        _kitty()._anonymousPlacements.resize(KittyParser::MaxPlacements);
         _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=2,f=24,s=1,v=1;AP8A\x1b\\");
-        VERIFY_ARE_EQUAL(static_cast<size_t>(0), _pDispatch->_kittyVirtualIds.count({ 1u, 0u }), L"virtual insertion evicts the anonymous virtual grid with its placement");
-        VERIFY_ARE_EQUAL(static_cast<size_t>(1), _pDispatch->_kittyVirtualIds.count({ 2u, 0u }));
+        VERIFY_ARE_EQUAL(static_cast<size_t>(0), _kitty()._virtualIds.count({ 1u, 0u }), L"virtual insertion evicts the anonymous virtual grid with its placement");
+        VERIFY_ARE_EQUAL(static_cast<size_t>(1), _kitty()._virtualIds.count({ 2u, 0u }));
     }
 
     TEST_METHOD(KittyAnonymousPhysicalPlacementKeepsVirtualPrototype)
     {
         _testGetSet->PrepData();
         _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,f=24,s=1,v=1;/wAA\x1b\\");
-        VERIFY_ARE_EQUAL(static_cast<size_t>(1), _pDispatch->_kittyAnonymousPlacements.size());
-        VERIFY_IS_TRUE(_pDispatch->_kittyAnonymousPlacements.front().isVirtual);
-        VERIFY_ARE_EQUAL(static_cast<size_t>(1), _pDispatch->_kittyVirtualIds.count({ 1u, 0u }));
+        VERIFY_ARE_EQUAL(static_cast<size_t>(1), _kitty()._anonymousPlacements.size());
+        VERIFY_IS_TRUE(_kitty()._anonymousPlacements.front().isVirtual);
+        VERIFY_ARE_EQUAL(static_cast<size_t>(1), _kitty()._virtualIds.count({ 1u, 0u }));
 
         _stateMachine->ProcessString(L"\x1b_Ga=p,i=1,C=1;\x1b\\");
-        VERIFY_ARE_EQUAL(static_cast<size_t>(2), _pDispatch->_kittyAnonymousPlacements.size());
-        VERIFY_ARE_EQUAL(static_cast<size_t>(1), static_cast<size_t>(std::count_if(_pDispatch->_kittyAnonymousPlacements.begin(), _pDispatch->_kittyAnonymousPlacements.end(), [](const auto& placement) {
+        VERIFY_ARE_EQUAL(static_cast<size_t>(2), _kitty()._anonymousPlacements.size());
+        VERIFY_ARE_EQUAL(static_cast<size_t>(1), static_cast<size_t>(std::count_if(_kitty()._anonymousPlacements.begin(), _kitty()._anonymousPlacements.end(), [](const auto& placement) {
                              return placement.isVirtual;
                          })));
-        VERIFY_ARE_EQUAL(static_cast<size_t>(1), _pDispatch->_kittyVirtualIds.count({ 1u, 0u }),
+        VERIFY_ARE_EQUAL(static_cast<size_t>(1), _kitty()._virtualIds.count({ 1u, 0u }),
                          L"an anonymous physical put must not replace the image's anonymous virtual prototype");
     }
 
@@ -4886,14 +4887,14 @@ public:
         _stateMachine->ProcessString(L"\x1b_Ga=t,i=8,f=24,s=1,v=1;AAAA\x1b\\");
         _stateMachine->ProcessString(L"\x1b_Ga=t,i=9,f=24,s=1,v=1;AAAA\x1b\\");
         _stateMachine->ProcessString(L"\x1b_Ga=d,d=a;\x1b\\");
-        VERIFY_ARE_EQUAL(static_cast<size_t>(1), _pDispatch->_kittyImages.count(8));
-        VERIFY_ARE_EQUAL(static_cast<size_t>(1), _pDispatch->_kittyImages.count(9));
+        VERIFY_ARE_EQUAL(static_cast<size_t>(1), _kitty()._images.count(8));
+        VERIFY_ARE_EQUAL(static_cast<size_t>(1), _kitty()._images.count(9));
 
         _stateMachine->ProcessString(L"\x1b_Ga=p,i=8,C=1;\x1b\\");
         _stateMachine->ProcessString(L"\x1b_Ga=p,i=9,C=1;\x1b\\");
         _stateMachine->ProcessString(L"\x1b_Ga=d,d=A;\x1b\\");
-        VERIFY_ARE_EQUAL(static_cast<size_t>(0), _pDispatch->_kittyImages.count(8));
-        VERIFY_ARE_EQUAL(static_cast<size_t>(0), _pDispatch->_kittyImages.count(9));
+        VERIFY_ARE_EQUAL(static_cast<size_t>(0), _kitty()._images.count(8));
+        VERIFY_ARE_EQUAL(static_cast<size_t>(0), _kitty()._images.count(9));
     }
 
     // Specifying both an id and a number is invalid (EINVAL).
@@ -5481,8 +5482,8 @@ public:
         // Round-trip proof: the stored image must hold the EXACT inflated pixels, not merely
         // a correctly-sized buffer. The payload inflates to [1..12] = four f=24 pixels
         // (1,2,3)(4,5,6)(7,8,9)(10,11,12); f=24 sets reserved (alpha) to 255.
-        const auto it = _pDispatch->_kittyImages.find(13);
-        VERIFY_IS_TRUE(it != _pDispatch->_kittyImages.end(), L"the o=z transmit must store an image under id 13.");
+        const auto it = _kitty()._images.find(13);
+        VERIFY_IS_TRUE(it != _kitty()._images.end(), L"the o=z transmit must store an image under id 13.");
         VERIFY_ARE_EQUAL(2u, it->second.width);
         VERIFY_ARE_EQUAL(2u, it->second.height);
         VERIFY_ARE_EQUAL(static_cast<size_t>(4), it->second.pixels.size());
@@ -5520,7 +5521,7 @@ public:
         _testGetSet->ValidateInputEvent(L"\x1b_Gi=7;EINVAL:unsupported compression\x1b\\");
     }
 
-    // --- o=z (zlib) inflate: direct unit tests of AdaptDispatch::_inflateKittyZlib. ---
+    // --- o=z (zlib) inflate: direct unit tests of KittyParser::_inflateZlib. ---
     // These drive the inflatelib inflater through the private helper (AdapterTest is a
     // friend). Inputs are real zlib streams from zlib.deflateSync, i.e. exactly what
     // kitty transmits, so an actual Huffman decode is exercised.
@@ -5533,7 +5534,7 @@ public:
         // zlib.deflateSync(Buffer.alloc(64, 0xAB)) -- inflates to 64 bytes of 0xAB.
         const std::vector<uint8_t> cAB{ 0x78, 0xda, 0x5b, 0xbd, 0x9a, 0x32, 0x00, 0x00, 0x6d, 0xeb, 0x2a, 0xc1 };
         std::vector<uint8_t> out;
-        VERIFY_IS_TRUE(AdaptDispatch::_inflateKittyZlib(cAB, out, 32 * 1024 * 1024));
+        VERIFY_IS_TRUE(KittyParser::_inflateZlib(cAB, out, 32 * 1024 * 1024));
         VERIFY_ARE_EQUAL(64u, out.size());
         for (const auto b : out)
         {
@@ -5544,7 +5545,7 @@ public:
         const std::vector<uint8_t> c12{ 0x78, 0xda, 0x63, 0x64, 0x62, 0x66, 0x61, 0x65, 0x63, 0xe7, 0xe0, 0xe4, 0xe2, 0xe6, 0x01, 0x00, 0x01, 0x78, 0x00, 0x4f };
         const std::vector<uint8_t> ramp{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12 };
         out.clear();
-        VERIFY_IS_TRUE(AdaptDispatch::_inflateKittyZlib(c12, out, 32 * 1024 * 1024));
+        VERIFY_IS_TRUE(KittyParser::_inflateZlib(c12, out, 32 * 1024 * 1024));
         VERIFY_ARE_EQUAL(ramp.size(), out.size());
         VERIFY_IS_TRUE(std::equal(out.begin(), out.end(), ramp.begin()));
     }
@@ -5556,9 +5557,9 @@ public:
     {
         const std::vector<uint8_t> cAB{ 0x78, 0xda, 0x5b, 0xbd, 0x9a, 0x32, 0x00, 0x00, 0x6d, 0xeb, 0x2a, 0xc1 };
         std::vector<uint8_t> out;
-        VERIFY_IS_FALSE(AdaptDispatch::_inflateKittyZlib(cAB, out, 32)); // 64 > 32 -> reject
+        VERIFY_IS_FALSE(KittyParser::_inflateZlib(cAB, out, 32)); // 64 > 32 -> reject
         VERIFY_IS_TRUE(out.empty());
-        VERIFY_IS_TRUE(AdaptDispatch::_inflateKittyZlib(cAB, out, 64)); // 64 <= 64 -> accept
+        VERIFY_IS_TRUE(KittyParser::_inflateZlib(cAB, out, 64)); // 64 <= 64 -> accept
         VERIFY_ARE_EQUAL(64u, out.size());
     }
 
@@ -5595,7 +5596,7 @@ public:
         static constexpr uint8_t pattern[]{ 0xDE, 0xAD, 0xBE, 0xEF };
 
         std::vector<uint8_t> out;
-        VERIFY_IS_TRUE(AdaptDispatch::_inflateKittyZlib(big, out, 32 * 1024 * 1024));
+        VERIFY_IS_TRUE(KittyParser::_inflateZlib(big, out, 32 * 1024 * 1024));
         VERIFY_ARE_EQUAL(expectedSize, out.size());
         // Byte-verify positionally: a uniform payload would hide an offset error, a
         // 4-byte repeating one does not.
@@ -5614,13 +5615,13 @@ public:
         // which exercises the bomb guard breaking mid-growth rather than at the first
         // chunk (10000 lands after the 8 KiB chunk but before the payload ends).
         out.clear();
-        VERIFY_IS_FALSE(AdaptDispatch::_inflateKittyZlib(big, out, 10000));
+        VERIFY_IS_FALSE(KittyParser::_inflateZlib(big, out, 10000));
         VERIFY_IS_TRUE(out.empty());
         // ...and at a cap one byte short of the real size, the tightest rejection.
-        VERIFY_IS_FALSE(AdaptDispatch::_inflateKittyZlib(big, out, expectedSize - 1));
+        VERIFY_IS_FALSE(KittyParser::_inflateZlib(big, out, expectedSize - 1));
         VERIFY_IS_TRUE(out.empty());
         // Exactly the real size is accepted, pinning the off-by-one at the cap boundary.
-        VERIFY_IS_TRUE(AdaptDispatch::_inflateKittyZlib(big, out, expectedSize));
+        VERIFY_IS_TRUE(KittyParser::_inflateZlib(big, out, expectedSize));
         VERIFY_ARE_EQUAL(expectedSize, out.size());
     }
 
@@ -5630,7 +5631,7 @@ public:
     {
         const std::vector<uint8_t> rawDef{ 0x63, 0x64, 0x62, 0x66, 0x61, 0x65, 0x63, 0xe7, 0xe0, 0xe4, 0xe2, 0xe6, 0x01, 0x00 };
         std::vector<uint8_t> out;
-        VERIFY_IS_FALSE(AdaptDispatch::_inflateKittyZlib(rawDef, out, 32 * 1024 * 1024));
+        VERIFY_IS_FALSE(KittyParser::_inflateZlib(rawDef, out, 32 * 1024 * 1024));
     }
 
     // A corrupted Adler-32 trailer is rejected (integrity check over the inflated data).
@@ -5639,7 +5640,7 @@ public:
         std::vector<uint8_t> c12{ 0x78, 0xda, 0x63, 0x64, 0x62, 0x66, 0x61, 0x65, 0x63, 0xe7, 0xe0, 0xe4, 0xe2, 0xe6, 0x01, 0x00, 0x01, 0x78, 0x00, 0x4f };
         c12.back() ^= 0xff; // flip the low byte of the trailing Adler-32
         std::vector<uint8_t> out;
-        VERIFY_IS_FALSE(AdaptDispatch::_inflateKittyZlib(c12, out, 32 * 1024 * 1024));
+        VERIFY_IS_FALSE(KittyParser::_inflateZlib(c12, out, 32 * 1024 * 1024));
     }
 
     // Too-short and bad-FCHECK headers are rejected before any inflate work.
@@ -5647,10 +5648,10 @@ public:
     {
         std::vector<uint8_t> out;
         const std::vector<uint8_t> tooShort{ 0x78, 0xda, 0x00 };
-        VERIFY_IS_FALSE(AdaptDispatch::_inflateKittyZlib(tooShort, out, 32 * 1024 * 1024));
+        VERIFY_IS_FALSE(KittyParser::_inflateZlib(tooShort, out, 32 * 1024 * 1024));
         // CMF=0x78, FLG=0x00 -> (0x7800 % 31) != 0 -> FCHECK fails.
         const std::vector<uint8_t> badCheck{ 0x78, 0x00, 0x01, 0x00, 0x00, 0x00 };
-        VERIFY_IS_FALSE(AdaptDispatch::_inflateKittyZlib(badCheck, out, 32 * 1024 * 1024));
+        VERIFY_IS_FALSE(KittyParser::_inflateZlib(badCheck, out, 32 * 1024 * 1024));
     }
 
     // Trailing bytes between the DEFLATE stream and the Adler-32 are rejected (the
@@ -5660,7 +5661,7 @@ public:
     {
         const std::vector<uint8_t> garbage{ 0x78, 0xda, 0x63, 0x64, 0x62, 0x66, 0x61, 0x65, 0x63, 0xe7, 0xe0, 0xe4, 0xe2, 0xe6, 0x01, 0x00, 0x00, 0x01, 0x78, 0x00, 0x4f };
         std::vector<uint8_t> out;
-        VERIFY_IS_FALSE(AdaptDispatch::_inflateKittyZlib(garbage, out, 32 * 1024 * 1024));
+        VERIFY_IS_FALSE(KittyParser::_inflateZlib(garbage, out, 32 * 1024 * 1024));
     }
 
     // More malformed edges all reject cleanly: a stream that inflates to zero bytes, a
@@ -5670,13 +5671,13 @@ public:
     {
         std::vector<uint8_t> out;
         const std::vector<uint8_t> emptyOut{ 0x78, 0x9c, 0x03, 0x00, 0x00, 0x00, 0x00, 0x01 };
-        VERIFY_IS_FALSE(AdaptDispatch::_inflateKittyZlib(emptyOut, out, 32 * 1024 * 1024));
+        VERIFY_IS_FALSE(KittyParser::_inflateZlib(emptyOut, out, 32 * 1024 * 1024));
         const std::vector<uint8_t> sixByte{ 0x78, 0x9c, 0x00, 0x00, 0x00, 0x01 };
-        VERIFY_IS_FALSE(AdaptDispatch::_inflateKittyZlib(sixByte, out, 32 * 1024 * 1024));
+        VERIFY_IS_FALSE(KittyParser::_inflateZlib(sixByte, out, 32 * 1024 * 1024));
         const std::vector<uint8_t> fdict{ 0x78, 0xbb, 0x04, 0x09, 0x01, 0xa5, 0x63, 0x64, 0x62, 0x06, 0x00, 0x00, 0x0d, 0x00, 0x07 };
-        VERIFY_IS_FALSE(AdaptDispatch::_inflateKittyZlib(fdict, out, 32 * 1024 * 1024));
+        VERIFY_IS_FALSE(KittyParser::_inflateZlib(fdict, out, 32 * 1024 * 1024));
         const std::vector<uint8_t> truncated{ 0x78, 0xda, 0x63, 0x64, 0x62, 0x66, 0x61, 0x65, 0x63, 0xe7, 0xe0, 0xe4, 0xe2, 0xe6, 0x01, 0x01, 0x78, 0x00, 0x4f };
-        VERIFY_IS_FALSE(AdaptDispatch::_inflateKittyZlib(truncated, out, 32 * 1024 * 1024));
+        VERIFY_IS_FALSE(KittyParser::_inflateZlib(truncated, out, 32 * 1024 * 1024));
     }
 
     // o=z over a chunked (m=1) transmission: the inflate must run on the REASSEMBLED
@@ -5711,7 +5712,7 @@ public:
         _testGetSet->PrepData();
         _stateMachine->ProcessString(L"\x1b_Ga=t,i=21,f=24,s=3,v=2,o=z;eNpjZGJmYWVj5+Dk4uYBAAF4AE8=\x1b\\");
         _testGetSet->ValidateInputEvent(L"\x1b_Gi=21;EINVAL:payload size mismatch\x1b\\");
-        VERIFY_ARE_EQUAL(static_cast<size_t>(0), _pDispatch->_kittyImages.count(21), L"a size-mismatched o=z payload must not store an image.");
+        VERIFY_ARE_EQUAL(static_cast<size_t>(0), _kitty()._images.count(21), L"a size-mismatched o=z payload must not store an image.");
     }
 
     // o=z + f=32 (RGBA): the inflated bytes go through the 4-byte-depth premultiply decode,
@@ -5724,8 +5725,8 @@ public:
         _testGetSet->PrepData();
         _stateMachine->ProcessString(L"\x1b_Ga=t,i=22,f=32,s=4,v=4,o=z;eNpbvZoyAABt6yrB\x1b\\");
         _testGetSet->ValidateInputEvent(L"\x1b_Gi=22;OK\x1b\\");
-        const auto it = _pDispatch->_kittyImages.find(22);
-        VERIFY_IS_TRUE(it != _pDispatch->_kittyImages.end(), L"the o=z f=32 transmit must store an image under id 22.");
+        const auto it = _kitty()._images.find(22);
+        VERIFY_IS_TRUE(it != _kitty()._images.end(), L"the o=z f=32 transmit must store an image under id 22.");
         VERIFY_ARE_EQUAL(4u, it->second.width);
         VERIFY_ARE_EQUAL(4u, it->second.height);
         VERIFY_ARE_EQUAL(static_cast<size_t>(16), it->second.pixels.size());
@@ -5763,7 +5764,7 @@ public:
         _testGetSet->ValidateInputEvent(L"\x1b_Gi=1;EINVAL:bad payload\x1b\\");
     }
 
-    // The registry is bounded; transmitting past MaxKittyImages evicts the oldest.
+    // The registry is bounded; transmitting past MaxImages evicts the oldest.
     TEST_METHOD(KittyGraphicsRegistryEvictsOldest)
     {
         _testGetSet->PrepData();
@@ -5820,9 +5821,9 @@ public:
         _stateMachine->ProcessString(L"\x1b_Ga=t,i=6,f=24,s=1,v=1;AAAA\x1b\\");
         _stateMachine->ProcessString(L"\x1b_Ga=t,i=9,f=24,s=1,v=1;AAAA\x1b\\");
         _stateMachine->ProcessString(L"\x1b_Ga=d,d=R,x=5,y=6;\x1b\\"); // delete ids 5..6 (uppercase frees data)
-        VERIFY_ARE_EQUAL(static_cast<size_t>(0), _pDispatch->_kittyImages.count(5), L"id 5 (in range) deleted");
-        VERIFY_ARE_EQUAL(static_cast<size_t>(0), _pDispatch->_kittyImages.count(6), L"id 6 (in range) deleted");
-        VERIFY_ARE_EQUAL(static_cast<size_t>(1), _pDispatch->_kittyImages.count(9), L"id 9 (outside range) survives");
+        VERIFY_ARE_EQUAL(static_cast<size_t>(0), _kitty()._images.count(5), L"id 5 (in range) deleted");
+        VERIFY_ARE_EQUAL(static_cast<size_t>(0), _kitty()._images.count(6), L"id 6 (in range) deleted");
+        VERIFY_ARE_EQUAL(static_cast<size_t>(1), _kitty()._images.count(9), L"id 9 (outside range) survives");
     }
 
     // d=c deletes the placement intersecting the current cursor cell (C=1 keeps the cursor on it).
@@ -5859,12 +5860,12 @@ public:
         _testGetSet->_cellSize = { 1, 1 };
         auto& buffer = *_testGetSet->_textBuffer;
         _stateMachine->ProcessString(L"\x1b_Ga=t,U=1,i=1,f=24,s=1,v=1;/wAA\x1b\\");
-        const auto virtualLayer = _pDispatch->_kittyAnonymousPlacements.front().layerId;
+        const auto virtualLayer = _kitty()._anonymousPlacements.front().layerId;
 
         const til::point physicalPosition{ 2, 26 };
         buffer.GetCursor().SetPosition(physicalPosition);
         _stateMachine->ProcessString(L"\x1b_Ga=p,i=1,C=1;\x1b\\");
-        const auto physicalLayer = _pDispatch->_kittyAnonymousPlacements.back().layerId;
+        const auto physicalLayer = _kitty()._anonymousPlacements.back().layerId;
 
         const til::point placeholderPosition{ 5, 26 };
         buffer.GetCursor().SetPosition(placeholderPosition);
@@ -5881,8 +5882,8 @@ public:
         placeholderSlice = buffer.GetRowByOffset(placeholderPosition.y).GetImageSlice();
         VERIFY_IS_NOT_NULL(placeholderSlice);
         VERIFY_IS_TRUE(placeholderSlice->ContainsPlacement(virtualLayer), L"positional deletion must preserve a coexisting virtual placement");
-        VERIFY_ARE_EQUAL(static_cast<size_t>(1), _pDispatch->_kittyVirtualIds.count({ 1u, 0u }));
-        VERIFY_ARE_EQUAL(static_cast<size_t>(1), _pDispatch->_kittyImages.count(1));
+        VERIFY_ARE_EQUAL(static_cast<size_t>(1), _kitty()._virtualIds.count({ 1u, 0u }));
+        VERIFY_ARE_EQUAL(static_cast<size_t>(1), _kitty()._images.count(1));
     }
 
     // d=x deletes placements intersecting column x (1-based) within the viewport; an image in
@@ -5991,14 +5992,14 @@ public:
     TEST_METHOD(KittyGraphicsByteAccounting)
     {
         _testGetSet->PrepData();
-        VERIFY_ARE_EQUAL(static_cast<size_t>(0), _pDispatch->_kittyTotalPixelBytes);
+        VERIFY_ARE_EQUAL(static_cast<size_t>(0), _kitty()._totalPixelBytes);
         // 2x2 RGBA = 4 px stored as 4 RGBQUAD = 16 bytes.
         _stateMachine->ProcessString(L"\x1b_Ga=t,i=1,f=32,s=2,v=2;AAAAAAAAAAAAAAAAAAAAAA==\x1b\\");
-        VERIFY_ARE_EQUAL(static_cast<size_t>(16), _pDispatch->_kittyTotalPixelBytes);
+        VERIFY_ARE_EQUAL(static_cast<size_t>(16), _kitty()._totalPixelBytes);
         _stateMachine->ProcessString(L"\x1b_Ga=t,i=1,f=32,s=2,v=2;AAAAAAAAAAAAAAAAAAAAAA==\x1b\\"); // replace
-        VERIFY_ARE_EQUAL(static_cast<size_t>(16), _pDispatch->_kittyTotalPixelBytes);
+        VERIFY_ARE_EQUAL(static_cast<size_t>(16), _kitty()._totalPixelBytes);
         _stateMachine->ProcessString(L"\x1b_Ga=d,d=I,i=1;\x1b\\"); // delete frees bytes
-        VERIFY_ARE_EQUAL(static_cast<size_t>(0), _pDispatch->_kittyTotalPixelBytes);
+        VERIFY_ARE_EQUAL(static_cast<size_t>(0), _kitty()._totalPixelBytes);
     }
 
     // A new self-describing transfer discards an orphaned chunked transfer (e.g. one
@@ -6033,30 +6034,30 @@ public:
         // storing the image, and q=2 must suppress the acknowledgement.
         _stateMachine->ProcessString(L"\x1b_Gm=0,q=2;AAAA\x1b\\");
         VERIFY_IS_TRUE(_testGetSet->_response.empty(), L"q=2 on the final chunk must suppress the ack.");
-        VERIFY_ARE_EQUAL(static_cast<size_t>(1), _pDispatch->_kittyImages.count(42), L"The chunked image must be stored, not dropped.");
+        VERIFY_ARE_EQUAL(static_cast<size_t>(1), _kitty()._images.count(42), L"The chunked image must be stored, not dropped.");
     }
 
     // Regression (why): the KittyGraphics handler set a single payloadValid flag both
-    // for malformed base64 and for an oversize payload, so _ProcessKittyCommand always
+    // for malformed base64 and for an oversize payload, so _ProcessCommand always
     // reported EINVAL and the advertised EFBIG was never returned. This guards that a
-    // payload exceeding MaxKittyPayload reports EFBIG (not EINVAL) and stores nothing.
+    // payload exceeding MaxPayload reports EFBIG (not EINVAL) and stores nothing.
     TEST_METHOD(KittyGraphicsOversizePayloadIsEfbig)
     {
         _testGetSet->PrepData();
         // Build a direct (non-chunked) transmit whose base64 payload exceeds the
-        // 32 MiB MaxKittyPayload cap so the oversize branch trips.
+        // 32 MiB MaxPayload cap so the oversize branch trips.
         constexpr size_t maxPayload = 32 * 1024 * 1024;
         std::wstring sequence = L"\x1b_Ga=t,i=77,f=24,s=1,v=1;";
-        sequence.append(maxPayload + 8, L'A'); // > MaxKittyPayload base64 chars
+        sequence.append(maxPayload + 8, L'A'); // > MaxPayload base64 chars
         sequence.append(L"\x1b\\");
         _stateMachine->ProcessString(sequence);
         _testGetSet->ValidateInputEvent(L"\x1b_Gi=77;EFBIG:payload exceeds maximum size\x1b\\");
-        VERIFY_ARE_EQUAL(static_cast<size_t>(0), _pDispatch->_kittyImages.count(77), L"An oversize payload must not store an image.");
+        VERIFY_ARE_EQUAL(static_cast<size_t>(0), _kitty()._images.count(77), L"An oversize payload must not store an image.");
     }
 
     // Regression (why): a CAN/SUB that aborts an APC used to null the handler WITHOUT
     // finalizing, so AdaptDispatch never learned the transfer was aborted and
-    // _kittyChunkActive stayed set; a later bare "m=0" was then treated as a
+    // _chunkActive stayed set; a later bare "m=0" was then treated as a
     // continuation and finalized STALE chunk data (storing a corrupt image). This
     // guards that a CAN-aborted APC clears the chunk state so a later "m=" cannot
     // finalize a stale transfer, while a normal (unaborted) chunked transfer works.
@@ -6067,25 +6068,25 @@ public:
         // exactly 3 pending bytes ("AAAA") that would satisfy s=1,v=1,f=24.
         _stateMachine->ProcessString(L"\x1b_Ga=t,i=90,f=24,s=1,v=1,m=1;AAAA\x1b\\");
         VERIFY_IS_TRUE(_testGetSet->_response.empty(), L"An intermediate chunk must not respond.");
-        VERIFY_IS_TRUE(_pDispatch->_kittyChunkActive, L"The first chunk should leave a transfer active.");
+        VERIFY_IS_TRUE(_kitty()._chunkActive, L"The first chunk should leave a transfer active.");
 
         // A continuation chunk is aborted mid-APC by a CAN; its payload must be
         // dropped AND the pending transfer discarded.
         _stateMachine->ProcessString(L"\x1b_Gm=1;BBBB\x18");
         VERIFY_IS_TRUE(_testGetSet->_response.empty(), L"CAN must abort without an acknowledgement.");
-        VERIFY_IS_FALSE(_pDispatch->_kittyChunkActive, L"CAN must clear the pending chunk state.");
+        VERIFY_IS_FALSE(_kitty()._chunkActive, L"CAN must clear the pending chunk state.");
 
         // A later bare "m=0" must NOT finalize the aborted transfer. Because the chunk
         // state was cleared it is treated as a fresh (and here, incomplete) command, so
         // no stale image id 90 is ever stored.
         _stateMachine->ProcessString(L"\x1b_Gm=0;\x1b\\");
-        VERIFY_ARE_EQUAL(static_cast<size_t>(0), _pDispatch->_kittyImages.count(90), L"The aborted transfer must not have been finalized.");
+        VERIFY_ARE_EQUAL(static_cast<size_t>(0), _kitty()._images.count(90), L"The aborted transfer must not have been finalized.");
 
         // A normal (unaborted) chunked transfer must still assemble and store.
         _stateMachine->ProcessString(L"\x1b_Ga=t,i=92,f=24,s=2,v=1,m=1;AAAA\x1b\\");
         _stateMachine->ProcessString(L"\x1b_Gm=0;AAAA\x1b\\");
         _testGetSet->ValidateInputEvent(L"\x1b_Gi=92;OK\x1b\\");
-        VERIFY_ARE_EQUAL(static_cast<size_t>(1), _pDispatch->_kittyImages.count(92), L"A normal chunked transfer must still work.");
+        VERIFY_ARE_EQUAL(static_cast<size_t>(1), _kitty()._images.count(92), L"A normal chunked transfer must still work.");
     }
 
     // Deleting an image erases its on-screen pixels (id-tagged slice clear),
@@ -6292,8 +6293,8 @@ public:
         _testGetSet->PrepData();
         _testGetSet->_cellSize = { 1, 1 };
         _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,f=24,s=1,v=1,c=100000,r=100000;/wAA\x1b\\");
-        const auto it = _pDispatch->_kittyVirtualIds.find({ 1u, 0u });
-        VERIFY_IS_TRUE(it != _pDispatch->_kittyVirtualIds.end(), L"the virtual grid is registered");
+        const auto it = _kitty()._virtualIds.find({ 1u, 0u });
+        VERIFY_IS_TRUE(it != _kitty()._virtualIds.end(), L"the virtual grid is registered");
         VERIFY_ARE_EQUAL(8192u, it->second.cols, L"grid columns clamp to maxCells");
         VERIFY_ARE_EQUAL(8192u, it->second.rows, L"grid rows clamp to maxCells");
     }
@@ -6312,8 +6313,8 @@ public:
             payload += L"/wAA"; // one red pixel (FF0000); 525 px total => a 525x1 f=24 image
         }
         _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,f=24,s=525,v=1,r=8192;" + payload + L"\x1b\\");
-        const auto it = _pDispatch->_kittyVirtualIds.find({ 1u, 0u });
-        VERIFY_IS_TRUE(it != _pDispatch->_kittyVirtualIds.end(), L"the virtual grid is registered");
+        const auto it = _kitty()._virtualIds.find({ 1u, 0u });
+        VERIFY_IS_TRUE(it != _kitty()._virtualIds.end(), L"the virtual grid is registered");
         // r-only: targetW = cropW * (r*cellHeight) / cropH = 525 * (8192*1000) / 1 = 4,300,800,000.
         const uint64_t expectedTargetW = 525ull * 8192ull * 1000ull;
         VERIFY_IS_TRUE(expectedTargetW > (1ull << 32), L"sanity: this target width genuinely exceeds 32 bits");
@@ -6624,14 +6625,14 @@ public:
     // (AdapterTest is a friend) at the boundaries the old 16-entry table missed.
     TEST_METHOD(KittyPlaceholderDiacriticTableIsComplete)
     {
-        VERIFY_ARE_EQUAL(0, AdaptDispatch::_KittyPlaceholderDiacriticIndex(0x0305)); // first entry
-        VERIFY_ARE_EQUAL(15, AdaptDispatch::_KittyPlaceholderDiacriticIndex(0x0357)); // last of the old 16
-        VERIFY_ARE_EQUAL(16, AdaptDispatch::_KittyPlaceholderDiacriticIndex(0x035B)); // first newly-covered entry
-        VERIFY_ARE_EQUAL(282, AdaptDispatch::_KittyPlaceholderDiacriticIndex(0xFE26)); // last BMP entry
-        VERIFY_ARE_EQUAL(283, AdaptDispatch::_KittyPlaceholderDiacriticIndex(0x10A0F)); // first astral entry
-        VERIFY_ARE_EQUAL(296, AdaptDispatch::_KittyPlaceholderDiacriticIndex(0x1D244)); // last entry (index 296)
-        VERIFY_ARE_EQUAL(-1, AdaptDispatch::_KittyPlaceholderDiacriticIndex(0x0041)); // 'A' is not a diacritic
-        VERIFY_ARE_EQUAL(-1, AdaptDispatch::_KittyPlaceholderDiacriticIndex(0x0306)); // a gap between entries
+        VERIFY_ARE_EQUAL(0, KittyParser::_PlaceholderDiacriticIndex(0x0305)); // first entry
+        VERIFY_ARE_EQUAL(15, KittyParser::_PlaceholderDiacriticIndex(0x0357)); // last of the old 16
+        VERIFY_ARE_EQUAL(16, KittyParser::_PlaceholderDiacriticIndex(0x035B)); // first newly-covered entry
+        VERIFY_ARE_EQUAL(282, KittyParser::_PlaceholderDiacriticIndex(0xFE26)); // last BMP entry
+        VERIFY_ARE_EQUAL(283, KittyParser::_PlaceholderDiacriticIndex(0x10A0F)); // first astral entry
+        VERIFY_ARE_EQUAL(296, KittyParser::_PlaceholderDiacriticIndex(0x1D244)); // last entry (index 296)
+        VERIFY_ARE_EQUAL(-1, KittyParser::_PlaceholderDiacriticIndex(0x0041)); // 'A' is not a diacritic
+        VERIFY_ARE_EQUAL(-1, KittyParser::_PlaceholderDiacriticIndex(0x0306)); // a gap between entries
     }
 
     // End-to-end: a COLUMN diacritic for index 16 (U+035B) -- the first entry the old 16-entry table
@@ -7097,7 +7098,7 @@ public:
 
         _stateMachine->ProcessString(L"\x1b_Ga=d,d=a;\x1b\\"); // delete all
         _stateMachine->ProcessString(Placeholder());
-        VERIFY_ARE_EQUAL(static_cast<size_t>(1), _pDispatch->_kittyVirtualIds.count({ 1u, 0u }));
+        VERIFY_ARE_EQUAL(static_cast<size_t>(1), _kitty()._virtualIds.count({ 1u, 0u }));
         VERIFY_IS_TRUE(BufferContainsColor(*_testGetSet->_textBuffer, 255, 0, 0), L"the preserved virtual map renders later placeholder text");
     }
 
@@ -7211,25 +7212,25 @@ public:
     // Regression (why): cap eviction removed the registry entry but did NOT un-draw
     // the evicted image's on-screen pixels (delete-by-id un-draws, but the LRU
     // eviction path missed it), leaving an orphaned ghost on screen. This guards
-    // that exceeding MaxKittyImages un-draws the evicted image's pixels, not just
+    // that exceeding MaxImages un-draws the evicted image's pixels, not just
     // its registry entry.
     TEST_METHOD(KittyGraphicsEvictionErasesPixels)
     {
         _testGetSet->PrepData();
         // Display id 1 (a=T) as a visible red pixel so it has on-screen pixels.
         _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,f=24,s=1,v=1;/wAA\x1b\\");
-        VERIFY_ARE_EQUAL(static_cast<size_t>(1), _pDispatch->_kittyImages.count(1), L"id 1 must be registered.");
+        VERIFY_ARE_EQUAL(static_cast<size_t>(1), _kitty()._images.count(1), L"id 1 must be registered.");
         VERIFY_IS_TRUE(BufferContainsColor(*_testGetSet->_textBuffer, 255, 0, 0), L"id 1 must be drawn before eviction.");
         VERIFY_ARE_EQUAL(1, CountImageRows(*_testGetSet->_textBuffer));
 
-        // Flood MaxKittyImages + 1 store-only transmits (a=t) to exceed the count
+        // Flood MaxImages + 1 store-only transmits (a=t) to exceed the count
         // cap and evict id 1, the oldest. Store-only entries draw nothing themselves.
-        for (auto n = 2; n <= static_cast<int>(AdaptDispatch::MaxKittyImages) + 2; ++n)
+        for (auto n = 2; n <= static_cast<int>(KittyParser::MaxImages) + 2; ++n)
         {
             _stateMachine->ProcessString(L"\x1b_Ga=t,i=" + std::to_wstring(n) + L",f=24,s=1,v=1;AAAA\x1b\\");
         }
 
-        VERIFY_ARE_EQUAL(static_cast<size_t>(0), _pDispatch->_kittyImages.count(1), L"id 1 must be evicted from the registry.");
+        VERIFY_ARE_EQUAL(static_cast<size_t>(0), _kitty()._images.count(1), L"id 1 must be evicted from the registry.");
         VERIFY_IS_FALSE(BufferContainsColor(*_testGetSet->_textBuffer, 255, 0, 0), L"Eviction must un-draw id 1's on-screen pixels, not just the registry entry.");
         VERIFY_ARE_EQUAL(0, CountImageRows(*_testGetSet->_textBuffer), L"No orphaned ghost row may remain after eviction.");
     }
@@ -7614,9 +7615,9 @@ public:
         _testGetSet->PrepData();
         _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,p=1,f=24,s=1,v=1,C=1;/wAA\x1b\\"); // parent
         _stateMachine->ProcessString(L"\x1b_Ga=T,i=2,p=1,P=1,Q=1,f=24,s=1,v=1,C=1;AP8A\x1b\\"); // child rel parent
-        VERIFY_ARE_EQUAL(static_cast<size_t>(2), _pDispatch->_kittyPlacements.size());
+        VERIFY_ARE_EQUAL(static_cast<size_t>(2), _kitty()._placements.size());
         _stateMachine->ProcessString(L"\x1b_Ga=d,d=I,i=1;\x1b\\"); // delete parent image
-        VERIFY_IS_TRUE(_pDispatch->_kittyPlacements.empty(), L"deleting the parent cascades to remove all group placements");
+        VERIFY_IS_TRUE(_kitty()._placements.empty(), L"deleting the parent cascades to remove all group placements");
         _testGetSet->_response.clear();
         _stateMachine->ProcessString(L"\x1b_Ga=p,i=2;\x1b\\");
         _testGetSet->ValidateInputEvent(L"\x1b_Gi=2;ENOENT:image not found\x1b\\"); // child image gone too
@@ -7632,12 +7633,12 @@ public:
         _stateMachine->ProcessString(L"\x1b_Ga=t,i=1,f=24,s=1,v=1;/wAA\x1b\\"); // store only
         _pDispatch->CursorPosition(4, 4);
         _stateMachine->ProcessString(L"\x1b_Ga=p,i=1,p=1,C=1;\x1b\\"); // place at the cursor
-        VERIFY_ARE_EQUAL(static_cast<size_t>(1), _pDispatch->_kittyPlacements.size());
+        VERIFY_ARE_EQUAL(static_cast<size_t>(1), _kitty()._placements.size());
         _pDispatch->CursorPosition(7, 7);
         const auto movedPos = _testGetSet->_textBuffer->GetCursor().GetPosition();
         _stateMachine->ProcessString(L"\x1b_Ga=p,i=1,p=1,C=1;\x1b\\"); // re-put at the new cursor
-        VERIFY_ARE_EQUAL(static_cast<size_t>(1), _pDispatch->_kittyPlacements.size(), L"same (i,p) overwrites, not appends");
-        const auto& placement = _pDispatch->_kittyPlacements.at({ 1u, 1u });
+        VERIFY_ARE_EQUAL(static_cast<size_t>(1), _kitty()._placements.size(), L"same (i,p) overwrites, not appends");
+        const auto& placement = _kitty()._placements.at({ 1u, 1u });
         VERIFY_ARE_EQUAL(movedPos.x, placement.anchorCol);
         VERIFY_ARE_EQUAL(movedPos.y, placement.anchorRow);
     }
@@ -7667,7 +7668,7 @@ public:
         const auto* newSlice = buffer.GetRowByOffset(newChild.y).GetImageSlice();
         VERIFY_IS_NOT_NULL(newSlice);
         VERIFY_ARE_EQUAL(2u, newSlice->ColumnOwner(newChild.x), L"the child must follow its moved parent");
-        const auto& child = _pDispatch->_kittyPlacements.at({ 2u, 1u });
+        const auto& child = _kitty()._placements.at({ 2u, 1u });
         VERIFY_ARE_EQUAL(newChild.x, child.anchorCol);
         VERIFY_ARE_EQUAL(newChild.y, child.anchorRow);
     }
@@ -7698,7 +7699,7 @@ public:
         const auto* newSlice = buffer.GetRowByOffset(newGrandchild.y).GetImageSlice();
         VERIFY_IS_NOT_NULL(newSlice);
         VERIFY_ARE_EQUAL(3u, newSlice->ColumnOwner(newGrandchild.x), L"the grandchild must follow its immediate parent");
-        const auto& grandchild = _pDispatch->_kittyPlacements.at({ 3u, 1u });
+        const auto& grandchild = _kitty()._placements.at({ 3u, 1u });
         VERIFY_ARE_EQUAL(newGrandchild.x, grandchild.anchorCol);
         VERIFY_ARE_EQUAL(newGrandchild.y, grandchild.anchorRow);
     }
@@ -7714,8 +7715,8 @@ public:
         _pDispatch->CursorPosition(4, 4);
         _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,p=1,f=24,s=1,v=1,C=1;/wAA\x1b\\");
         _stateMachine->ProcessString(L"\x1b_Ga=T,i=2,P=1,Q=1,H=1,V=1,f=24,s=1,v=1,C=1;AP8A\x1b\\");
-        VERIFY_ARE_EQUAL(static_cast<size_t>(1), _pDispatch->_kittyAnonymousPlacements.size());
-        const auto oldChild = _pDispatch->_kittyAnonymousPlacements.front();
+        VERIFY_ARE_EQUAL(static_cast<size_t>(1), _kitty()._anonymousPlacements.size());
+        const auto oldChild = _kitty()._anonymousPlacements.front();
 
         _pDispatch->CursorPosition(10, 8);
         const auto newParent = buffer.GetCursor().GetPosition();
@@ -7727,8 +7728,8 @@ public:
         const auto* newSlice = buffer.GetRowByOffset(newChild.y).GetImageSlice();
         VERIFY_IS_NOT_NULL(newSlice);
         VERIFY_ARE_EQUAL(2u, newSlice->ColumnOwner(newChild.x));
-        VERIFY_ARE_EQUAL(newChild.x, _pDispatch->_kittyAnonymousPlacements.front().anchorCol);
-        VERIFY_ARE_EQUAL(newChild.y, _pDispatch->_kittyAnonymousPlacements.front().anchorRow);
+        VERIFY_ARE_EQUAL(newChild.x, _kitty()._anonymousPlacements.front().anchorCol);
+        VERIFY_ARE_EQUAL(newChild.y, _kitty()._anonymousPlacements.front().anchorRow);
     }
 
     // Moving a group is erase-all-then-draw-all. Without that ordering, the first same-image
@@ -7792,7 +7793,7 @@ public:
         const auto originalParent = buffer.GetCursor().GetPosition();
         _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,p=1,f=24,s=1,v=1,C=1;/wAA\x1b\\");
         _stateMachine->ProcessString(L"\x1b_Ga=T,i=2,p=1,P=1,Q=1,H=1,V=1,f=24,s=1,v=1,C=1;AP8A\x1b\\");
-        const auto childLayer = _pDispatch->_kittyPlacements.at({ 2u, 1u }).layerId;
+        const auto childLayer = _kitty()._placements.at({ 2u, 1u }).layerId;
         buffer.ScrollRows(originalParent.y, 2, 1);
         buffer.GetMutableRowByOffset(originalParent.y).SetImageSlice(nullptr);
         VERIFY_IS_TRUE(buffer.GetRowByOffset(originalParent.y + 2).GetImageSlice()->ContainsPlacement(childLayer));
@@ -7824,7 +7825,7 @@ public:
         _stateMachine->ProcessString(L"\x1b_Ga=T,i=2,p=1,P=1,Q=1,H=1,V=1,f=24,s=1,v=1,C=1;AP8A\x1b\\");
 
         const til::point expectedChild{ originalParent.x + 1, originalParent.y + 2 };
-        const auto childLayer = _pDispatch->_kittyPlacements.at({ 2u, 1u }).layerId;
+        const auto childLayer = _kitty()._placements.at({ 2u, 1u }).layerId;
         const auto* slice = buffer.GetRowByOffset(expectedChild.y).GetImageSlice();
         VERIFY_IS_NOT_NULL(slice);
         VERIFY_IS_TRUE(slice->PlacementCoversColumn(childLayer, expectedChild.x), L"relative resolution must use the parent's retained scrolled layer");
@@ -7851,7 +7852,7 @@ public:
         VERIFY_IS_NOT_NULL(slice);
         VERIFY_ARE_EQUAL(0, static_cast<int>(SlicePixelAt(slice, 0, 0).rgbGreen), L"the retained X/Y gutter remains transparent");
         VERIFY_ARE_EQUAL(255, static_cast<int>(SlicePixelAt(slice, 2, 1).rgbGreen), L"the child retains its scaled, shifted pixels");
-        const auto& placement = _pDispatch->_kittyPlacements.at({ 2u, 1u });
+        const auto& placement = _kitty()._placements.at({ 2u, 1u });
         VERIFY_ARE_EQUAL(1u, placement.displayCols);
         VERIFY_ARE_EQUAL(1u, placement.displayRows);
         VERIFY_ARE_EQUAL(2u, placement.cellOffsetX);
@@ -7880,7 +7881,7 @@ public:
 
         _stateMachine->ProcessString(L"\x1b_Ga=p,i=1,p=1,P=20,Q=1,C=1;\x1b\\");
         _testGetSet->ValidateInputEvent(L"\x1b_Gi=1,p=1;ETOODEEP:relative placement chain too deep\x1b\\");
-        const auto& root = _pDispatch->_kittyPlacements.at({ 1u, 1u });
+        const auto& root = _kitty()._placements.at({ 1u, 1u });
         VERIFY_IS_FALSE(root.hasParent, L"the rejected reparent must retain the prior root placement");
         VERIFY_ARE_EQUAL(oldRoot.x, root.anchorCol);
         VERIFY_ARE_EQUAL(oldRoot.y, root.anchorRow);
@@ -7907,10 +7908,10 @@ public:
         _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,p=1,f=24,s=1,v=1,C=1;/wAA\x1b\\");
         _stateMachine->ProcessString(L"\x1b_Ga=T,i=2,p=1,P=1,Q=1,V=1,f=24,s=1,v=1,C=1;AP8A\x1b\\");
         _stateMachine->ProcessString(L"\x1b_Ga=T,i=3,p=1,P=2,Q=1,V=1,f=24,s=1,v=1,C=1;AAD/\x1b\\");
-        VERIFY_ARE_EQUAL(static_cast<size_t>(3), _pDispatch->_kittyPlacements.size());
+        VERIFY_ARE_EQUAL(static_cast<size_t>(3), _kitty()._placements.size());
 
         _stateMachine->ProcessString(L"\x1b_Ga=t,i=1,f=24,s=1,v=1;////\x1b\\"); // re-transmit id 1
-        VERIFY_IS_TRUE(_pDispatch->_kittyPlacements.empty(), L"re-transmit must clear the image's placements + group");
+        VERIFY_IS_TRUE(_kitty()._placements.empty(), L"re-transmit must clear the image's placements + group");
         VERIFY_ARE_EQUAL(0, CountImageRows(*_testGetSet->_textBuffer), L"cascaded children's pixels must be erased");
 
         _stateMachine->ProcessString(L"\x1b_Ga=p,i=2;\x1b\\");
@@ -7932,12 +7933,12 @@ public:
         _stateMachine->ProcessString(L"\x1b_Ga=T,i=2,p=1,P=1,Q=1,H=1,f=24,s=1,v=1,C=1;AP8A\x1b\\"); // (2,1) rel (1,1)
         _pDispatch->CursorPosition(10, 10);
         _stateMachine->ProcessString(L"\x1b_Ga=p,i=2,p=2,C=1;\x1b\\"); // (2,2) independent placement of image 2
-        VERIFY_ARE_EQUAL(static_cast<size_t>(3), _pDispatch->_kittyPlacements.size());
+        VERIFY_ARE_EQUAL(static_cast<size_t>(3), _kitty()._placements.size());
 
         _stateMachine->ProcessString(L"\x1b_Ga=d,d=i,i=1;\x1b\\"); // delete parent image 1
-        VERIFY_ARE_EQUAL(static_cast<size_t>(1), _pDispatch->_kittyPlacements.size());
-        VERIFY_ARE_EQUAL(static_cast<size_t>(0), _pDispatch->_kittyPlacements.count({ 2u, 1u }), L"the relative child is removed");
-        VERIFY_ARE_EQUAL(static_cast<size_t>(1), _pDispatch->_kittyPlacements.count({ 2u, 2u }), L"the independent placement survives");
+        VERIFY_ARE_EQUAL(static_cast<size_t>(1), _kitty()._placements.size());
+        VERIFY_ARE_EQUAL(static_cast<size_t>(0), _kitty()._placements.count({ 2u, 1u }), L"the relative child is removed");
+        VERIFY_ARE_EQUAL(static_cast<size_t>(1), _kitty()._placements.count({ 2u, 2u }), L"the independent placement survives");
 
         _testGetSet->_response.clear();
         _stateMachine->ProcessString(L"\x1b_Ga=p,i=2,p=3;\x1b\\");
@@ -7953,7 +7954,7 @@ public:
         _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,p=1,f=24,s=1,v=1,C=1;/wAA\x1b\\");
         _stateMachine->ProcessString(L"\x1b_Ga=T,i=2,p=1,P=1,Q=1,H=-999,V=-999,f=24,s=1,v=1,C=1;AP8A\x1b\\");
 
-        const auto& placement = _pDispatch->_kittyPlacements.at({ 2u, 1u });
+        const auto& placement = _kitty()._placements.at({ 2u, 1u });
         VERIFY_ARE_EQUAL(0, placement.anchorCol);
         VERIFY_ARE_EQUAL(0, placement.anchorRow);
         const auto* slice = _testGetSet->_textBuffer->GetRowByOffset(0).GetImageSlice();
@@ -7998,7 +7999,7 @@ public:
         _stateMachine->ProcessString(L"\x1b_Ga=T,i=2,p=1,P=1,Q=1,H=1,V=1,f=24,s=1,v=1;AP8A\x1b\\");
         // Child anchor = (min over all placeholder x, min over all placeholder y) + (H=1, V=1),
         // with the two mins taken independently (so they may come from different rows).
-        const auto& child = _pDispatch->_kittyPlacements.at({ 2u, 1u });
+        const auto& child = _kitty()._placements.at({ 2u, 1u });
         VERIFY_ARE_EQUAL(minX + 1, child.anchorCol, L"child x = min(all placeholder x) + H");
         VERIFY_ARE_EQUAL(minY + 1, child.anchorRow, L"child y = min(all placeholder y) + V");
         const auto* childSlice = buf.GetRowByOffset(minY + 1).GetImageSlice();
@@ -8015,11 +8016,11 @@ public:
         _pDispatch->CursorPosition(3, 3);
         _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,p=1,f=24,s=1,v=1,C=1;/wAA\x1b\\"); // real placement (1,1)
         _stateMachine->ProcessString(L"\x1b_Ga=T,i=2,p=1,P=1,Q=1,H=1,f=24,s=1,v=1,C=1;AP8A\x1b\\"); // child image 2 rel (1,1)
-        VERIFY_ARE_EQUAL(static_cast<size_t>(2), _pDispatch->_kittyPlacements.size());
+        VERIFY_ARE_EQUAL(static_cast<size_t>(2), _kitty()._placements.size());
 
         _stateMachine->ProcessString(L"\x1b_Ga=p,U=1,i=1,p=2,c=2,r=2;\x1b\\"); // virtual put of image 1, new placement id 2
-        VERIFY_ARE_EQUAL(static_cast<size_t>(1), _pDispatch->_kittyPlacements.count({ 1u, 1u }), L"the real placement (1,1) must survive");
-        VERIFY_ARE_EQUAL(static_cast<size_t>(1), _pDispatch->_kittyPlacements.count({ 2u, 1u }), L"the relative child (2,1) must survive");
+        VERIFY_ARE_EQUAL(static_cast<size_t>(1), _kitty()._placements.count({ 1u, 1u }), L"the real placement (1,1) must survive");
+        VERIFY_ARE_EQUAL(static_cast<size_t>(1), _kitty()._placements.count({ 2u, 1u }), L"the relative child (2,1) must survive");
 
         _testGetSet->_response.clear();
         _stateMachine->ProcessString(L"\x1b_Ga=p,i=2,p=9;\x1b\\");
@@ -8057,7 +8058,7 @@ public:
         _pDispatch->CursorPosition(8, 8);
         const auto posB = buf.GetCursor().GetPosition();
         _stateMachine->ProcessString(L"\x1b_Ga=p,i=1,p=1,C=1;\x1b\\"); // re-put at B
-        VERIFY_ARE_EQUAL(static_cast<size_t>(1), _pDispatch->_kittyPlacements.size(), L"re-put replaces, not appends");
+        VERIFY_ARE_EQUAL(static_cast<size_t>(1), _kitty()._placements.size(), L"re-put replaces, not appends");
 
         const auto* sliceA = buf.GetRowByOffset(posA.y).GetImageSlice();
         VERIFY_IS_TRUE(sliceA == nullptr || sliceA->ColumnOwner(posA.x) == 0, L"the prior position's pixels must be erased on re-put");
@@ -8083,12 +8084,12 @@ public:
         _pDispatch->CursorPosition(6, 6);
         const auto posB = buf.GetCursor().GetPosition();
         _stateMachine->ProcessString(L"\x1b_Ga=p,i=1,p=2,C=1;\x1b\\"); // placement (1,2) at B
-        VERIFY_ARE_EQUAL(static_cast<size_t>(2), _pDispatch->_kittyPlacements.size());
+        VERIFY_ARE_EQUAL(static_cast<size_t>(2), _kitty()._placements.size());
 
         _pDispatch->CursorPosition(9, 9);
         const auto posC = buf.GetCursor().GetPosition();
         _stateMachine->ProcessString(L"\x1b_Ga=p,i=1,p=1,C=1;\x1b\\"); // re-put (1,1) to C
-        VERIFY_ARE_EQUAL(static_cast<size_t>(2), _pDispatch->_kittyPlacements.size());
+        VERIFY_ARE_EQUAL(static_cast<size_t>(2), _kitty()._placements.size());
 
         const auto* sliceB = buf.GetRowByOffset(posB.y).GetImageSlice();
         VERIFY_IS_NOT_NULL(sliceB);
@@ -8114,8 +8115,8 @@ public:
         _stateMachine->ProcessString(L"\x1b_Ga=p,i=1,p=1,z=4,C=1;\x1b\\");
         buffer.GetCursor().SetPosition({ 4, origin.y });
         _stateMachine->ProcessString(L"\x1b_Ga=p,i=1,p=2,z=4,C=1;\x1b\\");
-        const auto firstLayer = _pDispatch->_kittyPlacements.at({ 1u, 1u }).layerId;
-        const auto secondLayer = _pDispatch->_kittyPlacements.at({ 1u, 2u }).layerId;
+        const auto firstLayer = _kitty()._placements.at({ 1u, 1u }).layerId;
+        const auto secondLayer = _kitty()._placements.at({ 1u, 2u }).layerId;
 
         buffer.ScrollRows(origin.y, 1, 1);
         _stateMachine->ProcessString(L"\x1b_Ga=d,d=i,i=1,p=1;\x1b\\");
@@ -8136,7 +8137,7 @@ public:
         const auto vtRow = origin.y - page.Top() + 1;
         buffer.GetCursor().SetPosition({ 0, origin.y });
         _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,p=1,f=24,s=1,v=1,C=1;/wAA\x1b\\");
-        const auto layerId = _pDispatch->_kittyPlacements.at({ 1u, 1u }).layerId;
+        const auto layerId = _kitty()._placements.at({ 1u, 1u }).layerId;
 
         buffer.GetCursor().SetPosition({ 0, origin.y });
         _stateMachine->ProcessString(L"\x1b[@");
@@ -8159,7 +8160,7 @@ public:
         const auto origin = buffer.GetCursor().GetPosition();
         buffer.GetCursor().SetPosition({ 10, origin.y });
         _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,p=1,f=24,s=1,v=1,C=1;/wAA\x1b\\");
-        const auto layerId = _pDispatch->_kittyPlacements.at({ 1u, 1u }).layerId;
+        const auto layerId = _kitty()._placements.at({ 1u, 1u }).layerId;
 
         auto reflowed = std::make_unique<TextBuffer>(til::size{ 5, 600 }, TextAttribute{}, 0, false, &_testGetSet->_renderer);
         TextBuffer::Reflow(buffer, *reflowed);
@@ -8186,13 +8187,13 @@ public:
 
         // Anonymous relative child (image 2, NO p=) at parent+(1,1).
         _stateMachine->ProcessString(L"\x1b_Ga=T,i=2,P=1,Q=1,H=1,V=1,f=24,s=1,v=1;AP8A\x1b\\"); // green
-        VERIFY_ARE_EQUAL(static_cast<size_t>(1), _pDispatch->_kittyAnonymousPlacements.size(), L"an anonymous relative placement is tracked for cascade");
+        VERIFY_ARE_EQUAL(static_cast<size_t>(1), _kitty()._anonymousPlacements.size(), L"an anonymous relative placement is tracked for cascade");
         const auto* childSlice = buf.GetRowByOffset(parentPos.y + 1).GetImageSlice();
         VERIFY_IS_NOT_NULL(childSlice);
         VERIFY_ARE_EQUAL(2u, childSlice->ColumnOwner(parentPos.x + 1), L"anonymous child drew at parent+(1,1)");
 
         _stateMachine->ProcessString(L"\x1b_Ga=d,d=i,i=1;\x1b\\"); // delete parent image 1
-        VERIFY_IS_TRUE(_pDispatch->_kittyAnonymousPlacements.empty(), L"deleting the parent removes the anonymous child tracking");
+        VERIFY_IS_TRUE(_kitty()._anonymousPlacements.empty(), L"deleting the parent removes the anonymous child tracking");
         const auto* gone = buf.GetRowByOffset(parentPos.y + 1).GetImageSlice();
         VERIFY_IS_TRUE(gone == nullptr || gone->ColumnOwner(parentPos.x + 1) == 0, L"the anonymous child's pixels must be erased");
 
@@ -8227,12 +8228,12 @@ public:
         const auto* indepSlice = buf.GetRowByOffset(indepPos.y).GetImageSlice();
         VERIFY_IS_NOT_NULL(indepSlice);
         VERIFY_ARE_EQUAL(2u, indepSlice->ColumnOwner(indepPos.x), L"independent placement of image 2 drew at the cursor");
-        VERIFY_ARE_EQUAL(static_cast<size_t>(3), _pDispatch->_kittyPlacements.size());
+        VERIFY_ARE_EQUAL(static_cast<size_t>(3), _kitty()._placements.size());
 
         _stateMachine->ProcessString(L"\x1b_Ga=d,d=i,i=1;\x1b\\"); // delete parent image 1
-        VERIFY_ARE_EQUAL(static_cast<size_t>(1), _pDispatch->_kittyPlacements.size());
-        VERIFY_ARE_EQUAL(static_cast<size_t>(0), _pDispatch->_kittyPlacements.count({ 2u, 1u }), L"the relative child placement is removed");
-        VERIFY_ARE_EQUAL(static_cast<size_t>(1), _pDispatch->_kittyPlacements.count({ 2u, 2u }), L"the independent placement survives");
+        VERIFY_ARE_EQUAL(static_cast<size_t>(1), _kitty()._placements.size());
+        VERIFY_ARE_EQUAL(static_cast<size_t>(0), _kitty()._placements.count({ 2u, 1u }), L"the relative child placement is removed");
+        VERIFY_ARE_EQUAL(static_cast<size_t>(1), _kitty()._placements.count({ 2u, 2u }), L"the independent placement survives");
 
         const auto* relGone = buf.GetRowByOffset(relChildRow).GetImageSlice();
         VERIFY_IS_TRUE(relGone == nullptr || relGone->ColumnOwner(relChildCol) == 0, L"the relative child's pixels must be erased");
@@ -8253,8 +8254,8 @@ public:
         _pDispatch->CursorPosition(4, 4);
         _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,p=1,f=24,s=1,v=1,C=1;/wAA\x1b\\"); // (1,1) normal (no parent)
         _stateMachine->ProcessString(L"\x1b_Ga=T,i=2,p=1,P=1,Q=1,f=24,s=1,v=1,C=1;AP8A\x1b\\"); // (2,1) relative to (1,1)
-        VERIFY_ARE_EQUAL(static_cast<size_t>(2), _pDispatch->_kittyPlacements.size());
-        const auto before = _pDispatch->_kittyPlacements.at({ 1u, 1u });
+        VERIFY_ARE_EQUAL(static_cast<size_t>(2), _kitty()._placements.size());
+        const auto before = _kitty()._placements.at({ 1u, 1u });
 
         _testGetSet->_response.clear();
         // Re-put (1,1) as a child of (2,1): 1 -> 2 -> 1 closes a cycle, so resolution fails.
@@ -8262,9 +8263,9 @@ public:
         _testGetSet->ValidateInputEvent(L"\x1b_Gi=1,p=1;ECYCLE:relative placement cycle\x1b\\");
 
         // The original (1,1) must still exist, unchanged (not destroyed by the failed re-put).
-        VERIFY_ARE_EQUAL(static_cast<size_t>(2), _pDispatch->_kittyPlacements.size(), L"a failed re-put must not add or remove a placement");
-        VERIFY_ARE_EQUAL(static_cast<size_t>(1), _pDispatch->_kittyPlacements.count({ 1u, 1u }), L"the existing placement must survive a failed relative re-put");
-        const auto after = _pDispatch->_kittyPlacements.at({ 1u, 1u });
+        VERIFY_ARE_EQUAL(static_cast<size_t>(2), _kitty()._placements.size(), L"a failed re-put must not add or remove a placement");
+        VERIFY_ARE_EQUAL(static_cast<size_t>(1), _kitty()._placements.count({ 1u, 1u }), L"the existing placement must survive a failed relative re-put");
+        const auto after = _kitty()._placements.at({ 1u, 1u });
         VERIFY_ARE_EQUAL(before.anchorCol, after.anchorCol, L"the surviving placement keeps its original anchor column");
         VERIFY_ARE_EQUAL(before.anchorRow, after.anchorRow, L"the surviving placement keeps its original anchor row");
         VERIFY_ARE_EQUAL(before.hasParent, after.hasParent, L"the surviving placement keeps its original (non-relative) parentage");
@@ -8312,8 +8313,8 @@ public:
     }
 
     // Fix H3 (bounded anonymous placements): a hostile stream of anonymous relative placements
-    // (P= parent, no p=) must not grow _kittyAnonymousPlacements without limit. This drives more
-    // than MaxKittyPlacements anonymous placements and asserts the vector stays bounded, guarding
+    // (P= parent, no p=) must not grow _anonymousPlacements without limit. This drives more
+    // than MaxPlacements anonymous placements and asserts the vector stays bounded, guarding
     // against an unbounded-memory DoS from untrusted input.
     TEST_METHOD(KittyAnonymousRelativePlacementsAreBounded)
     {
@@ -8324,15 +8325,15 @@ public:
         _stateMachine->ProcessString(L"\x1b_Ga=t,i=2,f=24,s=1,v=1;AP8A\x1b\\"); // store image 2 (green)
 
         // Each a=p,i=2,P=1,Q=1 (NO p=) creates an anonymous relative placement of image 2.
-        for (uint32_t k = 0; k < AdaptDispatch::MaxKittyPlacements + 50; ++k)
+        for (uint32_t k = 0; k < KittyParser::MaxPlacements + 50; ++k)
         {
             _stateMachine->ProcessString(L"\x1b_Ga=p,i=2,P=1,Q=1,H=1,V=1,C=1;\x1b\\");
         }
-        VERIFY_IS_TRUE(_pDispatch->_kittyAnonymousPlacements.size() <= AdaptDispatch::MaxKittyPlacements,
-                       L"anonymous relative placements must stay bounded by MaxKittyPlacements");
+        VERIFY_IS_TRUE(_kitty()._anonymousPlacements.size() <= KittyParser::MaxPlacements,
+                       L"anonymous relative placements must stay bounded by MaxPlacements");
     }
 
-    // Fix M1 (registry-cap eviction integrity): when _kittyPlacements hits its cap, evicting a
+    // Fix M1 (registry-cap eviction integrity): when _placements hits its cap, evicting a
     // victim must erase the victim's drawn cells (no ghost pixels) AND cascade-delete its relative
     // children (no dangling child referencing a gone parent). The prior code only erased the map
     // entry. Here a real drawn parent (1,1) has a relative child (2,1); flooding the registry past
@@ -8348,19 +8349,19 @@ public:
         const auto parentPos = buf.GetCursor().GetPosition();
         _stateMachine->ProcessString(L"\x1b_Ga=p,i=1,p=1,C=1;\x1b\\"); // parent (1,1) drawn at the cursor
         _stateMachine->ProcessString(L"\x1b_Ga=T,i=2,p=1,P=1,Q=1,H=1,V=0,f=24,s=1,v=1,C=1;AP8A\x1b\\"); // child (2,1) rel (1,1)
-        VERIFY_ARE_EQUAL(static_cast<size_t>(1), _pDispatch->_kittyPlacements.count({ 1u, 1u }));
-        VERIFY_ARE_EQUAL(static_cast<size_t>(1), _pDispatch->_kittyPlacements.count({ 2u, 1u }));
+        VERIFY_ARE_EQUAL(static_cast<size_t>(1), _kitty()._placements.count({ 1u, 1u }));
+        VERIFY_ARE_EQUAL(static_cast<size_t>(1), _kitty()._placements.count({ 2u, 1u }));
 
         // Flood the registry past its cap with cheap VIRTUAL placements of image 1 (no draw, no
         // re-transmit). (1,1) is the lowest-keyed entry, so it is the first eviction victim.
-        for (uint32_t k = 2; k <= AdaptDispatch::MaxKittyPlacements + 2; ++k)
+        for (uint32_t k = 2; k <= KittyParser::MaxPlacements + 2; ++k)
         {
             _stateMachine->ProcessString(L"\x1b_Ga=p,U=1,i=1,p=" + std::to_wstring(k) + L";\x1b\\");
         }
 
-        VERIFY_IS_TRUE(_pDispatch->_kittyPlacements.size() <= AdaptDispatch::MaxKittyPlacements, L"the placement registry must stay bounded");
-        VERIFY_ARE_EQUAL(static_cast<size_t>(0), _pDispatch->_kittyPlacements.count({ 1u, 1u }), L"the parent (1,1) was evicted at the cap");
-        VERIFY_ARE_EQUAL(static_cast<size_t>(0), _pDispatch->_kittyPlacements.count({ 2u, 1u }), L"the evicted parent's relative child must be cascaded, not left dangling");
+        VERIFY_IS_TRUE(_kitty()._placements.size() <= KittyParser::MaxPlacements, L"the placement registry must stay bounded");
+        VERIFY_ARE_EQUAL(static_cast<size_t>(0), _kitty()._placements.count({ 1u, 1u }), L"the parent (1,1) was evicted at the cap");
+        VERIFY_ARE_EQUAL(static_cast<size_t>(0), _kitty()._placements.count({ 2u, 1u }), L"the evicted parent's relative child must be cascaded, not left dangling");
         const auto* ghost = buf.GetRowByOffset(parentPos.y).GetImageSlice();
         VERIFY_IS_TRUE(ghost == nullptr || ghost->ColumnOwner(parentPos.x) == 0, L"the evicted parent's drawn cell must be erased (no ghost pixels)");
     }
@@ -8380,7 +8381,7 @@ public:
         _pDispatch->CursorPosition(9, 9);
         const auto posB = buf.GetCursor().GetPosition();
         _stateMachine->ProcessString(L"\x1b_Ga=p,i=1,p=2,C=1;\x1b\\"); // (1,2) at B
-        VERIFY_ARE_EQUAL(static_cast<size_t>(2), _pDispatch->_kittyPlacements.size());
+        VERIFY_ARE_EQUAL(static_cast<size_t>(2), _kitty()._placements.size());
 
         const auto* sliceA = buf.GetRowByOffset(posA.y).GetImageSlice();
         VERIFY_IS_NOT_NULL(sliceA);
@@ -8390,9 +8391,9 @@ public:
         VERIFY_ARE_EQUAL(1u, sliceB->ColumnOwner(posB.x));
 
         _stateMachine->ProcessString(L"\x1b_Ga=d,d=i,i=1,p=1;\x1b\\"); // delete only placement (1,1)
-        VERIFY_ARE_EQUAL(static_cast<size_t>(1), _pDispatch->_kittyPlacements.size());
-        VERIFY_ARE_EQUAL(static_cast<size_t>(0), _pDispatch->_kittyPlacements.count({ 1u, 1u }), L"placement (1,1) is removed");
-        VERIFY_ARE_EQUAL(static_cast<size_t>(1), _pDispatch->_kittyPlacements.count({ 1u, 2u }), L"placement (1,2) survives");
+        VERIFY_ARE_EQUAL(static_cast<size_t>(1), _kitty()._placements.size());
+        VERIFY_ARE_EQUAL(static_cast<size_t>(0), _kitty()._placements.count({ 1u, 1u }), L"placement (1,1) is removed");
+        VERIFY_ARE_EQUAL(static_cast<size_t>(1), _kitty()._placements.count({ 1u, 2u }), L"placement (1,2) survives");
 
         const auto* goneA = buf.GetRowByOffset(posA.y).GetImageSlice();
         VERIFY_IS_TRUE(goneA == nullptr || goneA->ColumnOwner(posA.x) == 0, L"placement (1,1) pixels must be erased");
@@ -8414,13 +8415,13 @@ public:
         _pDispatch->CursorPosition(3, 3);
         const auto pos = buf.GetCursor().GetPosition();
         _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,p=1,f=24,s=1,v=1,C=1;/wAA\x1b\\"); // only placement (1,1)
-        VERIFY_ARE_EQUAL(static_cast<size_t>(1), _pDispatch->_kittyPlacements.size());
+        VERIFY_ARE_EQUAL(static_cast<size_t>(1), _kitty()._placements.size());
         const auto* slice = buf.GetRowByOffset(pos.y).GetImageSlice();
         VERIFY_IS_NOT_NULL(slice);
         VERIFY_ARE_EQUAL(1u, slice->ColumnOwner(pos.x));
 
         _stateMachine->ProcessString(L"\x1b_Ga=d,d=I,i=1,p=1;\x1b\\"); // delete the only placement
-        VERIFY_IS_TRUE(_pDispatch->_kittyPlacements.empty());
+        VERIFY_IS_TRUE(_kitty()._placements.empty());
         const auto* gone = buf.GetRowByOffset(pos.y).GetImageSlice();
         VERIFY_IS_TRUE(gone == nullptr || gone->ColumnOwner(pos.x) == 0, L"the placement's pixels must be erased");
 
@@ -8440,7 +8441,7 @@ public:
         const auto parentPos = buf.GetCursor().GetPosition();
         _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,p=1,f=24,s=1,v=1,C=1;/wAA\x1b\\"); // parent (1,1) red
         _stateMachine->ProcessString(L"\x1b_Ga=T,i=2,p=1,P=1,Q=1,H=1,V=0,f=24,s=1,v=1,C=1;AP8A\x1b\\"); // child (2,1) green rel (1,1)
-        VERIFY_ARE_EQUAL(static_cast<size_t>(2), _pDispatch->_kittyPlacements.size());
+        VERIFY_ARE_EQUAL(static_cast<size_t>(2), _kitty()._placements.size());
 
         const auto childCol = parentPos.x + 1;
         const auto* childSlice = buf.GetRowByOffset(parentPos.y).GetImageSlice();
@@ -8448,7 +8449,7 @@ public:
         VERIFY_ARE_EQUAL(2u, childSlice->ColumnOwner(childCol));
 
         _stateMachine->ProcessString(L"\x1b_Ga=d,d=I,i=1,p=1;\x1b\\"); // delete (1,1) -> cascades to its child
-        VERIFY_IS_TRUE(_pDispatch->_kittyPlacements.empty(), L"deleting the parent placement cascades to its relative child");
+        VERIFY_IS_TRUE(_kitty()._placements.empty(), L"deleting the parent placement cascades to its relative child");
 
         const auto* erased = buf.GetRowByOffset(parentPos.y).GetImageSlice();
         VERIFY_IS_TRUE(erased == nullptr || erased->ColumnOwner(parentPos.x) == 0, L"the parent placement's pixels must be erased");
@@ -8473,10 +8474,10 @@ public:
         _pDispatch->CursorPosition(9, 9);
         const auto posB = buf.GetCursor().GetPosition();
         _stateMachine->ProcessString(L"\x1b_Ga=p,i=1,p=2,C=1;\x1b\\"); // (1,2) at B
-        VERIFY_ARE_EQUAL(static_cast<size_t>(2), _pDispatch->_kittyPlacements.size());
+        VERIFY_ARE_EQUAL(static_cast<size_t>(2), _kitty()._placements.size());
 
         _stateMachine->ProcessString(L"\x1b_Ga=d,d=I,i=1;\x1b\\"); // no p= -> whole-image delete
-        VERIFY_IS_TRUE(_pDispatch->_kittyPlacements.empty(), L"delete by id without p removes all of the image's placements");
+        VERIFY_IS_TRUE(_kitty()._placements.empty(), L"delete by id without p removes all of the image's placements");
 
         const auto* goneA = buf.GetRowByOffset(posA.y).GetImageSlice();
         VERIFY_IS_TRUE(goneA == nullptr || goneA->ColumnOwner(posA.x) == 0);
@@ -8495,8 +8496,8 @@ public:
         _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,p=1,z=-999999999999,f=24,s=1,v=1,C=1;/wAA\x1b\\");
         _stateMachine->ProcessString(L"\x1b_Ga=T,i=2,p=1,z=999999999999,f=24,s=1,v=1,C=1;AP8A\x1b\\");
 
-        VERIFY_ARE_EQUAL(INT32_MIN, _pDispatch->_kittyPlacements.at({ 1u, 1u }).zIndex);
-        VERIFY_ARE_EQUAL(INT32_MAX, _pDispatch->_kittyPlacements.at({ 2u, 1u }).zIndex);
+        VERIFY_ARE_EQUAL(INT32_MIN, _kitty()._placements.at({ 1u, 1u }).zIndex);
+        VERIFY_ARE_EQUAL(INT32_MAX, _kitty()._placements.at({ 2u, 1u }).zIndex);
     }
 
     TEST_METHOD(KittyGraphicsZIndexUsesThreeRenderBands)
@@ -8579,7 +8580,7 @@ public:
         const auto x = origin.x - slice->ColumnOffset();
         VERIFY_ARE_EQUAL(static_cast<BYTE>(255), SlicePixelAt(slice, ImageSlice::RenderPosition::BehindText, x, 0).rgbRed);
         VERIFY_IS_FALSE(slice->HasPixels(ImageSlice::RenderPosition::AboveText), L"d=z must not leave the selected z layer");
-        VERIFY_ARE_EQUAL(static_cast<size_t>(1), _pDispatch->_kittyImages.count(2), L"lowercase d=z must retain image data");
+        VERIFY_ARE_EQUAL(static_cast<size_t>(1), _kitty()._images.count(2), L"lowercase d=z must retain image data");
     }
 
     TEST_METHOD(KittyGraphicsDeleteByUppercaseZFreesOnlyAfterLastPlacement)
@@ -8590,13 +8591,13 @@ public:
         _stateMachine->ProcessString(L"\x1b_Ga=p,i=1,p=2,z=2,C=1;\x1b\\");
 
         _stateMachine->ProcessString(L"\x1b_Ga=d,d=Z,z=1;\x1b\\");
-        VERIFY_ARE_EQUAL(static_cast<size_t>(1), _pDispatch->_kittyImages.count(1), L"a surviving placement must retain its shared image data");
-        VERIFY_ARE_EQUAL(static_cast<size_t>(0), _pDispatch->_kittyPlacements.count({ 1u, 1u }));
-        VERIFY_ARE_EQUAL(static_cast<size_t>(1), _pDispatch->_kittyPlacements.count({ 1u, 2u }));
+        VERIFY_ARE_EQUAL(static_cast<size_t>(1), _kitty()._images.count(1), L"a surviving placement must retain its shared image data");
+        VERIFY_ARE_EQUAL(static_cast<size_t>(0), _kitty()._placements.count({ 1u, 1u }));
+        VERIFY_ARE_EQUAL(static_cast<size_t>(1), _kitty()._placements.count({ 1u, 2u }));
 
         _stateMachine->ProcessString(L"\x1b_Ga=d,d=Z,z=2;\x1b\\");
-        VERIFY_ARE_EQUAL(static_cast<size_t>(0), _pDispatch->_kittyImages.count(1), L"uppercase d=Z must free data after the final placement");
-        VERIFY_ARE_EQUAL(static_cast<size_t>(0), _pDispatch->_kittyPlacements.count({ 1u, 2u }));
+        VERIFY_ARE_EQUAL(static_cast<size_t>(0), _kitty()._images.count(1), L"uppercase d=Z must free data after the final placement");
+        VERIFY_ARE_EQUAL(static_cast<size_t>(0), _kitty()._placements.count({ 1u, 2u }));
     }
 
     TEST_METHOD(KittyGraphicsDeleteByQMatchesViewportCellAndZ)
@@ -8620,7 +8621,7 @@ public:
         VERIFY_IS_FALSE(slice->Contains(1), L"d=q must delete the matching image/z placement");
         VERIFY_IS_TRUE(slice->Contains(2), L"d=q must preserve the same z at another cell");
         VERIFY_IS_TRUE(slice->Contains(3), L"d=q must preserve another z at the selected cell");
-        VERIFY_ARE_EQUAL(static_cast<size_t>(1), _pDispatch->_kittyImages.count(1), L"lowercase d=q must retain image data");
+        VERIFY_ARE_EQUAL(static_cast<size_t>(1), _kitty()._images.count(1), L"lowercase d=q must retain image data");
     }
 
     TEST_METHOD(KittyGraphicsDeleteByQDistinguishesSameImageSameZPlacements)
@@ -8634,8 +8635,8 @@ public:
         _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,p=1,z=3,f=24,s=1,v=1,C=1;/wAA\x1b\\");
         buffer.GetCursor().SetPosition({ 3, row });
         _stateMachine->ProcessString(L"\x1b_Ga=p,i=1,p=2,z=3,C=1;\x1b\\");
-        const auto firstLayer = _pDispatch->_kittyPlacements.at({ 1u, 1u }).layerId;
-        const auto secondLayer = _pDispatch->_kittyPlacements.at({ 1u, 2u }).layerId;
+        const auto firstLayer = _kitty()._placements.at({ 1u, 1u }).layerId;
+        const auto secondLayer = _kitty()._placements.at({ 1u, 2u }).layerId;
 
         _stateMachine->ProcessString(L"\x1b_Ga=d,d=q,x=1,y=1,z=3;\x1b\\");
 
@@ -8643,8 +8644,8 @@ public:
         VERIFY_IS_NOT_NULL(slice);
         VERIFY_IS_FALSE(slice->ContainsPlacement(firstLayer));
         VERIFY_IS_TRUE(slice->ContainsPlacement(secondLayer), L"d=q preserves a non-intersecting placement with the same image and z");
-        VERIFY_ARE_EQUAL(static_cast<size_t>(0), _pDispatch->_kittyPlacements.count({ 1u, 1u }));
-        VERIFY_ARE_EQUAL(static_cast<size_t>(1), _pDispatch->_kittyPlacements.count({ 1u, 2u }));
+        VERIFY_ARE_EQUAL(static_cast<size_t>(0), _kitty()._placements.count({ 1u, 1u }));
+        VERIFY_ARE_EQUAL(static_cast<size_t>(1), _kitty()._placements.count({ 1u, 2u }));
     }
 
     TEST_METHOD(KittyGraphicsDeleteByQDistinguishesAnonymousPlacements)
@@ -8658,9 +8659,9 @@ public:
         _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,z=6,f=24,s=1,v=1,C=1;/wAA\x1b\\");
         buffer.GetCursor().SetPosition({ 3, row });
         _stateMachine->ProcessString(L"\x1b_Ga=p,i=1,z=6,C=1;\x1b\\");
-        VERIFY_ARE_EQUAL(static_cast<size_t>(2), _pDispatch->_kittyAnonymousPlacements.size());
-        const auto firstLayer = _pDispatch->_kittyAnonymousPlacements[0].layerId;
-        const auto secondLayer = _pDispatch->_kittyAnonymousPlacements[1].layerId;
+        VERIFY_ARE_EQUAL(static_cast<size_t>(2), _kitty()._anonymousPlacements.size());
+        const auto firstLayer = _kitty()._anonymousPlacements[0].layerId;
+        const auto secondLayer = _kitty()._anonymousPlacements[1].layerId;
 
         _stateMachine->ProcessString(L"\x1b_Ga=d,d=q,x=1,y=1,z=6;\x1b\\");
 
@@ -8668,8 +8669,8 @@ public:
         VERIFY_IS_NOT_NULL(slice);
         VERIFY_IS_FALSE(slice->ContainsPlacement(firstLayer));
         VERIFY_IS_TRUE(slice->ContainsPlacement(secondLayer), L"anonymous p=0 placements receive distinct internal identities");
-        VERIFY_ARE_EQUAL(static_cast<size_t>(1), _pDispatch->_kittyAnonymousPlacements.size());
-        VERIFY_ARE_EQUAL(secondLayer, _pDispatch->_kittyAnonymousPlacements.front().layerId);
+        VERIFY_ARE_EQUAL(static_cast<size_t>(1), _kitty()._anonymousPlacements.size());
+        VERIFY_ARE_EQUAL(secondLayer, _kitty()._anonymousPlacements.front().layerId);
     }
 
     TEST_METHOD(KittyGraphicsDeleteByUppercaseQFreesData)
@@ -8682,7 +8683,7 @@ public:
         _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,z=-3,f=24,s=1,v=1,C=1;/wAA\x1b\\");
         _stateMachine->ProcessString(L"\x1b_Ga=d,d=Q,x=1,y=1,z=-3;\x1b\\");
 
-        VERIFY_ARE_EQUAL(static_cast<size_t>(0), _pDispatch->_kittyImages.count(1));
+        VERIFY_ARE_EQUAL(static_cast<size_t>(0), _kitty()._images.count(1));
     }
 
     TEST_METHOD(KittyGraphicsDeleteByZAndQIgnoreVirtualPlacements)
@@ -8704,8 +8705,8 @@ public:
         const auto* slice = _testGetSet->_textBuffer->GetRowByOffset(origin.y).GetImageSlice();
         VERIFY_IS_NOT_NULL(slice);
         VERIFY_IS_TRUE(slice->Contains(1), L"z-based selectors must not affect virtual placements");
-        VERIFY_ARE_EQUAL(static_cast<size_t>(1), _pDispatch->_kittyVirtualIds.count({ 1u, 1u }));
-        VERIFY_ARE_EQUAL(static_cast<size_t>(1), _pDispatch->_kittyImages.count(1), L"uppercase d=Q must not free virtual image data");
+        VERIFY_ARE_EQUAL(static_cast<size_t>(1), _kitty()._virtualIds.count({ 1u, 1u }));
+        VERIFY_ARE_EQUAL(static_cast<size_t>(1), _kitty()._images.count(1), L"uppercase d=Q must not free virtual image data");
     }
 
     TEST_METHOD(KittyGraphicsDeleteByZPreservesCoexistingVirtualPlacement)
@@ -8726,8 +8727,8 @@ public:
         VERIFY_IS_NOT_NULL(slice);
         VERIFY_IS_TRUE(slice->ColumnOwner(origin.x) != 1, L"the physical z=3 placement must be deleted");
         VERIFY_IS_TRUE(slice->ColumnOwner(origin.x + 2) == 1, L"the coexisting virtual z=5 placement must survive");
-        VERIFY_ARE_EQUAL(static_cast<size_t>(1), _pDispatch->_kittyVirtualIds.count({ 1u, 0u }));
-        VERIFY_ARE_EQUAL(static_cast<size_t>(1), _pDispatch->_kittyImages.count(1), L"the surviving virtual placement must retain shared data");
+        VERIFY_ARE_EQUAL(static_cast<size_t>(1), _kitty()._virtualIds.count({ 1u, 0u }));
+        VERIFY_ARE_EQUAL(static_cast<size_t>(1), _kitty()._images.count(1), L"the surviving virtual placement must retain shared data");
     }
 
     TEST_METHOD(KittyGraphicsDeleteByZCascadesRelativeChildren)
@@ -8738,10 +8739,10 @@ public:
         _stateMachine->ProcessString(L"\x1b_Ga=T,i=2,p=1,P=1,Q=1,H=1,z=8,f=24,s=1,v=1,C=1;AP8A\x1b\\");
         _stateMachine->ProcessString(L"\x1b_Ga=d,d=z,z=7;\x1b\\");
 
-        VERIFY_ARE_EQUAL(static_cast<size_t>(0), _pDispatch->_kittyPlacements.count({ 1u, 1u }));
-        VERIFY_ARE_EQUAL(static_cast<size_t>(0), _pDispatch->_kittyPlacements.count({ 2u, 1u }));
-        VERIFY_ARE_EQUAL(static_cast<size_t>(1), _pDispatch->_kittyImages.count(1), L"lowercase d=z keeps the selected parent's data");
-        VERIFY_ARE_EQUAL(static_cast<size_t>(0), _pDispatch->_kittyImages.count(2), L"relative children are deleted with the selected parent");
+        VERIFY_ARE_EQUAL(static_cast<size_t>(0), _kitty()._placements.count({ 1u, 1u }));
+        VERIFY_ARE_EQUAL(static_cast<size_t>(0), _kitty()._placements.count({ 2u, 1u }));
+        VERIFY_ARE_EQUAL(static_cast<size_t>(1), _kitty()._images.count(1), L"lowercase d=z keeps the selected parent's data");
+        VERIFY_ARE_EQUAL(static_cast<size_t>(0), _kitty()._images.count(2), L"relative children are deleted with the selected parent");
     }
 
     TEST_METHOD(KittyGraphicsDeleteByZCascadesSameZChildBeforeLowerKey)
@@ -8752,9 +8753,9 @@ public:
         _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,p=1,P=2,Q=1,H=1,z=7,f=24,s=1,v=1,C=1;AP8A\x1b\\");
         _stateMachine->ProcessString(L"\x1b_Ga=d,d=z,z=7;\x1b\\");
 
-        VERIFY_IS_TRUE(_pDispatch->_kittyPlacements.empty());
-        VERIFY_ARE_EQUAL(static_cast<size_t>(1), _pDispatch->_kittyImages.count(2), L"lowercase d=z keeps the selected parent's data");
-        VERIFY_ARE_EQUAL(static_cast<size_t>(0), _pDispatch->_kittyImages.count(1), L"the lower-keyed same-z child must still be cascade-freed");
+        VERIFY_IS_TRUE(_kitty()._placements.empty());
+        VERIFY_ARE_EQUAL(static_cast<size_t>(1), _kitty()._images.count(2), L"lowercase d=z keeps the selected parent's data");
+        VERIFY_ARE_EQUAL(static_cast<size_t>(0), _kitty()._images.count(1), L"the lower-keyed same-z child must still be cascade-freed");
     }
 
     TEST_METHOD(KittyGraphicsZLayersSurviveScrollAndCellCopy)
@@ -8898,7 +8899,7 @@ public:
         buffer.GetCursor().SetPosition(origin);
         _stateMachine->ProcessString(L"\x1b_Ga=T,i=2,z=1,f=24,s=1,v=1,C=1;AP8A\x1b\\");
 
-        const auto anchor = _pDispatch->_deriveVirtualPlacementAnchor(1, 1);
+        const auto anchor = _kitty()._deriveVirtualPlacementAnchor(1, 1);
         VERIFY_IS_TRUE(anchor.has_value());
         VERIFY_ARE_EQUAL(origin, *anchor);
     }
@@ -8959,14 +8960,14 @@ public:
         _stateMachine->ProcessString(L"\x1b[58:2::0:0:1m");
         buffer.GetCursor().SetPosition(placeholderPosition);
         _stateMachine->ProcessString(Placeholder() + L"\x0305" + L"\x0305");
-        const auto virtualLayer = _pDispatch->_kittyPlacements.at({ 1u, 1u }).layerId;
+        const auto virtualLayer = _kitty()._placements.at({ 1u, 1u }).layerId;
         const auto* placeholderSlice = buffer.GetRowByOffset(placeholderPosition.y).GetImageSlice();
         VERIFY_IS_NOT_NULL(placeholderSlice);
         VERIFY_IS_TRUE(placeholderSlice->Contains(1));
         VERIFY_IS_TRUE(placeholderSlice->ContainsPlacement(virtualLayer));
         buffer.GetCursor().SetPosition(placeholderPosition);
         _stateMachine->ProcessString(L"\x1b_Ga=p,i=1,p=2,z=1,C=1;\x1b\\");
-        const auto physicalLayer = _pDispatch->_kittyPlacements.at({ 1u, 2u }).layerId;
+        const auto physicalLayer = _kitty()._placements.at({ 1u, 2u }).layerId;
         buffer.GetCursor().SetPosition(placeholderPosition);
         _stateMachine->ProcessString(L"\x1b_Ga=T,i=2,p=1,z=2,f=24,s=1,v=1,C=1;AP8A\x1b\\");
         const auto* sourceSlice = buffer.GetRowByOffset(placeholderPosition.y).GetImageSlice();
@@ -9033,7 +9034,7 @@ public:
 
         buffer.GetCursor().SetPosition(placeholderPosition);
         _stateMachine->ProcessString(L"\x1b_Ga=p,i=1,p=1,z=1,C=1;\x1b\\");
-        const auto physicalLayer = _pDispatch->_kittyPlacements.at({ 1u, 1u }).layerId;
+        const auto physicalLayer = _kitty()._placements.at({ 1u, 1u }).layerId;
 
         auto reflowed = std::make_unique<TextBuffer>(til::size{ 5, 600 }, TextAttribute{}, 0, false, &_testGetSet->_renderer);
         TextBuffer::Reflow(buffer, *reflowed);
@@ -9156,14 +9157,14 @@ public:
         auto& buffer = *_testGetSet->_textBuffer;
 
         _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,p=1,f=24,s=1,v=1,c=1,r=1,C=1;/wAA\x1b\\");
-        VERIFY_IS_TRUE(_pDispatch->_kittyPlacements.contains({ 1u, 1u }), L"sanity: the placement was registered");
+        VERIFY_IS_TRUE(_kitty()._placements.contains({ 1u, 1u }), L"sanity: the placement was registered");
         VERIFY_IS_TRUE(BufferContainsColor(buffer, 255, 0, 0), L"sanity: the image was drawn");
 
         _stateMachine->ProcessString(L"\x1b[2J");
 
-        VERIFY_IS_FALSE(_pDispatch->_kittyPlacements.contains({ 1u, 1u }), L"erasing the display must drop the placement");
+        VERIFY_IS_FALSE(_kitty()._placements.contains({ 1u, 1u }), L"erasing the display must drop the placement");
         VERIFY_IS_FALSE(BufferContainsColor(*_testGetSet->_textBuffer, 255, 0, 0), L"and the pixels must be gone");
-        VERIFY_IS_TRUE(_pDispatch->_kittyImages.contains(1u), L"but the image data is kept, so a=p can redisplay it");
+        VERIFY_IS_TRUE(_kitty()._images.contains(1u), L"but the image data is kept, so a=p can redisplay it");
 
         // Prove the retained data is actually usable rather than merely present.
         _stateMachine->ProcessString(L"\x1b_Ga=p,i=1,p=2,c=1,r=1,C=1;\x1b\\");
@@ -9172,7 +9173,7 @@ public:
 
     // Entering the alternate buffer has to take the kitty registry with it: the alt
     // buffer gets a clean slate, and everything the main buffer had comes back on the
-    // way out. This whole path -- _takeKittyBufferState / _restoreKittyBufferState --
+    // way out. This whole path -- _takeBufferState / _restoreBufferState --
     // had no coverage at all, and nothing in the suite issued \e[?1049h.
     TEST_METHOD(KittyGraphicsAlternateBufferGetsACleanRegistryAndGivesItBack)
     {
@@ -9185,39 +9186,39 @@ public:
         _stateMachine->ProcessString(L"\x1b_Ga=t,I=3,f=24,s=1,v=1;AAD/\x1b\\");
         _stateMachine->ProcessString(L"\x1b_Ga=t,U=1,i=8,f=24,s=1,v=1;AP8A\x1b\\");
         _stateMachine->ProcessString(L"\x1b_Ga=p,U=1,i=8,p=6,c=1,r=1;\x1b\\");
-        VERIFY_IS_TRUE(_pDispatch->_kittyImages.contains(7u));
-        VERIFY_IS_TRUE(_pDispatch->_kittyPlacements.contains({ 7u, 5u }));
-        VERIFY_IS_TRUE(_pDispatch->_kittyVirtualIds.contains({ 8u, 6u }));
-        VERIFY_IS_FALSE(_pDispatch->_kittyImageNumbers.empty());
-        const auto mainBytes = _pDispatch->_kittyTotalPixelBytes;
+        VERIFY_IS_TRUE(_kitty()._images.contains(7u));
+        VERIFY_IS_TRUE(_kitty()._placements.contains({ 7u, 5u }));
+        VERIFY_IS_TRUE(_kitty()._virtualIds.contains({ 8u, 6u }));
+        VERIFY_IS_FALSE(_kitty()._imageNumbers.empty());
+        const auto mainBytes = _kitty()._totalPixelBytes;
         VERIFY_IS_GREATER_THAN(mainBytes, size_t{ 0 });
 
         _stateMachine->ProcessString(L"\x1b[?1049h");
 
-        VERIFY_IS_TRUE(_pDispatch->_kittyImages.empty(), L"the alt buffer starts with no images");
-        VERIFY_IS_TRUE(_pDispatch->_kittyPlacements.empty(), L"and no placements");
-        VERIFY_IS_TRUE(_pDispatch->_kittyVirtualIds.empty(), L"and no virtual ids");
-        VERIFY_IS_TRUE(_pDispatch->_kittyImageNumbers.empty(), L"and no image numbers");
-        VERIFY_ARE_EQUAL(size_t{ 0 }, _pDispatch->_kittyTotalPixelBytes, L"and no pixel budget spent");
+        VERIFY_IS_TRUE(_kitty()._images.empty(), L"the alt buffer starts with no images");
+        VERIFY_IS_TRUE(_kitty()._placements.empty(), L"and no placements");
+        VERIFY_IS_TRUE(_kitty()._virtualIds.empty(), L"and no virtual ids");
+        VERIFY_IS_TRUE(_kitty()._imageNumbers.empty(), L"and no image numbers");
+        VERIFY_ARE_EQUAL(size_t{ 0 }, _kitty()._totalPixelBytes, L"and no pixel budget spent");
 
         // The main buffer's pixels are still held, so the quota must still count them --
         // otherwise the two buffers together could exceed the process-wide budget.
-        VERIFY_ARE_EQUAL(mainBytes, _pDispatch->_kittyRetainedPixelBytes(), L"the retained main-buffer bytes still count against the quota");
+        VERIFY_ARE_EQUAL(mainBytes, _kitty()._retainedPixelBytes(), L"the retained main-buffer bytes still count against the quota");
 
         // An id used in the main buffer is free to be reused in the alt buffer, and doing
         // so must not disturb what the main buffer had.
         _stateMachine->ProcessString(L"\x1b_Ga=t,i=7,f=24,s=1,v=1;AAD/\x1b\\");
-        VERIFY_IS_TRUE(_pDispatch->_kittyImages.contains(7u), L"the alt buffer may reuse the id");
-        VERIFY_IS_GREATER_THAN(_pDispatch->_kittyRetainedPixelBytes(), mainBytes, L"both buffers' pixels count while both are held");
+        VERIFY_IS_TRUE(_kitty()._images.contains(7u), L"the alt buffer may reuse the id");
+        VERIFY_IS_GREATER_THAN(_kitty()._retainedPixelBytes(), mainBytes, L"both buffers' pixels count while both are held");
 
         _stateMachine->ProcessString(L"\x1b[?1049l");
 
-        VERIFY_IS_TRUE(_pDispatch->_kittyImages.contains(7u), L"the main buffer's image is back");
-        VERIFY_IS_TRUE(_pDispatch->_kittyPlacements.contains({ 7u, 5u }), L"and its placement");
-        VERIFY_IS_TRUE(_pDispatch->_kittyVirtualIds.contains({ 8u, 6u }), L"and its virtual id");
-        VERIFY_IS_FALSE(_pDispatch->_kittyImageNumbers.empty(), L"and its image number");
-        VERIFY_ARE_EQUAL(mainBytes, _pDispatch->_kittyTotalPixelBytes, L"and exactly its pixel budget -- the alt buffer's image is gone");
-        VERIFY_ARE_EQUAL(mainBytes, _pDispatch->_kittyRetainedPixelBytes());
+        VERIFY_IS_TRUE(_kitty()._images.contains(7u), L"the main buffer's image is back");
+        VERIFY_IS_TRUE(_kitty()._placements.contains({ 7u, 5u }), L"and its placement");
+        VERIFY_IS_TRUE(_kitty()._virtualIds.contains({ 8u, 6u }), L"and its virtual id");
+        VERIFY_IS_FALSE(_kitty()._imageNumbers.empty(), L"and its image number");
+        VERIFY_ARE_EQUAL(mainBytes, _kitty()._totalPixelBytes, L"and exactly its pixel budget -- the alt buffer's image is gone");
+        VERIFY_ARE_EQUAL(mainBytes, _kitty()._retainedPixelBytes());
     }
 
     // A chunked transfer is state that spans escape sequences, so it cannot be allowed
@@ -9229,19 +9230,19 @@ public:
         _testGetSet->_cellSize = { 1, 1 };
 
         _stateMachine->ProcessString(L"\x1b_Ga=t,i=9,f=24,s=1,v=1,m=1;/w\x1b\\");
-        VERIFY_IS_TRUE(_pDispatch->_kittyChunkActive, L"sanity: a transfer is in progress");
+        VERIFY_IS_TRUE(_kitty()._chunkActive, L"sanity: a transfer is in progress");
 
         _stateMachine->ProcessString(L"\x1b[?1049h");
-        VERIFY_IS_FALSE(_pDispatch->_kittyChunkActive, L"entering the alt buffer discards it");
+        VERIFY_IS_FALSE(_kitty()._chunkActive, L"entering the alt buffer discards it");
 
         // The continuation that would have completed it must now do nothing at all.
         _stateMachine->ProcessString(L"\x1b_Gm=0;AAA=\x1b\\");
-        VERIFY_IS_FALSE(_pDispatch->_kittyImages.contains(9u), L"the orphaned continuation must not produce an image");
+        VERIFY_IS_FALSE(_kitty()._images.contains(9u), L"the orphaned continuation must not produce an image");
 
         _stateMachine->ProcessString(L"\x1b_Ga=t,i=9,f=24,s=1,v=1,m=1;/w\x1b\\");
-        VERIFY_IS_TRUE(_pDispatch->_kittyChunkActive);
+        VERIFY_IS_TRUE(_kitty()._chunkActive);
         _stateMachine->ProcessString(L"\x1b[?1049l");
-        VERIFY_IS_FALSE(_pDispatch->_kittyChunkActive, L"leaving the alt buffer discards it too");
+        VERIFY_IS_FALSE(_kitty()._chunkActive, L"leaving the alt buffer discards it too");
     }
 
     // The control block is length-bounded, but silently dropping the excess is not a safe
@@ -9272,8 +9273,8 @@ public:
         VERIFY_IS_GREATER_THAN(control.size(), bound, L"sanity: the id straddles the bound");
         _stateMachine->ProcessString(L"\x1b_G" + control + L";/wAA\x1b\\");
 
-        VERIFY_IS_TRUE(_pDispatch->_kittyImages.empty(), L"nothing may be stored from a control block we could not read");
-        VERIFY_IS_FALSE(_pDispatch->_kittyImages.contains(12u), L"and certainly not under the truncated id");
+        VERIFY_IS_TRUE(_kitty()._images.empty(), L"nothing may be stored from a control block we could not read");
+        VERIFY_IS_FALSE(_kitty()._images.contains(12u), L"and certainly not under the truncated id");
 
         // Also the simpler shape, where the bound falls before the id entirely and
         // truncation would leave a valid id-less transmit that gets an auto-assigned id.
@@ -9284,7 +9285,7 @@ public:
         }
         past += L",i=1234";
         _stateMachine->ProcessString(L"\x1b_G" + past + L";/wAA\x1b\\");
-        VERIFY_IS_TRUE(_pDispatch->_kittyImages.empty(), L"nor may an over-long block store an auto-assigned image");
+        VERIFY_IS_TRUE(_kitty()._images.empty(), L"nor may an over-long block store an auto-assigned image");
 
         // And the same command within the bound still works, so the guard has not simply
         // disabled long-but-legal control blocks.
@@ -9295,7 +9296,7 @@ public:
         }
         shorter += L",i=1234";
         _stateMachine->ProcessString(L"\x1b_G" + shorter + L";/wAA\x1b\\");
-        VERIFY_IS_TRUE(_pDispatch->_kittyImages.contains(1234u), L"a long but in-bounds control block still parses");
+        VERIFY_IS_TRUE(_kitty()._images.contains(1234u), L"a long but in-bounds control block still parses");
     }
 
     TEST_METHOD(KittyGraphicsWideningReflowPreservesJoinedRowLayers)
@@ -9354,19 +9355,19 @@ public:
     TEST_METHOD(KittyGraphicsImageAdmissionIsTransactionalAcrossBuffers)
     {
         _testGetSet->PrepData();
-        _pDispatch->_kittyMainBufferState.emplace();
-        _pDispatch->_kittyMainBufferState->totalPixelBytes = AdaptDispatch::MaxKittyTotalBytes - sizeof(RGBQUAD);
+        _kitty()._mainBufferState.emplace();
+        _kitty()._mainBufferState->totalPixelBytes = KittyParser::MaxTotalBytes - sizeof(RGBQUAD);
 
-        AdaptDispatch::KittyImage existing;
+        KittyParser::Image existing;
         existing.pixels.resize(1);
-        VERIFY_IS_TRUE(_pDispatch->_registerKittyImage(1, std::move(existing)));
+        VERIFY_IS_TRUE(_kitty()._registerImage(1, std::move(existing)));
 
-        AdaptDispatch::KittyImage rejected;
+        KittyParser::Image rejected;
         rejected.pixels.resize(2);
-        VERIFY_IS_FALSE(_pDispatch->_registerKittyImage(2, std::move(rejected)));
-        VERIFY_ARE_EQUAL(static_cast<size_t>(1), _pDispatch->_kittyImages.size());
-        VERIFY_IS_TRUE(_pDispatch->_kittyImages.contains(1), L"a rejected image must not evict an existing alternate-buffer image");
-        VERIFY_ARE_EQUAL(sizeof(RGBQUAD), _pDispatch->_kittyTotalPixelBytes);
+        VERIFY_IS_FALSE(_kitty()._registerImage(2, std::move(rejected)));
+        VERIFY_ARE_EQUAL(static_cast<size_t>(1), _kitty()._images.size());
+        VERIFY_IS_TRUE(_kitty()._images.contains(1), L"a rejected image must not evict an existing alternate-buffer image");
+        VERIFY_ARE_EQUAL(sizeof(RGBQUAD), _kitty()._totalPixelBytes);
     }
 
     TEST_METHOD(KittyGraphicsQuotaEvictionCascadesRelativeChildren)
@@ -9375,18 +9376,18 @@ public:
         _testGetSet->_cellSize = { 1, 1 };
         _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,p=1,f=24,s=1,v=1,C=1;/wAA\x1b\\");
         _stateMachine->ProcessString(L"\x1b_Ga=T,i=2,p=1,P=1,Q=1,H=1,f=24,s=1,v=1,C=1;AP8A\x1b\\");
-        for (auto id = 3u; id <= AdaptDispatch::MaxKittyImages; ++id)
+        for (auto id = 3u; id <= KittyParser::MaxImages; ++id)
         {
-            _pDispatch->_kittyImages.emplace(id, AdaptDispatch::KittyImage{});
-            _pDispatch->_kittyImageOrder.push_back(id);
+            _kitty()._images.emplace(id, KittyParser::Image{});
+            _kitty()._imageOrder.push_back(id);
         }
-        VERIFY_ARE_EQUAL(AdaptDispatch::MaxKittyImages, _pDispatch->_kittyImages.size());
+        VERIFY_ARE_EQUAL(KittyParser::MaxImages, _kitty()._images.size());
 
-        VERIFY_IS_TRUE(_pDispatch->_registerKittyImage(AdaptDispatch::MaxKittyImages + 1, AdaptDispatch::KittyImage{}));
-        VERIFY_ARE_EQUAL(static_cast<size_t>(0), _pDispatch->_kittyImages.count(1), L"the oldest parent is evicted");
-        VERIFY_ARE_EQUAL(static_cast<size_t>(0), _pDispatch->_kittyImages.count(2), L"normal admission cascades its relative child");
-        VERIFY_IS_TRUE(_pDispatch->_kittyPlacements.empty());
-        VERIFY_ARE_EQUAL(AdaptDispatch::MaxKittyImages - 1, _pDispatch->_kittyImages.size());
+        VERIFY_IS_TRUE(_kitty()._registerImage(KittyParser::MaxImages + 1, KittyParser::Image{}));
+        VERIFY_ARE_EQUAL(static_cast<size_t>(0), _kitty()._images.count(1), L"the oldest parent is evicted");
+        VERIFY_ARE_EQUAL(static_cast<size_t>(0), _kitty()._images.count(2), L"normal admission cascades its relative child");
+        VERIFY_IS_TRUE(_kitty()._placements.empty());
+        VERIFY_ARE_EQUAL(KittyParser::MaxImages - 1, _kitty()._images.size());
     }
 
     // An APC string with a non-'G' identifier is not Kitty graphics and is ignored.
@@ -9409,6 +9410,17 @@ public:
 private:
     TerminalInput _terminalInput;
     std::unique_ptr<TestGetSet> _testGetSet;
+    // The parser is created on the first APC G sequence. A test that inspects its
+    // state before sending one sees the same empty registry either way.
+    KittyParser& _kitty()
+    {
+        if (!_pDispatch->_kittyParser)
+        {
+            _pDispatch->_kittyParser = std::make_unique<KittyParser>(*_pDispatch);
+        }
+        return *_pDispatch->_kittyParser;
+    }
+
     AdaptDispatch* _pDispatch; // non-ownership pointer
     std::unique_ptr<StateMachine> _stateMachine;
 };
