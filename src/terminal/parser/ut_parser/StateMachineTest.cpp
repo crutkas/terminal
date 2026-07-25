@@ -199,6 +199,7 @@ class Microsoft::Console::VirtualTerminal::StateMachineTest
     TEST_METHOD(ApcWithoutAnIdentifierIsIgnored);
     TEST_METHOD(ApcEntryIgnoresControlCharacters);
     TEST_METHOD(ApcDataStringSplitAcrossWrites);
+    TEST_METHOD(ApcDataStringIsOpaqueToTheParser);
 
     TEST_METHOD(VtParameterSubspanTest);
 };
@@ -538,6 +539,22 @@ void StateMachineTest::ApcDataStringSplitAcrossWrites()
 
     VERIFY_ARE_EQUAL(size_t{ 1 }, engine.apcDispatchCount);
     VERIFY_ARE_EQUAL(L"printed text", engine.printed);
+}
+
+void StateMachineTest::ApcDataStringIsOpaqueToTheParser()
+{
+    auto enginePtr{ std::make_unique<TestStateMachineEngine>() };
+    auto& engine{ *enginePtr.get() };
+    StateMachine machine{ std::move(enginePtr) };
+
+    // An APC string is application data in an encoding only its handler knows.
+    // The parser must not filter it down to what looks like text: a handler that
+    // is silently handed a shortened string cannot tell a malformed payload from
+    // one that was never sent, and will report the wrong thing back to the app.
+    machine.ProcessString(L"\033_Gok\u00FF\u2603\uFFFD\x7Fdone\033\\");
+    VERIFY_ARE_EQUAL(VTID("G"), engine.apcId);
+    VERIFY_ARE_EQUAL(L"ok\u00FF\u2603\uFFFD\x7Fdone\033", engine.apcDataString);
+    VERIFY_ARE_EQUAL(size_t{ 1 }, engine.apcDispatchCount);
 }
 
 void StateMachineTest::ApcWithoutAnIdentifierIsIgnored()
