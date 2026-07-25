@@ -753,6 +753,22 @@ IStateMachineEngine::StringHandler OutputStateMachineEngine::ActionDcsDispatch(c
 }
 
 // Routine Description:
+// - Triggers the ApcDispatch action to indicate that the listener should handle
+//      an application program command. Returns the handler function that is to
+//      be used to process the subsequent data string characters in the sequence.
+// Arguments:
+// - id - Identifier of the application the string is addressed to.
+// Return Value:
+// - the data string handler function or nullptr if the application is not supported
+IStateMachineEngine::StringHandler OutputStateMachineEngine::ActionApcDispatch(const VTID /*id*/) noexcept
+{
+    // No APC application is recognised yet. Returning nullptr leaves the state
+    // machine to ignore the string, which is what it did before APC strings
+    // were dispatched at all.
+    return nullptr;
+}
+
+// Routine Description:
 // - Triggers the OscDispatch action to indicate that the listener should handle a control sequence.
 //   These sequences perform various API-type commands that can include many parameters.
 // Arguments:
