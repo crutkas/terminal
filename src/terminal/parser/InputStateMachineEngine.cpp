@@ -552,6 +552,23 @@ IStateMachineEngine::StringHandler InputStateMachineEngine::ActionDcsDispatch(co
 }
 
 // Routine Description:
+// - Triggers the ApcDispatch action to indicate that the listener should handle
+//      an application program command. Returns the handler function that is to
+//      be used to process the subsequent data string characters in the sequence.
+// Arguments:
+// - id - Identifier of the application the string is addressed to.
+// Return Value:
+// - the data string handler function or nullptr if the application is not supported
+IStateMachineEngine::StringHandler InputStateMachineEngine::ActionApcDispatch(const VTID /*id*/) noexcept
+{
+    // The input engine has no use for APC strings. Returning nullptr keeps the
+    // state machine ignoring them, exactly as it did before they were
+    // dispatched. Note that, unlike DCS, no string terminator is expected: an
+    // ignored APC is not buffered for a later flush.
+    return nullptr;
+}
+
+// Routine Description:
 // - Triggers the Ss3Dispatch action to indicate that the listener should handle
 //      a control sequence. These sequences perform various API-type commands
 //      that can include many parameters.
