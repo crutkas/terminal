@@ -7,7 +7,96 @@
 #include "Row.hpp"
 #include "textBuffer.hpp"
 
+#include <algorithm>
+
 static std::atomic<uint64_t> s_revision{ 0 };
+
+// A process-wide accounting of identified layer storage. Untagged content is
+// not accounted, because its footprint is already bounded by the dimensions of
+// the text buffer that owns it.
+static std::atomic<size_t> s_layerBytes{ 0 };
+
+namespace
+{
+    // Maps a layer's z-index onto the plane it composites into.
+    constexpr ImageSlice::RenderPosition PositionOf(const int32_t zIndex) noexcept
+    {
+        if (zIndex < ImageSlice::BackgroundZThreshold)
+        {
+            return ImageSlice::RenderPosition::BehindBackground;
+        }
+        return zIndex < 0 ? ImageSlice::RenderPosition::BehindText : ImageSlice::RenderPosition::AboveText;
+    }
+
+    // Moves a plane of pixels into a wider plane, aligned to the new origin.
+    void RelocatePlane(std::vector<RGBQUAD>& plane, const til::CoordType oldPixelWidth, const til::CoordType newPixelWidth, const til::CoordType newPixelOffset, const til::CoordType cellHeight)
+    {
+        if (plane.empty())
+        {
+            return;
+        }
+        auto relocated = std::vector<RGBQUAD>(gsl::narrow_cast<size_t>(newPixelWidth) * cellHeight);
+        auto srcIterator = plane.data();
+        auto dstIterator = std::next(relocated.data(), newPixelOffset);
+        // Because widths are rounded up to multiples of 4, it's possible that
+        // the old width will extend past the right border of the new plane, so
+        // the range that we copy must be clamped to fit.
+        const auto range = std::min(oldPixelWidth, newPixelWidth - newPixelOffset);
+        for (auto y = 0; y < cellHeight; y++)
+        {
+            std::memcpy(dstIterator, srcIterator, gsl::narrow_cast<size_t>(range) * sizeof(RGBQUAD));
+            std::advance(srcIterator, oldPixelWidth);
+            std::advance(dstIterator, newPixelWidth);
+        }
+        plane = std::move(relocated);
+    }
+
+    // Moves per-column coverage flags into a wider range, aligned to the new origin.
+    void RelocateColumns(std::vector<uint8_t>& columns, const size_t newCount, const size_t newOffset)
+    {
+        if (columns.empty())
+        {
+            return;
+        }
+        auto relocated = std::vector<uint8_t>(newCount, 0);
+        const auto count = std::min(columns.size(), newCount - newOffset);
+        std::copy_n(columns.begin(), count, std::next(relocated.begin(), newOffset));
+        columns = std::move(relocated);
+    }
+}
+
+size_t ImageSlice::LayerBytesAvailable() noexcept
+{
+    const auto used = s_layerBytes.load(std::memory_order_relaxed);
+    return used >= MaxLayerBytes ? 0 : MaxLayerBytes - used;
+}
+
+// A copy is made whenever a row is cloned, which happens during scrolling and
+// reflow. That must not be allowed to fail, so the budget is charged for the
+// copy but is deliberately not enforced here.
+ImageSlice::ImageSlice(const ImageSlice& rhs) :
+    _revision{ rhs._revision },
+    _cellSize{ rhs._cellSize },
+    _pixelBuffer{ rhs._pixelBuffer },
+    _columnBegin{ rhs._columnBegin },
+    _columnEnd{ rhs._columnEnd },
+    _pixelWidth{ rhs._pixelWidth },
+    _layers{ rhs._layers }
+{
+    for (const auto& layer : _layers)
+    {
+        _accountedBytes += _layerBytes(layer);
+    }
+    s_layerBytes.fetch_add(_accountedBytes, std::memory_order_relaxed);
+}
+
+ImageSlice::~ImageSlice() noexcept
+{
+    if (_accountedBytes != 0)
+    {
+        s_layerBytes.fetch_sub(_accountedBytes, std::memory_order_relaxed);
+    }
+}
 
 ImageSlice::ImageSlice(const til::size cellSize) noexcept :
     _cellSize{ cellSize }
@@ -16,16 +105,24 @@ ImageSlice::ImageSlice(const til::size cellSize) noexcept :
 
 void ImageSlice::BumpRevision() noexcept
 {
-    // Avoid setting the revision to 0. This allows the renderer to use 0 as a sentinel value.
+    // Reserve one value per render position, so each of a slice's composited
+    // planes has a revision no other slice can also hand out. Renderers cache
+    // uploaded pixels by revision, and would otherwise draw one plane's pixels
+    // when asked for another's.
     do
     {
-        _revision = s_revision.fetch_add(1, std::memory_order_relaxed);
+        _revision = s_revision.fetch_add(RenderPositionCount, std::memory_order_relaxed);
     } while (_revision == 0);
 }
 
 uint64_t ImageSlice::Revision() const noexcept
 {
     return _revision;
+}
+
+uint64_t ImageSlice::Revision(const RenderPosition position) const noexcept
+{
+    return _revision == 0 ? 0 : _revision + static_cast<uint64_t>(position);
 }
 
 til::size ImageSlice::CellSize() const noexcept
@@ -54,43 +151,50 @@ const RGBQUAD* ImageSlice::Pixels(const til::CoordType columnBegin) const noexce
     return &til::at(_pixelBuffer, pixelOffset);
 }
 
+// Widens the slice to cover the requested range, relocating the base plane and
+// every layer so they stay aligned with the new origin.
+void ImageSlice::_ensureRange(const til::CoordType columnBegin, const til::CoordType columnEnd)
+{
+    const auto hasRange = _columnEnd > _columnBegin;
+    if (hasRange && columnBegin >= _columnBegin && columnEnd <= _columnEnd)
+    {
+        return;
+    }
+
+    const auto oldColumnBegin = _columnBegin;
+    const auto oldPixelWidth = _pixelWidth;
+    _columnBegin = hasRange ? std::min(_columnBegin, columnBegin) : columnBegin;
+    _columnEnd = hasRange ? std::max(_columnEnd, columnEnd) : columnEnd;
+    _pixelWidth = (_columnEnd - _columnBegin) * _cellSize.width;
+
+    if (!hasRange)
+    {
+        return;
+    }
+
+    const auto newPixelOffset = (oldColumnBegin - _columnBegin) * _cellSize.width;
+    const auto newColumnOffset = gsl::narrow_cast<size_t>(oldColumnBegin - _columnBegin);
+    const auto newColumnCount = gsl::narrow_cast<size_t>(_columnEnd - _columnBegin);
+
+    RelocatePlane(_pixelBuffer, oldPixelWidth, _pixelWidth, newPixelOffset, _cellSize.height);
+    for (auto& layer : _layers)
+    {
+        const auto before = _layerBytes(layer);
+        RelocatePlane(layer.pixels, oldPixelWidth, _pixelWidth, newPixelOffset, _cellSize.height);
+        RelocateColumns(layer.columns, newColumnCount, newColumnOffset);
+        // This growth is forced by geometry rather than requested by a write,
+        // so it is charged to the budget but not refused.
+        _reserveLayerBytes(_layerBytes(layer) - before);
+    }
+}
+
 RGBQUAD* ImageSlice::MutablePixels(const til::CoordType columnBegin, const til::CoordType columnEnd)
 {
-    // IF the buffer is empty or isn't large enough for the requested range, we'll need to resize it.
+    // If the buffer is empty or isn't large enough for the requested range, we'll need to resize it.
     if (_pixelBuffer.empty() || columnBegin < _columnBegin || columnEnd > _columnEnd)
     {
-        const auto oldColumnBegin = _columnBegin;
-        const auto oldPixelWidth = _pixelWidth;
-        const auto existingData = !_pixelBuffer.empty();
-        _columnBegin = existingData ? std::min(_columnBegin, columnBegin) : columnBegin;
-        _columnEnd = existingData ? std::max(_columnEnd, columnEnd) : columnEnd;
-        _pixelWidth = (_columnEnd - _columnBegin) * _cellSize.width;
-        const auto bufferSize = _pixelWidth * _cellSize.height;
-        if (existingData)
-        {
-            // If there is existing data in the buffer, we need to copy it
-            // across to the appropriate position in the new buffer.
-            auto newPixelBuffer = std::vector<RGBQUAD>(bufferSize);
-            const auto newPixelOffset = (oldColumnBegin - _columnBegin) * _cellSize.width;
-            auto newIterator = std::next(newPixelBuffer.data(), newPixelOffset);
-            auto oldIterator = _pixelBuffer.data();
-            // Because widths are rounded up to multiples of 4, it's possible
-            // that the old width will extend past the right border of the new
-            // buffer, so the range that we copy must be clamped to fit.
-            const auto newPixelRange = std::min(oldPixelWidth, _pixelWidth - newPixelOffset);
-            for (auto i = 0; i < _cellSize.height; i++)
-            {
-                std::memcpy(newIterator, oldIterator, newPixelRange * sizeof(RGBQUAD));
-                std::advance(oldIterator, oldPixelWidth);
-                std::advance(newIterator, _pixelWidth);
-            }
-            _pixelBuffer = std::move(newPixelBuffer);
-        }
-        else
-        {
-            // Otherwise we just initialize the buffer to the correct size.
-            _pixelBuffer.resize(bufferSize);
-        }
+        _ensureRange(columnBegin, columnEnd);
+        _pixelBuffer.resize(gsl::narrow_cast<size_t>(_pixelWidth) * _cellSize.height);
     }
     const auto pixelOffset = (columnBegin - _columnBegin) * _cellSize.width;
     return &til::at(_pixelBuffer, pixelOffset);
@@ -173,16 +277,30 @@ bool ImageSlice::_copyCells(const ImageSlice& srcSlice, const til::CoordType src
 
     if (dstWriteBegin < dstWriteEnd)
     {
-        auto dstIterator = MutablePixels(dstWriteBegin, dstWriteEnd);
-        auto srcIterator = srcSlice.Pixels(srcUsedBegin);
-        const auto writeCellCount = dstWriteEnd - dstWriteBegin;
-        const auto writeByteCount = sizeof(RGBQUAD) * writeCellCount * _cellSize.width;
-        for (auto y = 0; y < _cellSize.height; y++)
+        // A slice can hold layers without ever holding untagged content, in
+        // which case there is no base plane to read from. The copy still has to
+        // replace whatever the destination had in that range.
+        if (!srcSlice._pixelBuffer.empty())
         {
-            std::memmove(dstIterator, srcIterator, writeByteCount);
-            std::advance(srcIterator, srcSlice._pixelWidth);
-            std::advance(dstIterator, _pixelWidth);
+            auto dstIterator = MutablePixels(dstWriteBegin, dstWriteEnd);
+            auto srcIterator = srcSlice.Pixels(srcUsedBegin);
+            const auto writeCellCount = dstWriteEnd - dstWriteBegin;
+            const auto writeByteCount = sizeof(RGBQUAD) * writeCellCount * _cellSize.width;
+            for (auto y = 0; y < _cellSize.height; y++)
+            {
+                std::memmove(dstIterator, srcIterator, writeByteCount);
+                std::advance(srcIterator, srcSlice._pixelWidth);
+                std::advance(dstIterator, _pixelWidth);
+            }
         }
+        else
+        {
+            // No base plane in the source means the destination's untagged
+            // pixels in this range are what the copy replaces them with:
+            // nothing. (A self-copy can't reach here with anything to erase.)
+            _eraseBasePlane(dstWriteBegin, dstWriteEnd);
+        }
+        _copyLayers(srcSlice, srcUsedBegin, dstWriteBegin, dstWriteEnd);
     }
 
     // The used destination before and after the written area must be erased.
@@ -257,15 +375,449 @@ bool ImageSlice::_eraseCells(const til::CoordType columnBegin, const til::CoordT
         const auto eraseEnd = std::min(columnEnd, _columnEnd);
         if (eraseBegin < eraseEnd)
         {
-            const auto eraseOffset = (eraseBegin - _columnBegin) * _cellSize.width;
-            const auto eraseLength = (eraseEnd - eraseBegin) * _cellSize.width;
-            auto eraseIterator = std::next(_pixelBuffer.data(), eraseOffset);
-            for (auto y = 0; y < _cellSize.height; y++)
+            _eraseBasePlane(eraseBegin, eraseEnd);
+            for (auto& layer : _layers)
             {
-                std::memset(eraseIterator, 0, eraseLength * sizeof(RGBQUAD));
-                std::advance(eraseIterator, _pixelWidth);
+                _clearLayerColumns(layer, eraseBegin, eraseEnd);
+            }
+            _removeEmptyLayers();
+            _invalidateComposites();
+        }
+        // Erasing a range can retire the last layer, which leaves the slice
+        // with nothing in it at all.
+        return !_hasContent();
+    }
+}
+
+// Zeroes the untagged base plane over a column range, leaving every identified
+// layer untouched. `_eraseCells` erases both; a copy only replaces this part.
+void ImageSlice::_eraseBasePlane(const til::CoordType columnBegin, const til::CoordType columnEnd) noexcept
+{
+    if (_pixelBuffer.empty())
+    {
+        return;
+    }
+
+    const auto eraseBegin = std::max(columnBegin, _columnBegin);
+    const auto eraseEnd = std::min(columnEnd, _columnEnd);
+    if (eraseBegin >= eraseEnd)
+    {
+        return;
+    }
+
+    const auto eraseOffset = (eraseBegin - _columnBegin) * _cellSize.width;
+    const auto eraseLength = (eraseEnd - eraseBegin) * _cellSize.width;
+    auto eraseIterator = std::next(_pixelBuffer.data(), eraseOffset);
+    for (auto y = 0; y < _cellSize.height; y++)
+    {
+        std::memset(eraseIterator, 0, static_cast<size_t>(eraseLength) * sizeof(RGBQUAD));
+        std::advance(eraseIterator, _pixelWidth);
+    }
+    _invalidateComposites();
+}
+
+size_t ImageSlice::_layerBytes(const Layer& layer) noexcept
+{
+    return layer.pixels.size() * sizeof(RGBQUAD) + layer.columns.size();
+}
+
+void ImageSlice::_reserveLayerBytes(const size_t bytes)
+{
+    if (bytes != 0)
+    {
+        _accountedBytes += bytes;
+        s_layerBytes.fetch_add(bytes, std::memory_order_relaxed);
+    }
+}
+
+void ImageSlice::_releaseLayerBytes(const size_t bytes) noexcept
+{
+    if (bytes != 0)
+    {
+        _accountedBytes -= bytes;
+        s_layerBytes.fetch_sub(bytes, std::memory_order_relaxed);
+    }
+}
+
+// A revision of 0 is never handed out by BumpRevision, so it doubles as the
+// "this composite is stale" marker.
+void ImageSlice::_invalidateComposites() noexcept
+{
+    for (auto& composite : _composites)
+    {
+        composite.revision = 0;
+    }
+}
+
+bool ImageSlice::_hasContent() const noexcept
+{
+    return !_pixelBuffer.empty() || !_layers.empty();
+}
+
+void ImageSlice::_clearLayerColumns(Layer& layer, const til::CoordType columnBegin, const til::CoordType columnEnd) noexcept
+{
+    const auto clearBegin = std::max(columnBegin, _columnBegin);
+    const auto clearEnd = std::min(columnEnd, _columnEnd);
+    if (clearBegin >= clearEnd)
+    {
+        return;
+    }
+
+    for (auto column = clearBegin; column < clearEnd; column++)
+    {
+        const auto index = static_cast<size_t>(column - _columnBegin);
+        if (index < layer.columns.size())
+        {
+            til::at(layer.columns, index) = 0;
+        }
+    }
+
+    // The pixels have to go too, or the next composite would resurrect them.
+    if (!layer.pixels.empty())
+    {
+        const auto offset = (clearBegin - _columnBegin) * _cellSize.width;
+        const auto length = (clearEnd - clearBegin) * _cellSize.width;
+        auto iterator = std::next(layer.pixels.data(), offset);
+        for (auto y = 0; y < _cellSize.height; y++)
+        {
+            std::memset(iterator, 0, static_cast<size_t>(length) * sizeof(RGBQUAD));
+            std::advance(iterator, _pixelWidth);
+        }
+    }
+}
+
+// Drops any layer that no longer covers a single cell, returning true if the
+// set of layers changed.
+bool ImageSlice::_removeEmptyLayers()
+{
+    auto removed = false;
+    for (auto it = _layers.begin(); it != _layers.end();)
+    {
+        const auto covered = std::any_of(it->columns.begin(), it->columns.end(), [](const uint8_t flag) { return flag != 0; });
+        if (covered)
+        {
+            ++it;
+        }
+        else
+        {
+            _releaseLayerBytes(_layerBytes(*it));
+            it = _layers.erase(it);
+            removed = true;
+        }
+    }
+    return removed;
+}
+
+ImageSlice::Layer& ImageSlice::_getLayer(const LayerKey key, const int32_t zIndex)
+{
+    const auto existing = std::find_if(_layers.begin(), _layers.end(), [&](const Layer& layer) {
+        return layer.key == key && layer.zIndex == zIndex;
+    });
+    if (existing != _layers.end())
+    {
+        return *existing;
+    }
+    _layers.push_back(Layer{ .key = key, .zIndex = zIndex });
+    return _layers.back();
+}
+
+const ImageSlice::Composite& ImageSlice::_composite(const RenderPosition position) const
+{
+    auto& composite = til::at(_composites, static_cast<size_t>(position));
+    if (composite.revision == _revision && _revision != 0)
+    {
+        return composite;
+    }
+
+    const auto planeSize = static_cast<size_t>(_pixelWidth) * _cellSize.height;
+    composite.pixels.assign(planeSize, RGBQUAD{});
+    composite.hasPixels = false;
+
+    // Untagged content composites above the text, which is where image content
+    // in a row has always been drawn.
+    if (position == RenderPosition::AboveText && !_pixelBuffer.empty())
+    {
+        const auto count = std::min(planeSize, _pixelBuffer.size());
+        std::copy_n(_pixelBuffer.begin(), count, composite.pixels.begin());
+        composite.hasPixels = true;
+    }
+
+    // Layers composite in ascending z, with ties broken by insertion order.
+    auto ordered = std::vector<const Layer*>{};
+    ordered.reserve(_layers.size());
+    for (const auto& layer : _layers)
+    {
+        if (PositionOf(layer.zIndex) == position && !layer.pixels.empty())
+        {
+            ordered.push_back(&layer);
+        }
+    }
+    std::stable_sort(ordered.begin(), ordered.end(), [](const Layer* lhs, const Layer* rhs) { return lhs->zIndex < rhs->zIndex; });
+
+    for (const auto layer : ordered)
+    {
+        const auto count = std::min(planeSize, layer->pixels.size());
+        for (size_t i = 0; i < count; i++)
+        {
+            // A fully transparent pixel leaves whatever is beneath it alone.
+            const auto& pixel = til::at(layer->pixels, i);
+            if (pixel.rgbReserved != 0)
+            {
+                til::at(composite.pixels, i) = pixel;
+                composite.hasPixels = true;
             }
         }
+    }
+
+    composite.revision = _revision;
+    return composite;
+}
+
+std::span<const RGBQUAD> ImageSlice::Pixels(const RenderPosition position) const
+{
+    // Most slices carry no identified layers at all. Hand back the base plane
+    // itself rather than compositing a copy of it every time it changes.
+    if (_layers.empty())
+    {
+        return position == RenderPosition::AboveText ? std::span<const RGBQUAD>{ _pixelBuffer } : std::span<const RGBQUAD>{};
+    }
+    return _composite(position).pixels;
+}
+
+bool ImageSlice::HasPixels(const RenderPosition position) const
+{
+    if (_layers.empty())
+    {
+        return position == RenderPosition::AboveText && !_pixelBuffer.empty();
+    }
+    return _composite(position).hasPixels;
+}
+
+// Returns null if the slice cannot take another layer, either because this one
+// would exceed the per-slice count or the process-wide byte budget.
+RGBQUAD* ImageSlice::MutablePixels(const til::CoordType columnBegin, const til::CoordType columnEnd, const LayerKey key, const int32_t zIndex)
+{
+    // Content that carries no identity belongs in the base plane.
+    if (key.Untagged())
+    {
+        return MutablePixels(columnBegin, columnEnd);
+    }
+
+    const auto isNewLayer = std::none_of(_layers.begin(), _layers.end(), [&](const Layer& layer) {
+        return layer.key == key && layer.zIndex == zIndex;
+    });
+    if (isNewLayer && _layers.size() >= MaxLayersPerSlice)
+    {
+        return nullptr;
+    }
+
+    _ensureRange(columnBegin, columnEnd);
+
+    const auto planeSize = static_cast<size_t>(_pixelWidth) * _cellSize.height;
+    const auto columnCount = static_cast<size_t>(_columnEnd - _columnBegin);
+    if (isNewLayer && planeSize * sizeof(RGBQUAD) + columnCount > LayerBytesAvailable())
+    {
+        return nullptr;
+    }
+
+    auto& layer = _getLayer(key, zIndex);
+    const auto before = _layerBytes(layer);
+    layer.pixels.resize(planeSize);
+    layer.columns.resize(columnCount, 0);
+    for (auto column = columnBegin; column < columnEnd; column++)
+    {
+        til::at(layer.columns, static_cast<size_t>(column - _columnBegin)) = 1;
+    }
+    _reserveLayerBytes(_layerBytes(layer) - before);
+    _invalidateComposites();
+
+    const auto pixelOffset = (columnBegin - _columnBegin) * _cellSize.width;
+    return &til::at(layer.pixels, pixelOffset);
+}
+
+bool ImageSlice::Contains(const uint32_t imageId) const noexcept
+{
+    return std::any_of(_layers.begin(), _layers.end(), [=](const Layer& layer) { return layer.key.imageId == imageId; });
+}
+
+bool ImageSlice::Contains(const LayerKey key) const noexcept
+{
+    return std::any_of(_layers.begin(), _layers.end(), [=](const Layer& layer) { return layer.key == key; });
+}
+
+bool ImageSlice::LayerCoversColumn(const LayerKey key, const til::CoordType column) const noexcept
+{
+    if (column < _columnBegin || column >= _columnEnd)
+    {
         return false;
     }
+    const auto index = static_cast<size_t>(column - _columnBegin);
+    return std::any_of(_layers.begin(), _layers.end(), [=](const Layer& layer) {
+        return layer.key == key && index < layer.columns.size() && til::at(layer.columns, index) != 0;
+    });
+}
+
+std::vector<ImageSlice::LayerKey> ImageSlice::LayersAtColumn(const til::CoordType column) const
+{
+    auto keys = std::vector<LayerKey>{};
+    if (column < _columnBegin || column >= _columnEnd)
+    {
+        return keys;
+    }
+    const auto index = static_cast<size_t>(column - _columnBegin);
+    for (const auto& layer : _layers)
+    {
+        if (index < layer.columns.size() && til::at(layer.columns, index) != 0)
+        {
+            keys.push_back(layer.key);
+        }
+    }
+    return keys;
+}
+
+std::vector<ImageSlice::LayerKey> ImageSlice::LayersAtZ(const int32_t zIndex) const
+{
+    auto keys = std::vector<LayerKey>{};
+    for (const auto& layer : _layers)
+    {
+        if (layer.zIndex == zIndex)
+        {
+            keys.push_back(layer.key);
+        }
+    }
+    return keys;
+}
+
+// The erase overloads all report true when the slice has been left with no
+// content at all, which tells the caller to drop the slice entirely.
+bool ImageSlice::EraseLayer(const uint32_t imageId)
+{
+    auto erased = false;
+    for (auto it = _layers.begin(); it != _layers.end();)
+    {
+        if (it->key.imageId == imageId)
+        {
+            _releaseLayerBytes(_layerBytes(*it));
+            it = _layers.erase(it);
+            erased = true;
+        }
+        else
+        {
+            ++it;
+        }
+    }
+    if (erased)
+    {
+        _invalidateComposites();
+    }
+    return !_hasContent();
+}
+
+bool ImageSlice::EraseLayer(const LayerKey key)
+{
+    auto erased = false;
+    for (auto it = _layers.begin(); it != _layers.end();)
+    {
+        if (it->key == key)
+        {
+            _releaseLayerBytes(_layerBytes(*it));
+            it = _layers.erase(it);
+            erased = true;
+        }
+        else
+        {
+            ++it;
+        }
+    }
+    if (erased)
+    {
+        _invalidateComposites();
+    }
+    return !_hasContent();
+}
+
+bool ImageSlice::EraseLayer(const uint32_t imageId, const til::CoordType columnBegin, const til::CoordType columnEnd)
+{
+    auto changed = false;
+    for (auto& layer : _layers)
+    {
+        if (layer.key.imageId == imageId)
+        {
+            _clearLayerColumns(layer, columnBegin, columnEnd);
+            changed = true;
+        }
+    }
+    if (changed)
+    {
+        _removeEmptyLayers();
+        _invalidateComposites();
+    }
+    return !_hasContent();
+}
+
+void ImageSlice::_copyLayers(const ImageSlice& srcSlice, const til::CoordType srcColumn, const til::CoordType dstColumnBegin, const til::CoordType dstColumnEnd)
+{
+    if (srcSlice._layers.empty() && _layers.empty())
+    {
+        return;
+    }
+
+    // A row can be copied onto itself, and writing to our own layers would
+    // invalidate the source we're reading from, so take a snapshot first.
+    const auto snapshot = &srcSlice == this ? _layers : std::vector<Layer>{};
+    const auto& srcLayers = &srcSlice == this ? snapshot : srcSlice._layers;
+    const auto srcColumnBegin = srcSlice._columnBegin;
+    const auto srcPixelWidth = srcSlice._pixelWidth;
+    const auto columnCount = dstColumnEnd - dstColumnBegin;
+
+    // A copy replaces the destination range outright, so every layer already
+    // there has to give up those columns before the source is written in.
+    // Otherwise a destination layer with no counterpart in the source would
+    // survive a copy that was meant to overwrite it.
+    for (auto& dstLayer : _layers)
+    {
+        _clearLayerColumns(dstLayer, dstColumnBegin, dstColumnEnd);
+    }
+
+    for (const auto& srcLayer : srcLayers)
+    {
+        if (srcLayer.pixels.empty())
+        {
+            continue;
+        }
+
+        const auto dstPixels = MutablePixels(dstColumnBegin, dstColumnEnd, srcLayer.key, srcLayer.zIndex);
+        if (!dstPixels)
+        {
+            // The budget is exhausted, so this layer simply doesn't survive the copy.
+            continue;
+        }
+
+        auto srcIterator = std::next(srcLayer.pixels.data(), (srcColumn - srcColumnBegin) * _cellSize.width);
+        auto dstIterator = dstPixels;
+        const auto byteCount = sizeof(RGBQUAD) * columnCount * _cellSize.width;
+        for (auto y = 0; y < _cellSize.height; y++)
+        {
+            std::memmove(dstIterator, srcIterator, byteCount);
+            std::advance(srcIterator, srcPixelWidth);
+            std::advance(dstIterator, _pixelWidth);
+        }
+
+        // Coverage has to follow the pixels, otherwise a later targeted erase
+        // would skip the cells we just wrote.
+        auto& dstLayer = _getLayer(srcLayer.key, srcLayer.zIndex);
+        for (auto column = 0; column < columnCount; column++)
+        {
+            const auto srcIndex = static_cast<size_t>(srcColumn - srcColumnBegin + column);
+            const auto dstIndex = static_cast<size_t>(dstColumnBegin - _columnBegin + column);
+            const auto covered = srcIndex < srcLayer.columns.size() && til::at(srcLayer.columns, srcIndex) != 0;
+            if (dstIndex < dstLayer.columns.size())
+            {
+                til::at(dstLayer.columns, dstIndex) = covered ? uint8_t{ 1 } : uint8_t{ 0 };
+            }
+        }
+    }
+
+    _removeEmptyLayers();
+    _invalidateComposites();
 }
