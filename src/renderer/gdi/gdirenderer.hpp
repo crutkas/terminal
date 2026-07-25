@@ -54,9 +54,11 @@ namespace Microsoft::Console::Render
                                                    const COLORREF underlineColor,
                                                    const size_t cchLine,
                                                    const til::point coordTarget) noexcept override;
-        [[nodiscard]] HRESULT PaintImageSlice(const ImageSlice& imageSlice,
-                                              const til::CoordType targetRow,
-                                              const til::CoordType viewportLeft) noexcept override;
+        [[nodiscard]] HRESULT BeginRowImages(const ImageSlice& imageSlice,
+                                             til::CoordType targetRow,
+                                             til::CoordType viewportLeft,
+                                             std::span<const uint8_t> defaultBackgroundMask) noexcept override;
+        [[nodiscard]] HRESULT EndRowImages() noexcept override;
         [[nodiscard]] HRESULT PaintSelection(const til::rect& rect) noexcept override;
 
         [[nodiscard]] HRESULT PaintCursor(const CursorOptions& options) noexcept override;
@@ -177,6 +179,25 @@ namespace Microsoft::Console::Render
         std::pmr::vector<std::pmr::vector<int>> _polyWidths;
 
         std::vector<DWORD> _imageMask;
+        std::vector<RGBQUAD> _imagePlane;
+        const ImageSlice* _rowImageSlice = nullptr;
+        til::CoordType _rowImageTargetRow = 0;
+        til::CoordType _rowImageViewportLeft = 0;
+        // One flag per screen column of the current row's slice, set where
+        // image content will end up visibly below the text. Text over those
+        // columns must not fill its own background or it would paint the
+        // image out. Screen columns, so the line rendition is already applied.
+        std::vector<uint8_t> _underlayColumns;
+        til::CoordType _underlayColumnOffset = 0;
+        int _underlayScale = 0;
+
+        [[nodiscard]] HRESULT _PaintImagePlane(const ImageSlice& imageSlice,
+                                               ImageSlice::RenderPosition position,
+                                               til::CoordType targetRow,
+                                               til::CoordType viewportLeft,
+                                               std::span<const uint8_t> defaultBackgroundMask,
+                                               bool underText) noexcept;
+        bool _UnderlayCoversColumns(til::CoordType columnBegin, til::CoordType columnEnd) const noexcept;
 
         [[nodiscard]] HRESULT _InvalidCombine(const til::rect* const prc) noexcept;
         [[nodiscard]] HRESULT _InvalidOffset(const til::point* const ppt) noexcept;
