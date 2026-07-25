@@ -760,12 +760,17 @@ IStateMachineEngine::StringHandler OutputStateMachineEngine::ActionDcsDispatch(c
 // - id - Identifier of the application the string is addressed to.
 // Return Value:
 // - the data string handler function or nullptr if the application is not supported
-IStateMachineEngine::StringHandler OutputStateMachineEngine::ActionApcDispatch(const VTID /*id*/) noexcept
+IStateMachineEngine::StringHandler OutputStateMachineEngine::ActionApcDispatch(const VTID id)
 {
-    // No APC application is recognised yet. Returning nullptr leaves the state
-    // machine to ignore the string, which is what it did before APC strings
-    // were dispatched at all.
-    return nullptr;
+    switch (id)
+    {
+    case VTID("G"):
+        return _dispatch->KittyGraphics();
+    default:
+        // Returning nullptr leaves the state machine to ignore the string,
+        // which is what it did before APC strings were dispatched at all.
+        return nullptr;
+    }
 }
 
 // Routine Description:

@@ -5,6 +5,7 @@
 
 #include <aclapi.h>
 #include <sddl.h>
+#include <winternl.h>
 #include <wil/token_helpers.h>
 
 namespace til // Terminal Implementation Library. Also: "Today I Learned"
@@ -263,4 +264,693 @@ namespace til // Terminal Implementation Library. Also: "Today I Learned"
             }
         }
     } // io
+
+    // Outcome of read_image_file, mapped by the Kitty adapter to the protocol's file
+    // error codes: ok -> (no error); not_found -> ENOENT (the allowed path names no
+    // existing file); invalid -> EINVAL (the request itself is malformed: empty path,
+    // an unsupported path form, or a bad byte range); read_error -> EBADF (the file
+    // exists/is refused but cannot be read: not a regular file, wrong volume, access
+    // or I/O failure).
+    enum class read_image_result : uint8_t
+    {
+        ok,
+        not_found,
+        invalid,
+        read_error,
+    };
+
+    // Outcome of read_shared_memory, mapped by the Kitty adapter to the protocol's
+    // local-medium error codes.
+    enum class read_shared_memory_result : uint8_t
+    {
+        ok,
+        not_found,
+        invalid,
+        read_error,
+    };
+
+    namespace shared_memory_details
+    {
+        _TIL_INLINEPREFIX bool is_readable_range(const void* source, const size_t size) noexcept
+        {
+            if (size == 0)
+            {
+                return true;
+            }
+
+            const auto begin = reinterpret_cast<uintptr_t>(source);
+            if (size > UINTPTR_MAX - begin)
+            {
+                return false;
+            }
+
+            const auto end = begin + size;
+            auto current = begin;
+            while (current < end)
+            {
+                MEMORY_BASIC_INFORMATION info{};
+                if (VirtualQuery(reinterpret_cast<const void*>(current), &info, sizeof(info)) != sizeof(info) ||
+                    info.State != MEM_COMMIT)
+                {
+                    return false;
+                }
+
+                const auto protection = info.Protect & 0xff;
+                const auto readable = protection == PAGE_READONLY ||
+                                      protection == PAGE_READWRITE ||
+                                      protection == PAGE_WRITECOPY ||
+                                      protection == PAGE_EXECUTE_READ ||
+                                      protection == PAGE_EXECUTE_READWRITE ||
+                                      protection == PAGE_EXECUTE_WRITECOPY;
+                if (!readable || (info.Protect & PAGE_GUARD) != 0)
+                {
+                    return false;
+                }
+
+                const auto regionBegin = reinterpret_cast<uintptr_t>(info.BaseAddress);
+                if (info.RegionSize > UINTPTR_MAX - regionBegin)
+                {
+                    return false;
+                }
+                const auto regionEnd = regionBegin + info.RegionSize;
+                if (regionEnd <= current)
+                {
+                    return false;
+                }
+                current = std::min(regionEnd, end);
+            }
+
+            return true;
+        }
+
+        // A file-backed section can fault after it has been mapped (for example if its
+        // backing file is truncated). Keep SEH in a leaf with no C++ objects requiring
+        // unwinding, then translate the fault into a normal protocol read error.
+        _TIL_INLINEPREFIX bool guarded_copy(void* destination, const void* source, const size_t size) noexcept
+        {
+            __try
+            {
+                memcpy(destination, source, size);
+                return true;
+            }
+            __except (GetExceptionCode() == EXCEPTION_ACCESS_VIOLATION ||
+                          GetExceptionCode() == EXCEPTION_IN_PAGE_ERROR ||
+                          GetExceptionCode() == EXCEPTION_GUARD_PAGE ?
+                      EXCEPTION_EXECUTE_HANDLER :
+                      EXCEPTION_CONTINUE_SEARCH)
+            {
+                return false;
+            }
+        }
+    }
+
+    // Reads up to a bounded number of bytes from a LOCAL image file for the Kitty
+    // graphics file/temporary transmission media (t=f / t=t), into 'out'. Returns a
+    // read_image_result the caller maps to the kitty file error codes: not_found ->
+    // ENOENT, invalid -> EINVAL, read_error -> EBADF, ok -> success. This is
+    // the single shared implementation behind ConhostInternalGetSet::ReadKittyImageFile
+    // and Terminal::ReadKittyImageFile; the ConPTY delete-suppression gate lives at
+    // those call sites, not here.
+    //
+    // Protocol (transmission media): https://sw.kovidgoyal.net/kitty/graphics-protocol/#transferring-data
+    //
+    // Security model:
+    //  * Only LOCAL, FIXED-drive, drive-absolute files are read. A path that is not of
+    //    the form "X:\..." (relative, drive-relative, or rooted) is rejected, as is any
+    //    UNC / Win32-device path ("\\server\share", "\\.\dev", "\\?\..."). After the
+    //    handle is open the canonical path is re-checked: a UNC final path
+    //    ("\\?\UNC\...") or a non-DRIVE_FIXED volume (remote/removable/optical) is
+    //    rejected. This blocks SSRF / NTLM-hash theft via "\\attacker\share" and device
+    //    access, even when a junction or mapped drive is used to disguise the target.
+    //  * The read is hard-bounded to 32 MiB regardless of the caller's 'size', so a
+    //    hostile S= can never force a large allocation.
+    //  * When 'deleteAfter' (t=t) is requested the file is removed via its OPEN handle
+    //    (FILE_DISPOSITION) — never by re-opening a path, closing the TOCTOU window —
+    //    and ONLY when that handle's canonical path is under the system temp directory
+    //    AND its name contains kitty's "tty-graphics-protocol" marker, so the medium
+    //    cannot delete arbitrary files.
+    // Never throws.
+    _TIL_INLINEPREFIX read_image_result read_image_file(const std::wstring_view path, uint64_t offset, uint64_t size, bool deleteAfter, std::vector<uint8_t>& out) noexcept
+    {
+        out.clear();
+
+        // 32 MiB cap, matching the adapter's direct (base64) payload limit; this also
+        // keeps a single ReadFile within DWORD range.
+        constexpr uint64_t maxBytes = 32ull * 1024 * 1024;
+
+        if (path.empty())
+        {
+            return read_image_result::invalid;
+        }
+
+        const auto isSep = [](const wchar_t c) noexcept { return c == L'\\' || c == L'/'; };
+
+        // Reject UNC and device-namespace paths before opening: any path whose first two
+        // characters are separators ("\\server\share", "\\.\dev", "\\?\...", "//host/..").
+        if (path.size() >= 2 && isSep(path[0]) && isSep(path[1]))
+        {
+            return read_image_result::invalid;
+        }
+
+        // Require a drive-absolute local path ("X:\..."): reject relative and drive-
+        // relative paths so a client cannot make the terminal read a file resolved
+        // against the terminal's own working directory.
+        const auto driveLetter = path[0];
+        const auto isAlpha = (driveLetter >= L'a' && driveLetter <= L'z') || (driveLetter >= L'A' && driveLetter <= L'Z');
+        if (path.size() < 3 || !isAlpha || path[1] != L':' || !isSep(path[2]))
+        {
+            return read_image_result::invalid;
+        }
+
+        // Defense in depth: reject a non-fixed drive letter BEFORE opening, so a mapped
+        // network drive (X: -> \\server\share) can't trigger an outbound SMB/NTLM auth
+        // inside CreateFileW. The post-open canonical check still catches junction/symlink
+        // redirects to other volumes; this closes the pre-handshake window for the common case.
+        const wchar_t driveRoot[]{ driveLetter, L':', L'\\', L'\0' };
+        if (GetDriveTypeW(driveRoot) != DRIVE_FIXED)
+        {
+            return read_image_result::invalid;
+        }
+
+        std::wstring pathStr;
+        const auto isReservedDosDevice = [](const std::wstring_view candidate) noexcept {
+            auto leaf = candidate.substr(candidate.find_last_of(L'\\') + 1);
+            while (!leaf.empty() && (leaf.back() == L' ' || leaf.back() == L'.'))
+            {
+                leaf.remove_suffix(1);
+            }
+            if (const auto suffix = leaf.find_first_of(L".:"); suffix != std::wstring_view::npos)
+            {
+                leaf = leaf.substr(0, suffix);
+            }
+            while (!leaf.empty() && leaf.back() == L' ')
+            {
+                leaf.remove_suffix(1);
+            }
+            const auto equalsLeaf = [&](const std::wstring_view value) noexcept {
+                return leaf.size() == value.size() &&
+                       CompareStringOrdinal(leaf.data(), static_cast<int>(leaf.size()), value.data(), static_cast<int>(value.size()), TRUE) == CSTR_EQUAL;
+            };
+            const auto isNumberedDevice = [&](const std::wstring_view prefix) noexcept {
+                if (leaf.size() != prefix.size() + 1)
+                {
+                    return false;
+                }
+                const auto suffix = leaf.back();
+                return ((suffix >= L'1' && suffix <= L'9') || suffix == L'\u00B9' || suffix == L'\u00B2' || suffix == L'\u00B3') &&
+                       CompareStringOrdinal(leaf.data(), static_cast<int>(prefix.size()), prefix.data(), static_cast<int>(prefix.size()), TRUE) == CSTR_EQUAL;
+            };
+            return equalsLeaf(L"CON") || equalsLeaf(L"PRN") || equalsLeaf(L"AUX") || equalsLeaf(L"NUL") ||
+                   equalsLeaf(L"CLOCK$") || equalsLeaf(L"CONIN$") || equalsLeaf(L"CONOUT$") ||
+                   isNumberedDevice(L"COM") || isNumberedDevice(L"LPT");
+        };
+        try
+        {
+            pathStr.assign(path);
+            std::replace(pathStr.begin(), pathStr.end(), L'/', L'\\');
+            if (isReservedDosDevice(pathStr))
+            {
+                return read_image_result::read_error;
+            }
+
+            // Apply the same lexical normalization as CreateFileW without touching the
+            // filesystem. This collapses ".", "..", duplicate separators, and trailing
+            // spaces/periods before the normalized path is opened relative to the drive.
+            const auto needed = GetFullPathNameW(pathStr.c_str(), 0, nullptr, nullptr);
+            if (needed == 0)
+            {
+                return read_image_result::invalid;
+            }
+            std::wstring normalized(needed, L'\0');
+            const auto written = GetFullPathNameW(pathStr.c_str(), needed, normalized.data(), nullptr);
+            if (written == 0 || written >= needed)
+            {
+                return read_image_result::invalid;
+            }
+            normalized.resize(written);
+            pathStr.swap(normalized);
+        }
+        catch (...)
+        {
+            return read_image_result::read_error;
+        }
+
+        if (pathStr.size() < 3 ||
+            CompareStringOrdinal(pathStr.data(), 1, &driveLetter, 1, TRUE) != CSTR_EQUAL ||
+            pathStr[1] != L':' || pathStr[2] != L'\\')
+        {
+            return read_image_result::invalid;
+        }
+
+        const auto relativePath = std::wstring_view{ pathStr }.substr(3);
+        if (relativePath.empty() || relativePath.size() > USHRT_MAX / sizeof(wchar_t))
+        {
+            return read_image_result::invalid;
+        }
+
+        // Resolve only the already-validated fixed drive root through Win32. The remaining
+        // untrusted path is opened relative to this handle so OBJ_DONT_REPARSE does not
+        // reject the Object Manager's normal \??\C: drive-letter symbolic link.
+        wil::unique_hfile drive{ CreateFileW(driveRoot,
+                                             FILE_READ_ATTRIBUTES,
+                                             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                             nullptr,
+                                             OPEN_EXISTING,
+                                             FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+                                             nullptr) };
+        if (!drive)
+        {
+            return read_image_result::read_error;
+        }
+
+        UNICODE_STRING objectName{
+            .Length = static_cast<USHORT>(relativePath.size() * sizeof(wchar_t)),
+            .MaximumLength = static_cast<USHORT>(relativePath.size() * sizeof(wchar_t)),
+            .Buffer = const_cast<wchar_t*>(relativePath.data()),
+        };
+        OBJECT_ATTRIBUTES objectAttributes{
+            .Length = sizeof(OBJECT_ATTRIBUTES),
+            .RootDirectory = drive.get(),
+            .ObjectName = &objectName,
+            .Attributes = OBJ_CASE_INSENSITIVE | OBJ_DONT_REPARSE,
+        };
+
+        // Open without following any reparse point in the path. The post-open canonical
+        // checks below are too late to prevent an intermediate junction or symlink from
+        // initiating an SMB/NTLM handshake, so this intentionally rejects all reparse
+        // traversal before the target is touched.
+        const auto openFile = [&](const ACCESS_MASK access, wil::unique_hfile& file) noexcept {
+            IO_STATUS_BLOCK status{};
+            return NtCreateFile(file.addressof(),
+                                access | SYNCHRONIZE,
+                                &objectAttributes,
+                                &status,
+                                nullptr,
+                                FILE_ATTRIBUTE_NORMAL,
+                                FILE_SHARE_READ | FILE_SHARE_DELETE,
+                                FILE_OPEN,
+                                FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT | FILE_OPEN_REPARSE_POINT,
+                                nullptr,
+                                0);
+        };
+
+        // Request DELETE only when we might remove a temp file so a plain t=f read never
+        // needs delete rights. FILE_SHARE_DELETE lets the file be unlinked while open.
+        wil::unique_hfile file;
+        auto status = openFile(GENERIC_READ | (deleteAfter ? static_cast<ACCESS_MASK>(DELETE) : 0ul), file);
+        if (status < 0 && deleteAfter)
+        {
+            // The file may not grant DELETE (e.g. a read-only ACL); fall back to a pure
+            // read so rendering still works. We then simply cannot delete it.
+            deleteAfter = false;
+            status = openFile(GENERIC_READ, file);
+        }
+        if (status < 0)
+        {
+            const auto err = RtlNtStatusToDosError(status);
+            return (err == ERROR_FILE_NOT_FOUND || err == ERROR_PATH_NOT_FOUND)
+                       ? read_image_result::not_found
+                       : read_image_result::read_error;
+        }
+
+        // Spec requirement (kitty graphics protocol): only REGULAR files may be read via t=f/t=t;
+        // device/pipe/socket "special" files must be refused. GetFileType on the open handle is
+        // FILE_TYPE_DISK only for a real on-disk file; a character device (e.g. a reserved name
+        // like NUL/CON resolved against a drive), a pipe, or an unknown type is rejected. The path
+        // checks above already block the device namespace and non-fixed volumes; this is the
+        // explicit, auditable form of the spec's "regular files only" rule and closes the
+        // reserved-name edge.
+        if (GetFileType(file.get()) != FILE_TYPE_DISK)
+        {
+            return read_image_result::read_error;
+        }
+
+        // Resolves the fully-normalized on-disk path for an open handle (following
+        // symlinks/junctions and 8.3 short names), or empty on failure. With
+        // VOLUME_NAME_DOS every result is prefixed with "\\?\" (e.g. "\\?\C:\dir\file",
+        // or "\\?\UNC\server\share\file" for a UNC target).
+        const auto finalPath = [](HANDLE handle) noexcept -> std::wstring {
+            const auto needed = GetFinalPathNameByHandleW(handle, nullptr, 0, FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
+            if (needed == 0)
+            {
+                return {};
+            }
+            std::wstring resolved;
+            try
+            {
+                resolved.resize(needed);
+            }
+            catch (...)
+            {
+                return {};
+            }
+            const auto written = GetFinalPathNameByHandleW(handle, resolved.data(), needed, FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
+            if (written == 0 || written >= needed)
+            {
+                return {};
+            }
+            resolved.resize(written);
+            return resolved;
+        };
+
+        const auto canonical = finalPath(file.get());
+        if (canonical.empty())
+        {
+            return read_image_result::read_error;
+        }
+
+        // Reject a UNC final path. A drive-absolute client path can still resolve through
+        // a junction/mapped drive to a UNC location, so this must be re-checked here.
+        static constexpr std::wstring_view uncPrefix{ L"\\\\?\\UNC\\" };
+        if (canonical.size() >= uncPrefix.size() &&
+            CompareStringOrdinal(canonical.c_str(), static_cast<int>(uncPrefix.size()), uncPrefix.data(), static_cast<int>(uncPrefix.size()), TRUE) == CSTR_EQUAL)
+        {
+            return read_image_result::read_error;
+        }
+
+        // Require a fixed local volume: reject network/removable/optical drives
+        // (DRIVE_REMOTE/REMOVABLE/CDROM, plus UNKNOWN/NO_ROOT_DIR).
+        wchar_t volumeRoot[MAX_PATH]{};
+        if (!GetVolumePathNameW(canonical.c_str(), volumeRoot, ARRAYSIZE(volumeRoot)) || GetDriveTypeW(volumeRoot) != DRIVE_FIXED)
+        {
+            return read_image_result::read_error;
+        }
+
+        LARGE_INTEGER fileSize{};
+        if (!GetFileSizeEx(file.get(), &fileSize) || fileSize.QuadPart < 0)
+        {
+            return read_image_result::read_error;
+        }
+        const auto total = static_cast<uint64_t>(fileSize.QuadPart);
+        if (offset > total)
+        {
+            return read_image_result::invalid; // offset past end of file
+        }
+
+        // Bytes to read: what remains after the offset, clamped by the client's S= when
+        // nonzero, and always by the hard 32 MiB cap.
+        uint64_t toRead = total - offset;
+        if (size != 0)
+        {
+            toRead = std::min(toRead, size);
+        }
+        toRead = std::min(toRead, maxBytes);
+
+        if (offset != 0)
+        {
+            LARGE_INTEGER move{};
+            move.QuadPart = static_cast<LONGLONG>(offset);
+            if (!SetFilePointerEx(file.get(), move, nullptr, FILE_BEGIN))
+            {
+                return read_image_result::read_error;
+            }
+        }
+
+        try
+        {
+            out.resize(static_cast<size_t>(toRead));
+        }
+        catch (...)
+        {
+            out.clear();
+            return read_image_result::read_error;
+        }
+
+        DWORD read = 0;
+        if (toRead != 0 && !ReadFile(file.get(), out.data(), static_cast<DWORD>(toRead), &read, nullptr))
+        {
+            out.clear();
+            return read_image_result::read_error;
+        }
+        out.resize(read);
+
+        // Decide deletion only after a successful read, using the canonical path of the
+        // exact inode behind our handle.
+        if (deleteAfter)
+        {
+            // The canonical system temp directory, normalized through a handle so it is in
+            // the same "\\?\" form as 'canonical', with a trailing backslash. Prefers
+            // GetTempPath2W (Win11, per-process) and falls back to GetTempPathW.
+            const auto tempDir = [&finalPath]() noexcept -> std::wstring {
+                wchar_t raw[MAX_PATH + 2]{};
+                using PfnGetTempPath2W = DWORD(WINAPI*)(DWORD, LPWSTR);
+                static const auto pfnGetTempPath2W = []() noexcept {
+                    const auto k32 = GetModuleHandleW(L"kernel32.dll");
+#pragma warning(suppress : 26490) // Don't use reinterpret_cast (type.1) -- required for GetProcAddress.
+                    return k32 ? reinterpret_cast<PfnGetTempPath2W>(GetProcAddress(k32, "GetTempPath2W")) : nullptr;
+                }();
+                const auto len = pfnGetTempPath2W ? pfnGetTempPath2W(ARRAYSIZE(raw), raw) : GetTempPathW(ARRAYSIZE(raw), raw);
+                if (len == 0 || len >= ARRAYSIZE(raw))
+                {
+                    return {};
+                }
+                wil::unique_hfile dir{ CreateFileW(raw, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr) };
+                if (!dir)
+                {
+                    return {};
+                }
+                auto resolved = finalPath(dir.get());
+                if (!resolved.empty() && resolved.back() != L'\\')
+                {
+                    try
+                    {
+                        resolved.push_back(L'\\');
+                    }
+                    catch (...)
+                    {
+                        return {};
+                    }
+                }
+                return resolved;
+            }();
+
+            const auto underTemp = !tempDir.empty() && canonical.size() >= tempDir.size() &&
+                                   CompareStringOrdinal(canonical.c_str(), static_cast<int>(tempDir.size()), tempDir.c_str(), static_cast<int>(tempDir.size()), TRUE) == CSTR_EQUAL;
+
+            // Kitty names its temporary files "tty-graphics-protocol-*"; require that
+            // marker (case-insensitively) so we only ever auto-delete files this protocol
+            // created, never an arbitrary file the client happened to place under temp.
+            static constexpr std::wstring_view marker{ L"tty-graphics-protocol" };
+            const auto separator = canonical.find_last_of(L'\\');
+            const auto filenameOffset = separator == std::wstring::npos ? 0 : separator + 1;
+            auto hasMarker = false;
+            for (auto i = filenameOffset; !hasMarker && i + marker.size() <= canonical.size(); ++i)
+            {
+                hasMarker = CompareStringOrdinal(canonical.c_str() + i, static_cast<int>(marker.size()), marker.data(), static_cast<int>(marker.size()), TRUE) == CSTR_EQUAL;
+            }
+
+            if (underTemp && hasMarker)
+            {
+                // Delete the exact open inode by setting its disposition, then closing the
+                // handle below. No path is re-resolved, so there is no window for a
+                // junction/symlink swap between validation and deletion (TOCTOU-safe).
+                FILE_DISPOSITION_INFO disposition{};
+                disposition.DeleteFile = TRUE;
+                std::ignore = SetFileInformationByHandle(file.get(), FileDispositionInfo, &disposition, sizeof(disposition));
+            }
+        }
+
+        return read_image_result::ok; // the handle closes here; a set disposition removes the inode.
+    }
+
+    // Copies bytes from a Kitty graphics t=s named shared-memory object. Windows file
+    // mappings are session-local by default; only unprefixed names and the explicit
+    // Local\ prefix are accepted so terminal output cannot reach a service's Global\
+    // object. The mapping is opened read-only, never inherited, copied into owned
+    // memory, and immediately closed. Unlike POSIX shm, Windows has no unlink step:
+    // the object disappears after every process closes its handles.
+    //
+    // S=0 means "to the end of the mapping". Windows rounds paging-file sections to a
+    // page boundary, so clients should send S= for exact non-page-aligned lengths. Raw
+    // Kitty transfers infer that exact length in the adapter when S= is omitted.
+    //
+    // Protocol (transmission media): https://sw.kovidgoyal.net/kitty/graphics-protocol/#transferring-data
+    _TIL_INLINEPREFIX read_shared_memory_result read_shared_memory(const std::wstring_view name, uint64_t offset, uint64_t size, std::vector<uint8_t>& out) noexcept
+    {
+        out.clear();
+
+        constexpr uint64_t maxBytes = 32ull * 1024 * 1024;
+        constexpr size_t maxNameChars = 32767;
+
+        const auto hasControlCharacter = std::any_of(name.begin(), name.end(), [](const wchar_t value) noexcept {
+            return value < L' ' || value == 0x7f;
+        });
+        if (name.empty() || name.size() > maxNameChars || hasControlCharacter)
+        {
+            return read_shared_memory_result::invalid;
+        }
+
+        // Kernel object prefixes are case-sensitive. Permit the current-session
+        // namespace, either implicitly or via Local\, and reject every other backslash
+        // (including Global\, Session\, and nested object-manager paths).
+        auto remainder = name;
+        if (remainder.starts_with(L"Local\\"))
+        {
+            remainder.remove_prefix(6);
+        }
+        if (remainder.empty() || remainder.find(L'\\') != std::wstring_view::npos)
+        {
+            return read_shared_memory_result::invalid;
+        }
+
+        std::wstring nameStr;
+        try
+        {
+            nameStr.assign(name);
+        }
+        catch (...)
+        {
+            return read_shared_memory_result::read_error;
+        }
+
+        wil::unique_handle mapping{ OpenFileMappingW(FILE_MAP_READ, FALSE, nameStr.c_str()) };
+        if (!mapping)
+        {
+            const auto error = GetLastError();
+            if (error == ERROR_FILE_NOT_FOUND)
+            {
+                return read_shared_memory_result::not_found;
+            }
+            if (error == ERROR_INVALID_NAME || error == ERROR_INVALID_PARAMETER)
+            {
+                return read_shared_memory_result::invalid;
+            }
+            return read_shared_memory_result::read_error;
+        }
+
+        SYSTEM_INFO systemInfo{};
+        GetSystemInfo(&systemInfo);
+        const auto granularity = static_cast<uint64_t>(systemInfo.dwAllocationGranularity);
+        if (granularity == 0)
+        {
+            return read_shared_memory_result::read_error;
+        }
+
+        const auto alignedOffset = offset - (offset % granularity);
+        const auto delta = static_cast<size_t>(offset - alignedOffset);
+        const auto offsetHigh = static_cast<DWORD>(alignedOffset >> 32);
+        const auto offsetLow = static_cast<DWORD>(alignedOffset);
+
+        const auto map = [&](const size_t bytes) noexcept {
+            return MapViewOfFile(mapping.get(), FILE_MAP_READ, offsetHigh, offsetLow, bytes);
+        };
+        const auto mapFailure = []() noexcept {
+            const auto error = GetLastError();
+            return (error == ERROR_NOT_ENOUGH_MEMORY || error == ERROR_OUTOFMEMORY)
+                       ? read_shared_memory_result::read_error
+                       : read_shared_memory_result::invalid;
+        };
+
+        auto toRead = static_cast<size_t>(std::min(size, maxBytes));
+        void* view = nullptr;
+
+        if (size != 0)
+        {
+            view = map(delta + toRead);
+            if (!view)
+            {
+                return mapFailure();
+            }
+        }
+        else
+        {
+            // Avoid mapping an attacker-sized section merely to discover its end. A
+            // bounded view succeeds for large sections; only smaller sections need the
+            // map-to-end fallback whose extent is then measured with VirtualQuery.
+            view = map(delta + static_cast<size_t>(maxBytes));
+            if (view)
+            {
+                toRead = static_cast<size_t>(maxBytes);
+            }
+            else
+            {
+                view = map(0);
+                if (!view)
+                {
+                    return mapFailure();
+                }
+
+                const auto viewBegin = reinterpret_cast<uintptr_t>(view);
+                const auto maximumExtent = delta + static_cast<size_t>(maxBytes);
+                if (maximumExtent > UINTPTR_MAX - viewBegin)
+                {
+                    UnmapViewOfFile(view);
+                    return read_shared_memory_result::read_error;
+                }
+
+                const auto limit = viewBegin + maximumExtent;
+                auto current = viewBegin;
+                while (current < limit)
+                {
+                    MEMORY_BASIC_INFORMATION info{};
+                    if (VirtualQuery(reinterpret_cast<const void*>(current), &info, sizeof(info)) != sizeof(info))
+                    {
+                        UnmapViewOfFile(view);
+                        return read_shared_memory_result::read_error;
+                    }
+                    if (info.AllocationBase != view)
+                    {
+                        break;
+                    }
+
+                    const auto regionBegin = reinterpret_cast<uintptr_t>(info.BaseAddress);
+                    if (regionBegin > current || info.RegionSize > UINTPTR_MAX - regionBegin)
+                    {
+                        UnmapViewOfFile(view);
+                        return read_shared_memory_result::read_error;
+                    }
+                    const auto regionEnd = regionBegin + info.RegionSize;
+                    if (regionEnd <= current)
+                    {
+                        UnmapViewOfFile(view);
+                        return read_shared_memory_result::read_error;
+                    }
+                    current = std::min(regionEnd, limit);
+                }
+
+                const auto viewExtent = current - viewBegin;
+                if (viewExtent <= delta)
+                {
+                    UnmapViewOfFile(view);
+                    return read_shared_memory_result::read_error;
+                }
+                toRead = std::min(viewExtent - delta, static_cast<size_t>(maxBytes));
+            }
+        }
+
+        struct mapped_view
+        {
+            void* value;
+            ~mapped_view()
+            {
+                if (value)
+                {
+                    UnmapViewOfFile(value);
+                }
+            }
+        } viewGuard{ view };
+
+        const auto first = static_cast<const uint8_t*>(view) + delta;
+        if (!shared_memory_details::is_readable_range(first, toRead))
+        {
+            return read_shared_memory_result::read_error;
+        }
+
+        try
+        {
+            out.resize(toRead);
+        }
+        catch (...)
+        {
+            out.clear();
+            return read_shared_memory_result::read_error;
+        }
+        if (!shared_memory_details::guarded_copy(out.data(), first, toRead))
+        {
+            out.clear();
+            return read_shared_memory_result::read_error;
+        }
+
+        return read_shared_memory_result::ok;
+    }
 } // til

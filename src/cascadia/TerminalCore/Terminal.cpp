@@ -261,6 +261,15 @@ void Terminal::SetCursorStyle(const DispatchTypes::CursorStyle cursorStyle)
     engine.Dispatch().SetCursorStyle(cursorStyle);
 }
 
+void Terminal::_refreshKittyImageLayers()
+{
+    if (_stateMachine)
+    {
+        auto& engine = reinterpret_cast<OutputStateMachineEngine&>(_stateMachine->Engine());
+        static_cast<AdaptDispatch&>(engine.Dispatch()).RefreshKittyImageLayers();
+    }
+}
+
 void Terminal::SetOptionalFeatures(winrt::Microsoft::Terminal::Core::ICoreSettings settings)
 {
     auto& engine = reinterpret_cast<OutputStateMachineEngine&>(_stateMachine->Engine());

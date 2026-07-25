@@ -7,6 +7,12 @@
 
 #include "../src/inc/unicode.hpp"
 
+#include <wincodec.h>
+#include <wil/com.h>
+#include <wil/resource.h>
+
+#include <til/io.h>
+
 using namespace Microsoft::Terminal::Core;
 using namespace Microsoft::Console::Render;
 using namespace Microsoft::Console::Types;
@@ -386,6 +392,104 @@ void Terminal::ShowNotification(const std::wstring_view title, const std::wstrin
     {
         _pfnShowNotification(title, body);
     }
+}
+
+// Decodes an encoded image (PNG etc.) into premultiplied BGRA pixels using WIC.
+// Returns false on any failure; never throws.
+bool Terminal::DecodeImageToBgra(const std::span<const uint8_t> data, std::vector<RGBQUAD>& pixels, til::size& size) noexcept
+try
+{
+    pixels.clear();
+    if (data.empty())
+    {
+        return false;
+    }
+
+    // WIC requires COM. It may already be initialized on this thread (in either
+    // apartment, both fine for WIC); only balance the call we actually made.
+    const auto coInitHr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    const auto coUninit = wil::scope_exit([coInitHr]() noexcept {
+        if (SUCCEEDED(coInitHr))
+        {
+            CoUninitialize();
+        }
+    });
+
+    const auto factory = wil::CoCreateInstance<IWICImagingFactory2>(CLSID_WICImagingFactory2);
+
+    wil::com_ptr<IWICStream> stream;
+    THROW_IF_FAILED(factory->CreateStream(stream.addressof()));
+    THROW_IF_FAILED(stream->InitializeFromMemory(const_cast<WICInProcPointer>(data.data()), gsl::narrow<DWORD>(data.size())));
+
+    wil::com_ptr<IWICBitmapDecoder> decoder;
+    THROW_IF_FAILED(factory->CreateDecoderFromStream(stream.get(), nullptr, WICDecodeMetadataCacheOnDemand, decoder.addressof()));
+
+    // Kitty's f=100 means PNG specifically; reject any other container WIC accepts.
+    GUID container{};
+    THROW_IF_FAILED(decoder->GetContainerFormat(&container));
+    if (container != GUID_ContainerFormatPng)
+    {
+        return false;
+    }
+
+    wil::com_ptr<IWICBitmapFrameDecode> frame;
+    THROW_IF_FAILED(decoder->GetFrame(0, frame.addressof()));
+
+    UINT width = 0;
+    UINT height = 0;
+    THROW_IF_FAILED(frame->GetSize(&width, &height));
+    // Bound the decoded size so a small but hostile image can't claim enormous
+    // dimensions and force a multi-gigabyte allocation.
+    if (width == 0 || height == 0 || static_cast<uint64_t>(width) * height > 64ull * 1024 * 1024)
+    {
+        return false;
+    }
+
+    wil::com_ptr<IWICFormatConverter> converter;
+    THROW_IF_FAILED(factory->CreateFormatConverter(converter.addressof()));
+    THROW_IF_FAILED(converter->Initialize(frame.get(), GUID_WICPixelFormat32bppPBGRA, WICBitmapDitherTypeNone, nullptr, 0.0, WICBitmapPaletteTypeCustom));
+
+    pixels.resize(static_cast<size_t>(width) * height);
+    const auto stride = width * static_cast<UINT>(sizeof(RGBQUAD));
+    const auto bufferSize = gsl::narrow<UINT>(pixels.size() * sizeof(RGBQUAD));
+    THROW_IF_FAILED(converter->CopyPixels(nullptr, stride, bufferSize, reinterpret_cast<BYTE*>(pixels.data())));
+
+    size = { static_cast<til::CoordType>(width), static_cast<til::CoordType>(height) };
+    return true;
+}
+catch (...)
+{
+    pixels.clear();
+    return false;
+}
+
+til::size Terminal::GetCellSize() const noexcept
+{
+    const auto size = _fontInfo.GetSize();
+    // Before the renderer reports the real font (via SetFontInfo), _fontInfo is a
+    // placeholder whose width is 0. Clamping that to 1 would lay images out on a
+    // degenerate 1px-per-cell grid, stretching them ~cell-width times horizontally.
+    // Fall back to a sane default cell (matching conhost/Sixel) until the real font
+    // is known, so images render at a correct grid rather than badly stretched.
+    if (size.width < 2 || size.height < 2)
+    {
+        return { 10, 20 };
+    }
+    return size;
+}
+
+til::read_image_result Terminal::ReadKittyImageFile(const std::wstring_view path, uint64_t offset, uint64_t size, bool deleteAfter, std::vector<uint8_t>& out) noexcept
+{
+    // Windows Terminal is the final terminal in the chain, so it owns deletion of a t=t
+    // temporary file (conhost suppresses its own delete under ConPTY). The shared helper
+    // still enforces local fixed-drive reads and temp-dir + marker containment before it
+    // removes anything.
+    return til::read_image_file(path, offset, size, deleteAfter, out);
+}
+
+til::read_shared_memory_result Terminal::ReadKittySharedMemory(const std::wstring_view name, uint64_t offset, uint64_t size, std::vector<uint8_t>& out) noexcept
+{
+    return til::read_shared_memory(name, offset, size, out);
 }
 
 void Terminal::NotifyBufferRotation(const int delta)

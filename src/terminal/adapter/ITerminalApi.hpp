@@ -22,6 +22,9 @@ Author(s):
 
 #include <deque>
 #include <memory>
+#include <span>
+
+#include <til/io.h>
 
 namespace Microsoft::Console::VirtualTerminal
 {
@@ -94,5 +97,43 @@ namespace Microsoft::Console::VirtualTerminal
         virtual void SearchMissingCommand(const std::wstring_view command) = 0;
 
         virtual void ShowNotification(const std::wstring_view title, const std::wstring_view body) = 0;
+
+        // Decodes an encoded image (e.g. PNG) into premultiplied BGRA pixels. Hosts
+        // without an image decoder (conhost) leave this unimplemented and return
+        // false; the Kitty graphics handler then skips display of that image.
+        virtual bool DecodeImageToBgra(const std::span<const uint8_t> /*data*/, std::vector<RGBQUAD>& /*pixels*/, til::size& /*size*/) noexcept
+        {
+            return false;
+        }
+
+        // Reads the contents of an image file for Kitty graphics file/temporary
+        // transmission (t=f / t=t). Reads up to 'size' bytes (or to EOF when size==0)
+        // starting at byte 'offset' into 'out'; the host bounds the read to a safe
+        // maximum so a hostile size cannot force an unbounded allocation. When
+        // 'deleteAfter' is true (t=t) the host deletes the file after a successful
+        // read ONLY if it resides under the system temporary directory, so the medium
+        // cannot be abused to delete arbitrary files. Hosts without file access (e.g.
+        // the unit-test mock by default) leave this unimplemented and return
+        // read_image_result::read_error; the caller then maps the result to the kitty
+        // file error codes (not_found -> ENOENT, invalid -> EINVAL, read_error -> EBADF).
+        virtual til::read_image_result ReadKittyImageFile(const std::wstring_view /*path*/, uint64_t /*offset*/, uint64_t /*size*/, bool /*deleteAfter*/, std::vector<uint8_t>& /*out*/) noexcept
+        {
+            return til::read_image_result::read_error;
+        }
+
+        // Copies bytes from a named, session-local Windows file mapping for Kitty
+        // graphics shared-memory transmission (t=s). The host opens it read-only,
+        // bounds the copy, and closes it before returning.
+        virtual til::read_shared_memory_result ReadKittySharedMemory(const std::wstring_view /*name*/, uint64_t /*offset*/, uint64_t /*size*/, std::vector<uint8_t>& /*out*/) noexcept
+        {
+            return til::read_shared_memory_result::read_error;
+        }
+
+        // Returns the pixel size of a text cell, used to lay out graphics images.
+        // The default is a reasonable fallback; hosts with real font metrics override.
+        virtual til::size GetCellSize() const noexcept
+        {
+            return { 10, 20 };
+        }
     };
 }

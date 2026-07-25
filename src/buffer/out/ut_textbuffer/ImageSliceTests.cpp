@@ -29,6 +29,8 @@ class ImageSliceTests
     TEST_METHOD(ErasingAColumnRangeSparesTheRest);
     TEST_METHOD(LayerCountIsCapped);
     TEST_METHOD(LayerBudgetIsReturnedOnDestruction);
+    TEST_METHOD(EqualZOrdersByImageIdNotWriteOrder);
+    TEST_METHOD(LayersCompositeSourceOver);
     TEST_METHOD(RenderPositionRevisionsNeverCollide);
     TEST_METHOD(UnlayeredContentIsNotCopiedToComposite);
     TEST_METHOD(CopyingReplacesDestinationLayers);
@@ -246,8 +248,42 @@ void ImageSliceTests::LayerCountIsCapped()
         const auto pixels = slice.MutablePixels(0, 1, ImageSlice::LayerKey{ i + 1, 0 }, 0);
         VERIFY_IS_NOT_NULL(pixels);
     }
-    // One past the cap is refused rather than accepted.
-    VERIFY_IS_NULL(slice.MutablePixels(0, 1, ImageSlice::LayerKey{ 0xF0000000, 0 }, 0));
+    // One past the cap is refused rather than accepted. A caller that asked for a
+    // layer it needs gets an exception, because carrying on without the pixels it
+    // was handed is never right; a caller that only wanted the layer if it fit
+    // asks for that explicitly and gets a null it is obliged to check.
+    VERIFY_THROWS(slice.MutablePixels(0, 1, ImageSlice::LayerKey{ 0xF0000000, 0 }, 0), std::bad_alloc);
+    VERIFY_IS_NULL(slice.TryMutablePixels(0, 1, ImageSlice::LayerKey{ 0xF0000000, 0 }, 0));
+}
+
+void ImageSliceTests::EqualZOrdersByImageIdNotWriteOrder()
+{
+    ImageSlice slice{ CellSize };
+    // Written highest-id first, so insertion order and identity order disagree.
+    Fill(slice, slice.MutablePixels(0, 1, ImageSlice::LayerKey{ 2, 20 }, 7), 1, Blue);
+    Fill(slice, slice.MutablePixels(0, 1, ImageSlice::LayerKey{ 1, 10 }, 7), 1, Red);
+
+    const auto pixels = slice.Pixels(ImageSlice::RenderPosition::AboveText);
+    VERIFY_ARE_EQUAL(Packed(Blue), Packed(pixels[0]), L"the higher image id must win at equal z");
+}
+
+void ImageSliceTests::LayersCompositeSourceOver()
+{
+    static constexpr RGBQUAD HalfRed{ 0, 0, 128, 128 };
+    static constexpr RGBQUAD HalfGreen{ 0, 128, 0, 128 };
+
+    ImageSlice slice{ CellSize };
+    Fill(slice, slice.MutablePixels(0, 1, ImageSlice::LayerKey{ 1, 10 }, 0), 1, HalfRed);
+    Fill(slice, slice.MutablePixels(0, 1, ImageSlice::LayerKey{ 2, 20 }, 0), 1, HalfGreen);
+
+    // Premultiplied source-over: dst = src + dst * (1 - srcAlpha). Half-green over
+    // half-red keeps all of the green and just under half of the red, rather than
+    // the top layer simply replacing what is beneath it.
+    const auto pixel = slice.Pixels(ImageSlice::RenderPosition::AboveText)[0];
+    VERIFY_ARE_EQUAL(64, static_cast<int>(pixel.rgbRed));
+    VERIFY_ARE_EQUAL(128, static_cast<int>(pixel.rgbGreen));
+    VERIFY_ARE_EQUAL(0, static_cast<int>(pixel.rgbBlue));
+    VERIFY_ARE_EQUAL(192, static_cast<int>(pixel.rgbReserved));
 }
 
 void ImageSliceTests::LayerBudgetIsReturnedOnDestruction()

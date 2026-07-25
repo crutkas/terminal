@@ -52,6 +52,8 @@ public:
     // Layers below this z composite behind the cell background rather than
     // merely behind the text.
     static constexpr int32_t BackgroundZThreshold = INT32_MIN / 2;
+    // Marks a pixel that samples nothing, so an image update leaves it alone.
+    static constexpr uint32_t NoSourceIndex = UINT32_MAX;
     // A process-wide ceiling on identified layer storage, plus a per-slice
     // layer count limit, so a stream of images cannot exhaust memory.
     static constexpr size_t MaxLayerBytes = 320ull * 1024ull * 1024ull;
@@ -84,21 +86,44 @@ public:
 
     // Identified-layer access. The untagged base plane is unaffected by these.
     RGBQUAD* MutablePixels(const til::CoordType columnBegin, const til::CoordType columnEnd, const LayerKey key, const int32_t zIndex);
+    RGBQUAD* TryMutablePixels(const til::CoordType columnBegin, const til::CoordType columnEnd, const LayerKey key, const int32_t zIndex);
+    bool PlacementCoversColumn(const uint64_t placementId, const til::CoordType column) const noexcept;
+    // Records which source-image pixel each written pixel sampled, so the layer
+    // can be re-sampled in place when the source image's content changes. The
+    // span is laid out exactly like the pixels returned by MutablePixels.
+    uint32_t* MutableSourceIndices(const til::CoordType columnBegin, const til::CoordType columnEnd, const LayerKey key, const int32_t zIndex);
+    bool UpdateImage(const uint32_t imageId, const std::span<const RGBQUAD> pixels);
+    // An upper bound on the bytes a MutablePixels write of this range would add,
+    // so a caller can refuse a placement before allocating any of it.
+    size_t WriteMemoryUpperBound(const til::CoordType columnBegin, const til::CoordType columnEnd, const LayerKey key, const int32_t zIndex) const noexcept;
     bool Contains(const uint32_t imageId) const noexcept;
     bool Contains(const LayerKey key) const noexcept;
     bool LayerCoversColumn(const LayerKey key, const til::CoordType column) const noexcept;
+    uint32_t ColumnOwner(const til::CoordType column) const noexcept;
+    bool ContainsPlacement(const uint64_t placementId) const noexcept;
     std::vector<LayerKey> LayersAtColumn(const til::CoordType column) const;
     std::vector<LayerKey> LayersAtZ(const int32_t zIndex) const;
+    std::vector<LayerKey> LayersAtZ(const int32_t zIndex, const til::CoordType column) const;
     bool EraseLayer(const uint32_t imageId);
     bool EraseLayer(const LayerKey key);
     bool EraseLayer(const uint32_t imageId, const til::CoordType columnBegin, const til::CoordType columnEnd);
+    bool EraseLayer(const uint32_t imageId, const int32_t zIndex);
+    // Drops every identified layer covering these columns, leaving the untagged
+    // base plane alone. Used when untagged content claims cells an identified
+    // layer was covering.
+    void ClearLayers(const til::CoordType columnBegin, const til::CoordType columnEnd);
 
     static void CopyBlock(const TextBuffer& srcBuffer, const til::rect srcRect, TextBuffer& dstBuffer, const til::rect dstRect);
     static void CopyRow(const ROW& srcRow, ROW& dstRow);
     static void CopyCells(const ROW& srcRow, const til::CoordType srcColumn, ROW& dstRow, const til::CoordType dstColumnBegin, const til::CoordType dstColumnEnd);
+    static void CopyLayerCells(const ROW& srcRow, const til::CoordType srcColumn, ROW& dstRow, const til::CoordType dstColumnBegin, const til::CoordType dstColumnEnd, const LayerKey key);
+    // Folds a slice set aside before a destructive copy back into a row, filling
+    // only cells the row does not already cover.
+    static void MergePreservedCells(Pointer srcSlice, ROW& dstRow);
     static void EraseBlock(TextBuffer& buffer, const til::rect rect);
     static void EraseCells(TextBuffer& buffer, const til::point at, const til::CoordType distance);
     static void EraseCells(ROW& row, const til::CoordType columnBegin, const til::CoordType columnEnd);
+    static void EraseLayerCells(ROW& row, const til::CoordType columnBegin, const til::CoordType columnEnd, const LayerKey key);
 
 private:
     // One identified plane of pixels. Layers composite in ascending zIndex
@@ -108,6 +133,9 @@ private:
         LayerKey key;
         int32_t zIndex = 0;
         std::vector<RGBQUAD> pixels;
+        // Which source-image pixel each entry of `pixels` sampled, so the layer
+        // survives its image being redrawn. NoSourceIndex means "not sampled".
+        std::vector<uint32_t> sourceIndices;
         // One flag per column in [_columnBegin, _columnEnd) marking the cells
         // this layer actually covers, so an erase can target only those cells
         // without disturbing another layer that overlaps the same range.
@@ -135,6 +163,10 @@ private:
     bool _hasContent() const noexcept;
     bool _copyCells(const ImageSlice& srcSlice, const til::CoordType srcColumn, const til::CoordType dstColumnBegin, const til::CoordType dstColumnEnd);
     void _copyLayers(const ImageSlice& srcSlice, const til::CoordType srcColumn, const til::CoordType dstColumnBegin, const til::CoordType dstColumnEnd);
+    bool _copyLayerCells(const ImageSlice& srcSlice, const til::CoordType srcColumn, const til::CoordType dstColumnBegin, const til::CoordType dstColumnEnd, const LayerKey key);
+    bool _eraseLayerCells(const til::CoordType columnBegin, const til::CoordType columnEnd, const LayerKey key);
+    void _mergePreservedCells(const ImageSlice& srcSlice);
+    bool _baseCellHasPixels(const til::CoordType column) const noexcept;
     bool _eraseCells(const til::CoordType columnBegin, const til::CoordType columnEnd);
     void _eraseBasePlane(const til::CoordType columnBegin, const til::CoordType columnEnd) noexcept;
 

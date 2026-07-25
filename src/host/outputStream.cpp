@@ -13,6 +13,8 @@
 
 #include "../interactivity/inc/ServiceLocator.hpp"
 
+#include <til/io.h>
+
 #pragma hdrstop
 
 using namespace Microsoft::Console;
@@ -462,4 +464,32 @@ void ConhostInternalGetSet::SearchMissingCommand(std::wstring_view /*missingComm
 void ConhostInternalGetSet::ShowNotification(std::wstring_view /*title*/, std::wstring_view /*body*/)
 {
     // Not implemented for conhost.
+}
+
+til::read_image_result ConhostInternalGetSet::ReadKittyImageFile(const std::wstring_view path, uint64_t offset, uint64_t size, bool deleteAfter, std::vector<uint8_t>& out) noexcept
+{
+    // Under ConPTY, conhost is parse-only: it has no renderer, its ACK is suppressed
+    // (ReturnResponse early-returns in VtIo mode), and the raw APC is forwarded verbatim to
+    // the connected terminal (e.g. Windows Terminal), which performs the file read and owns
+    // t=t deletion. Reading the file here would be redundant filesystem access in the wrong
+    // process context (and deleting it would remove it before the terminal can read it), so
+    // skip the read entirely and let the final terminal handle the transmission.
+    if (IsConPTY())
+    {
+        out.clear();
+        return til::read_image_result::read_error;
+    }
+    return til::read_image_file(path, offset, size, deleteAfter, out);
+}
+
+til::read_shared_memory_result ConhostInternalGetSet::ReadKittySharedMemory(const std::wstring_view name, uint64_t offset, uint64_t size, std::vector<uint8_t>& out) noexcept
+{
+    // Under ConPTY the final terminal receives the raw APC and owns the mapping read.
+    // Avoid a redundant read in conhost, matching the t=f/t=t path above.
+    if (IsConPTY())
+    {
+        out.clear();
+        return til::read_shared_memory_result::read_error;
+    }
+    return til::read_shared_memory(name, offset, size, out);
 }
