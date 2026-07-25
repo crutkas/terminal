@@ -735,13 +735,9 @@ try
         plane = _imagePlane;
     }
 
-    if (_imageMask.size() < plane.size())
-    {
-        _imageMask.resize(plane.size());
-    }
-
-    // Whatever survives here is what the text has to avoid painting over. It's
-    // recorded after masking, so a cell whose background won stays uncovered.
+    // Whatever survives here is what the text has to avoid painting over. It is
+    // recorded after the background mask has been applied, so a cell whose own
+    // background won stays uncovered.
     if (underText && !_underlayColumns.empty())
     {
         for (auto column = 0; column < columnCount; column++)
@@ -777,27 +773,87 @@ try
 
     auto allOpaque = true;
     auto allTransparent = true;
-    for (size_t i = 0; i < plane.size(); i++)
+    for (const auto& pixel : plane)
     {
-        const auto opaque = til::at(plane, i).rgbReserved != 0;
-        allOpaque &= opaque;
-        allTransparent &= !opaque;
-        til::at(_imageMask, i) = (opaque ? 0 : 0xFFFFFF);
+        allOpaque &= pixel.rgbReserved == 0xff;
+        allTransparent &= pixel.rgbReserved == 0;
+    }
+
+    if (allTransparent)
+    {
+        return S_OK;
     }
 
     if (allOpaque)
     {
         StretchDIBits(_hdcMemoryContext, x, y, dstWidth, dstHeight, 0, 0, srcWidth, srcHeight, plane.data(), &bitmapInfo, DIB_RGB_COLORS, SRCCOPY);
+        return S_OK;
     }
-    else if (!allTransparent)
-    {
-        StretchDIBits(_hdcMemoryContext, x, y, dstWidth, dstHeight, 0, 0, srcWidth, srcHeight, _imageMask.data(), &bitmapInfo, DIB_RGB_COLORS, SRCAND);
-        StretchDIBits(_hdcMemoryContext, x, y, dstWidth, dstHeight, 0, 0, srcWidth, srcHeight, plane.data(), &bitmapInfo, DIB_RGB_COLORS, SRCPAINT);
-    }
+
+    // Anything else has to be blended rather than masked. A mask can only say
+    // "this pixel, or that one", which is all Sixel ever needed because its
+    // pixels are either fully there or not there at all. A pixel that is only
+    // partly opaque has to end up over what the cell already holds, and with
+    // premultiplied planes that is precisely what AC_SRC_ALPHA does.
+    RGBQUAD* bits = nullptr;
+    RETURN_IF_FAILED(_PrepareImageSourceSurface({ srcWidth, srcHeight }, &bits));
+    memcpy(bits, plane.data(), plane.size_bytes());
+
+    constexpr BLENDFUNCTION blend{ .BlendOp = AC_SRC_OVER, .BlendFlags = 0, .SourceConstantAlpha = 255, .AlphaFormat = AC_SRC_ALPHA };
+    RETURN_HR_IF(E_FAIL, !GdiAlphaBlend(_hdcMemoryContext, x, y, dstWidth, dstHeight, _hdcImageSource.get(), 0, 0, srcWidth, srcHeight, blend));
 
     return S_OK;
 }
 CATCH_RETURN();
+
+// Routine Description:
+// - Hands back a device context holding a top-down 32bpp surface of this size,
+//   creating or resizing it as needed, so that image content can be blended from
+//   it. GDI can only blend between device contexts, not from loose pixels.
+// Arguments:
+// - size - the surface size required, in pixels
+// - bits - receives the surface's pixels, laid out top row first
+// Return Value:
+// - S_OK or a GDI failure.
+[[nodiscard]] HRESULT GdiEngine::_PrepareImageSourceSurface(const til::size size, _Outptr_result_maybenull_ RGBQUAD** const bits) noexcept
+{
+    *bits = nullptr;
+    RETURN_HR_IF(E_INVALIDARG, size.width <= 0 || size.height <= 0);
+
+    if (!_hdcImageSource)
+    {
+        _hdcImageSource.reset(CreateCompatibleDC(nullptr));
+        RETURN_LAST_ERROR_IF_NULL(_hdcImageSource.get());
+    }
+
+    if (!_hbitmapImageSource || _szImageSource != size)
+    {
+        const BITMAPINFO info{
+            .bmiHeader = {
+                .biSize = sizeof(BITMAPINFOHEADER),
+                .biWidth = size.width,
+                .biHeight = -size.height,
+                .biPlanes = 1,
+                .biBitCount = 32,
+                .biCompression = BI_RGB,
+            }
+        };
+
+        void* surface = nullptr;
+        wil::unique_hbitmap bitmap{ CreateDIBSection(_hdcImageSource.get(), &info, DIB_RGB_COLORS, &surface, nullptr, 0) };
+        RETURN_LAST_ERROR_IF_NULL(bitmap.get());
+        // Selecting the replacement first is what releases the one being
+        // replaced, which has to happen before it is destroyed below.
+        RETURN_LAST_ERROR_IF_NULL(SelectObject(_hdcImageSource.get(), bitmap.get()));
+
+        _hbitmapImageSource = std::move(bitmap);
+        _szImageSource = size;
+        _imageSourceBits = static_cast<RGBQUAD*>(surface);
+    }
+
+    *bits = _imageSourceBits;
+    return S_OK;
+}
 
 [[nodiscard]] HRESULT GdiEngine::BeginRowImages(const ImageSlice& imageSlice,
                                                 const til::CoordType targetRow,

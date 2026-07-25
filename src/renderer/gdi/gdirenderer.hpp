@@ -178,8 +178,14 @@ namespace Microsoft::Console::Render
         std::pmr::vector<std::pmr::wstring> _polyStrings;
         std::pmr::vector<std::pmr::vector<int>> _polyWidths;
 
-        std::vector<DWORD> _imageMask;
         std::vector<RGBQUAD> _imagePlane;
+        // A DIB section to blend image content from. Declared before the device
+        // context that selects it so that the context is destroyed first and the
+        // bitmap is no longer selected anywhere by the time it goes.
+        wil::unique_hbitmap _hbitmapImageSource;
+        wil::unique_hdc _hdcImageSource;
+        til::size _szImageSource;
+        RGBQUAD* _imageSourceBits = nullptr;
         const ImageSlice* _rowImageSlice = nullptr;
         til::CoordType _rowImageTargetRow = 0;
         til::CoordType _rowImageViewportLeft = 0;
@@ -200,8 +206,8 @@ namespace Microsoft::Console::Render
                                                til::CoordType viewportLeft,
                                                std::span<const uint8_t> defaultBackgroundMask,
                                                bool underText) noexcept;
-        bool _UnderlayCoversColumn(til::CoordType column) const noexcept;
-        bool _UnderlayCoversBufferCell(til::CoordType bufferColumn) const noexcept;
+        [[nodiscard]] HRESULT _PrepareImageSourceSurface(til::size size, _Outptr_result_maybenull_ RGBQUAD** bits) noexcept;
+        bool _UnderlayCoversColumn(til::CoordType column) const noexcept;        bool _UnderlayCoversBufferCell(til::CoordType bufferColumn) const noexcept;
         bool _UnderlayCoversAnyOf(til::CoordType columnBegin, til::CoordType columnEnd) const noexcept;
         [[nodiscard]] HRESULT _FillUncoveredRunBackground(const RECT& runRect, til::CoordType fontWidth) noexcept;
 
