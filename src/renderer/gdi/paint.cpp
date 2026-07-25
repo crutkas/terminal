@@ -40,6 +40,10 @@ bool GdiEngine::FontHasWesternScript(HDC hdc)
 
     // At the beginning of a new frame, we have 0 lines ready for painting in PolyTextOut
     _cPolyText = 0;
+    // A row that failed mid-paint could have left these set, and stale underlay
+    // state would suppress cell backgrounds on unrelated rows.
+    _underlayColumns.clear();
+    _rowImageSlice = nullptr;
 
     // Prepare our in-memory bitmap for double-buffered composition.
     RETURN_IF_FAILED(_PrepareMemoryBitmap(_hwndTargetWindow));
@@ -425,6 +429,21 @@ bool GdiEngine::FontHasWesternScript(HDC hdc)
             pPolyTextLine->rcl.left += coordFontSize.width;
         }
 
+        // ETO_OPAQUE fills the cell background, which would paint over image
+        // content this row has sitting below its text. Where the image is
+        // visible under every cell of the run, drop the fill and let the image
+        // be the background. `rcl` is pre-transform, so it is in buffer columns
+        // times the font width; the slice indexes screen columns.
+        if (!_underlayColumns.empty() && coordFontSize.width > 0)
+        {
+            const auto beginColumn = (pPolyTextLine->rcl.left / coordFontSize.width) << _underlayScale;
+            const auto endColumn = (pPolyTextLine->rcl.right / coordFontSize.width) << _underlayScale;
+            if (_UnderlayCoversColumns(beginColumn, endColumn))
+            {
+                WI_ClearFlag(pPolyTextLine->uiFlags, ETO_OPAQUE);
+            }
+        }
+
         _cPolyText++;
 
         if (_cPolyText >= s_cPolyTextCache)
@@ -666,28 +685,81 @@ try
 }
 CATCH_RETURN();
 
-[[nodiscard]] HRESULT GdiEngine::PaintImageSlice(const ImageSlice& imageSlice,
+[[nodiscard]] HRESULT GdiEngine::_PaintImagePlane(const ImageSlice& imageSlice,
+                                                 const ImageSlice::RenderPosition position,
                                                  const til::CoordType targetRow,
-                                                 const til::CoordType viewportLeft) noexcept
+                                                 const til::CoordType viewportLeft,
+                                                 const std::span<const uint8_t> defaultBackgroundMask,
+                                                 const bool underText) noexcept
 try
 {
-    LOG_IF_FAILED(_FlushBufferLines());
-    LOG_IF_FAILED(ResetLineTransform());
-
-    const auto& imagePixels = imageSlice.Pixels();
-    if (_imageMask.size() < imagePixels.size())
+    if (!imageSlice.HasPixels(position))
     {
-        _imageMask.resize(imagePixels.size());
+        return S_OK;
     }
 
     const auto srcCellSize = imageSlice.CellSize();
     const auto dstCellSize = _GetFontSize();
+    RETURN_HR_IF(S_OK, srcCellSize.width <= 0 || srcCellSize.height <= 0);
+
     const auto srcWidth = imageSlice.PixelWidth();
     const auto srcHeight = srcCellSize.height;
     const auto dstWidth = srcWidth * dstCellSize.width / srcCellSize.width;
     const auto dstHeight = dstCellSize.height;
     const auto x = (imageSlice.ColumnOffset() - viewportLeft) * dstCellSize.width;
     const auto y = targetRow * dstCellSize.height;
+    const auto columnCount = srcWidth / srcCellSize.width;
+
+    auto plane = imageSlice.Pixels(position);
+    if (defaultBackgroundMask.size() == gsl::narrow_cast<size_t>(columnCount))
+    {
+        // Content below the background is only visible through cells whose
+        // background is the default one. Blanking the rest makes it transparent
+        // to the compositing below, which is exactly what we want.
+        _imagePlane.assign(plane.begin(), plane.end());
+        for (auto column = 0; column < columnCount; column++)
+        {
+            if (til::at(defaultBackgroundMask, gsl::narrow_cast<size_t>(column)) != 0)
+            {
+                continue;
+            }
+            for (auto pixelRow = 0; pixelRow < srcHeight; pixelRow++)
+            {
+                const auto first = _imagePlane.data() + gsl::narrow_cast<size_t>(pixelRow) * srcWidth + gsl::narrow_cast<size_t>(column) * srcCellSize.width;
+                std::fill_n(first, srcCellSize.width, RGBQUAD{});
+            }
+        }
+        plane = _imagePlane;
+    }
+
+    if (_imageMask.size() < plane.size())
+    {
+        _imageMask.resize(plane.size());
+    }
+
+    // Whatever survives here is what the text has to avoid painting over. It's
+    // recorded after masking, so a cell whose background won stays uncovered.
+    if (underText && !_underlayColumns.empty())
+    {
+        for (auto column = 0; column < columnCount; column++)
+        {
+            const auto slot = gsl::narrow_cast<size_t>(column);
+            if (slot >= _underlayColumns.size() || til::at(_underlayColumns, slot) != 0)
+            {
+                continue;
+            }
+            for (auto pixelRow = 0; pixelRow < srcHeight; pixelRow++)
+            {
+                const auto first = plane.data() + gsl::narrow_cast<size_t>(pixelRow) * srcWidth + gsl::narrow_cast<size_t>(column) * srcCellSize.width;
+                const auto opaque = std::any_of(first, first + srcCellSize.width, [](const RGBQUAD& pixel) noexcept { return pixel.rgbReserved != 0; });
+                if (opaque)
+                {
+                    til::at(_underlayColumns, slot) = 1;
+                    break;
+                }
+            }
+        }
+    }
 
     auto bitmapInfo = BITMAPINFO{
         .bmiHeader = {
@@ -702,9 +774,9 @@ try
 
     auto allOpaque = true;
     auto allTransparent = true;
-    for (size_t i = 0; i < imagePixels.size(); i++)
+    for (size_t i = 0; i < plane.size(); i++)
     {
-        const auto opaque = til::at(imagePixels, i).rgbReserved != 0;
+        const auto opaque = til::at(plane, i).rgbReserved != 0;
         allOpaque &= opaque;
         allTransparent &= !opaque;
         til::at(_imageMask, i) = (opaque ? 0 : 0xFFFFFF);
@@ -712,12 +784,92 @@ try
 
     if (allOpaque)
     {
-        StretchDIBits(_hdcMemoryContext, x, y, dstWidth, dstHeight, 0, 0, srcWidth, srcHeight, imagePixels.data(), &bitmapInfo, DIB_RGB_COLORS, SRCCOPY);
+        StretchDIBits(_hdcMemoryContext, x, y, dstWidth, dstHeight, 0, 0, srcWidth, srcHeight, plane.data(), &bitmapInfo, DIB_RGB_COLORS, SRCCOPY);
     }
     else if (!allTransparent)
     {
         StretchDIBits(_hdcMemoryContext, x, y, dstWidth, dstHeight, 0, 0, srcWidth, srcHeight, _imageMask.data(), &bitmapInfo, DIB_RGB_COLORS, SRCAND);
-        StretchDIBits(_hdcMemoryContext, x, y, dstWidth, dstHeight, 0, 0, srcWidth, srcHeight, imagePixels.data(), &bitmapInfo, DIB_RGB_COLORS, SRCPAINT);
+        StretchDIBits(_hdcMemoryContext, x, y, dstWidth, dstHeight, 0, 0, srcWidth, srcHeight, plane.data(), &bitmapInfo, DIB_RGB_COLORS, SRCPAINT);
+    }
+
+    return S_OK;
+}
+CATCH_RETURN();
+
+[[nodiscard]] HRESULT GdiEngine::BeginRowImages(const ImageSlice& imageSlice,
+                                                const til::CoordType targetRow,
+                                                const til::CoordType viewportLeft,
+                                                const std::span<const uint8_t> defaultBackgroundMask) noexcept
+try
+{
+    // Text is buffered until something forces it out, so flushing here means
+    // only this row's text can end up above what we're about to paint.
+    LOG_IF_FAILED(_FlushBufferLines());
+
+    const auto srcCellSize = imageSlice.CellSize();
+    _underlayColumns.clear();
+    _underlayColumnOffset = imageSlice.ColumnOffset();
+    // The rendition is already baked into the slice's own geometry, but the
+    // text's coordinates are not, so runs get scaled up to match.
+    _underlayScale = _currentLineRendition != LineRendition::SingleWidth ? 1 : 0;
+    if (srcCellSize.width > 0)
+    {
+        _underlayColumns.assign(gsl::narrow_cast<size_t>(imageSlice.PixelWidth() / srcCellSize.width), uint8_t{ 0 });
+    }
+
+    // The slice already accounts for line rendition in its own geometry, so it
+    // is painted untransformed. The row's text still needs the transform.
+    const auto rendition = _currentLineRendition;
+    LOG_IF_FAILED(ResetLineTransform());
+
+    LOG_IF_FAILED(_PaintImagePlane(imageSlice, ImageSlice::RenderPosition::BehindBackground, targetRow, viewportLeft, defaultBackgroundMask, true));
+    LOG_IF_FAILED(_PaintImagePlane(imageSlice, ImageSlice::RenderPosition::BehindText, targetRow, viewportLeft, {}, true));
+
+    LOG_IF_FAILED(PrepareLineTransform(rendition, targetRow, viewportLeft));
+
+    _rowImageSlice = &imageSlice;
+    _rowImageTargetRow = targetRow;
+    _rowImageViewportLeft = viewportLeft;
+
+    return S_OK;
+}
+CATCH_RETURN();
+
+// Reports whether image content below the text covers every one of these
+// screen columns, in which case the text must not fill its own background.
+bool GdiEngine::_UnderlayCoversColumns(const til::CoordType columnBegin, const til::CoordType columnEnd) const noexcept
+{
+    if (_underlayColumns.empty() || columnBegin >= columnEnd || columnBegin < _underlayColumnOffset)
+    {
+        return false;
+    }
+
+    for (auto column = columnBegin; column < columnEnd; column++)
+    {
+        const auto index = gsl::narrow_cast<size_t>(column - _underlayColumnOffset);
+        if (index >= _underlayColumns.size() || til::at(_underlayColumns, index) == 0)
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+[[nodiscard]] HRESULT GdiEngine::EndRowImages() noexcept
+try
+{
+    // Push the row's text out over whatever was painted below it...
+    _underlayColumns.clear();
+    LOG_IF_FAILED(_FlushBufferLines());
+
+    // ...and only then put the above-text content on top of all of it.
+    if (_rowImageSlice)
+    {
+        const auto rendition = _currentLineRendition;
+        LOG_IF_FAILED(ResetLineTransform());
+        LOG_IF_FAILED(_PaintImagePlane(*_rowImageSlice, ImageSlice::RenderPosition::AboveText, _rowImageTargetRow, _rowImageViewportLeft, {}, false));
+        LOG_IF_FAILED(PrepareLineTransform(rendition, _rowImageTargetRow, _rowImageViewportLeft));
+        _rowImageSlice = nullptr;
     }
 
     return S_OK;

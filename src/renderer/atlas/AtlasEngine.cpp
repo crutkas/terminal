@@ -261,9 +261,12 @@ try
 
     for (const auto r : _p.rows)
     {
-        if (r->bitmap.revision != 0 && !r->bitmap.active)
+        for (auto& bitmap : r->bitmaps)
         {
-            r->bitmap = {};
+            if (bitmap.revision != 0 && !bitmap.active)
+            {
+                bitmap = {};
+            }
         }
     }
 
@@ -545,49 +548,105 @@ try
 }
 CATCH_RETURN()
 
-[[nodiscard]] HRESULT AtlasEngine::PaintImageSlice(const ImageSlice& imageSlice, const til::CoordType targetRow, const til::CoordType viewportLeft) noexcept
+[[nodiscard]] HRESULT AtlasEngine::BeginRowImages(const ImageSlice& imageSlice, const til::CoordType targetRow, const til::CoordType viewportLeft, const std::span<const uint8_t> defaultBackgroundMask) noexcept
 try
 {
     const auto y = clamp<til::CoordType>(targetRow, 0, _p.s->viewportCellCount.y - 1);
     const auto row = _p.rows[y];
-    const auto revision = imageSlice.Revision();
     const auto srcWidth = std::max(0, imageSlice.PixelWidth());
     const auto srcCellSize = imageSlice.CellSize();
-    auto& b = row->bitmap;
-
-    // If this row's ImageSlice has changed we need to update our snapshot.
-    // Theoretically another _p.rows[y]->bitmap may have this particular revision already,
-    // but that can only happen if we're scrolling _and_ the entire viewport was invalidated.
-    if (b.revision != revision)
+    if (srcCellSize.width <= 0)
     {
-        const auto srcHeight = std::max(0, srcCellSize.height);
-        const auto pixels = imageSlice.Pixels();
-        const auto expectedSize = gsl::narrow_cast<size_t>(srcWidth) * gsl::narrow_cast<size_t>(srcHeight);
-
-        // Sanity check.
-        if (pixels.size() != expectedSize)
-        {
-            assert(false);
-            return S_OK;
-        }
-
-        if (b.source.size() != pixels.size())
-        {
-            b.source = Buffer<u32, 32>{ pixels.size() };
-        }
-
-        memcpy(b.source.data(), pixels.data(), pixels.size_bytes());
-        b.revision = revision;
-        b.sourceSize.x = srcWidth;
-        b.sourceSize.y = srcHeight;
+        return S_OK;
     }
+    const auto columnCount = srcWidth / srcCellSize.width;
 
-    b.targetOffset = (imageSlice.ColumnOffset() - viewportLeft);
-    b.targetWidth = srcWidth / srcCellSize.width;
-    b.active = true;
+    for (size_t i = 0; i < ImageSlice::RenderPositionCount; i++)
+    {
+        const auto position = static_cast<ImageSlice::RenderPosition>(i);
+        if (!imageSlice.HasPixels(position))
+        {
+            continue;
+        }
+
+        // Snapshots are cached by revision. A masked snapshot is no longer the
+        // slice's own pixels, so it needs a key of its own. Keeping those in the
+        // top half of the space puts them permanently out of reach of the
+        // revision counter, which starts at zero and only ever climbs.
+        auto revision = imageSlice.Revision(position);
+        const auto masked = position == ImageSlice::RenderPosition::BehindBackground &&
+                            defaultBackgroundMask.size() == gsl::narrow_cast<size_t>(columnCount);
+        if (masked)
+        {
+            for (const auto value : defaultBackgroundMask)
+            {
+                revision = (revision ^ value) * 0x100000001b3ull;
+            }
+            revision |= 0x8000000000000000ull;
+        }
+
+        auto& b = til::at(row->bitmaps, i);
+
+        // If this row's ImageSlice has changed we need to update our snapshot.
+        // Theoretically another _p.rows[y]->bitmaps may have this particular revision already,
+        // but that can only happen if we're scrolling _and_ the entire viewport was invalidated.
+        if (b.revision != revision)
+        {
+            const auto srcHeight = std::max(0, srcCellSize.height);
+            const auto pixels = imageSlice.Pixels(position);
+            const auto expectedSize = gsl::narrow_cast<size_t>(srcWidth) * gsl::narrow_cast<size_t>(srcHeight);
+
+            // Sanity check.
+            if (pixels.size() != expectedSize)
+            {
+                assert(false);
+                continue;
+            }
+
+            if (b.source.size() != pixels.size())
+            {
+                b.source = Buffer<u32, 32>{ pixels.size() };
+            }
+
+            memcpy(b.source.data(), pixels.data(), pixels.size_bytes());
+
+            if (masked)
+            {
+                // Content below the background is only visible through cells
+                // whose background is the default one.
+                for (auto column = 0; column < columnCount; column++)
+                {
+                    if (til::at(defaultBackgroundMask, gsl::narrow_cast<size_t>(column)) != 0)
+                    {
+                        continue;
+                    }
+                    for (auto pixelRow = 0; pixelRow < srcHeight; pixelRow++)
+                    {
+                        const auto first = b.source.data() + gsl::narrow_cast<size_t>(pixelRow) * srcWidth + gsl::narrow_cast<size_t>(column) * srcCellSize.width;
+                        std::fill_n(first, srcCellSize.width, 0u);
+                    }
+                }
+            }
+
+            b.revision = revision;
+            b.sourceSize.x = srcWidth;
+            b.sourceSize.y = srcHeight;
+        }
+
+        b.targetOffset = (imageSlice.ColumnOffset() - viewportLeft);
+        b.targetWidth = columnCount;
+        b.active = true;
+    }
     return S_OK;
 }
 CATCH_RETURN()
+
+[[nodiscard]] HRESULT AtlasEngine::EndRowImages() noexcept
+{
+    // Nothing to do: this backend defers all drawing, so the row's snapshots are
+    // placed relative to its text when the frame is actually drawn.
+    return S_OK;
+}
 
 [[nodiscard]] HRESULT AtlasEngine::PaintSelection(const til::rect& rect) noexcept
 {

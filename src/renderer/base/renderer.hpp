@@ -123,6 +123,7 @@ namespace Microsoft::Console::Render
         void _PaintBufferOutput(_In_ IRenderEngine* const pEngine);
         ROW* _PaintBufferOutputComposition(TextBuffer& buffer, const ROW& r, const Composition& activeComposition);
         void _PaintBufferOutputHelper(_In_ IRenderEngine* const pEngine, TextBufferCellIterator it, const til::point target);
+        std::span<const uint8_t> _buildDefaultBackgroundMask(const ROW& r, const ImageSlice& imageSlice);
         void _PaintBufferOutputGridLineHelper(_In_ IRenderEngine* const pEngine, const TextAttribute textAttribute, const size_t cchLine, const til::point coordTarget);
         bool _isHoveredHyperlink(const TextAttribute& textAttribute) const noexcept;
         void _PaintSelection(_In_ IRenderEngine* const pEngine);
@@ -171,6 +172,7 @@ namespace Microsoft::Console::Render
         Microsoft::Console::Types::Viewport _viewport;
         std::optional<CompositionCache> _compositionCache;
         std::vector<Cluster> _clusterBuffer;
+        std::vector<uint8_t> _backgroundMask;
         std::function<void()> _pfnBackgroundColorChanged;
         std::function<void()> _pfnFrameColorChanged;
         std::function<void()> _pfnRendererEnteredErrorState;
