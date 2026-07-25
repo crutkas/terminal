@@ -167,6 +167,9 @@ public:
 
     void ShowNotification(const std::wstring_view title, const std::wstring_view body) override;
 
+    bool DecodeImageToBgra(const std::span<const uint8_t> data, std::vector<RGBQUAD>& pixels, til::size& size) noexcept override;
+    til::size GetCellSize() const noexcept override;
+
 #pragma endregion
 
     void ClearMark();

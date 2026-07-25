@@ -36,6 +36,7 @@ class ImageSliceTests
     TEST_METHOD(CopyingReplacesDestinationLayers);
     TEST_METHOD(CopyingFromAnUnlayeredSourceClearsDestinationLayers);
     TEST_METHOD(CopyingFromALayerOnlySourceClearsDestinationBasePlane);
+    TEST_METHOD(CopyingACellOutsideTheSourceLayerCopiesNothing);
 
     static constexpr til::size CellSize{ 4, 2 };
     static constexpr RGBQUAD Red{ 0, 0, 255, 255 };
@@ -405,4 +406,43 @@ void ImageSliceTests::CopyingFromALayerOnlySourceClearsDestinationBasePlane()
     VERIFY_IS_TRUE(slice->Contains(source));
     VERIFY_ARE_EQUAL(Packed(Clear), PixelAt(slice->Pixels(), *slice, 0), L"the untagged pixels should have been replaced by nothing");
     VERIFY_ARE_EQUAL(Packed(Red), PixelAt(slice->Pixels(ImageSlice::RenderPosition::AboveText), *slice, 0));
+}
+
+// CopyLayerCells takes a source column from the caller, and reflow derives that
+// column from per-cell metadata rather than from the layer itself. Metadata can name
+// a column the layer never covered, so the copy has to treat an uncovered source as
+// nothing to carry rather than trusting the caller and indexing outside the plane --
+// which would splice unrelated heap into a layer that is then composited and painted.
+void ImageSliceTests::CopyingACellOutsideTheSourceLayerCopiesNothing()
+{
+    DummyRenderer renderer;
+    TextBuffer buffer{ til::size{ 8, 2 }, TextAttribute{}, 0, false, &renderer };
+    constexpr ImageSlice::LayerKey key{ .imageId = 1, .placementId = 1 };
+
+    // The source layer covers columns 0-1 only.
+    FillLayer(buffer.GetMutableRowByOffset(0), key, 2, Red);
+    const auto source = buffer.GetRowByOffset(0).GetImageSlice();
+    VERIFY_IS_NOT_NULL(source);
+    VERIFY_IS_TRUE(source->LayerCoversColumn(key, 1), L"sanity: column 1 is covered");
+    VERIFY_IS_FALSE(source->LayerCoversColumn(key, 5), L"sanity: column 5 is not");
+
+    FillLayer(buffer.GetMutableRowByOffset(1), key, 4, Blue);
+
+    // Column 5 is past the source layer. Like every copy here the destination range is
+    // cleared first, so the observable result must be transparency -- the source had
+    // nothing for this column. What must never appear is bytes: neither the layer's own
+    // Red, which lives at a different column, nor whatever follows the allocation.
+    ImageSlice::CopyLayerCells(buffer.GetRowByOffset(0), 5, buffer.GetMutableRowByOffset(1), 0, 1, key);
+
+    const auto destination = buffer.GetRowByOffset(1).GetImageSlice();
+    VERIFY_IS_NOT_NULL(destination);
+    VERIFY_ARE_EQUAL(Packed(Clear), PixelAt(destination->Pixels(ImageSlice::RenderPosition::AboveText), *destination, 0), L"an uncovered source column must contribute no pixels");
+
+    // A negative offset is the same hazard in the other direction.
+    ImageSlice::CopyLayerCells(buffer.GetRowByOffset(0), -3, buffer.GetMutableRowByOffset(1), 1, 2, key);
+    VERIFY_ARE_EQUAL(Packed(Clear), PixelAt(buffer.GetRowByOffset(1).GetImageSlice()->Pixels(ImageSlice::RenderPosition::AboveText), *buffer.GetRowByOffset(1).GetImageSlice(), 1), L"a negative source offset must not copy either");
+
+    // And the in-range case still works, so the guard has not simply disabled the copy.
+    ImageSlice::CopyLayerCells(buffer.GetRowByOffset(0), 0, buffer.GetMutableRowByOffset(1), 2, 3, key);
+    VERIFY_ARE_EQUAL(Packed(Red), PixelAt(buffer.GetRowByOffset(1).GetImageSlice()->Pixels(ImageSlice::RenderPosition::AboveText), *buffer.GetRowByOffset(1).GetImageSlice(), 2), L"a covered source column still copies");
 }
