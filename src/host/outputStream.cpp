@@ -14,6 +14,8 @@
 #include "../interactivity/inc/ServiceLocator.hpp"
 #include "../renderer/base/renderer.hpp"
 
+#include <til/io.h>
+
 #pragma hdrstop
 
 using namespace Microsoft::Console;
@@ -465,19 +467,6 @@ void ConhostInternalGetSet::ShowNotification(std::wstring_view /*title*/, std::w
     // Not implemented for conhost.
 }
 
-bool ConhostInternalGetSet::DecodeImageToBgra(const std::span<const uint8_t> /*data*/, std::vector<RGBQUAD>& pixels, til::size& /*size*/) noexcept
-{
-    // conhost has no image decoder. Under ConPTY the connected terminal decodes; standalone,
-    // an encoded image simply isn't displayed.
-    pixels.clear();
-    return false;
-}
-
-til::size ConhostInternalGetSet::GetCellSize() const noexcept
-{
-    return _io.GetActiveOutputBuffer().GetCurrentFont().GetSize();
-}
-
 // Stores the handler the adapter wants called when timed content advances.
 // A null handler clears any prior registration and stops the outstanding timer.
 void ConhostInternalGetSet::SetTimedContentHandler(std::function<void()> handler)
@@ -538,4 +527,45 @@ void ConhostInternalGetSet::RequestTimedContentUpdate(
     }
 
     pRender->StartTimerAt(_timedContentTimer, *deadline);
+}
+
+bool ConhostInternalGetSet::DecodeImageToBgra(const std::span<const uint8_t> /*data*/, std::vector<RGBQUAD>& pixels, til::size& /*size*/) noexcept
+{
+    // conhost has no image decoder. Under ConPTY the connected terminal decodes; standalone,
+    // an encoded image simply isn't displayed.
+    pixels.clear();
+    return false;
+}
+
+til::size ConhostInternalGetSet::GetCellSize() const noexcept
+{
+    return _io.GetActiveOutputBuffer().GetCurrentFont().GetSize();
+}
+
+til::read_file_result ConhostInternalGetSet::ReadLocalFile(const std::wstring_view path, uint64_t offset, uint64_t size, bool deleteAfter, const std::wstring_view deleteNameMarker, std::vector<uint8_t>& out) noexcept
+{
+    // Under ConPTY, conhost is parse-only: it has no renderer, its ACK is suppressed
+    // (ReturnResponse early-returns in VtIo mode), and the raw APC is forwarded verbatim to
+    // the connected terminal (e.g. Windows Terminal), which performs the file read and owns
+    // t=t deletion. Reading the file here would be redundant filesystem access in the wrong
+    // process context (and deleting it would remove it before the terminal can read it), so
+    // skip the read entirely and let the final terminal handle the transmission.
+    if (IsConPTY())
+    {
+        out.clear();
+        return til::read_file_result::read_error;
+    }
+    return til::read_file_as_bytes(path, offset, size, deleteAfter, deleteNameMarker, out);
+}
+
+Microsoft::Console::Utils::ReadSharedMemoryResult ConhostInternalGetSet::ReadSharedMemory(const std::wstring_view name, uint64_t offset, uint64_t size, std::vector<uint8_t>& out) noexcept
+{
+    // Under ConPTY the final terminal receives the raw APC and owns the mapping read.
+    // Avoid a redundant read in conhost, matching the t=f/t=t path above.
+    if (IsConPTY())
+    {
+        out.clear();
+        return Microsoft::Console::Utils::ReadSharedMemoryResult::read_error;
+    }
+    return Microsoft::Console::Utils::ReadSharedMemory(name, offset, size, out);
 }
