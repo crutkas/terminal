@@ -52,6 +52,8 @@ public:
     // Layers below this z composite behind the cell background rather than
     // merely behind the text.
     static constexpr int32_t BackgroundZThreshold = INT32_MIN / 2;
+    // Marks a pixel that samples nothing, so an image update leaves it alone.
+    static constexpr uint32_t NoSourceIndex = UINT32_MAX;
     // A process-wide ceiling on identified layer storage, plus a per-slice
     // layer count limit, so a stream of images cannot exhaust memory.
     static constexpr size_t MaxLayerBytes = 320ull * 1024ull * 1024ull;
@@ -92,6 +94,11 @@ public:
     RGBQUAD* MutablePixels(const til::CoordType columnBegin, const til::CoordType columnEnd, const LayerKey key, const int32_t zIndex);
     RGBQUAD* TryMutablePixels(const til::CoordType columnBegin, const til::CoordType columnEnd, const LayerKey key, const int32_t zIndex);
     bool PlacementCoversColumn(const uint64_t placementId, const til::CoordType column) const noexcept;
+    // Records which source-image pixel each written pixel sampled, so the layer
+    // can be re-sampled in place when the source image's content changes. The
+    // span is laid out exactly like the pixels returned by MutablePixels.
+    uint32_t* MutableSourceIndices(const til::CoordType columnBegin, const til::CoordType columnEnd, const LayerKey key, const int32_t zIndex);
+    bool UpdateImage(const uint32_t imageId, const std::span<const RGBQUAD> pixels);
     // An upper bound on the bytes a MutablePixels write of this range would add,
     // so a caller can refuse a placement before allocating any of it.
     size_t WriteMemoryUpperBound(const til::CoordType columnBegin, const til::CoordType columnEnd, const LayerKey key, const int32_t zIndex) const noexcept;
@@ -132,6 +139,9 @@ private:
         LayerKey key;
         int32_t zIndex = 0;
         std::vector<RGBQUAD> pixels;
+        // Which source-image pixel each entry of `pixels` sampled, so the layer
+        // survives its image being redrawn. NoSourceIndex means "not sampled".
+        std::vector<uint32_t> sourceIndices;
         // One flag per column in [_columnBegin, _columnEnd) marking the cells
         // this layer actually covers, so an erase can target only those cells
         // without disturbing another layer that overlaps the same range.

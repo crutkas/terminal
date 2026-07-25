@@ -61,6 +61,21 @@ AdaptDispatch::AdaptDispatch(ITerminalApi& api, Renderer* renderer, RenderSettin
     _termOutput(),
     _pages{ api, renderer }
 {
+    // Animated images have to keep advancing with nothing arriving in the stream to
+    // drive them. Hand the host a routine to run; it decides when to run it.
+    _api.SetTimedContentHandler([this]() {
+        if (_kittyParser)
+        {
+            _kittyParser->AdvanceAnimations(std::chrono::steady_clock::now());
+        }
+    });
+}
+
+AdaptDispatch::~AdaptDispatch()
+{
+    // _api is a reference, so it outlives us; withdraw before the captured pointer
+    // back to this object goes stale.
+    _api.SetTimedContentHandler(nullptr);
 }
 
 void AdaptDispatch::UnknownSequence() noexcept
@@ -1712,6 +1727,17 @@ void AdaptDispatch::PrecedingPage(const VTInt pageCount)
 }
 
 // Routine Description:
+// - Lets the host tell us its font changed. Anything the dispatch has laid out in
+//   pixels was measured against the old cell size and has to be measured again.
+void AdaptDispatch::NotifyFontChanged()
+{
+    if (_kittyParser)
+    {
+        _kittyParser->RefreshImageLayers();
+    }
+}
+
+// Routine Description:
 // - PPA - Moves the active position to the specified page number, without
 //   altering the cursor coordinates.
 // Arguments:
@@ -1719,6 +1745,10 @@ void AdaptDispatch::PrecedingPage(const VTInt pageCount)
 void AdaptDispatch::PagePositionAbsolute(const VTInt page)
 {
     _pages.MoveTo(page, _modes.test(Mode::PageCursorCoupling));
+    if (_kittyParser)
+    {
+        _kittyParser->RefreshImageLayers();
+    }
 }
 
 // Routine Description:
@@ -1729,6 +1759,10 @@ void AdaptDispatch::PagePositionAbsolute(const VTInt page)
 void AdaptDispatch::PagePositionRelative(const VTInt pageCount)
 {
     _pages.MoveRelative(pageCount, _modes.test(Mode::PageCursorCoupling));
+    if (_kittyParser)
+    {
+        _kittyParser->RefreshImageLayers();
+    }
 }
 
 // Routine Description:
@@ -1739,6 +1773,10 @@ void AdaptDispatch::PagePositionRelative(const VTInt pageCount)
 void AdaptDispatch::PagePositionBack(const VTInt pageCount)
 {
     _pages.MoveRelative(-pageCount, _modes.test(Mode::PageCursorCoupling));
+    if (_kittyParser)
+    {
+        _kittyParser->RefreshImageLayers();
+    }
 }
 
 // Routine Description:

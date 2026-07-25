@@ -51,6 +51,16 @@ namespace Microsoft::Console::VirtualTerminal
         // Resolves the placeholder cells in a run of text the writer just placed.
         void RenderPlaceholders(const std::wstring_view segment, const til::CoordType screenRow, const til::CoordType startColumn);
 
+        // Runs every animated image forward to the given time, then reports when it
+        // next needs to be called. The host calls this when the deadline it was last
+        // given comes due.
+        void AdvanceAnimations(std::chrono::steady_clock::time_point now);
+
+        // Re-pushes every placement's pixels into the active page's buffer. The
+        // registry outlives the buffer it drew into, so anything that swaps the
+        // buffer under it has to ask for the layers again.
+        void RefreshImageLayers();
+
         // Drops every image, every placement, and any transfer in progress.
         void HardReset() noexcept;
 
@@ -108,18 +118,38 @@ namespace Microsoft::Console::VirtualTerminal
             bool havePlacementId = false;    // true if p= was present (so p= is echoed in the ack)
             bool haveParent = false;         // true if P= was present (a relative placement was requested)
         };
-        // A stored Kitty image: RGBA pixels plus the canvas dimensions they describe.
+        struct AnimationFrame
+        {
+            std::vector<RGBQUAD> pixels;
+            int32_t gapMilliseconds = 0;
+        };
+        // A stored Kitty image. Frame 1 is the root pixel vector; additional
+        // full-canvas frames share its dimensions and carry their own next-frame gap.
         struct Image
         {
             uint32_t number = 0;
             uint32_t width = 0;
             uint32_t height = 0;
             std::vector<RGBQUAD> pixels;
+            int32_t rootGapMilliseconds = 0;
+            std::vector<AnimationFrame> animationFrames;
+            uint32_t currentFrame = 1;
+            uint32_t animationState = 1;
+            uint32_t loopCount = 1;
+            uint32_t loopsRemaining = UINT32_MAX;
+            uint32_t presentedFrame = 1;
+            bool waitingForFrames = false;
             bool hasRenderedPlacements = false;
+            std::chrono::steady_clock::time_point nextFrameTime{};
 
             size_t PixelBytes() const noexcept
             {
-                return pixels.size() * sizeof(RGBQUAD);
+                auto bytes = pixels.size() * sizeof(RGBQUAD);
+                for (const auto& frame : animationFrames)
+                {
+                    bytes += frame.pixels.size() * sizeof(RGBQUAD);
+                }
+                return bytes;
             }
         };
         // The target pixel size a c=/r= request maps to (one axis preserves aspect). Shared
@@ -210,6 +240,20 @@ namespace Microsoft::Console::VirtualTerminal
         static bool _DecodeBase64(const std::string_view input, std::vector<uint8_t>& output) noexcept;
         static bool _inflateZlib(const std::vector<uint8_t>& input, std::vector<uint8_t>& output, size_t cap) noexcept;
         static std::vector<RGBQUAD> _decodePixels(const uint32_t format, const std::vector<uint8_t>& bytes);
+        static RGBQUAD _rgbaColor(uint32_t rgba) noexcept;
+        static void _compositePixels(std::span<RGBQUAD> destination, std::span<const RGBQUAD> source, bool replace) noexcept;
+        static size_t _frameCount(const Image& image) noexcept;
+        static std::vector<RGBQUAD>* _framePixels(Image& image, uint32_t frameNumber) noexcept;
+        static const std::vector<RGBQUAD>* _framePixels(const Image& image, uint32_t frameNumber) noexcept;
+        static int32_t* _frameGap(Image& image, uint32_t frameNumber) noexcept;
+        void _updateImageLayers(uint32_t imageId, std::span<const RGBQUAD> pixels);
+        void _scheduleAnimation(uint32_t imageId, Image& image, std::chrono::steady_clock::time_point now);
+        void _scheduleAnimationTimer();
+        bool _advanceImage(uint32_t imageId, Image& image, std::chrono::steady_clock::time_point now);
+        bool _processAnimationFrame(const Control& command, const std::string_view payload, bool payloadValid, bool payloadTooLarge, uint32_t imageId, std::wstring_view& code);
+        bool _processAnimationControl(const Control& command, uint32_t imageId, std::wstring_view& code);
+        bool _processFrameComposition(const Control& command, uint32_t imageId, std::wstring_view& code);
+        void _deleteAnimationFrames(uint32_t imageId, uint32_t frameNumber, bool freeData);
         uint32_t _assignImageId();
         bool _registerImage(const uint32_t id, Image&& image);
         void _eraseImage(const uint32_t id);
@@ -269,6 +313,7 @@ namespace Microsoft::Console::VirtualTerminal
         std::unordered_map<uint32_t, Image> _images;
         std::unordered_map<uint32_t, uint32_t> _imageNumbers;
         std::deque<uint32_t> _imageOrder;
+
         // Virtual placements keyed by the external (image id, placement id). U+10EEEE selects
         // this key through its foreground and underline colors.
         std::map<std::pair<uint32_t, uint32_t>, VirtualPlacement> _virtualIds;

@@ -12,6 +12,7 @@
 #include "output.h"
 
 #include "../interactivity/inc/ServiceLocator.hpp"
+#include "../renderer/base/renderer.hpp"
 
 #pragma hdrstop
 
@@ -475,4 +476,66 @@ bool ConhostInternalGetSet::DecodeImageToBgra(const std::span<const uint8_t> /*d
 til::size ConhostInternalGetSet::GetCellSize() const noexcept
 {
     return _io.GetActiveOutputBuffer().GetCurrentFont().GetSize();
+}
+
+// Stores the handler the adapter wants called when timed content advances.
+// A null handler clears any prior registration and stops the outstanding timer.
+void ConhostInternalGetSet::SetTimedContentHandler(std::function<void()> handler)
+{
+    const auto stop = !handler;
+    {
+        std::lock_guard lock(_timedContentMutex);
+        _timedContentHandler = std::move(handler);
+    }
+    if (stop && _timedContentTimer)
+    {
+        if (auto* const pRender = ServiceLocator::LocateGlobals().pRender)
+        {
+            pRender->StopTimer(_timedContentTimer);
+        }
+    }
+}
+
+// Arms the render-thread timer so the adapter is woken at `deadline`.
+// No value means the adapter no longer needs a wakeup; stop the timer.
+void ConhostInternalGetSet::RequestTimedContentUpdate(
+    const std::optional<std::chrono::steady_clock::time_point> deadline)
+{
+    auto* const pRender = ServiceLocator::LocateGlobals().pRender;
+    if (!pRender)
+    {
+        return;
+    }
+
+    if (!deadline)
+    {
+        if (_timedContentTimer)
+        {
+            pRender->StopTimer(_timedContentTimer);
+        }
+        return;
+    }
+
+    if (!_timedContentTimer)
+    {
+        // Registered lazily, so a session that never shows timed content never
+        // takes a timer slot. Binding the callback to _timedContentLifetime lets
+        // the renderer retire the slot on its own once this object is gone.
+        _timedContentTimer = pRender->RegisterTimer(
+            "timed content",
+            [this](Microsoft::Console::Render::Renderer&, Microsoft::Console::Render::TimerHandle) {
+                std::function<void()> handler;
+                {
+                    std::lock_guard lock(_timedContentMutex);
+                    handler = _timedContentHandler;
+                }
+                if (handler)
+                {
+                    handler();
+                }
+            },
+            _timedContentLifetime);
+    }
+
+    pRender->StartTimerAt(_timedContentTimer, *deadline);
 }
