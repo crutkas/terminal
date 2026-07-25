@@ -7050,6 +7050,25 @@ public:
         VERIFY_IS_FALSE(SliceContainsColor(slice, 0, 0, 255), L"must not drop to grid row 1 (blue) on a same-row chunk");
     }
 
+    // A write can be split anywhere, including between a placeholder's two diacritics - the console
+    // write path chunks long runs. The orphaned diacritic then opens the next segment, where it
+    // joins the cell the previous segment already wrote and so occupies no column of its own.
+    // Old failure: it was counted as a cell, shifting every placeholder after it one column right
+    // onto a cell with no image foreground, which dropped that tile silently. Reproduced in the
+    // real host as a hole in a 12x6 grid, at a different tile per screen column, deterministically.
+    TEST_METHOD(KittyPlaceholderSplitBetweenDiacriticsStillRenders)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,f=24,s=2,v=1,c=2,r=1;/wAAAP8A\x1b\\"); // red|green, grid 2x1
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m");
+        // Cell 0 is written with its row diacritic only; its column diacritic is orphaned into the
+        // next write, immediately ahead of cell 1's placeholder.
+        _stateMachine->ProcessString(Placeholder() + L"\x0305");
+        _stateMachine->ProcessString(L"\x0305" + Placeholder() + L"\x0305" + L"\x030D"); // orphan, then row 0 col 1
+        VERIFY_IS_TRUE(BufferContainsColor(*_testGetSet->_textBuffer, 255, 0, 0), L"col 0 = red");
+        VERIFY_IS_TRUE(BufferContainsColor(*_testGetSet->_textBuffer, 0, 255, 0), L"col 1 = green; a split between diacritics must not drop the cell");
+    }
+
     // Re-storing a virtual placement must not erase the resolved metadata attached to existing
     // placeholder text. Old failure: resetting placement-global counters made the adjacent
     // no-diacritic cell repeat col 0 instead of inheriting col 1 from the left cell.

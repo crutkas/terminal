@@ -2829,6 +2829,30 @@ bool KittyParser::_placeImageCellRef(const Image& image, const uint32_t imageId,
     return true;
 }
 
+// True when a grapheme cluster is made up entirely of kitty rowcolumn diacritics, i.e. it is the
+// tail of a placeholder cell whose write was split, not a cell of its own.
+bool KittyParser::_IsPlaceholderDiacriticRun(const std::wstring_view cluster) noexcept
+{
+    if (cluster.empty())
+    {
+        return false;
+    }
+    for (size_t i = 0; i < cluster.size(); ++i)
+    {
+        auto cp = static_cast<char32_t>(cluster[i]);
+        if (til::is_leading_surrogate(cluster[i]) && i + 1 < cluster.size() && til::is_trailing_surrogate(cluster[i + 1]))
+        {
+            cp = til::combine_surrogates(cluster[i], cluster[i + 1]);
+            ++i;
+        }
+        if (_PlaceholderDiacriticIndex(cp) < 0)
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
 // Overlays each U+10EEEE placeholder in one just-written segment with its sub-rect of the
 // (virtual) image named by the cell's foreground (24-bit RGB or a 256-color index = the id).
 // The grid (rows x cols) is the geometry recorded when the image was stored virtually, so it
@@ -2862,6 +2886,17 @@ void KittyParser::RenderPlaceholders(const std::wstring_view segment, const til:
     for (size_t i = 0; i < segment.size();)
     {
         const auto next = buffer.GraphemeNext(segment, i);
+        // A write may be split anywhere, including between a placeholder's two diacritics - the
+        // console write path chunks long runs. The orphaned marks then open the next segment, where
+        // they join the cell the previous segment already wrote, occupying no column of their own.
+        // Step over them without advancing: counting them as a cell shifted every placeholder that
+        // followed one column right, onto a cell carrying no image foreground, so that tile was
+        // silently dropped and the grid rendered with a hole in it.
+        if (i == 0 && _IsPlaceholderDiacriticRun(segment.substr(i, next - i)))
+        {
+            i = next;
+            continue;
+        }
         if (i + 1 < next && segment[i] == PlaceholderCodePointHigh && segment[i + 1] == PlaceholderCodePointLow)
         {
             // The first two recognized diacritics in the cluster give row then column; an optional

@@ -253,6 +253,7 @@ namespace Microsoft::Console::VirtualTerminal
         // Returns true if a placeholder tile was drawn (the caller batches one redraw per segment).
         bool _placeImageCellRef(const Image& image, const uint32_t imageId, const til::CoordType column, const til::CoordType row, const uint32_t cellRow, const uint32_t cellCol, const VirtualPlacement& place);
         static int _PlaceholderDiacriticIndex(const char32_t ch) noexcept;
+        static bool _IsPlaceholderDiacriticRun(const std::wstring_view cluster) noexcept;
 
         // Kitty graphics image registry. Each id maps to an Image (number +
         // decoded BGRA pixels); a reverse number -> id map and FIFO/LRU eviction
