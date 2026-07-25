@@ -552,20 +552,32 @@ const ImageSlice::Composite& ImageSlice::_composite(const RenderPosition positio
             ordered.push_back(&layer);
         }
     }
-    std::stable_sort(ordered.begin(), ordered.end(), [](const Layer* lhs, const Layer* rhs) { return lhs->zIndex < rhs->zIndex; });
+    std::stable_sort(ordered.begin(), ordered.end(), [](const Layer* lhs, const Layer* rhs) {
+        return std::tie(lhs->zIndex, lhs->key.imageId) < std::tie(rhs->zIndex, rhs->key.imageId);
+    });
 
     for (const auto layer : ordered)
     {
         const auto count = std::min(planeSize, layer->pixels.size());
         for (size_t i = 0; i < count; i++)
         {
-            // A fully transparent pixel leaves whatever is beneath it alone.
-            const auto& pixel = til::at(layer->pixels, i);
-            if (pixel.rgbReserved != 0)
-            {
-                til::at(composite.pixels, i) = pixel;
-                composite.hasPixels = true;
-            }
+            // Source-over on premultiplied pixels: dst = src + dst * (1 - srcAlpha).
+            // A fully transparent source leaves what is beneath it untouched, and
+            // a fully opaque one replaces it, without either being a special case.
+            const auto& src = til::at(layer->pixels, i);
+            auto& dst = til::at(composite.pixels, i);
+            const auto inverseAlpha = 255u - src.rgbReserved;
+            const auto over = [inverseAlpha](const BYTE s, const BYTE d) {
+                return static_cast<BYTE>(std::min(255u, static_cast<uint32_t>(s) + (static_cast<uint32_t>(d) * inverseAlpha + 127u) / 255u));
+            };
+            dst.rgbRed = over(src.rgbRed, dst.rgbRed);
+            dst.rgbGreen = over(src.rgbGreen, dst.rgbGreen);
+            dst.rgbBlue = over(src.rgbBlue, dst.rgbBlue);
+            dst.rgbReserved = over(src.rgbReserved, dst.rgbReserved);
+            // Any pixel the compositor produced is content. Whether a colour with
+            // no alpha ends up visible is for the engine that draws it to decide;
+            // treating it as nothing here would drop the row before it gets asked.
+            composite.hasPixels = composite.hasPixels || dst.rgbRed != 0 || dst.rgbGreen != 0 || dst.rgbBlue != 0 || dst.rgbReserved != 0;
         }
     }
 
@@ -593,9 +605,21 @@ bool ImageSlice::HasPixels(const RenderPosition position) const
     return _composite(position).hasPixels;
 }
 
-// Returns null if the slice cannot take another layer, either because this one
-// would exceed the per-slice count or the process-wide byte budget.
+// Throws std::bad_alloc if the slice cannot take another layer, either because
+// this one would exceed the per-slice count or the process-wide byte budget.
+// Callers for whom "it did not fit" is an ordinary outcome -- copying a row that
+// is being scrolled, say -- want TryMutablePixels instead.
 RGBQUAD* ImageSlice::MutablePixels(const til::CoordType columnBegin, const til::CoordType columnEnd, const LayerKey key, const int32_t zIndex)
+{
+    const auto pixels = TryMutablePixels(columnBegin, columnEnd, key, zIndex);
+    if (!pixels)
+    {
+        throw std::bad_alloc{};
+    }
+    return pixels;
+}
+
+RGBQUAD* ImageSlice::TryMutablePixels(const til::CoordType columnBegin, const til::CoordType columnEnd, const LayerKey key, const int32_t zIndex)
 {
     // Content that carries no identity belongs in the base plane.
     if (key.Untagged())

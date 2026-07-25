@@ -84,6 +84,7 @@ public:
 
     // Identified-layer access. The untagged base plane is unaffected by these.
     RGBQUAD* MutablePixels(const til::CoordType columnBegin, const til::CoordType columnEnd, const LayerKey key, const int32_t zIndex);
+    RGBQUAD* TryMutablePixels(const til::CoordType columnBegin, const til::CoordType columnEnd, const LayerKey key, const int32_t zIndex);
     bool Contains(const uint32_t imageId) const noexcept;
     bool Contains(const LayerKey key) const noexcept;
     bool LayerCoversColumn(const LayerKey key, const til::CoordType column) const noexcept;
