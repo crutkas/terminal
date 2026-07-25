@@ -268,9 +268,9 @@ namespace
             return _frameCount.load();
         }
 
-        bool WaitForFrameAfter(const uint64_t frameCount) noexcept
+        bool WaitForFrameAfter(const uint64_t frameCount, const DWORD timeout) noexcept
         {
-            return (_frameCount.load() > frameCount || _frameReady.wait(5000)) && _frameCount.load() > frameCount;
+            return (_frameCount.load() > frameCount || _frameReady.wait(timeout)) && _frameCount.load() > frameCount;
         }
 
         uint64_t PrepareForFullRepaint() noexcept
@@ -279,21 +279,13 @@ namespace
             return _invalidationGeneration.load() + 1;
         }
 
-        bool WaitForFullRepaint(const uint64_t invalidation) noexcept
+        bool WaitForFullRepaint(const uint64_t invalidation, const DWORD timeout) noexcept
         {
-            for (auto attempt = 0; attempt < 5 && _presentedInvalidation.load() < invalidation; ++attempt)
-            {
-                _frameReady.ResetEvent();
-                if (_presentedInvalidation.load() >= invalidation)
-                {
-                    break;
-                }
-                if (!_frameReady.wait(1000))
-                {
-                    return false;
-                }
-            }
-            return _presentedInvalidation.load() >= invalidation;
+            // Reset before the check, so a frame presented between the two is seen
+            // by the check rather than lost by the reset.
+            _frameReady.ResetEvent();
+            return _presentedInvalidation.load() >= invalidation ||
+                   (_frameReady.wait(timeout) && _presentedInvalidation.load() >= invalidation);
         }
 
         PaintedFrame Snapshot() const
@@ -341,26 +333,50 @@ namespace
 
         void StartPainting()
         {
-            const auto previousFrame = engine.PrepareForNextFrame();
             renderer.EnablePainting();
             // Enabling painting only starts the render thread; the thread then sleeps until
             // something asks for a frame. Whether one is already pending depends on what the
             // caller happened to write beforehand, so ask for a frame outright rather than
-            // waiting on one that may never be requested.
-            renderer.TriggerRedrawAll();
-            VERIFY_IS_TRUE(engine.WaitForFrameAfter(previousFrame), L"initial render timed out");
+            // waiting on one that may never be requested -- and keep asking. A request is a
+            // flag the thread clears when it starts painting, so one that lands while a frame
+            // is already in flight is not a request for the frame being waited on.
+            VERIFY_IS_TRUE(_pump([&](const DWORD timeout) {
+                               const auto previousFrame = engine.PrepareForNextFrame();
+                               renderer.TriggerRedrawAll();
+                               return engine.WaitForFrameAfter(previousFrame, timeout);
+                           }),
+                           L"initial render timed out");
         }
 
         void Repaint()
         {
             const auto invalidation = engine.PrepareForFullRepaint();
-            renderer.TriggerRedrawAll();
-            VERIFY_IS_TRUE(engine.WaitForFullRepaint(invalidation), L"full repaint timed out");
+            VERIFY_IS_TRUE(_pump([&](const DWORD timeout) {
+                               renderer.TriggerRedrawAll();
+                               return engine.WaitForFullRepaint(invalidation, timeout);
+                           }),
+                           L"full repaint timed out");
         }
 
         KittyRecordingRenderEngine engine;
         Terminal terminal;
         DummyRenderer renderer;
+
+    private:
+        // Re-asks for a frame every second rather than issuing one request and waiting
+        // out a single long timeout, which a loaded machine can lose to scheduling.
+        template<typename F>
+        static bool _pump(F&& request)
+        {
+            for (auto attempt = 0; attempt < 15; ++attempt)
+            {
+                if (request(1000))
+                {
+                    return true;
+                }
+            }
+            return false;
+        }
     };
 
     constexpr std::wstring_view StoreRedKittyImage{ L"\x1b_Ga=T,U=1,i=1,f=24,s=1,v=1,c=1,r=1,q=2;/wAA\x1b\\" };
