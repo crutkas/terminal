@@ -36,6 +36,8 @@ namespace
         std::vector<uint32_t> columnOwners;
         std::vector<bool> columnsContainRed;
         std::vector<bool> columnsContainGreen;
+        std::vector<uint8_t> defaultBackgroundMask;
+        std::vector<COLORREF> cellBackgrounds;
     };
 
     struct PaintedFrame
@@ -133,8 +135,8 @@ namespace
         HRESULT BeginRowImages(const ImageSlice& imageSlice,
                                const til::CoordType targetRow,
                                const til::CoordType viewportLeft,
-                               const std::span<const uint8_t> /*defaultBackgroundMask*/,
-                               const std::span<const COLORREF> /*cellBackgrounds*/) noexcept override
+                               const std::span<const uint8_t> defaultBackgroundMask,
+                               const std::span<const COLORREF> cellBackgrounds) noexcept override
         try
         {
             // The real engines decide when each plane lands relative to the
@@ -142,7 +144,7 @@ namespace
             // records one entry per plane and lets the assertions search.
             for (size_t plane = 0; plane < ImageSlice::RenderPositionCount; ++plane)
             {
-                _recordPlane(imageSlice, static_cast<ImageSlice::RenderPosition>(plane), targetRow, viewportLeft);
+                _recordPlane(imageSlice, static_cast<ImageSlice::RenderPosition>(plane), targetRow, viewportLeft, defaultBackgroundMask, cellBackgrounds);
             }
             return S_OK;
         }
@@ -156,12 +158,16 @@ namespace
         void _recordPlane(const ImageSlice& imageSlice,
                           const ImageSlice::RenderPosition position,
                           const til::CoordType targetRow,
-                          const til::CoordType viewportLeft)
+                          const til::CoordType viewportLeft,
+                          const std::span<const uint8_t> defaultBackgroundMask,
+                          const std::span<const COLORREF> cellBackgrounds)
         {
             PaintedImage image{
                 targetRow,
                 imageSlice.ColumnOffset() - viewportLeft,
             };
+            image.defaultBackgroundMask.assign(defaultBackgroundMask.begin(), defaultBackgroundMask.end());
+            image.cellBackgrounds.assign(cellBackgrounds.begin(), cellBackgrounds.end());
 
             const auto columnCount = imageSlice.PixelWidth() / std::max(1, imageSlice.CellSize().width);
             const auto pixels = imageSlice.Pixels(position);
@@ -384,6 +390,8 @@ namespace
     constexpr std::wstring_view SelectKittyImageAndBackground{ L"\x1b[38;2;0;0;1;48;2;4;5;6m" };
     constexpr std::wstring_view KittyPlaceholder{ L"\xDBFB\xDEEE\x0305\x0305\x0305" };
     constexpr std::wstring_view OrdinaryCombiningText{ L"A\x0301" };
+    // A 4x1 red image drawn across four columns, between the background and the text.
+    constexpr std::wstring_view PlaceRedKittyImageBehindText{ L"\x1b_Ga=T,f=24,s=4,v=1,c=4,r=1,z=-1,q=2;/wAA/wAA/wAA/wAA\x1b\\" };
 
     std::optional<til::point> FindKittyPlaceholder(const TextBuffer& buffer)
     {
@@ -483,6 +491,7 @@ namespace TerminalCoreUnitTests
         TEST_METHOD(GetCellSizeFallsBackWhenFontUnset);
 
         TEST_METHOD(KittyPlaceholderRendersInRealTerminal);
+        TEST_METHOD(KittyImageRowCarriesEachCellsBackgroundColor);
         TEST_METHOD(KittyPlaceholderSuppressesGlyphOnPaintAndRepaint);
         TEST_METHOD(KittyPlaceholderLeavesUnrecognizedTextUntouched);
         TEST_METHOD(KittyPlaceholderSuppressesGlyphAfterResize);
@@ -887,6 +896,36 @@ void TerminalApiTest::KittyPlaceholderRendersInRealTerminal()
         }
     }
     VERIFY_IS_TRUE(renderedRed, L"a placeholder cell must render the stored image's red pixels in the real Terminal");
+}
+
+// An engine that withholds the text pass's background fill from the cells an image
+// covers has to paint those backgrounds itself, or the image composites over the
+// default background instead of the cell's own. That means the row's per-column
+// background colors have to reach the engine, not just which of them are default.
+void TerminalApiTest::KittyImageRowCarriesEachCellsBackgroundColor()
+{
+    KittyRenderFixture fixture{ { 8, 3 }, 0 };
+    auto& stateMachine = *fixture.terminal._stateMachine;
+
+    // Two cells with an explicit background, then two that keep the default one.
+    stateMachine.ProcessString(L"\x1b[48;2;4;5;6m  \x1b[0m  ");
+    stateMachine.ProcessString(L"\x1b[1;1H");
+    stateMachine.ProcessString(PlaceRedKittyImageBehindText);
+
+    fixture.StartPainting();
+    const auto frame = fixture.engine.Snapshot();
+
+    const auto painted = std::ranges::find(frame.images, til::CoordType{ 0 }, &PaintedImage::targetRow);
+    VERIFY_IS_TRUE(painted != frame.images.end(), L"the image row was never handed to the engine");
+
+    const std::vector<uint8_t> expectedMask{ 0, 0, 1, 1 };
+    VERIFY_ARE_EQUAL(expectedMask, painted->defaultBackgroundMask, L"only the two cells with an explicit background are non-default");
+
+    VERIFY_ARE_EQUAL(size_t{ 4 }, painted->cellBackgrounds.size(), L"the engine needs one color per column of the slice");
+    VERIFY_ARE_EQUAL(RGB(4, 5, 6), painted->cellBackgrounds.at(0), L"a cell's own background color must survive to the engine");
+    VERIFY_ARE_EQUAL(RGB(4, 5, 6), painted->cellBackgrounds.at(1), L"a cell's own background color must survive to the engine");
+    VERIFY_ARE_EQUAL(painted->cellBackgrounds.at(2), painted->cellBackgrounds.at(3), L"the default-background cells must agree");
+    VERIFY_ARE_NOT_EQUAL(RGB(4, 5, 6), painted->cellBackgrounds.at(2), L"a default cell must not inherit the colored one");
 }
 
 void TerminalApiTest::KittyPlaceholderSuppressesGlyphOnPaintAndRepaint()
