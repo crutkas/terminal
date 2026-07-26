@@ -54,7 +54,6 @@ namespace
             const auto guard = _lock.lock_exclusive();
             _clusters.clear();
             _images.clear();
-            _paintingInvalidation = _invalidationGeneration.load();
             return S_OK;
         }
 
@@ -66,14 +65,9 @@ namespace
         HRESULT Present() noexcept override
         try
         {
-            {
-                const auto guard = _lock.lock_exclusive();
-                _presentedClusters = _clusters;
-                _presentedImages = _images;
-                _presentedInvalidation.store(_paintingInvalidation);
-            }
-            ++_frameCount;
-            _frameReady.SetEvent();
+            const auto guard = _lock.lock_exclusive();
+            _presentedClusters = _clusters;
+            _presentedImages = _images;
             return S_OK;
         }
         CATCH_RETURN()
@@ -105,7 +99,6 @@ namespace
 
         HRESULT InvalidateAll() noexcept override
         {
-            ++_invalidationGeneration;
             return S_OK;
         }
 
@@ -269,32 +262,6 @@ namespace
         {
         }
 
-        uint64_t PrepareForNextFrame() noexcept
-        {
-            _frameReady.ResetEvent();
-            return _frameCount.load();
-        }
-
-        bool WaitForFrameAfter(const uint64_t frameCount, const DWORD timeout) noexcept
-        {
-            return (_frameCount.load() > frameCount || _frameReady.wait(timeout)) && _frameCount.load() > frameCount;
-        }
-
-        uint64_t PrepareForFullRepaint() noexcept
-        {
-            _frameReady.ResetEvent();
-            return _invalidationGeneration.load() + 1;
-        }
-
-        bool WaitForFullRepaint(const uint64_t invalidation, const DWORD timeout) noexcept
-        {
-            // Reset before the check, so a frame presented between the two is seen
-            // by the check rather than lost by the reset.
-            _frameReady.ResetEvent();
-            return _presentedInvalidation.load() >= invalidation ||
-                   (_frameReady.wait(timeout) && _presentedInvalidation.load() >= invalidation);
-        }
-
         PaintedFrame Snapshot() const
         {
             const auto guard = _lock.lock_shared();
@@ -309,11 +276,6 @@ namespace
 
     private:
         mutable wil::srwlock _lock;
-        wil::slim_event_manual_reset _frameReady;
-        std::atomic<uint64_t> _frameCount{ 0 };
-        std::atomic<uint64_t> _invalidationGeneration{ 1 };
-        std::atomic<uint64_t> _presentedInvalidation{ 0 };
-        uint64_t _paintingInvalidation = 0;
         til::rect _dirtyArea{ 0, 0, SHRT_MAX, SHRT_MAX };
         TextAttribute _currentAttribute;
         std::vector<PaintedCluster> _clusters;
@@ -338,52 +300,27 @@ namespace
             renderer.TriggerTeardown();
         }
 
+        // Painting normally happens on the renderer's own thread, but a test that starts
+        // one is at the mercy of the scheduler: on a machine busy with I/O the thread can
+        // fail to run at all for tens of seconds, and every wait for a frame then expires
+        // for reasons that have nothing to do with what is being tested. Paint on the
+        // calling thread instead. Nothing here needs a frame to arrive on its own -- the
+        // tests write to the buffer, ask for a paint, and look at what the engine was
+        // handed -- so the thread bought nothing but flakiness.
         void StartPainting()
         {
-            renderer.EnablePainting();
-            // Enabling painting only starts the render thread; the thread then sleeps until
-            // something asks for a frame. Whether one is already pending depends on what the
-            // caller happened to write beforehand, so ask for a frame outright rather than
-            // waiting on one that may never be requested -- and keep asking. A request is a
-            // flag the thread clears when it starts painting, so one that lands while a frame
-            // is already in flight is not a request for the frame being waited on.
-            VERIFY_IS_TRUE(_pump([&](const DWORD timeout) {
-                               const auto previousFrame = engine.PrepareForNextFrame();
-                               renderer.TriggerRedrawAll();
-                               return engine.WaitForFrameAfter(previousFrame, timeout);
-                           }),
-                           L"initial render timed out");
+            Repaint();
         }
 
         void Repaint()
         {
-            const auto invalidation = engine.PrepareForFullRepaint();
-            VERIFY_IS_TRUE(_pump([&](const DWORD timeout) {
-                               renderer.TriggerRedrawAll();
-                               return engine.WaitForFullRepaint(invalidation, timeout);
-                           }),
-                           L"full repaint timed out");
+            renderer.TriggerRedrawAll();
+            THROW_IF_FAILED(renderer.PaintFrame());
         }
 
         KittyRecordingRenderEngine engine;
         Terminal terminal;
         DummyRenderer renderer;
-
-    private:
-        // Re-asks for a frame every second rather than issuing one request and waiting
-        // out a single long timeout, which a loaded machine can lose to scheduling.
-        template<typename F>
-        static bool _pump(F&& request)
-        {
-            for (auto attempt = 0; attempt < 15; ++attempt)
-            {
-                if (request(1000))
-                {
-                    return true;
-                }
-            }
-            return false;
-        }
     };
 
     constexpr std::wstring_view StoreRedKittyImage{ L"\x1b_Ga=T,U=1,i=1,f=24,s=1,v=1,c=1,r=1,q=2;/wAA\x1b\\" };
