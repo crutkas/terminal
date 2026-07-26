@@ -858,7 +858,8 @@ CATCH_RETURN();
 [[nodiscard]] HRESULT GdiEngine::BeginRowImages(const ImageSlice& imageSlice,
                                                 const til::CoordType targetRow,
                                                 const til::CoordType viewportLeft,
-                                                const std::span<const uint8_t> defaultBackgroundMask) noexcept
+                                                const std::span<const uint8_t> defaultBackgroundMask,
+                                                const std::span<const COLORREF> cellBackgrounds) noexcept
 try
 {
     // Text is buffered until something forces it out, so flushing here means
@@ -882,6 +883,11 @@ try
     LOG_IF_FAILED(ResetLineTransform());
 
     LOG_IF_FAILED(_PaintImagePlane(imageSlice, ImageSlice::RenderPosition::BehindBackground, targetRow, viewportLeft, defaultBackgroundMask, true));
+    // Content between the background and the text has to be composited over the
+    // cell's own background, and the text pass will not paint one for any cell
+    // this row's images cover. Lay it down now, in the one window where the plane
+    // below the background is already painted and the plane above it is not.
+    LOG_IF_FAILED(_FillImageRowCellBackgrounds(imageSlice, targetRow, viewportLeft, defaultBackgroundMask, cellBackgrounds));
     LOG_IF_FAILED(_PaintImagePlane(imageSlice, ImageSlice::RenderPosition::BehindText, targetRow, viewportLeft, {}, true));
 
     // Withholding ETO_OPAQUE stops the text filling its background *rectangle*,
@@ -982,6 +988,79 @@ bool GdiEngine::_UnderlayCoversAnyOf(const til::CoordType columnBegin, const til
     }
     return S_OK;
 }
+
+// Routine Description:
+// - Paints each cell of a row's image slice in its own background colour, for the
+//   cells whose background is not the default one. `PaintBackground` has already
+//   covered the frame in the default colour, and the text pass fills the rest --
+//   but it skips every cell an image covers, and it runs after the image is drawn,
+//   so a cell with an explicit background would otherwise composite the image over
+//   the default colour and show the default colour anywhere the image is
+//   transparent. Called with the slice's own untransformed geometry.
+// Arguments:
+// - imageSlice - the row's slice, whose columns these are
+// - targetRow - the screen row the slice paints on
+// - viewportLeft - the leftmost visible column, which the slice is offset from
+// - defaultBackgroundMask - one byte per slice column, non-zero where the cell's
+//   background is the default one and this fill is unnecessary
+// - cellBackgrounds - one color per slice column
+// Return Value:
+// - S_OK, or E_FAIL if GDI failed.
+[[nodiscard]] HRESULT GdiEngine::_FillImageRowCellBackgrounds(const ImageSlice& imageSlice,
+                                                              const til::CoordType targetRow,
+                                                              const til::CoordType viewportLeft,
+                                                              const std::span<const uint8_t> defaultBackgroundMask,
+                                                              const std::span<const COLORREF> cellBackgrounds) noexcept
+try
+{
+    // Only content between the background and the text composites over the cell's
+    // background. The plane below the background is masked to the cells that have
+    // none, and the plane above the text is painted after the text pass has filled
+    // whatever it was going to fill.
+    if (!imageSlice.HasPixels(ImageSlice::RenderPosition::BehindText))
+    {
+        return S_OK;
+    }
+
+    const auto srcCellSize = imageSlice.CellSize();
+    RETURN_HR_IF(S_OK, srcCellSize.width <= 0);
+    const auto columnCount = gsl::narrow_cast<size_t>(imageSlice.PixelWidth() / srcCellSize.width);
+    RETURN_HR_IF(S_OK, cellBackgrounds.size() != columnCount || defaultBackgroundMask.size() != columnCount);
+
+    const auto dstCellSize = _GetFontSize();
+    RETURN_HR_IF(S_OK, dstCellSize.width <= 0 || dstCellSize.height <= 0);
+    const auto top = targetRow * dstCellSize.height;
+    const auto left = (imageSlice.ColumnOffset() - viewportLeft) * dstCellSize.width;
+
+    // Adjacent cells usually share a colour, so they are filled as one rectangle.
+    for (size_t column = 0; column < columnCount;)
+    {
+        if (til::at(defaultBackgroundMask, column) != 0)
+        {
+            column++;
+            continue;
+        }
+        const auto color = til::at(cellBackgrounds, column);
+        auto end = column + 1;
+        while (end < columnCount && til::at(defaultBackgroundMask, end) == 0 && til::at(cellBackgrounds, end) == color)
+        {
+            end++;
+        }
+
+        const RECT fill{
+            left + gsl::narrow_cast<til::CoordType>(column) * dstCellSize.width,
+            top,
+            left + gsl::narrow_cast<til::CoordType>(end) * dstCellSize.width,
+            top + dstCellSize.height,
+        };
+        wil::unique_hbrush brush{ CreateSolidBrush(color) };
+        RETURN_HR_IF_NULL(E_FAIL, brush.get());
+        RETURN_HR_IF(E_FAIL, !FillRect(_hdcMemoryContext, &fill, brush.get()));
+        column = end;
+    }
+    return S_OK;
+}
+CATCH_RETURN();
 
 [[nodiscard]] HRESULT GdiEngine::EndRowImages() noexcept
 try

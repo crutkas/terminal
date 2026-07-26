@@ -86,9 +86,14 @@ namespace Microsoft::Console::Render
         //
         // defaultBackgroundMask holds one byte per column of the slice, non-zero
         // where the cell's background is default and content sitting below the
-        // background may therefore show through. It is empty when the slice has
-        // nothing below the background to draw.
-        [[nodiscard]] virtual HRESULT BeginRowImages(const ImageSlice& imageSlice, til::CoordType targetRow, til::CoordType viewportLeft, std::span<const uint8_t> defaultBackgroundMask) noexcept = 0;
+        // background may therefore show through.
+        //
+        // cellBackgrounds holds that column's background color. Content painted
+        // between the background and the text has to be composited over it, so an
+        // engine that suppresses the text pass's background fill must lay the
+        // color down itself first. Both spans are empty when the slice has nothing
+        // to draw beneath the text.
+        [[nodiscard]] virtual HRESULT BeginRowImages(const ImageSlice& imageSlice, til::CoordType targetRow, til::CoordType viewportLeft, std::span<const uint8_t> defaultBackgroundMask, std::span<const COLORREF> cellBackgrounds) noexcept = 0;
         [[nodiscard]] virtual HRESULT EndRowImages() noexcept = 0;
         [[nodiscard]] virtual HRESULT PaintSelection(const til::rect& rect) noexcept = 0;
         [[nodiscard]] virtual HRESULT PaintCursor(const CursorOptions& options) noexcept = 0;

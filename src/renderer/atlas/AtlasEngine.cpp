@@ -548,7 +548,10 @@ try
 }
 CATCH_RETURN()
 
-[[nodiscard]] HRESULT AtlasEngine::BeginRowImages(const ImageSlice& imageSlice, const til::CoordType targetRow, const til::CoordType viewportLeft, const std::span<const uint8_t> defaultBackgroundMask) noexcept
+// cellBackgrounds is unused here: this engine draws the whole row's backgrounds in
+// its own pass before any of the image quads it appends below, so content between
+// the background and the text already composites over the right color.
+[[nodiscard]] HRESULT AtlasEngine::BeginRowImages(const ImageSlice& imageSlice, const til::CoordType targetRow, const til::CoordType viewportLeft, const std::span<const uint8_t> defaultBackgroundMask, const std::span<const COLORREF> /*cellBackgrounds*/) noexcept
 try
 {
     const auto y = clamp<til::CoordType>(targetRow, 0, _p.s->viewportCellCount.y - 1);

@@ -1107,7 +1107,8 @@ void Renderer::_PaintBufferOutput(_In_ IRenderEngine* const pEngine)
                                                   imageSlice->HasPixels(ImageSlice::RenderPosition::AboveText));
             if (hasImages) [[unlikely]]
             {
-                LOG_IF_FAILED(pEngine->BeginRowImages(*imageSlice, screenPosition.y, _viewport.Left(), _buildDefaultBackgroundMask(r, *imageSlice)));
+                _buildImageRowBackgrounds(r, *imageSlice);
+                LOG_IF_FAILED(pEngine->BeginRowImages(*imageSlice, screenPosition.y, _viewport.Left(), _backgroundMask, _backgroundColors));
             }
 
             // Painting text can throw, and an engine left mid-row would keep
@@ -1125,28 +1126,36 @@ void Renderer::_PaintBufferOutput(_In_ IRenderEngine* const pEngine)
     }
 }
 
-// Marks the columns of `imageSlice` whose cell background is the default one,
-// and where content below the background can therefore show through. Returns an
-// empty span when the slice has nothing below the background, which is the case
-// for every image that predates layering.
-std::span<const uint8_t> Renderer::_buildDefaultBackgroundMask(const ROW& r, const ImageSlice& imageSlice)
+// Resolves, for each column of `imageSlice`, whether the cell's background is the
+// default one - content below the background only shows through where it is - and
+// what that background's color is, which content above the background has to be
+// composited over. Both are left empty when the slice has nothing to draw beneath
+// the text, which is the case for every image that predates layering.
+void Renderer::_buildImageRowBackgrounds(const ROW& r, const ImageSlice& imageSlice)
 {
-    if (!imageSlice.HasPixels(ImageSlice::RenderPosition::BehindBackground))
+    _backgroundMask.clear();
+    _backgroundColors.clear();
+
+    if (!imageSlice.HasPixels(ImageSlice::RenderPosition::BehindBackground) &&
+        !imageSlice.HasPixels(ImageSlice::RenderPosition::BehindText))
     {
-        return {};
+        return;
     }
 
     const auto cellWidth = imageSlice.CellSize().width;
     if (cellWidth <= 0)
     {
-        return {};
+        return;
     }
 
     const auto columnCount = gsl::narrow_cast<size_t>(imageSlice.PixelWidth() / cellWidth);
     // Reused across rows and frames; painting is hot and this would otherwise
-    // be a heap allocation per row per frame. Columns we can't resolve stay 0,
-    // which hides the image rather than letting it bleed through.
+    // be a heap allocation per row per frame. Columns we can't resolve keep the
+    // default background, which hides content below it rather than letting it
+    // bleed through, and makes the fill above it a no-op.
+    const auto defaultBackground = _renderSettings.GetAttributeColors({}).second;
     _backgroundMask.assign(columnCount, uint8_t{ 0 });
+    _backgroundColors.assign(columnCount, defaultBackground);
 
     // A slice indexes screen columns, which a non-single-width rendition
     // doubles; the row's attributes are indexed by buffer column.
@@ -1158,11 +1167,11 @@ std::span<const uint8_t> Renderer::_buildDefaultBackgroundMask(const ROW& r, con
         const auto bufferColumn = sliceColumn >> scale;
         if (bufferColumn >= 0 && bufferColumn < readableColumns)
         {
-            til::at(_backgroundMask, column) = r.GetAttrByColumn(bufferColumn).GetBackground().IsDefault() ? 1 : 0;
+            const auto attributes = r.GetAttrByColumn(bufferColumn);
+            til::at(_backgroundMask, column) = attributes.GetBackground().IsDefault() ? 1 : 0;
+            til::at(_backgroundColors, column) = _renderSettings.GetAttributeColors(attributes).second;
         }
     }
-
-    return _backgroundMask;
 }
 
 ROW* Renderer::_PaintBufferOutputComposition(TextBuffer& buffer, const ROW& r, const Composition& activeComposition)

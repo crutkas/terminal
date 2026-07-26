@@ -57,7 +57,8 @@ namespace Microsoft::Console::Render
         [[nodiscard]] HRESULT BeginRowImages(const ImageSlice& imageSlice,
                                              til::CoordType targetRow,
                                              til::CoordType viewportLeft,
-                                             std::span<const uint8_t> defaultBackgroundMask) noexcept override;
+                                             std::span<const uint8_t> defaultBackgroundMask,
+                                             std::span<const COLORREF> cellBackgrounds) noexcept override;
         [[nodiscard]] HRESULT EndRowImages() noexcept override;
         [[nodiscard]] HRESULT PaintSelection(const til::rect& rect) noexcept override;
 
@@ -210,6 +211,11 @@ namespace Microsoft::Console::Render
         bool _UnderlayCoversColumn(til::CoordType column) const noexcept;        bool _UnderlayCoversBufferCell(til::CoordType bufferColumn) const noexcept;
         bool _UnderlayCoversAnyOf(til::CoordType columnBegin, til::CoordType columnEnd) const noexcept;
         [[nodiscard]] HRESULT _FillUncoveredRunBackground(const RECT& runRect, til::CoordType fontWidth) noexcept;
+        [[nodiscard]] HRESULT _FillImageRowCellBackgrounds(const ImageSlice& imageSlice,
+                                                           til::CoordType targetRow,
+                                                           til::CoordType viewportLeft,
+                                                           std::span<const uint8_t> defaultBackgroundMask,
+                                                           std::span<const COLORREF> cellBackgrounds) noexcept;
 
         [[nodiscard]] HRESULT _InvalidCombine(const til::rect* const prc) noexcept;
         [[nodiscard]] HRESULT _InvalidOffset(const til::point* const ppt) noexcept;
