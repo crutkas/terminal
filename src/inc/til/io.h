@@ -300,7 +300,6 @@ namespace til // Terminal Implementation Library. Also: "Today I Learned"
     //    AND its name contains 'deleteNameMarker'. The marker is the caller's, because
     //    only the caller knows what it named the files it is entitled to remove; an
     //    empty one deletes nothing, so a caller cannot opt out of the check by omission.
-    // Never throws.
     _TIL_INLINEPREFIX read_file_result read_file_as_bytes(const std::wstring_view path, uint64_t offset, uint64_t size, bool deleteAfter, const std::wstring_view deleteNameMarker, std::vector<uint8_t>& out) noexcept
     {
         out.clear();

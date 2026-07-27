@@ -35,6 +35,6 @@ namespace Microsoft::Console::Utils
     //
     // 'size' of 0 means "to the end of the mapping". Windows rounds paging-file sections
     // up to a page boundary, so a caller that needs an exact non-page-aligned length has
-    // to know it and pass it. Never throws.
+    // to know it and pass it.
     ReadSharedMemoryResult ReadSharedMemory(const std::wstring_view name, uint64_t offset, uint64_t size, std::vector<uint8_t>& out) noexcept;
 }
