@@ -791,7 +791,7 @@ void StateMachine::_ActionApcDispatch(const wchar_t wch)
     {
         // Nothing claimed it, so it degrades to the string every APC used to
         // be: reported as unknown, and otherwise ignored to its terminator.
-        _EnterSosPmApcString();
+        _EnterSosPmString();
     }
 }
 
@@ -1078,7 +1078,7 @@ void StateMachine::_EnterDcsPassThrough() noexcept
 }
 
 // Routine Description:
-// - Moves the state machine into the SosPmApcString state.
+// - Moves the state machine into the SosPmString state.
 //   This state is entered:
 //   1. When the Sos character is seen after an Escape entry
 //   2. When the Pm character is seen after an Escape entry
@@ -1087,12 +1087,12 @@ void StateMachine::_EnterDcsPassThrough() noexcept
 // - <none>
 // Return Value:
 // - <none>
-void StateMachine::_EnterSosPmApcString() noexcept
+void StateMachine::_EnterSosPmString() noexcept
 {
-    _state = VTStates::SosPmApcString;
+    _state = VTStates::SosPmString;
     _cachedSequence.reset();
     _engine->UnknownSequence();
-    _trace.TraceStateChange(L"SosPmApcString");
+    _trace.TraceStateChange(L"SosPmString");
 }
 
 // Routine Description:
@@ -1220,7 +1220,7 @@ void StateMachine::_EventEscape(const wchar_t wch)
         }
         else if (_isSosIndicator(wch) || _isPmIndicator(wch))
         {
-            _EnterSosPmApcString();
+            _EnterSosPmString();
         }
         else if (_isApcIndicator(wch))
         {
@@ -1906,9 +1906,9 @@ void StateMachine::_EventDcsPassThrough(const wchar_t wch)
 // - wch - Character that triggered the event
 // Return Value:
 // - <none>
-void StateMachine::_EventSosPmApcString(const wchar_t /*wch*/) noexcept
+void StateMachine::_EventSosPmString(const wchar_t /*wch*/) noexcept
 {
-    _trace.TraceOnEvent(L"SosPmApcString");
+    _trace.TraceOnEvent(L"SosPmString");
     _ActionIgnore();
 }
 
@@ -1916,7 +1916,7 @@ void StateMachine::_EventSosPmApcString(const wchar_t /*wch*/) noexcept
 // - Moves the state machine into the ApcIgnore state.
 //   This state is entered:
 //   1. When the handler that claimed an APC string gives up on the rest of it
-//   Unlike SosPmApcString, this does not report an unknown sequence: the string
+//   Unlike SosPmString, this does not report an unknown sequence: the string
 //   was recognised and claimed, the handler simply stopped wanting it.
 // Arguments:
 // - <none>
@@ -2083,8 +2083,8 @@ void StateMachine::ProcessCharacter(const wchar_t wch)
             return _EventDcsParam(wch);
         case VTStates::DcsPassThrough:
             return _EventDcsPassThrough(wch);
-        case VTStates::SosPmApcString:
-            return _EventSosPmApcString(wch);
+        case VTStates::SosPmString:
+            return _EventSosPmString(wch);
         case VTStates::ApcEntry:
             return _EventApcEntry(wch);
         case VTStates::ApcPassThrough:
@@ -2246,16 +2246,15 @@ void StateMachine::ProcessString(const std::wstring_view string)
                 cacheUnusedRun = false;
             }
         }
-        else if (_state == VTStates::SosPmApcString || _state == VTStates::ApcEntry || _state == VTStates::ApcPassThrough || _state == VTStates::ApcIgnore || _state == VTStates::DcsPassThrough || _state == VTStates::DcsIgnore)
+        else if (_state == VTStates::SosPmString || _state == VTStates::ApcEntry || _state == VTStates::ApcPassThrough || _state == VTStates::ApcIgnore || _state == VTStates::DcsPassThrough || _state == VTStates::DcsIgnore)
         {
             // There is no need to cache the run if we've reached one of the
             // string processing states in the output engine, since that data
             // will be dealt with as soon as it is received.
             // ApcEntry is included because FlushToTerminal can never run from
-            // there - _ActionApcDispatch's lambda always succeeds - and on main
-            // an APC introducer went straight to SosPmApcString, which didn't
-            // cache either. Leaving it out would let ESC _ followed by a long
-            // run of control codes accumulate without bound.
+            // there - _ActionApcDispatch's lambda always succeeds - so leaving it
+            // out would let ESC _ followed by a long run of control codes
+            // accumulate without bound.
             cacheUnusedRun = false;
         }
 

@@ -134,7 +134,7 @@ namespace Microsoft::Console::VirtualTerminal
         void _EnterDcsIgnore() noexcept;
         void _EnterDcsIntermediate() noexcept;
         void _EnterDcsPassThrough() noexcept;
-        void _EnterSosPmApcString() noexcept;
+        void _EnterSosPmString() noexcept;
         void _EnterApcEntry() noexcept;
         void _EnterApcPassThrough() noexcept;
         void _EnterApcIgnore() noexcept;
@@ -158,7 +158,7 @@ namespace Microsoft::Console::VirtualTerminal
         void _EventDcsIntermediate(const wchar_t wch);
         void _EventDcsParam(const wchar_t wch);
         void _EventDcsPassThrough(const wchar_t wch);
-        void _EventSosPmApcString(const wchar_t wch) noexcept;
+        void _EventSosPmString(const wchar_t wch) noexcept;
         void _EventApcEntry(const wchar_t wch);
         void _EventApcPassThrough(const wchar_t wch);
         void _EventApcIgnore() noexcept;
@@ -191,7 +191,7 @@ namespace Microsoft::Console::VirtualTerminal
             DcsIntermediate,
             DcsParam,
             DcsPassThrough,
-            SosPmApcString,
+            SosPmString,
             ApcEntry,
             ApcPassThrough,
             ApcIgnore
