@@ -767,8 +767,6 @@ IStateMachineEngine::StringHandler OutputStateMachineEngine::ActionApcDispatch(c
     case VTID("G"):
         return _dispatch->KittyGraphics();
     default:
-        // Returning nullptr leaves the state machine to ignore the string,
-        // which is what it did before APC strings were dispatched at all.
         return nullptr;
     }
 }

@@ -339,10 +339,8 @@ private:
     // Stores any image content covering the row.
     ImageSlice::Pointer _imageSlice;
 
-    // Allocated lazily, and holds exactly _columnCount entries when it exists,
-    // so like _charOffsets it does not need to carry a size of its own. A vector
-    // here would cost every row in the buffer 24 bytes to describe an allocation
-    // that almost none of them ever make.
+    // Allocated lazily; when present it holds exactly _columnCount entries, so
+    // like _charOffsets it carries no size of its own.
     std::unique_ptr<ImageCellRef[]> _imageCellRefs;
 };
 
