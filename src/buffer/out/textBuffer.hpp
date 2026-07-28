@@ -50,6 +50,7 @@ filling in the last row, and updating the screen.
 #pragma once
 
 #include "cursor.h"
+#include "Image.hpp"
 #include "Row.hpp"
 #include "TextAttribute.hpp"
 #include "../types/inc/Viewport.hpp"
@@ -89,6 +90,8 @@ public:
     ROW& GetScratchpadRow(const TextAttribute& attributes);
     const ROW& GetRowByOffset(til::CoordType index) const;
     ROW& GetMutableRowByOffset(til::CoordType index);
+    const ImageCollection& GetImages() const noexcept;
+    ImageCollection& GetMutableImages() noexcept;
 
     TextBufferCellIterator GetCellDataAt(const til::point at) const;
     TextBufferCellIterator GetCellLineDataAt(const til::point at) const;
@@ -342,6 +345,7 @@ private:
     static void _AppendRTFText(std::string& contentBuilder, const std::wstring_view& text);
 
     Microsoft::Console::Render::Renderer* _renderer = nullptr;
+    ImageCollection _images;
 
     std::unordered_map<uint16_t, std::wstring> _hyperlinkMap;
     std::unordered_map<std::wstring, uint16_t> _hyperlinkCustomIdMap;

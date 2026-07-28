@@ -269,6 +269,17 @@ ROW& TextBuffer::GetMutableRowByOffset(const til::CoordType index)
     return _getRow(index);
 }
 
+const ImageCollection& TextBuffer::GetImages() const noexcept
+{
+    return _images;
+}
+
+ImageCollection& TextBuffer::GetMutableImages() noexcept
+{
+    _lastMutationId++;
+    return _images;
+}
+
 // Returns a row filled with whitespace and the current attributes, for you to freely use.
 ROW& TextBuffer::GetScratchpadRow()
 {
