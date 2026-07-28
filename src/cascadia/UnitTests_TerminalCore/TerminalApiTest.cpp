@@ -438,20 +438,13 @@ namespace TerminalCoreUnitTests
         // filesystem path of Terminal::ReadLocalFile (the shared til::read_file_as_bytes
         // helper), including the security gates that the adapter-level mock cannot cover.
         TEST_METHOD(ReadLocalFileReadsFromTemp);
-        TEST_METHOD(ReadLocalFileDeletesTempWithMarker);
-        TEST_METHOD(ReadLocalFileOutsideTempNotDeleted);
-        TEST_METHOD(ReadLocalFileNoMarkerNotDeleted);
-        TEST_METHOD(ReadLocalFileEmptyMarkerNeverDeletes);
-        TEST_METHOD(ReadLocalFileParentMarkerNotDeleted);
+        TEST_METHOD(ReadLocalFileMarkerGatesDeletion);
         TEST_METHOD(ReadLocalFileOffsetAndSizeSlice);
         TEST_METHOD(ReadLocalFileOversizeSizeClampsToEof);
-        TEST_METHOD(ReadLocalFileRejectsUncPath);
-        TEST_METHOD(ReadLocalFileRejectsRelativePath);
+        TEST_METHOD(ReadLocalFileRejectsInvalidPaths);
         TEST_METHOD(ReadLocalFileNormalizesWin32Path);
         TEST_METHOD(ReadLocalFileRejectsIntermediateJunction);
-        TEST_METHOD(ReadLocalFileNonexistentFails);
         TEST_METHOD(ReadLocalFileRejectsCharDevice);
-        TEST_METHOD(ReadLocalFileRejectsDirectory);
         TEST_METHOD(ReadLocalFileCapsAtMaxBytes);
         TEST_METHOD(ReadLocalFileFailedReadKeepsTempFile);
 
@@ -1063,106 +1056,114 @@ void TerminalApiTest::ReadLocalFileReadsFromTemp()
     DeleteFileW(path.c_str());
 }
 
-void TerminalApiTest::ReadLocalFileDeletesTempWithMarker()
+void TerminalApiTest::ReadLocalFileMarkerGatesDeletion()
 {
-    Terminal term{ Terminal::TestDummyMarker{} };
-    DummyRenderer renderer{ &term };
-    term.Create({ 100, 100 }, 0, renderer);
+    // A t=t read only deletes the file it read when the file is under the system temp
+    // directory AND its name carries the "tty-graphics-protocol" marker AND the caller
+    // passes that same marker. Every other combination must leave the file in place --
+    // the gate exists so a client cannot turn "read this file" into "delete that file".
 
-    const auto dir = KittyTempDir();
-    VERIFY_IS_FALSE(dir.empty());
-    const auto path = KittyUniquePath(dir, L"tty-graphics-protocol-del-");
-    VERIFY_IS_TRUE(KittyWriteAllBytes(path, { 9, 8, 7 }));
-
-    std::vector<uint8_t> out;
-    VERIFY_IS_TRUE(til::read_file_result::ok == term.ReadLocalFile(path, 0, 0, true, TempFileMarker, out), L"the read should succeed");
-    VERIFY_ARE_EQUAL(static_cast<size_t>(3), out.size());
-    VERIFY_IS_FALSE(KittyFileExists(path), L"a temp file carrying the kitty marker must be deleted after a t=t read");
-
-    if (KittyFileExists(path))
+    // Under temp, marked name, marker passed: the file is deleted.
     {
+        Terminal term{ Terminal::TestDummyMarker{} };
+        DummyRenderer renderer{ &term };
+        term.Create({ 100, 100 }, 0, renderer);
+
+        const auto dir = KittyTempDir();
+        VERIFY_IS_FALSE(dir.empty());
+        const auto path = KittyUniquePath(dir, L"tty-graphics-protocol-del-");
+        VERIFY_IS_TRUE(KittyWriteAllBytes(path, { 9, 8, 7 }));
+
+        std::vector<uint8_t> out;
+        VERIFY_IS_TRUE(til::read_file_result::ok == term.ReadLocalFile(path, 0, 0, true, TempFileMarker, out), L"the read should succeed");
+        VERIFY_ARE_EQUAL(static_cast<size_t>(3), out.size());
+        VERIFY_IS_FALSE(KittyFileExists(path), L"a temp file carrying the kitty marker must be deleted after a t=t read");
+
+        if (KittyFileExists(path))
+        {
+            DeleteFileW(path.c_str());
+        }
+    }
+
+    // Outside the temp dir: never deleted, even with the marker and deleteAfter.
+    {
+        Terminal term{ Terminal::TestDummyMarker{} };
+        DummyRenderer renderer{ &term };
+        term.Create({ 100, 100 }, 0, renderer);
+
+        // The current directory (the test's output folder) is a local, writable location
+        // that is not under the system temp directory.
+        const auto dir = KittyCurrentDir();
+        VERIFY_IS_FALSE(dir.empty());
+        const auto path = KittyUniquePath(dir, L"tty-graphics-protocol-outside-");
+        VERIFY_IS_TRUE(KittyWriteAllBytes(path, { 4, 5, 6 }));
+
+        std::vector<uint8_t> out;
+        VERIFY_IS_TRUE(til::read_file_result::ok == term.ReadLocalFile(path, 0, 0, true, TempFileMarker, out), L"the read should still succeed");
+        VERIFY_IS_TRUE(KittyFileExists(path), L"a file OUTSIDE the temp dir must never be deleted, even with deleteAfter (anti arbitrary-delete)");
+
         DeleteFileW(path.c_str());
     }
-}
 
-void TerminalApiTest::ReadLocalFileOutsideTempNotDeleted()
-{
-    Terminal term{ Terminal::TestDummyMarker{} };
-    DummyRenderer renderer{ &term };
-    term.Create({ 100, 100 }, 0, renderer);
+    // Under temp but the name lacks the marker: not deleted.
+    {
+        Terminal term{ Terminal::TestDummyMarker{} };
+        DummyRenderer renderer{ &term };
+        term.Create({ 100, 100 }, 0, renderer);
 
-    // The current directory (the test's output folder) is a local, writable location
-    // that is not under the system temp directory.
-    const auto dir = KittyCurrentDir();
-    VERIFY_IS_FALSE(dir.empty());
-    const auto path = KittyUniquePath(dir, L"tty-graphics-protocol-outside-");
-    VERIFY_IS_TRUE(KittyWriteAllBytes(path, { 4, 5, 6 }));
+        const auto dir = KittyTempDir();
+        VERIFY_IS_FALSE(dir.empty());
+        // Under temp, but the name lacks the "tty-graphics-protocol" marker.
+        const auto path = KittyUniquePath(dir, L"kitty-no-marker-");
+        VERIFY_IS_TRUE(KittyWriteAllBytes(path, { 1, 1, 1 }));
 
-    std::vector<uint8_t> out;
-    VERIFY_IS_TRUE(til::read_file_result::ok == term.ReadLocalFile(path, 0, 0, true, TempFileMarker, out), L"the read should still succeed");
-    VERIFY_IS_TRUE(KittyFileExists(path), L"a file OUTSIDE the temp dir must never be deleted, even with deleteAfter (anti arbitrary-delete)");
+        std::vector<uint8_t> out;
+        VERIFY_IS_TRUE(til::read_file_result::ok == term.ReadLocalFile(path, 0, 0, true, TempFileMarker, out), L"the read should succeed");
+        VERIFY_IS_TRUE(KittyFileExists(path), L"a temp file WITHOUT the kitty marker must not be auto-deleted");
 
-    DeleteFileW(path.c_str());
-}
+        DeleteFileW(path.c_str());
+    }
 
-void TerminalApiTest::ReadLocalFileNoMarkerNotDeleted()
-{
-    Terminal term{ Terminal::TestDummyMarker{} };
-    DummyRenderer renderer{ &term };
-    term.Create({ 100, 100 }, 0, renderer);
+    // Marked name under temp, but the caller passes an EMPTY marker: deletes nothing.
+    {
+        Terminal term{ Terminal::TestDummyMarker{} };
+        DummyRenderer renderer{ &term };
+        term.Create({ 100, 100 }, 0, renderer);
 
-    const auto dir = KittyTempDir();
-    VERIFY_IS_FALSE(dir.empty());
-    // Under temp, but the name lacks the "tty-graphics-protocol" marker.
-    const auto path = KittyUniquePath(dir, L"kitty-no-marker-");
-    VERIFY_IS_TRUE(KittyWriteAllBytes(path, { 1, 1, 1 }));
+        const auto dir = KittyTempDir();
+        VERIFY_IS_FALSE(dir.empty());
+        // Named exactly the way a caller that DOES pass a marker would name it, so the only
+        // thing standing between this file and deletion is the empty marker below.
+        const auto path = KittyUniquePath(dir, L"tty-graphics-protocol-nomarker-");
+        VERIFY_IS_TRUE(KittyWriteAllBytes(path, { 1, 1, 1 }));
 
-    std::vector<uint8_t> out;
-    VERIFY_IS_TRUE(til::read_file_result::ok == term.ReadLocalFile(path, 0, 0, true, TempFileMarker, out), L"the read should succeed");
-    VERIFY_IS_TRUE(KittyFileExists(path), L"a temp file WITHOUT the kitty marker must not be auto-deleted");
+        std::vector<uint8_t> out;
+        VERIFY_IS_TRUE(til::read_file_result::ok == term.ReadLocalFile(path, 0, 0, true, L"", out), L"the read should succeed");
+        VERIFY_IS_TRUE(KittyFileExists(path), L"an empty marker must delete nothing: a caller cannot opt out of the name check by omitting it");
 
-    DeleteFileW(path.c_str());
-}
+        DeleteFileW(path.c_str());
+    }
 
-void TerminalApiTest::ReadLocalFileEmptyMarkerNeverDeletes()
-{
-    Terminal term{ Terminal::TestDummyMarker{} };
-    DummyRenderer renderer{ &term };
-    term.Create({ 100, 100 }, 0, renderer);
+    // The marker on a PARENT directory does not authorize deleting a file inside it.
+    {
+        Terminal term{ Terminal::TestDummyMarker{} };
+        DummyRenderer renderer{ &term };
+        term.Create({ 100, 100 }, 0, renderer);
 
-    const auto dir = KittyTempDir();
-    VERIFY_IS_FALSE(dir.empty());
-    // Named exactly the way a caller that DOES pass a marker would name it, so the only
-    // thing standing between this file and deletion is the empty marker below.
-    const auto path = KittyUniquePath(dir, L"tty-graphics-protocol-nomarker-");
-    VERIFY_IS_TRUE(KittyWriteAllBytes(path, { 1, 1, 1 }));
+        const auto dir = KittyTempDir();
+        VERIFY_IS_FALSE(dir.empty());
+        const auto subdir = KittyUniquePath(dir, L"tty-graphics-protocol-parent-");
+        VERIFY_IS_TRUE(CreateDirectoryW(subdir.c_str(), nullptr) != FALSE, L"failed to create the marked parent directory");
+        const auto path = KittyUniquePath(subdir + L"\\", L"unrelated-");
+        VERIFY_IS_TRUE(KittyWriteAllBytes(path, { 1, 2, 3 }));
 
-    std::vector<uint8_t> out;
-    VERIFY_IS_TRUE(til::read_file_result::ok == term.ReadLocalFile(path, 0, 0, true, L"", out), L"the read should succeed");
-    VERIFY_IS_TRUE(KittyFileExists(path), L"an empty marker must delete nothing: a caller cannot opt out of the name check by omitting it");
+        std::vector<uint8_t> out;
+        VERIFY_IS_TRUE(til::read_file_result::ok == term.ReadLocalFile(path, 0, 0, true, TempFileMarker, out), L"the read should succeed");
+        VERIFY_IS_TRUE(KittyFileExists(path), L"a marker in a parent directory must not authorize deleting an unrelated file");
 
-    DeleteFileW(path.c_str());
-}
-
-void TerminalApiTest::ReadLocalFileParentMarkerNotDeleted()
-{
-    Terminal term{ Terminal::TestDummyMarker{} };
-    DummyRenderer renderer{ &term };
-    term.Create({ 100, 100 }, 0, renderer);
-
-    const auto dir = KittyTempDir();
-    VERIFY_IS_FALSE(dir.empty());
-    const auto subdir = KittyUniquePath(dir, L"tty-graphics-protocol-parent-");
-    VERIFY_IS_TRUE(CreateDirectoryW(subdir.c_str(), nullptr) != FALSE, L"failed to create the marked parent directory");
-    const auto path = KittyUniquePath(subdir + L"\\", L"unrelated-");
-    VERIFY_IS_TRUE(KittyWriteAllBytes(path, { 1, 2, 3 }));
-
-    std::vector<uint8_t> out;
-    VERIFY_IS_TRUE(til::read_file_result::ok == term.ReadLocalFile(path, 0, 0, true, TempFileMarker, out), L"the read should succeed");
-    VERIFY_IS_TRUE(KittyFileExists(path), L"a marker in a parent directory must not authorize deleting an unrelated file");
-
-    DeleteFileW(path.c_str());
-    RemoveDirectoryW(subdir.c_str());
+        DeleteFileW(path.c_str());
+        RemoveDirectoryW(subdir.c_str());
+    }
 }
 
 void TerminalApiTest::ReadLocalFileOffsetAndSizeSlice()
@@ -1207,29 +1208,69 @@ void TerminalApiTest::ReadLocalFileOversizeSizeClampsToEof()
     DeleteFileW(path.c_str());
 }
 
-void TerminalApiTest::ReadLocalFileRejectsUncPath()
+void TerminalApiTest::ReadLocalFileRejectsInvalidPaths()
 {
-    Terminal term{ Terminal::TestDummyMarker{} };
-    DummyRenderer renderer{ &term };
-    term.Create({ 100, 100 }, 0, renderer);
+    // A path that is malformed or does not name a readable regular file is refused before
+    // any bytes are returned, and a rejected read always leaves the output empty. Each
+    // class of bad path reports its own result code.
 
-    // A UNC path must be rejected up front (no SMB connection, no NTLM handshake).
-    std::vector<uint8_t> out{ 7, 7, 7 };
-    VERIFY_IS_TRUE(til::read_file_result::invalid == term.ReadLocalFile(L"\\\\127.0.0.1\\share\\never.bin", 0, 0, false, TempFileMarker, out), L"a UNC path must be rejected as an invalid request");
-    VERIFY_ARE_EQUAL(static_cast<size_t>(0), out.size(), L"a rejected read must leave the output empty");
-}
+    // A UNC path is rejected up front (no SMB connection, no NTLM handshake): invalid.
+    {
+        Terminal term{ Terminal::TestDummyMarker{} };
+        DummyRenderer renderer{ &term };
+        term.Create({ 100, 100 }, 0, renderer);
 
-void TerminalApiTest::ReadLocalFileRejectsRelativePath()
-{
-    Terminal term{ Terminal::TestDummyMarker{} };
-    DummyRenderer renderer{ &term };
-    term.Create({ 100, 100 }, 0, renderer);
+        std::vector<uint8_t> out{ 7, 7, 7 };
+        VERIFY_IS_TRUE(til::read_file_result::invalid == term.ReadLocalFile(L"\\\\127.0.0.1\\share\\never.bin", 0, 0, false, TempFileMarker, out), L"a UNC path must be rejected as an invalid request");
+        VERIFY_ARE_EQUAL(static_cast<size_t>(0), out.size(), L"a rejected read must leave the output empty");
+    }
 
-    // Relative paths are rejected so a client cannot read a file resolved against the
-    // terminal's own working directory.
-    std::vector<uint8_t> out;
-    VERIFY_IS_TRUE(til::read_file_result::invalid == term.ReadLocalFile(L"relative\\file.bin", 0, 0, false, TempFileMarker, out), L"a non-absolute path must be rejected as an invalid request");
-    VERIFY_ARE_EQUAL(static_cast<size_t>(0), out.size());
+    // A relative path is rejected so a client cannot read a file resolved against the
+    // terminal's own working directory: invalid.
+    {
+        Terminal term{ Terminal::TestDummyMarker{} };
+        DummyRenderer renderer{ &term };
+        term.Create({ 100, 100 }, 0, renderer);
+
+        std::vector<uint8_t> out;
+        VERIFY_IS_TRUE(til::read_file_result::invalid == term.ReadLocalFile(L"relative\\file.bin", 0, 0, false, TempFileMarker, out), L"a non-absolute path must be rejected as an invalid request");
+        VERIFY_ARE_EQUAL(static_cast<size_t>(0), out.size());
+    }
+
+    // A well-formed absolute path that names no file reports not_found (ENOENT).
+    {
+        Terminal term{ Terminal::TestDummyMarker{} };
+        DummyRenderer renderer{ &term };
+        term.Create({ 100, 100 }, 0, renderer);
+
+        const auto dir = KittyTempDir();
+        VERIFY_IS_FALSE(dir.empty());
+        // A unique path we never create.
+        const auto path = KittyUniquePath(dir, L"tty-graphics-protocol-missing-");
+
+        std::vector<uint8_t> out;
+        VERIFY_IS_TRUE(til::read_file_result::not_found == term.ReadLocalFile(path, 0, 0, false, TempFileMarker, out), L"a missing file must report not_found (ENOENT)");
+        VERIFY_ARE_EQUAL(static_cast<size_t>(0), out.size());
+    }
+
+    // A real, drive-absolute directory passes every pre-open path check but must not be
+    // readable as an image. FILE_NON_DIRECTORY_FILE reports it as read_error (EBADF).
+    {
+        Terminal term{ Terminal::TestDummyMarker{} };
+        DummyRenderer renderer{ &term };
+        term.Create({ 100, 100 }, 0, renderer);
+
+        const auto dir = KittyTempDir();
+        VERIFY_IS_FALSE(dir.empty());
+        const auto subdir = KittyUniquePath(dir, L"tty-graphics-protocol-dir-");
+        VERIFY_IS_TRUE(CreateDirectoryW(subdir.c_str(), nullptr) != FALSE, L"failed to create the test directory");
+
+        std::vector<uint8_t> out{ 1, 2, 3 };
+        VERIFY_IS_TRUE(til::read_file_result::read_error == term.ReadLocalFile(subdir, 0, 0, false, TempFileMarker, out), L"a directory must be refused as unreadable (EBADF): only regular files may be read");
+        VERIFY_ARE_EQUAL(static_cast<size_t>(0), out.size(), L"a rejected read must leave the output empty");
+
+        RemoveDirectoryW(subdir.c_str());
+    }
 }
 
 void TerminalApiTest::ReadLocalFileNormalizesWin32Path()
@@ -1280,22 +1321,6 @@ void TerminalApiTest::ReadLocalFileRejectsIntermediateJunction()
     VERIFY_ARE_EQUAL(static_cast<size_t>(0), out.size());
 }
 
-void TerminalApiTest::ReadLocalFileNonexistentFails()
-{
-    Terminal term{ Terminal::TestDummyMarker{} };
-    DummyRenderer renderer{ &term };
-    term.Create({ 100, 100 }, 0, renderer);
-
-    const auto dir = KittyTempDir();
-    VERIFY_IS_FALSE(dir.empty());
-    // A unique path we never create.
-    const auto path = KittyUniquePath(dir, L"tty-graphics-protocol-missing-");
-
-    std::vector<uint8_t> out;
-    VERIFY_IS_TRUE(til::read_file_result::not_found == term.ReadLocalFile(path, 0, 0, false, TempFileMarker, out), L"a missing file must report not_found (ENOENT)");
-    VERIFY_ARE_EQUAL(static_cast<size_t>(0), out.size());
-}
-
 void TerminalApiTest::ReadLocalFileRejectsCharDevice()
 {
     Terminal term{ Terminal::TestDummyMarker{} };
@@ -1313,26 +1338,6 @@ void TerminalApiTest::ReadLocalFileRejectsCharDevice()
         VERIFY_IS_TRUE(til::read_file_result::read_error == term.ReadLocalFile(devicePath, 0, 0, false, TempFileMarker, out), L"a DOS character device must be refused as unreadable (EBADF): only regular files may be read");
         VERIFY_ARE_EQUAL(static_cast<size_t>(0), out.size(), L"a rejected read must leave the output empty");
     }
-}
-
-void TerminalApiTest::ReadLocalFileRejectsDirectory()
-{
-    Terminal term{ Terminal::TestDummyMarker{} };
-    DummyRenderer renderer{ &term };
-    term.Create({ 100, 100 }, 0, renderer);
-
-    const auto dir = KittyTempDir();
-    VERIFY_IS_FALSE(dir.empty());
-    // A real, drive-absolute directory passes every pre-open path check but must not be
-    // readable as an image. FILE_NON_DIRECTORY_FILE reports it as read_error (EBADF).
-    const auto subdir = KittyUniquePath(dir, L"tty-graphics-protocol-dir-");
-    VERIFY_IS_TRUE(CreateDirectoryW(subdir.c_str(), nullptr) != FALSE, L"failed to create the test directory");
-
-    std::vector<uint8_t> out{ 1, 2, 3 };
-    VERIFY_IS_TRUE(til::read_file_result::read_error == term.ReadLocalFile(subdir, 0, 0, false, TempFileMarker, out), L"a directory must be refused as unreadable (EBADF): only regular files may be read");
-    VERIFY_ARE_EQUAL(static_cast<size_t>(0), out.size(), L"a rejected read must leave the output empty");
-
-    RemoveDirectoryW(subdir.c_str());
 }
 
 void TerminalApiTest::ReadLocalFileCapsAtMaxBytes()
