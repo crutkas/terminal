@@ -548,97 +548,117 @@ try
 }
 CATCH_RETURN()
 
+[[nodiscard]] HRESULT AtlasEngine::PrepareImageFrame(const ImageFrameInfo info) noexcept
+try
+{
+    _api.imagePlacements.assign(info.placements.begin(), info.placements.end());
+    _p.imageSurfaces.assign(info.surfaces.begin(), info.surfaces.end());
+    _api.imageViewportOrigin = info.viewportOrigin;
+    return S_OK;
+}
+CATCH_RETURN()
+
 // cellBackgrounds is unused here: this engine draws the whole row's backgrounds in
 // its own pass before any of the image quads it appends below, so content between
 // the background and the text already composites over the right color.
-[[nodiscard]] HRESULT AtlasEngine::BeginRowImages(const ImageSlice& imageSlice, const til::CoordType targetRow, const til::CoordType viewportLeft, const std::span<const uint8_t> defaultBackgroundMask, const std::span<const COLORREF> /*cellBackgrounds*/) noexcept
+[[nodiscard]] HRESULT AtlasEngine::BeginRowImages(const ImageSlice* const imageSlice, const til::CoordType targetRow, const til::CoordType viewportLeft, const std::span<const uint8_t> defaultBackgroundMask, const std::span<const COLORREF> /*cellBackgrounds*/) noexcept
 try
 {
     const auto y = clamp<til::CoordType>(targetRow, 0, _p.s->viewportCellCount.y - 1);
     const auto row = _p.rows[y];
-    const auto srcWidth = std::max(0, imageSlice.PixelWidth());
-    const auto srcCellSize = imageSlice.CellSize();
-    if (srcCellSize.width <= 0)
+    row->images.clear();
+    row->imageDefaultBackground.assign(defaultBackgroundMask.begin(), defaultBackgroundMask.end());
+    const auto bufferRow = targetRow + _api.imageViewportOrigin.y;
+    for (const auto& placement : _api.imagePlacements)
     {
-        return S_OK;
-    }
-    const auto columnCount = srcWidth / srcCellSize.width;
-
-    for (size_t i = 0; i < ImageSlice::RenderPositionCount; i++)
-    {
-        const auto position = static_cast<ImageSlice::RenderPosition>(i);
-        if (!imageSlice.HasPixels(position))
+        const auto bounds = placement.CellBounds();
+        if (bufferRow >= bounds.top && bufferRow < bounds.bottom)
         {
-            continue;
-        }
-
-        // Snapshots are cached by revision. A masked snapshot is no longer the
-        // slice's own pixels, so it needs a key of its own. Keeping those in the
-        // top half of the space puts them permanently out of reach of the
-        // revision counter, which starts at zero and only ever climbs.
-        auto revision = imageSlice.Revision(position);
-        const auto masked = position == ImageSlice::RenderPosition::BehindBackground &&
-                            defaultBackgroundMask.size() == gsl::narrow_cast<size_t>(columnCount);
-        if (masked)
-        {
-            for (const auto value : defaultBackgroundMask)
+            if (auto fragment = placement.Crop({ bounds.left, bufferRow, bounds.right, bufferRow + 1 }))
             {
-                revision = (revision ^ value) * 0x100000001b3ull;
+                row->images.emplace_back(std::move(*fragment));
             }
-            revision |= 0x8000000000000000ull;
         }
+    }
 
-        auto& b = til::at(row->bitmaps, i);
-
-        // If this row's ImageSlice has changed we need to update our snapshot.
-        // Theoretically another _p.rows[y]->bitmaps may have this particular revision already,
-        // but that can only happen if we're scrolling _and_ the entire viewport was invalidated.
-        if (b.revision != revision)
+    if (imageSlice)
+    {
+        const auto srcWidth = std::max(0, imageSlice->PixelWidth());
+        const auto srcCellSize = imageSlice->CellSize();
+        if (srcCellSize.width <= 0)
         {
-            const auto srcHeight = std::max(0, srcCellSize.height);
-            const auto pixels = imageSlice.Pixels(position);
-            const auto expectedSize = gsl::narrow_cast<size_t>(srcWidth) * gsl::narrow_cast<size_t>(srcHeight);
+            return S_OK;
+        }
+        const auto columnCount = srcWidth / srcCellSize.width;
 
-            // Sanity check.
-            if (pixels.size() != expectedSize)
+        for (size_t i = 0; i < ImageSlice::RenderPositionCount; i++)
+        {
+            const auto position = static_cast<ImageSlice::RenderPosition>(i);
+            if (!imageSlice->HasPixels(position))
             {
-                assert(false);
                 continue;
             }
 
-            if (b.source.size() != pixels.size())
-            {
-                b.source = Buffer<u32, 32>{ pixels.size() };
-            }
-
-            memcpy(b.source.data(), pixels.data(), pixels.size_bytes());
-
+            auto revision = imageSlice->Revision(position);
+            const auto maskOffset = imageSlice->ColumnOffset() - viewportLeft;
+            const auto masked = position == ImageSlice::RenderPosition::BehindBackground &&
+                                maskOffset >= 0 &&
+                                maskOffset + columnCount <= gsl::narrow_cast<til::CoordType>(defaultBackgroundMask.size());
             if (masked)
             {
-                // Content below the background is only visible through cells
-                // whose background is the default one.
-                for (auto column = 0; column < columnCount; column++)
+                for (auto column = 0; column < columnCount; ++column)
                 {
-                    if (til::at(defaultBackgroundMask, gsl::narrow_cast<size_t>(column)) != 0)
-                    {
-                        continue;
-                    }
-                    for (auto pixelRow = 0; pixelRow < srcHeight; pixelRow++)
-                    {
-                        const auto first = b.source.data() + gsl::narrow_cast<size_t>(pixelRow) * srcWidth + gsl::narrow_cast<size_t>(column) * srcCellSize.width;
-                        std::fill_n(first, srcCellSize.width, 0u);
-                    }
+                    revision = (revision ^ til::at(defaultBackgroundMask, gsl::narrow_cast<size_t>(maskOffset + column))) * 0x100000001b3ull;
                 }
+                revision |= 0x8000000000000000ull;
             }
 
-            b.revision = revision;
-            b.sourceSize.x = srcWidth;
-            b.sourceSize.y = srcHeight;
-        }
+            auto& b = til::at(row->bitmaps, i);
 
-        b.targetOffset = (imageSlice.ColumnOffset() - viewportLeft);
-        b.targetWidth = columnCount;
-        b.active = true;
+            if (b.revision != revision)
+            {
+                const auto srcHeight = std::max(0, srcCellSize.height);
+                const auto pixels = imageSlice->Pixels(position);
+                const auto expectedSize = gsl::narrow_cast<size_t>(srcWidth) * gsl::narrow_cast<size_t>(srcHeight);
+
+                if (pixels.size() != expectedSize)
+                {
+                    assert(false);
+                    continue;
+                }
+
+                if (b.source.size() != pixels.size())
+                {
+                    b.source = Buffer<u32, 32>{ pixels.size() };
+                }
+
+                memcpy(b.source.data(), pixels.data(), pixels.size_bytes());
+
+                if (masked)
+                {
+                    for (auto column = 0; column < columnCount; column++)
+                    {
+                        if (til::at(defaultBackgroundMask, gsl::narrow_cast<size_t>(maskOffset + column)) != 0)
+                        {
+                            continue;
+                        }
+                        for (auto pixelRow = 0; pixelRow < srcHeight; pixelRow++)
+                        {
+                            const auto first = b.source.data() + gsl::narrow_cast<size_t>(pixelRow) * srcWidth + gsl::narrow_cast<size_t>(column) * srcCellSize.width;
+                            std::fill_n(first, srcCellSize.width, 0u);
+                        }
+                    }
+                }
+
+                b.revision = revision;
+                b.sourceSize.x = srcWidth;
+                b.sourceSize.y = srcHeight;
+            }
+
+            b.targetOffset = (imageSlice->ColumnOffset() - viewportLeft);
+            b.targetWidth = columnCount;
+            b.active = true;
+        }
     }
     return S_OK;
 }

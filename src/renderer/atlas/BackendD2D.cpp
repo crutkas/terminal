@@ -30,6 +30,7 @@ void BackendD2D::ReleaseResources() noexcept
 {
     _renderTarget.reset();
     _renderTarget4.reset();
+    _imageCache.clear();
     // Ensure _handleSettingsUpdate() is called so that _renderTarget gets recreated.
     _generation = {};
 }
@@ -40,6 +41,7 @@ void BackendD2D::Render(RenderingPayload& p)
     {
         _handleSettingsUpdate(p);
     }
+    _pruneImageCache(p);
 
     _renderTarget->BeginDraw();
     try
@@ -85,6 +87,7 @@ void BackendD2D::_handleSettingsUpdate(const RenderingPayload& p)
 
     if (renderTargetChanged)
     {
+        _imageCache.clear();
         {
             wil::com_ptr<ID3D11Texture2D> buffer;
             THROW_IF_FAILED(p.swapChain.swapChain->GetBuffer(0, __uuidof(ID3D11Texture2D), reinterpret_cast<void**>(buffer.addressof())));
@@ -232,6 +235,7 @@ void BackendD2D::_drawText(RenderingPayload& p)
             {
                 _drawBitmap(p, underlay, y);
             }
+            _drawImages(p, *row, y, static_cast<ImagePlacement::RenderPosition>(i));
         }
 
         if (row->lineRendition != LineRendition::SingleWidth)
@@ -336,6 +340,7 @@ void BackendD2D::_drawText(RenderingPayload& p)
         {
             _drawBitmap(p, overlay, y);
         }
+        _drawImages(p, *row, y, ImagePlacement::RenderPosition::AboveText);
 
         if (p.invalidatedRows.contains(y))
         {
@@ -848,6 +853,150 @@ void BackendD2D::_drawBitmap(const RenderingPayload& p, const Bitmap& b, u16 y) 
         static_cast<f32>(bottom),
     };
     _renderTarget->DrawBitmap(bitmap.get(), &rectF, 1, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
+}
+
+void BackendD2D::_pruneImageCache(const RenderingPayload& p)
+{
+    for (auto it = _imageCache.begin(); it != _imageCache.end();)
+    {
+        auto active = false;
+        for (const auto row : p.rows)
+        {
+            active = std::any_of(row->images.begin(), row->images.end(), [&](const auto& placement) {
+                return placement.SurfacePointer().get() == it->first;
+            });
+            if (active)
+            {
+                break;
+            }
+        }
+        it = active ? std::next(it) : _imageCache.erase(it);
+    }
+}
+
+void BackendD2D::_drawImages(const RenderingPayload& p, const ShapedRow& row, const u16 y, const ImagePlacement::RenderPosition position)
+{
+    const auto cellWidth = p.s->font->cellSize.x;
+    const auto cellHeight = p.s->font->cellSize.y;
+    const auto rowTop = static_cast<f32>(y * cellHeight);
+    const auto rowBottom = rowTop + cellHeight;
+
+    for (const auto& placement : row.images)
+    {
+        if (placement.Position() != position)
+        {
+            continue;
+        }
+        const auto bounds = placement.CellBounds();
+        auto left = bounds.left;
+        const auto right = bounds.right;
+        if (position == ImagePlacement::RenderPosition::BehindBackground)
+        {
+            while (left < right)
+            {
+                while (left < right)
+                {
+                    const auto index = left - p.scrollOffsetX;
+                    if (index >= 0 && gsl::narrow_cast<size_t>(index) < row.imageDefaultBackground.size() && row.imageDefaultBackground[index] != 0)
+                    {
+                        break;
+                    }
+                    ++left;
+                }
+                const auto runBegin = left;
+                while (left < right)
+                {
+                    const auto index = left - p.scrollOffsetX;
+                    if (index < 0 || gsl::narrow_cast<size_t>(index) >= row.imageDefaultBackground.size() || row.imageDefaultBackground[index] == 0)
+                    {
+                        break;
+                    }
+                    ++left;
+                }
+                if (runBegin < left)
+                {
+                    const D2D1_RECT_F clip{
+                        static_cast<f32>((runBegin - p.scrollOffsetX) * cellWidth),
+                        rowTop,
+                        static_cast<f32>((left - p.scrollOffsetX) * cellWidth),
+                        rowBottom,
+                    };
+                    _drawImage(p, placement, clip);
+                }
+            }
+        }
+        else
+        {
+            const D2D1_RECT_F clip{
+                static_cast<f32>((left - p.scrollOffsetX) * cellWidth),
+                rowTop,
+                static_cast<f32>((right - p.scrollOffsetX) * cellWidth),
+                rowBottom,
+            };
+            _drawImage(p, placement, clip);
+        }
+    }
+}
+
+void BackendD2D::_drawImage(const RenderingPayload& p, const ImagePlacement& placement, const D2D1_RECT_F& clip)
+{
+    const auto& image = placement.SurfacePointer();
+    const auto snapshot = std::ranges::find(p.imageSurfaces, image.get(), [](const auto& surface) {
+        return surface.image.get();
+    });
+    THROW_HR_IF(E_UNEXPECTED, snapshot == p.imageSurfaces.end() || !snapshot->pixels);
+    auto& cached = _imageCache[image.get()];
+    cached.image = image;
+    if (!cached.bitmap)
+    {
+        const auto size = image->PixelSize();
+        const D2D1_SIZE_U bitmapSize{
+            gsl::narrow_cast<UINT32>(size.width),
+            gsl::narrow_cast<UINT32>(size.height),
+        };
+        const D2D1_BITMAP_PROPERTIES properties{
+            .pixelFormat = { DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED },
+            .dpiX = static_cast<f32>(p.s->font->dpi),
+            .dpiY = static_cast<f32>(p.s->font->dpi),
+        };
+        THROW_IF_FAILED(_renderTarget->CreateBitmap(bitmapSize, nullptr, 0, &properties, cached.bitmap.put()));
+    }
+    if (cached.revision != snapshot->revision)
+    {
+        const auto size = image->PixelSize();
+        const auto pixels = std::span{ *snapshot->pixels };
+        THROW_HR_IF(E_UNEXPECTED, pixels.size() != static_cast<size_t>(size.width) * size.height);
+        THROW_IF_FAILED(cached.bitmap->CopyFromMemory(nullptr, pixels.data(), gsl::narrow_cast<UINT32>(size.width * sizeof(RGBQUAD))));
+        cached.revision = snapshot->revision;
+    }
+
+    const auto cellWidth = static_cast<f32>(p.s->font->cellSize.x);
+    const auto cellHeight = static_cast<f32>(p.s->font->cellSize.y);
+    const auto original = placement.OriginalCellBounds();
+    const auto fragment = placement.CellBounds();
+    const auto& geometry = placement.Geometry();
+    const auto left = static_cast<f32>(original.left - p.scrollOffsetX) * cellWidth +
+                      static_cast<f32>(geometry.offset.x) * cellWidth / geometry.cellSize.width;
+    const auto top = clip.top -
+                     static_cast<f32>(fragment.top - original.top) * cellHeight +
+                     static_cast<f32>(geometry.offset.y) * cellHeight / geometry.cellSize.height;
+    const D2D1_RECT_F target{
+        left,
+        top,
+        left + static_cast<f32>(geometry.targetWidth) * cellWidth / geometry.cellSize.width,
+        top + static_cast<f32>(geometry.targetHeight) * cellHeight / geometry.cellSize.height,
+    };
+    const auto source = placement.SourceInPixels();
+    const D2D1_RECT_F sourceRect{
+        static_cast<f32>(source.left),
+        static_cast<f32>(source.top),
+        static_cast<f32>(source.right),
+        static_cast<f32>(source.bottom),
+    };
+
+    _renderTarget->PushAxisAlignedClip(&clip, D2D1_ANTIALIAS_MODE_ALIASED);
+    _renderTarget->DrawBitmap(cached.bitmap.get(), &target, 1, D2D1_BITMAP_INTERPOLATION_MODE_NEAREST_NEIGHBOR, &sourceRect);
+    _renderTarget->PopAxisAlignedClip();
 }
 
 void BackendD2D::_drawCursorPart1(const RenderingPayload& p)

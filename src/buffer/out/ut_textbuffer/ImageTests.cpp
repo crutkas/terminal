@@ -30,7 +30,7 @@ class ImageTests
     TEST_METHOD(RectangularCopyAndErasePreserveSampling);
     TEST_METHOD(CrossBufferBlankCopyErasesPlacement);
     TEST_METHOD(TraditionalResizeClipsAndRetainsImages);
-    TEST_METHOD(ResizeRebuildHandlesMixedCellSizes);
+    TEST_METHOD(ResizeRetainsMixedCellSizesWithoutRowSlices);
     TEST_METHOD(ReflowAppliesDirectPlacementPolicy);
 
     static constexpr til::size CellSize{ 2, 3 };
@@ -63,18 +63,19 @@ class ImageTests
 
     static void AddPlacement(TextBuffer& buffer, ImagePlacement placement)
     {
-        const auto bounds = placement.CellBounds() & buffer.GetSize().ToExclusive();
-        for (auto rowIndex = bounds.top; rowIndex < bounds.bottom; ++rowIndex)
-        {
-            auto& row = buffer.GetMutableRowByOffset(rowIndex);
-            auto slice = row.GetMutableImageSlice();
-            if (!slice)
-            {
-                slice = row.SetImageSlice(std::make_unique<ImageSlice>(placement.Geometry().cellSize));
-            }
-            THROW_HR_IF(E_UNEXPECTED, !placement.RasterizeRow(rowIndex, bounds.left, bounds.right, *slice));
-        }
         buffer.GetMutableImages().Add(std::move(placement));
+    }
+
+    static bool PlacementCoversCell(const TextBuffer& buffer, const uint32_t imageId, const til::point cell)
+    {
+        for (const auto& placement : buffer.GetImages().IntersectingRows(cell.y, cell.y + 1))
+        {
+            if (placement->Identity().imageId == imageId && placement->CellBounds().contains(cell))
+            {
+                return true;
+            }
+        }
+        return false;
     }
 };
 
@@ -188,12 +189,15 @@ void ImageTests::SurfaceUpdateReachesEveryFragment()
     images.Add(MakePlacement({ 1, 1 }, { 0, 0, 6, 6 }));
     const auto surface = images.All()[0].SurfacePointer();
     const auto oldRevision = surface->Revision();
+    const auto oldStorage = surface->Storage();
     images.EraseArea({ 2, 2, 4, 4 });
 
     auto pixels = std::vector<RGBQUAD>(surface->Pixels().size(), RGBQUAD{ 1, 2, 3, 4 });
     surface->UpdatePixels(pixels);
 
     VERIFY_ARE_NOT_EQUAL(oldRevision, surface->Revision());
+    VERIFY_ARE_NOT_EQUAL(oldStorage.get(), surface->Storage().get());
+    VERIFY_ARE_EQUAL(0, static_cast<int>(oldStorage->front().rgbBlue), L"a frame snapshot must retain immutable pixels across revision updates");
     for (const auto& fragment : images.All())
     {
         VERIFY_ARE_EQUAL(surface->Revision(), fragment.Surface().Revision());
@@ -293,9 +297,8 @@ void ImageTests::CircularAndRegionalScrollUseLogicalRows()
     {
         VERIFY_ARE_EQUAL(surface.get(), fragment.SurfacePointer().get());
     }
-    const auto* copiedRow = buffer.GetRowByOffset(1).GetImageSlice();
-    VERIFY_IS_NOT_NULL(copiedRow);
-    VERIFY_ARE_EQUAL(1u, copiedRow->ColumnOwner(2));
+    VERIFY_IS_TRUE(PlacementCoversCell(buffer, 1, { 2, 1 }));
+    VERIFY_IS_NULL(buffer.GetRowByOffset(1).GetImageSlice());
 
     buffer.IncrementCircularBuffer(TextAttribute{});
 
@@ -335,8 +338,8 @@ void ImageTests::RectangularCopyAndErasePreserveSampling()
         }
     }
     VERIFY_IS_TRUE(foundCopy);
-    VERIFY_ARE_EQUAL(1u, buffer.GetRowByOffset(0).GetImageSlice()->ColumnOwner(7));
-    VERIFY_ARE_EQUAL(1u, buffer.GetRowByOffset(1).GetImageSlice()->ColumnOwner(7));
+    VERIFY_IS_TRUE(PlacementCoversCell(buffer, 1, { 7, 0 }));
+    VERIFY_IS_TRUE(PlacementCoversCell(buffer, 1, { 7, 1 }));
 
     ImageSlice::EraseBlock(buffer, { 7, 0, 8, 2 });
 
@@ -352,11 +355,10 @@ void ImageTests::RectangularCopyAndErasePreserveSampling()
     }
     for (auto rowIndex = 0; rowIndex < 2; ++rowIndex)
     {
-        const auto* slice = buffer.GetRowByOffset(rowIndex).GetImageSlice();
-        VERIFY_IS_NOT_NULL(slice);
-        VERIFY_ARE_EQUAL(1u, slice->ColumnOwner(6));
-        VERIFY_ARE_EQUAL(0u, slice->ColumnOwner(7));
-        VERIFY_ARE_EQUAL(1u, slice->ColumnOwner(8));
+        VERIFY_IS_NULL(buffer.GetRowByOffset(rowIndex).GetImageSlice());
+        VERIFY_IS_TRUE(PlacementCoversCell(buffer, 1, { 6, rowIndex }));
+        VERIFY_IS_FALSE(PlacementCoversCell(buffer, 1, { 7, rowIndex }));
+        VERIFY_IS_TRUE(PlacementCoversCell(buffer, 1, { 8, rowIndex }));
     }
 }
 
@@ -396,15 +398,14 @@ void ImageTests::TraditionalResizeClipsAndRetainsImages()
     VERIFY_IS_NULL(buffer.GetRowByOffset(0).GetImageSlice());
     for (auto rowIndex = 1; rowIndex < 3; ++rowIndex)
     {
-        const auto* slice = buffer.GetRowByOffset(rowIndex).GetImageSlice();
-        VERIFY_IS_NOT_NULL(slice);
-        VERIFY_ARE_EQUAL(1u, slice->ColumnOwner(4));
-        VERIFY_ARE_EQUAL(1u, slice->ColumnOwner(5));
-        VERIFY_ARE_EQUAL(0u, slice->ColumnOwner(6));
+        VERIFY_IS_NULL(buffer.GetRowByOffset(rowIndex).GetImageSlice());
+        VERIFY_IS_TRUE(PlacementCoversCell(buffer, 1, { 4, rowIndex }));
+        VERIFY_IS_TRUE(PlacementCoversCell(buffer, 1, { 5, rowIndex }));
+        VERIFY_IS_FALSE(PlacementCoversCell(buffer, 1, { 6, rowIndex }));
     }
 }
 
-void ImageTests::ResizeRebuildHandlesMixedCellSizes()
+void ImageTests::ResizeRetainsMixedCellSizesWithoutRowSlices()
 {
     DummyRenderer renderer;
     TextBuffer buffer{ til::size{ 8, 2 }, TextAttribute{}, 0, false, &renderer };
@@ -428,11 +429,9 @@ void ImageTests::ResizeRebuildHandlesMixedCellSizes()
     buffer.ResizeTraditional({ 6, 2 });
 
     VERIFY_ARE_EQUAL(size_t{ 2 }, buffer.GetImages().Size());
-    const auto* slice = buffer.GetRowByOffset(0).GetImageSlice();
-    VERIFY_IS_NOT_NULL(slice);
-    VERIFY_ARE_EQUAL(smallCell, slice->CellSize());
-    VERIFY_IS_FALSE(slice->Contains({ 1, 1 }));
-    VERIFY_IS_TRUE(slice->Contains({ 2, 2 }));
+    VERIFY_IS_NULL(buffer.GetRowByOffset(0).GetImageSlice());
+    VERIFY_IS_TRUE(PlacementCoversCell(buffer, 1, { 0, 0 }));
+    VERIFY_IS_TRUE(PlacementCoversCell(buffer, 2, { 0, 0 }));
 }
 
 void ImageTests::ReflowAppliesDirectPlacementPolicy()
@@ -484,9 +483,13 @@ void ImageTests::ReflowAppliesDirectPlacementPolicy()
     VERIFY_IS_TRUE(foundSecondSegment, L"the joined source row follows its first destination segment");
     VERIFY_IS_TRUE(foundSecondWrappedSegment, L"the joined source row also fragments when it wraps");
     VERIFY_IS_TRUE(foundImageOnlyRow, L"an image-only source row participates in reflow");
-    VERIFY_ARE_EQUAL(1u, reflowed.GetRowByOffset(0).GetImageSlice()->ColumnOwner(2));
-    VERIFY_ARE_EQUAL(1u, reflowed.GetRowByOffset(1).GetImageSlice()->ColumnOwner(0));
-    VERIFY_ARE_EQUAL(1u, reflowed.GetRowByOffset(2).GetImageSlice()->ColumnOwner(2));
-    VERIFY_ARE_EQUAL(1u, reflowed.GetRowByOffset(3).GetImageSlice()->ColumnOwner(0));
-    VERIFY_ARE_EQUAL(2u, reflowed.GetRowByOffset(6).GetImageSlice()->ColumnOwner(0));
+    VERIFY_IS_TRUE(PlacementCoversCell(reflowed, 1, { 2, 0 }));
+    VERIFY_IS_TRUE(PlacementCoversCell(reflowed, 1, { 0, 1 }));
+    VERIFY_IS_TRUE(PlacementCoversCell(reflowed, 1, { 2, 2 }));
+    VERIFY_IS_TRUE(PlacementCoversCell(reflowed, 1, { 0, 3 }));
+    VERIFY_IS_TRUE(PlacementCoversCell(reflowed, 2, { 0, 6 }));
+    for (til::CoordType row = 0; row < reflowed.GetSize().Height(); ++row)
+    {
+        VERIFY_IS_NULL(reflowed.GetRowByOffset(row).GetImageSlice());
+    }
 }

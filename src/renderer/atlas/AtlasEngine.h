@@ -38,12 +38,13 @@ namespace Microsoft::Console::Render::Atlas
         [[nodiscard]] HRESULT InvalidateTitle(std::wstring_view proposedTitle) noexcept override;
         [[nodiscard]] HRESULT NotifyNewText(const std::wstring_view newText) noexcept override;
         [[nodiscard]] HRESULT PrepareRenderInfo(RenderFrameInfo info) noexcept override;
+        [[nodiscard]] HRESULT PrepareImageFrame(ImageFrameInfo info) noexcept override;
         [[nodiscard]] HRESULT ResetLineTransform() noexcept override;
         [[nodiscard]] HRESULT PrepareLineTransform(LineRendition lineRendition, til::CoordType targetRow, til::CoordType viewportLeft) noexcept override;
         [[nodiscard]] HRESULT PaintBackground() noexcept override;
         [[nodiscard]] HRESULT PaintBufferLine(std::span<const Cluster> clusters, til::point coord, bool fTrimLeft) noexcept override;
         [[nodiscard]] HRESULT PaintBufferGridLines(const GridLineSet lines, const COLORREF gridlineColor, const COLORREF underlineColor, const size_t cchLine, const til::point coordTarget) noexcept override;
-        [[nodiscard]] HRESULT BeginRowImages(const ImageSlice& imageSlice, til::CoordType targetRow, til::CoordType viewportLeft, std::span<const uint8_t> defaultBackgroundMask, std::span<const COLORREF> cellBackgrounds) noexcept override;
+        [[nodiscard]] HRESULT BeginRowImages(const ImageSlice* imageSlice, til::CoordType targetRow, til::CoordType viewportLeft, std::span<const uint8_t> defaultBackgroundMask, std::span<const COLORREF> cellBackgrounds) noexcept override;
         [[nodiscard]] HRESULT EndRowImages() noexcept override;
         [[nodiscard]] HRESULT PaintSelection(const til::rect& rect) noexcept override;
         [[nodiscard]] HRESULT PaintCursor(const CursorOptions& options) noexcept override;
@@ -168,6 +169,8 @@ namespace Microsoft::Console::Render::Atlas
             u16x2 lastPaintBufferLineCoord{};
             // UpdateHyperlinkHoveredId()
             u16 hyperlinkHoveredId = 0;
+            std::vector<ImagePlacement> imagePlacements;
+            til::point imageViewportOrigin{};
 
             // These tracks the highlighted regions on the screen that are yet to be painted.
             std::span<const til::point_span> searchHighlights;

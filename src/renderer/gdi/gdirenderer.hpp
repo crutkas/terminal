@@ -16,6 +16,7 @@ Author(s):
 
 #include "../inc/RenderEngineBase.hpp"
 #include "../inc/FontResource.hpp"
+#include <unordered_map>
 
 namespace Microsoft::Console::Render
 {
@@ -54,7 +55,8 @@ namespace Microsoft::Console::Render
                                                    const COLORREF underlineColor,
                                                    const size_t cchLine,
                                                    const til::point coordTarget) noexcept override;
-        [[nodiscard]] HRESULT BeginRowImages(const ImageSlice& imageSlice,
+        [[nodiscard]] HRESULT PrepareImageFrame(ImageFrameInfo info) noexcept override;
+        [[nodiscard]] HRESULT BeginRowImages(const ImageSlice* imageSlice,
                                              til::CoordType targetRow,
                                              til::CoordType viewportLeft,
                                              std::span<const uint8_t> defaultBackgroundMask,
@@ -180,6 +182,20 @@ namespace Microsoft::Console::Render
         std::pmr::vector<std::pmr::vector<int>> _polyWidths;
 
         std::vector<RGBQUAD> _imagePlane;
+        struct CachedImageSurface
+        {
+            Image::Pointer image;
+            uint64_t revision = 0;
+            til::size size{};
+            wil::unique_hbitmap bitmap;
+            wil::unique_hdc context;
+            RGBQUAD* bits = nullptr;
+            bool allOpaque = false;
+            bool allTransparent = true;
+        };
+        std::unordered_map<const Image*, CachedImageSurface> _imageSurfaces;
+        std::vector<ImagePlacement> _frameImagePlacements;
+        til::point _imageViewportOrigin{};
         // A DIB section to blend image content from. Declared before the device
         // context that selects it so that the context is destroyed first and the
         // bitmap is no longer selected anywhere by the time it goes.
@@ -201,6 +217,17 @@ namespace Microsoft::Console::Render
         // or 0 if we never changed it. See BeginRowImages.
         int _restoreBkMode = 0;
 
+        [[nodiscard]] HRESULT _PrepareImageSurface(const ImageFrameInfo::Surface& surface) noexcept;
+        [[nodiscard]] HRESULT _PaintDirectImages(ImagePlacement::RenderPosition position,
+                                                 til::CoordType targetRow,
+                                                 std::span<const uint8_t> defaultBackgroundMask,
+                                                 bool markUnderlay) noexcept;
+        [[nodiscard]] HRESULT _PaintDirectImage(const ImagePlacement& placement, const RECT& clip) noexcept;
+        void _MarkDirectImageUnderlay(const ImagePlacement& placement,
+                                      til::CoordType targetRow,
+                                      std::span<const uint8_t> defaultBackgroundMask) noexcept;
+        void _MarkSliceUnderlay(const ImageSlice& imageSlice,
+                                til::CoordType viewportLeft) noexcept;
         [[nodiscard]] HRESULT _PaintImagePlane(const ImageSlice& imageSlice,
                                                ImageSlice::RenderPosition position,
                                                til::CoordType targetRow,
@@ -211,9 +238,7 @@ namespace Microsoft::Console::Render
         bool _UnderlayCoversColumn(til::CoordType column) const noexcept;        bool _UnderlayCoversBufferCell(til::CoordType bufferColumn) const noexcept;
         bool _UnderlayCoversAnyOf(til::CoordType columnBegin, til::CoordType columnEnd) const noexcept;
         [[nodiscard]] HRESULT _FillUncoveredRunBackground(const RECT& runRect, til::CoordType fontWidth) noexcept;
-        [[nodiscard]] HRESULT _FillImageRowCellBackgrounds(const ImageSlice& imageSlice,
-                                                           til::CoordType targetRow,
-                                                           til::CoordType viewportLeft,
+        [[nodiscard]] HRESULT _FillImageRowCellBackgrounds(til::CoordType targetRow,
                                                            std::span<const uint8_t> defaultBackgroundMask,
                                                            std::span<const COLORREF> cellBackgrounds) noexcept;
 

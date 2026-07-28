@@ -328,8 +328,6 @@ private:
     bool _isRowCommitted(til::CoordType y) const noexcept;
     void _copyRowData(til::CoordType srcRow, til::CoordType dstRow, TextBuffer& dstBuffer) const;
     void _scrollRows(til::CoordType firstRow, til::CoordType size, til::CoordType delta, bool copyImages);
-    void _rebuildImageSlices(std::span<const ImagePlacement> previousImages);
-
     void _SetFirstRowIndex(const til::CoordType FirstRowIndex) noexcept;
     void _ExpandTextRow(til::inclusive_rect& selectionRow) const;
     DelimiterClass _GetDelimiterClassAt(const til::point pos, const std::wstring_view wordDelimiters) const;

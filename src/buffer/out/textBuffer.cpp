@@ -58,73 +58,6 @@ static uint64_t imageCellRefLayerId(const ROW& row, const til::CoordType column)
     return metadata ? metadata->layerId : 0;
 }
 
-struct StagedImageRow
-{
-    til::CoordType row = 0;
-    ImageSlice::Pointer slice;
-};
-
-static std::vector<StagedImageRow> stageImageSlices(TextBuffer& buffer,
-                                                   const ImageCollection& images,
-                                                   const std::span<const ImagePlacement> previousImages)
-{
-    std::vector<ImagePlacement::Key> keys;
-    keys.reserve(previousImages.size());
-    for (const auto& image : previousImages)
-    {
-        keys.emplace_back(image.Identity());
-    }
-    std::sort(keys.begin(), keys.end(), [](const auto lhs, const auto rhs) {
-        return std::tie(lhs.imageId, lhs.layerId) < std::tie(rhs.imageId, rhs.layerId);
-    });
-    keys.erase(std::unique(keys.begin(), keys.end()), keys.end());
-
-    std::vector<StagedImageRow> stagedRows;
-    images.PrepareRowIndex();
-    const auto height = buffer.GetSize().Height();
-    for (auto rowIndex = 0; rowIndex < height; ++rowIndex)
-    {
-        const auto placements = images.IntersectingRows(rowIndex, rowIndex + 1);
-        const auto existing = buffer.GetRowByOffset(rowIndex).GetImageSlice();
-        const auto removesPlacement = existing && std::any_of(keys.begin(), keys.end(), [&](const auto key) {
-            return existing->Contains({ key.imageId, key.layerId });
-        });
-        if (!removesPlacement && placements.empty())
-        {
-            continue;
-        }
-
-        auto staged = existing ? std::make_unique<ImageSlice>(*existing) : nullptr;
-        for (const auto key : keys)
-        {
-            if (staged && staged->Contains({ key.imageId, key.layerId }) && staged->EraseLayer({ key.imageId, key.layerId }))
-            {
-                staged.reset();
-            }
-        }
-        for (const auto placement : placements)
-        {
-            if (!staged || staged->CellSize() != placement->Geometry().cellSize)
-            {
-                auto replacement = std::make_unique<ImageSlice>(placement->Geometry().cellSize);
-                staged = std::move(replacement);
-            }
-            const auto bounds = placement->CellBounds();
-            THROW_HR_IF(E_UNEXPECTED, !placement->RasterizeRow(rowIndex, bounds.left, bounds.right, *staged));
-        }
-        stagedRows.push_back({ rowIndex, std::move(staged) });
-    }
-    return stagedRows;
-}
-
-static void commitImageSlices(TextBuffer& buffer, std::vector<StagedImageRow> stagedRows) noexcept
-{
-    for (auto& staged : stagedRows)
-    {
-        buffer.GetMutableRowByOffset(staged.row).SetImageSlice(std::move(staged.slice));
-    }
-}
-
 static std::atomic<uint64_t> s_lastMutationIdInitialValue;
 
 // Routine Description:
@@ -1017,11 +950,6 @@ void TextBuffer::_copyRowData(const til::CoordType srcRowIndex, const til::Coord
     ImageSlice::CopyRow(srcRow, dstRow);
 }
 
-void TextBuffer::_rebuildImageSlices(const std::span<const ImagePlacement> previousImages)
-{
-    commitImageSlices(*this, stageImageSlices(*this, _images, previousImages));
-}
-
 Cursor& TextBuffer::GetCursor() noexcept
 {
     return _cursor;
@@ -1192,7 +1120,6 @@ void TextBuffer::ResizeTraditional(til::size newSize)
     newSize.height = std::max(newSize.height, 1);
 
     TextBuffer newBuffer{ newSize, _currentAttributes, 0, false, _renderer };
-    const auto oldImages = _images.All();
     const auto cursorRow = GetCursor().GetPosition().y;
     const auto copyableRows = std::min<til::CoordType>(_height, newSize.height);
     til::CoordType srcRow = 0;
@@ -1208,7 +1135,6 @@ void TextBuffer::ResizeTraditional(til::size newSize)
         CopyRow(srcRow, dstRow, newBuffer);
     }
     newBuffer._images.ClipArea({ 0, 0, newSize.width, newSize.height });
-    newBuffer._rebuildImageSlices(oldImages);
 
     // NOTE: Keep this in sync with _reserve().
     _images = std::move(newBuffer._images);
@@ -3310,9 +3236,7 @@ void TextBuffer::Reflow(TextBuffer& oldBuffer, TextBuffer& newBuffer, const View
         }
     }
 
-    auto stagedImageRows = stageImageSlices(newBuffer, reflowedImages, oldImages);
     newBuffer._images = std::move(reflowedImages);
-    commitImageSlices(newBuffer, std::move(stagedImageRows));
     newBuffer.CopyProperties(oldBuffer);
     newBuffer.CopyHyperlinkMaps(oldBuffer);
 

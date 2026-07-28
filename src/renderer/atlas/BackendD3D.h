@@ -7,6 +7,7 @@
 #include <til/flat_set.h>
 
 #include "Backend.h"
+#include <unordered_map>
 
 namespace Microsoft::Console::Render::Atlas
 {
@@ -95,7 +96,8 @@ namespace Microsoft::Console::Render::Atlas
             alignas(u16) u8x2 renditionScale;
             alignas(u32) i16x2 position;
             alignas(u32) u16x2 size;
-            alignas(u32) u16x2 texcoord;
+            alignas(u32) f32x2 texcoord;
+            alignas(u32) f32x2 textureSize;
             alignas(u32) u32 color;
         };
 
@@ -257,6 +259,10 @@ namespace Microsoft::Console::Render::Atlas
         static void _splitDoubleHeightGlyph(const RenderingPayload& p, const ShapedRow& row, AtlasFontFaceEntry& fontFaceEntry, AtlasGlyphEntry* glyphEntry);
         ATLAS_ATTR_COLD void _drawGridlines(const RenderingPayload& p, u16 y);
         ATLAS_ATTR_COLD void _drawBitmap(const RenderingPayload& p, const Bitmap& bitmap, u16 y);
+        void _drawImages(const RenderingPayload& p, const ShapedRow& row, u16 y, ImagePlacement::RenderPosition position);
+        void _drawImage(const RenderingPayload& p, const ImagePlacement& placement, const i32r& clip);
+        void _uploadImage(const RenderingPayload& p, const ImageFrameInfo::Surface& surface);
+        void _pruneImageCache(const RenderingPayload& p);
         void _drawCursorBackground(const RenderingPayload& p);
         ATLAS_ATTR_COLD void _drawCursorForeground();
         ATLAS_ATTR_COLD size_t _drawCursorForegroundSlowPath(const CursorRect& c, size_t offset);
@@ -297,6 +303,14 @@ namespace Microsoft::Console::Render::Atlas
         wil::com_ptr<ID3D11ShaderResourceView> _glyphAtlasView;
         til::linear_flat_set<AtlasFontFaceEntry, AtlasFontFaceEntryHashTrait> _glyphAtlasMap;
         til::linear_flat_set<AtlasBitmap, AtlasBitmapHashTrait> _glyphAtlasBitmaps;
+        struct CachedImage
+        {
+            Image::Pointer image;
+            uint64_t revision = 0;
+            u16x2 size{};
+            u16x2 texcoord{};
+        };
+        std::unordered_map<const Image*, CachedImage> _imageCache;
         AtlasFontFaceEntry _builtinGlyphs;
         Buffer<stbrp_node> _rectPackerData;
         stbrp_context _rectPacker{};

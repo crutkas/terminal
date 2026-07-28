@@ -546,7 +546,8 @@ namespace
         { L"query invalid payload", L"\x1b_Ga=q,i=5,f=100;AAA\x1b\\", L"\x1b_Gi=5;EINVAL:bad payload\x1b\\" },
         { L"unsupported format", L"\x1b_Ga=t,i=6,f=99;\x1b\\", L"\x1b_Gi=6;EINVAL:unsupported format\x1b\\" },
         { L"unsupported compression", L"\x1b_Ga=t,i=7,o=x;\x1b\\", L"\x1b_Gi=7;EINVAL:unsupported compression\x1b\\" },
-        { L"overflow dimensions", L"\x1b_Ga=t,i=14,f=32,s=2147483648,v=2147483648;AQIDBA==\x1b\\", L"\x1b_Gi=14;EINVAL:payload size mismatch\x1b\\" },
+        { L"overflow dimensions", L"\x1b_Ga=t,i=14,f=32,s=2147483648,v=2147483648;AQIDBA==\x1b\\", L"\x1b_Gi=14;EFBIG:image dimensions exceed renderer limit\x1b\\" },
+        { L"renderer dimension limit", L"\x1b_Ga=t,i=15,f=32,s=8193,v=1;AQIDBA==\x1b\\", L"\x1b_Gi=15;EFBIG:image dimensions exceed renderer limit\x1b\\" },
         { L"semicolon in payload", L"\x1b_Ga=t,i=1,f=100;AAAA;BBBB\x1b\\", L"\x1b_Gi=1;EINVAL:bad payload\x1b\\" },
         { L"missing dimensions", L"\x1b_Ga=t,i=1,f=24;AAAA\x1b\\", L"\x1b_Gi=1;EINVAL:missing dimensions\x1b\\" },
         { L"unsupported medium", L"\x1b_Ga=t,i=1,f=24,s=1,v=1,t=x;AAAA\x1b\\", L"\x1b_Gi=1;EINVAL:unsupported transmission medium\x1b\\" },
@@ -4270,6 +4271,14 @@ public:
                 return slice;
             }
         }
+        for (til::CoordType y = 0; y < height; y++)
+        {
+            if (const auto slice = DirectImageSlice(buffer, y))
+            {
+                outRow = y;
+                return slice;
+            }
+        }
         outRow = -1;
         return nullptr;
     }
@@ -4300,7 +4309,8 @@ public:
         const auto height = buffer.GetSize().Height();
         for (til::CoordType y = 0; y < height; y++)
         {
-            if (SliceContainsColor(buffer.GetRowByOffset(y).GetImageSlice(), r, g, b))
+            if (SliceContainsColor(buffer.GetRowByOffset(y).GetImageSlice(), r, g, b) ||
+                SliceContainsColor(DirectImageSlice(buffer, y), r, g, b))
             {
                 return true;
             }
@@ -4314,12 +4324,67 @@ public:
         const auto height = buffer.GetSize().Height();
         for (til::CoordType y = 0; y < height; y++)
         {
-            if (buffer.GetRowByOffset(y).GetImageSlice())
+            VerifyNoDirectImageLayers(buffer, y);
+            if (buffer.GetRowByOffset(y).GetImageSlice() ||
+                !buffer.GetImages().IntersectingRows(y, y + 1).empty())
             {
                 count++;
             }
         }
         return count;
+    }
+
+    static void VerifyNoDirectImageLayers(const TextBuffer& buffer, const til::CoordType row)
+    {
+        const auto slice = buffer.GetRowByOffset(row).GetImageSlice();
+        if (!slice)
+        {
+            return;
+        }
+
+        for (til::CoordType x = 0; x < buffer.GetSize().Width(); ++x)
+        {
+            VERIFY_IS_TRUE(slice->LayersAtColumn(x).empty(), L"Kitty must not create row-local ImageSlice layers");
+        }
+    }
+
+    static void VerifyNoDirectImageLayers(const TextBuffer& buffer)
+    {
+        for (til::CoordType row = 0; row < buffer.GetSize().Height(); ++row)
+        {
+            VerifyNoDirectImageLayers(buffer, row);
+        }
+    }
+
+    // Adapter tests inspect the collection through the same legacy rasterizer that
+    // previously populated rows. The synthesized slice is test-only and never
+    // becomes part of the TextBuffer.
+    static const ImageSlice* DirectImageSlice(const TextBuffer& buffer, const til::CoordType row)
+    {
+        VerifyNoDirectImageLayers(buffer, row);
+
+        const auto placements = buffer.GetImages().IntersectingRows(row, row + 1);
+        if (placements.empty())
+        {
+            return nullptr;
+        }
+
+        static thread_local std::vector<std::unique_ptr<ImageSlice>> slices;
+        if (slices.size() == 64)
+        {
+            slices.erase(slices.begin());
+        }
+        auto slice = std::make_unique<ImageSlice>(placements.front()->Geometry().cellSize);
+        const auto width = buffer.GetSize().Width();
+        for (const auto& placement : placements)
+        {
+            VERIFY_ARE_EQUAL(slice->CellSize(), placement->Geometry().cellSize);
+            VERIFY_IS_TRUE(placement->RasterizeRow(row, 0, width, *slice));
+        }
+
+        const auto result = slice.get();
+        slices.emplace_back(std::move(slice));
+        return result;
     }
 
     // Returns the pixel at (px, py) within an image slice's own pixel buffer (px is
@@ -5028,7 +5093,7 @@ public:
         _pDispatch->CursorPosition(3, 3);
         const auto normalPos = buf.GetCursor().GetPosition();
         _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,p=1,f=24,s=1,v=1,C=1;/wAA\x1b\\"); // red, non-virtual
-        const auto* normalSlice = buf.GetRowByOffset(normalPos.y).GetImageSlice();
+        const auto* normalSlice = DirectImageSlice(buf, normalPos.y);
         VERIFY_IS_NOT_NULL(normalSlice);
         VERIFY_ARE_EQUAL(1u, normalSlice->ColumnOwner(normalPos.x), L"the normal placement (1,1) owns its cell");
 
@@ -5039,7 +5104,7 @@ public:
         _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m"); // fg = image id 1
         _stateMachine->ProcessString(L"\x1b[58:2::0:0:2m"); // underline = placement id 2
         _stateMachine->ProcessString(L"\xDBFB\xDEEE"); // one U+10EEEE placeholder
-        const auto* phSlice = buf.GetRowByOffset(phPos.y).GetImageSlice();
+        const auto* phSlice = DirectImageSlice(buf, phPos.y);
         VERIFY_IS_NOT_NULL(phSlice);
         VERIFY_ARE_EQUAL(1u, phSlice->ColumnOwner(phPos.x), L"the virtual placement's placeholder owns its cell");
 
@@ -5049,10 +5114,10 @@ public:
         VERIFY_ARE_EQUAL(static_cast<size_t>(1), _kitty()._placements.count({ 1u, 1u }), L"the normal placement (1,1) survives");
         VERIFY_ARE_EQUAL(static_cast<size_t>(1), _kitty()._images.count(1u), L"lowercase kept the image data");
         // The invariant we guarantee: the surviving normal placement (1,1) keeps its pixels.
-        const auto* normalAfter = buf.GetRowByOffset(normalPos.y).GetImageSlice();
+        const auto* normalAfter = DirectImageSlice(buf, normalPos.y);
         VERIFY_IS_NOT_NULL(normalAfter);
         VERIFY_ARE_EQUAL(1u, normalAfter->ColumnOwner(normalPos.x), L"the surviving normal placement (1,1) keeps its pixels");
-        const auto* phAfter = buf.GetRowByOffset(phPos.y).GetImageSlice();
+        const auto* phAfter = DirectImageSlice(buf, phPos.y);
         VERIFY_IS_TRUE(phAfter == nullptr || phAfter->ColumnOwner(phPos.x) != 1u, L"only the deleted virtual placement's layer is erased");
     }
 
@@ -5369,7 +5434,7 @@ public:
         auto greenRows = 0;
         for (til::CoordType y = 0; y < buffer.GetSize().Height(); ++y)
         {
-            const auto slice = buffer.GetRowByOffset(y).GetImageSlice();
+            const auto slice = DirectImageSlice(buffer, y);
             if (slice && SliceContainsColor(slice, 0, 255, 0))
             {
                 ++greenRows;
@@ -6174,15 +6239,15 @@ public:
         buffer.GetCursor().SetPosition(placeholderPosition);
         _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m");
         _stateMachine->ProcessString(Placeholder());
-        const auto* placeholderSlice = buffer.GetRowByOffset(placeholderPosition.y).GetImageSlice();
+        const auto* placeholderSlice = DirectImageSlice(buffer, placeholderPosition.y);
         VERIFY_IS_NOT_NULL(placeholderSlice);
         VERIFY_IS_TRUE(placeholderSlice->ContainsPlacement(virtualLayer));
 
         _stateMachine->ProcessString(L"\x1b_Ga=d,d=p,x=3,y=7;\x1b\\");
 
-        const auto* physicalSlice = buffer.GetRowByOffset(physicalPosition.y).GetImageSlice();
+        const auto* physicalSlice = DirectImageSlice(buffer, physicalPosition.y);
         VERIFY_IS_TRUE(physicalSlice == nullptr || !physicalSlice->ContainsPlacement(physicalLayer));
-        placeholderSlice = buffer.GetRowByOffset(placeholderPosition.y).GetImageSlice();
+        placeholderSlice = DirectImageSlice(buffer, placeholderPosition.y);
         VERIFY_IS_NOT_NULL(placeholderSlice);
         VERIFY_IS_TRUE(placeholderSlice->ContainsPlacement(virtualLayer), L"positional deletion must preserve a coexisting virtual placement");
         VERIFY_ARE_EQUAL(static_cast<size_t>(1), _kitty()._virtualIds.count({ 1u, 0u }));
@@ -6234,9 +6299,9 @@ public:
         VERIFY_IS_TRUE(BufferContainsColor(*_testGetSet->_textBuffer, 255, 0, 0));
     }
 
-    // Placing over a row whose slice has a different cell size replaces the slice
-    // (the stride must match the write extent, or the slice buffer would overflow).
-    TEST_METHOD(KittyGraphicsCellSizeMismatchReplacesSlice)
+    // Complete surfaces retain the cell metrics used for each placement instead
+    // of forcing unrelated images through one row-local pixel stride.
+    TEST_METHOD(KittyGraphicsDifferentCellSizesRemainIndependent)
     {
         _testGetSet->PrepData();
         _pDispatch->CursorPosition(2, 1);
@@ -6244,11 +6309,11 @@ public:
         _testGetSet->_cellSize = { 5, 10 };
         _stateMachine->ProcessString(L"\x1b_Ga=T,i=2,f=24,s=1,v=1,C=1;AP8A\x1b\\"); // same row, new size
         const auto& buffer = *_testGetSet->_textBuffer;
-        til::CoordType row = -1;
-        const auto slice = FindFirstImageSlice(buffer, row);
-        VERIFY_IS_NOT_NULL(slice);
-        VERIFY_ARE_EQUAL(5, slice->CellSize().width);
-        VERIFY_ARE_EQUAL(10, slice->CellSize().height);
+        VERIFY_ARE_EQUAL(size_t{ 2 }, buffer.GetImages().Size());
+        const auto placements = buffer.GetImages().All();
+        VERIFY_ARE_EQUAL((til::size{ 10, 20 }), placements[0].Geometry().cellSize);
+        VERIFY_ARE_EQUAL((til::size{ 5, 10 }), placements[1].Geometry().cellSize);
+        VerifyNoDirectImageLayers(buffer);
     }
 
     // An image wider than the remaining columns is clipped to the page, not overflowed.
@@ -6485,7 +6550,7 @@ public:
         _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,f=24,s=2,v=1;/wAAAP8A\x1b\\"); // 2px: red,green
         _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m");
         _stateMachine->ProcessString(Placeholder() + Placeholder());
-        const auto* slice = _testGetSet->_textBuffer->GetRowByOffset(origin.y).GetImageSlice();
+        const auto* slice = DirectImageSlice(*_testGetSet->_textBuffer, origin.y);
         VERIFY_IS_NOT_NULL(slice);
         VERIFY_IS_TRUE(SlicePixelIs(slice, 0, 0, 255, 0, 0), L"grid col 0 (left cell) = red only");
         VERIFY_IS_TRUE(SlicePixelIs(slice, 1, 0, 0, 255, 0), L"grid col 1 (right cell) = green only");
@@ -6520,8 +6585,8 @@ public:
         // Every pixel of the 2-cell x 2-row footprint must be identical between the renders.
         for (til::CoordType r = 0; r < 2; ++r)
         {
-            const auto* sd = buf.GetRowByOffset(directRow + r).GetImageSlice();
-            const auto* sp = buf.GetRowByOffset(phRow + r).GetImageSlice();
+            const auto* sd = DirectImageSlice(buf, directRow + r);
+            const auto* sp = DirectImageSlice(buf, phRow + r);
             VERIFY_IS_NOT_NULL(sd, L"direct render produced an image slice");
             VERIFY_IS_NOT_NULL(sp, L"placeholder render produced an image slice");
             for (til::CoordType py = 0; py < cell.height; ++py)
@@ -6566,8 +6631,8 @@ public:
 
         for (til::CoordType r = 0; r < 2; ++r)
         {
-            const auto* sd = buf.GetRowByOffset(directRow + r).GetImageSlice();
-            const auto* sp = buf.GetRowByOffset(phRow + r).GetImageSlice();
+            const auto* sd = DirectImageSlice(buf, directRow + r);
+            const auto* sp = DirectImageSlice(buf, phRow + r);
             VERIFY_IS_NOT_NULL(sd, L"direct render produced an image slice");
             VERIFY_IS_NOT_NULL(sp, L"placeholder render produced an image slice");
             for (til::CoordType py = 0; py < cell.height; ++py)
@@ -6658,8 +6723,8 @@ public:
         _stateMachine->ProcessString(Placeholder() + L"\x030D" + Placeholder()); // explicit grid row 1, then inherit
         _stateMachine->ProcessString(L"\x1b[0m");
 
-        const auto* r0 = _testGetSet->_textBuffer->GetRowByOffset(origin.y).GetImageSlice();
-        const auto* r1 = _testGetSet->_textBuffer->GetRowByOffset(origin.y + 1).GetImageSlice();
+        const auto* r0 = DirectImageSlice(*_testGetSet->_textBuffer, origin.y);
+        const auto* r1 = DirectImageSlice(*_testGetSet->_textBuffer, origin.y + 1);
         VERIFY_IS_NOT_NULL(r0);
         VERIFY_IS_NOT_NULL(r1);
         VERIFY_IS_TRUE(SlicePixelIs(r0, 0, 0, 255, 255, 255), L"crop=BR: grid (0,0) must be white");
@@ -6746,7 +6811,7 @@ public:
         _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,f=24,s=1,v=2;/wAAAP8A\x1b\\"); // top red, bottom green
         _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m");
         _stateMachine->ProcessString(Placeholder() + L"\x0305" + Placeholder() + L"\x030D"); // row 0, row 1
-        const auto* slice = _testGetSet->_textBuffer->GetRowByOffset(origin.y).GetImageSlice();
+        const auto* slice = DirectImageSlice(*_testGetSet->_textBuffer, origin.y);
         VERIFY_IS_NOT_NULL(slice);
         VERIFY_IS_TRUE(SlicePixelIs(slice, 0, 0, 255, 0, 0), L"row-0 cell = top tile (red) only");
         VERIFY_IS_TRUE(SlicePixelIs(slice, 1, 0, 0, 255, 0), L"row-1 cell = bottom tile (green) only");
@@ -6839,7 +6904,7 @@ public:
         _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,f=24,s=3,v=1,c=2,r=1;/wAAAP8AAAD/\x1b\\"); // red,green,blue; grid 2x1
         _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m");
         _stateMachine->ProcessString(Placeholder() + Placeholder());
-        const auto* slice = _testGetSet->_textBuffer->GetRowByOffset(origin.y).GetImageSlice();
+        const auto* slice = DirectImageSlice(*_testGetSet->_textBuffer, origin.y);
         VERIFY_IS_NOT_NULL(slice);
         VERIFY_IS_TRUE(SlicePixelIs(slice, 0, 0, 255, 0, 0), L"grid col 0 starts at the red pixel");
         VERIFY_IS_TRUE(SlicePixelIs(slice, slice->PixelWidth() - 1, 0, 0, 0, 255), L"rightmost pixel (blue) must survive the 3px/2col split");
@@ -6860,14 +6925,14 @@ public:
 
         // Write 1: grid row 0 on the origin screen row -> top tile (red), no green.
         _stateMachine->ProcessString(Placeholder() + L"\x0305");
-        const auto* row0 = _testGetSet->_textBuffer->GetRowByOffset(origin.y).GetImageSlice();
+        const auto* row0 = DirectImageSlice(*_testGetSet->_textBuffer, origin.y);
         VERIFY_IS_TRUE(SliceContainsColor(row0, 255, 0, 0), L"grid row 0 = top tile (red)");
         VERIFY_IS_FALSE(SliceContainsColor(row0, 0, 255, 0), L"stored rows=2 must keep the bottom tile (green) out of grid row 0");
 
         // Write 2: a SEPARATE call on the next screen row, grid row 1 -> bottom tile (green).
         _testGetSet->_textBuffer->GetCursor().SetPosition({ origin.x, origin.y + 1 });
         _stateMachine->ProcessString(Placeholder() + L"\x030D");
-        const auto* row1 = _testGetSet->_textBuffer->GetRowByOffset(origin.y + 1).GetImageSlice();
+        const auto* row1 = DirectImageSlice(*_testGetSet->_textBuffer, origin.y + 1);
         VERIFY_IS_TRUE(SliceContainsColor(row1, 0, 255, 0), L"grid row 1 = bottom tile (green)");
         VERIFY_IS_FALSE(SliceContainsColor(row1, 255, 0, 0), L"grid row 1 must not contain the top tile (red)");
     }
@@ -7045,7 +7110,7 @@ public:
         _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m");
         _stateMachine->ProcessString(Placeholder() + L"\x030D" + L"\x0305" + Placeholder() + L"\x030D"); // (1,0), then row-only (1,1)
 
-        const auto* slice = _testGetSet->_textBuffer->GetRowByOffset(origin.y).GetImageSlice();
+        const auto* slice = DirectImageSlice(*_testGetSet->_textBuffer, origin.y);
         VERIFY_IS_TRUE(SlicePixelIs(slice, 0, 0, 0, 0, 255), L"explicit (row 1, col 0) selects blue");
         VERIFY_IS_TRUE(SlicePixelIs(slice, 1, 0, 255, 255, 255), L"the row-only cell inherits col 1 from the matching left row (white)");
     }
@@ -7062,7 +7127,7 @@ public:
         _stateMachine->ProcessString(Placeholder() + L"\x030D" + L"\x0305"); // explicit (1,0)
         _stateMachine->ProcessString(Placeholder()); // separate call, inherited (1,1)
 
-        const auto* slice = _testGetSet->_textBuffer->GetRowByOffset(origin.y).GetImageSlice();
+        const auto* slice = DirectImageSlice(*_testGetSet->_textBuffer, origin.y);
         VERIFY_IS_TRUE(SlicePixelIs(slice, 0, 0, 0, 0, 255), L"the earlier explicit cell remains blue");
         VERIFY_IS_TRUE(SlicePixelIs(slice, 1, 0, 255, 255, 255), L"the later write inherits from the stored left cell");
     }
@@ -7084,7 +7149,7 @@ public:
         buffer.GetCursor().SetPosition({ 1, origin.y });
         _stateMachine->ProcessString(Placeholder()); // must inherit col 1 from x=0
 
-        const auto* slice = buffer.GetRowByOffset(origin.y).GetImageSlice();
+        const auto* slice = DirectImageSlice(buffer, origin.y);
         VERIFY_IS_TRUE(SlicePixelIs(slice, 1, 0, 0, 255, 0), L"interleaving cannot corrupt immediate-left inheritance (col 1 = green)");
     }
 
@@ -7103,7 +7168,7 @@ public:
         _stateMachine->ProcessString(L"\x1b[38;2;0;0;2m");
         _stateMachine->ProcessString(Placeholder());
 
-        const auto* slice = _testGetSet->_textBuffer->GetRowByOffset(origin.y).GetImageSlice();
+        const auto* slice = DirectImageSlice(*_testGetSet->_textBuffer, origin.y);
         VERIFY_IS_TRUE(SlicePixelIs(slice, 0, 0, 0, 255, 0), L"the explicit image-1 cell is col 1 (green)");
         VERIFY_IS_TRUE(SlicePixelIs(slice, 1, 0, 255, 0, 0), L"foreground mismatch rejects inheritance and defaults image 2 to col 0 (red)");
     }
@@ -7122,7 +7187,7 @@ public:
         _stateMachine->ProcessString(L"\x1b[58:2::0:0:2m");
         _stateMachine->ProcessString(Placeholder()); // placement color 2: no inheritance
 
-        const auto* slice = _testGetSet->_textBuffer->GetRowByOffset(origin.y).GetImageSlice();
+        const auto* slice = DirectImageSlice(*_testGetSet->_textBuffer, origin.y);
         VERIFY_IS_TRUE(SlicePixelIs(slice, 0, 0, 0, 255, 0), L"the explicit left cell is col 1 (green)");
         VERIFY_IS_TRUE(SlicePixelIs(slice, 1, 0, 255, 0, 0), L"underline mismatch defaults to col 0 (red), not stale col 2");
     }
@@ -7142,7 +7207,7 @@ public:
         buffer.GetCursor().SetPosition({ 0, origin.y + 1 });
         _stateMachine->ProcessString(Placeholder()); // no left cell => (0,0)
 
-        const auto* slice = buffer.GetRowByOffset(origin.y + 1).GetImageSlice();
+        const auto* slice = DirectImageSlice(buffer, origin.y + 1);
         VERIFY_IS_TRUE(SlicePixelIs(slice, 0, 0, 255, 0, 0), L"column 0 omission defaults to grid col 0 (red)");
     }
 
@@ -7158,7 +7223,7 @@ public:
         _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m"); // low 24 bits
         _stateMachine->ProcessString(Placeholder() + L"\x0305" + L"\x0305" + L"\x030D" + Placeholder());
 
-        const auto* slice = _testGetSet->_textBuffer->GetRowByOffset(origin.y).GetImageSlice();
+        const auto* slice = DirectImageSlice(*_testGetSet->_textBuffer, origin.y);
         VERIFY_IS_TRUE(SlicePixelIs(slice, 0, 0, 255, 0, 0), L"explicit high byte selects the >24-bit image at col 0");
         VERIFY_IS_TRUE(SlicePixelIs(slice, 1, 0, 0, 255, 0), L"omitting all marks inherits high byte and advances to col 1");
     }
@@ -7183,7 +7248,7 @@ public:
         buffer.GetCursor().SetPosition({ 1, origin.y + 1 });
         _stateMachine->ProcessString(Placeholder()); // inherit from the moved (1,0) cell
 
-        const auto* slice = buffer.GetRowByOffset(origin.y + 1).GetImageSlice();
+        const auto* slice = DirectImageSlice(buffer, origin.y + 1);
         VERIFY_IS_TRUE(SlicePixelIs(slice, 0, 0, 0, 0, 255), L"the explicit blue cell moved with the row");
         VERIFY_IS_TRUE(SlicePixelIs(slice, 1, 0, 255, 255, 255), L"the moved metadata resolves the adjacent omission as (1,1) white");
         const auto* metadata = buffer.GetRowByOffset(origin.y + 1).GetImageCellRef(origin.x);
@@ -7224,13 +7289,13 @@ public:
         buffer.GetCursor().SetPosition({ origin.x + 2, origin.y });
         _stateMachine->ProcessString(Placeholder()); // inherit (0,1) from moved x=1
 
-        const auto* slice = buffer.GetRowByOffset(origin.y).GetImageSlice();
+        const auto* slice = DirectImageSlice(buffer, origin.y);
         VERIFY_IS_NOT_NULL(slice);
         VERIFY_ARE_EQUAL(0u, slice->ColumnOwner(origin.x), L"ICH clears the newly inserted cell's image ownership");
         VERIFY_ARE_EQUAL(1u, slice->ColumnOwner(origin.x + 1), L"ICH moved the explicit placeholder one cell right");
         VERIFY_ARE_EQUAL(1u, slice->ColumnOwner(origin.x + 2), L"the adjacent omitted placeholder rendered for image 1");
-        VERIFY_IS_TRUE(SlicePixelIs(slice, origin.x + 1, 0, 255, 0, 0), L"the moved explicit placeholder remains grid col 0 (red)");
-        VERIFY_IS_TRUE(SlicePixelIs(slice, origin.x + 2, 0, 0, 255, 0), L"the adjacent omission inherits grid col 1 (green)");
+        VERIFY_IS_TRUE(SlicePixelIs(slice, origin.x + 1 - slice->ColumnOffset(), 0, 255, 0, 0), L"the moved explicit placeholder remains grid col 0 (red)");
+        VERIFY_IS_TRUE(SlicePixelIs(slice, origin.x + 2 - slice->ColumnOffset(), 0, 0, 255, 0), L"the adjacent omission inherits grid col 1 (green)");
     }
 
     // A partial-width vertical scroll uses the cell-walking path rather than rotating whole ROW
@@ -7252,7 +7317,7 @@ public:
         buffer.GetCursor().SetPosition({ origin.x + 1, origin.y + 1 });
         _stateMachine->ProcessString(Placeholder()); // inherit from moved (1,0)
 
-        const auto* slice = buffer.GetRowByOffset(origin.y + 1).GetImageSlice();
+        const auto* slice = DirectImageSlice(buffer, origin.y + 1);
         VERIFY_IS_NOT_NULL(slice);
         VERIFY_IS_TRUE(SlicePixelIs(slice, 0, 0, 0, 0, 255), L"the explicit blue cell moved down with the partial-width scroll");
         VERIFY_IS_TRUE(SlicePixelIs(slice, 1, 0, 255, 255, 255), L"the adjacent omission inherits (1,1) white after the move");
@@ -7288,7 +7353,7 @@ public:
         _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m");
         _stateMachine->ProcessString(Placeholder() + L"\x0305" + L"\x030D"); // explicit (0,1) green
 
-        const auto* sourceSlice = buffer.GetRowByOffset(origin.y).GetImageSlice();
+        const auto* sourceSlice = DirectImageSlice(buffer, origin.y);
         const auto* sourceMetadata = buffer.GetRowByOffset(origin.y).GetImageCellRef(origin.x);
         VERIFY_IS_NOT_NULL(sourceMetadata);
         VERIFY_ARE_NOT_EQUAL(0u, sourceMetadata->layerId);
@@ -7302,7 +7367,7 @@ public:
         buffer.GetCursor().SetPosition({ 6, origin.y });
         _stateMachine->ProcessString(Placeholder()); // inherit (0,2) from copied x=5
 
-        const auto* slice = buffer.GetRowByOffset(origin.y).GetImageSlice();
+        const auto* slice = DirectImageSlice(buffer, origin.y);
         VERIFY_IS_NOT_NULL(slice);
         const auto copiedPixel = SlicePixelAt(slice, 5, 0);
         VERIFY_ARE_EQUAL(static_cast<BYTE>(0), copiedPixel.rgbRed);
@@ -7392,7 +7457,7 @@ public:
         _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m");
         _stateMachine->ProcessString(Placeholder()); // (0,0) = TL red
         _stateMachine->ProcessString(Placeholder()); // separate write, same row -> (0,1) = TR green
-        const auto* slice = _testGetSet->_textBuffer->GetRowByOffset(origin.y).GetImageSlice();
+        const auto* slice = DirectImageSlice(*_testGetSet->_textBuffer, origin.y);
         VERIFY_IS_TRUE(SliceContainsColor(slice, 255, 0, 0), L"col 0 = TL red");
         VERIFY_IS_TRUE(SliceContainsColor(slice, 0, 255, 0), L"col 1 = TR green (auto col continued, same grid row)");
         VERIFY_IS_FALSE(SliceContainsColor(slice, 0, 0, 255), L"must not drop to grid row 1 (blue) on a same-row chunk");
@@ -7433,7 +7498,7 @@ public:
         _testGetSet->_textBuffer->GetCursor().SetPosition({ origin.x + 1, origin.y });
         _stateMachine->ProcessString(Placeholder());
 
-        const auto* slice = _testGetSet->_textBuffer->GetRowByOffset(origin.y).GetImageSlice();
+        const auto* slice = DirectImageSlice(*_testGetSet->_textBuffer, origin.y);
         VERIFY_IS_NOT_NULL(slice);
         VERIFY_ARE_EQUAL(origin.x + 1, slice->ColumnOffset(), L"only the newly rendered adjacent cell remains after re-transmit");
         VERIFY_IS_TRUE(SlicePixelIs(slice, 0, 0, 0, 255, 0), L"re-storing the image preserves left-cell inheritance (col 1 = green)");
@@ -7475,7 +7540,7 @@ public:
         const auto freshRow = origin.y + 10;
         _testGetSet->_textBuffer->GetCursor().SetPosition({ 0, freshRow });
         _stateMachine->ProcessString(Placeholder());
-        VERIFY_IS_NOT_NULL(_testGetSet->_textBuffer->GetRowByOffset(freshRow).GetImageSlice(), L"non-virtual put preserves placeholder eligibility");
+        VERIFY_IS_NOT_NULL(DirectImageSlice(*_testGetSet->_textBuffer, freshRow), L"non-virtual put preserves placeholder eligibility");
     }
 
     // Delete-all does not affect virtual placements, so later placeholder text can reuse the grid.
@@ -7844,7 +7909,7 @@ public:
         _testGetSet->_cellSize = { 4, 4 };
         const auto origin = _testGetSet->_textBuffer->GetCursor().GetPosition();
         _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,f=24,s=1,v=1,X=2,Y=0;/wAA\x1b\\"); // 1px red, X offset 2
-        const auto* slice = _testGetSet->_textBuffer->GetRowByOffset(origin.y).GetImageSlice();
+        const auto* slice = DirectImageSlice(*_testGetSet->_textBuffer, origin.y);
         VERIFY_IS_NOT_NULL(slice);
         VERIFY_ARE_EQUAL(0, static_cast<int>(SlicePixelAt(slice, 0, 0).rgbRed), L"the X-offset gutter pixel (0,0) is transparent");
         VERIFY_ARE_EQUAL(255, static_cast<int>(SlicePixelAt(slice, 2, 0).rgbRed), L"the red pixel is shifted to x=2");
@@ -7860,7 +7925,7 @@ public:
         const auto origin = _testGetSet->_textBuffer->GetCursor().GetPosition();
         _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,p=1,f=24,s=1,v=1,C=1;/wAA\x1b\\"); // red at (0,0)
         _stateMachine->ProcessString(L"\x1b_Ga=p,i=1,p=1,X=2,C=1;\x1b\\"); // re-put red shifted to (2,0)
-        const auto* slice = _testGetSet->_textBuffer->GetRowByOffset(origin.y).GetImageSlice();
+        const auto* slice = DirectImageSlice(*_testGetSet->_textBuffer, origin.y);
         VERIFY_IS_NOT_NULL(slice);
         VERIFY_ARE_EQUAL(0, static_cast<int>(SlicePixelAt(slice, 0, 0).rgbRed), L"the reused gutter pixel must be cleared, not the old red");
         VERIFY_ARE_EQUAL(255, static_cast<int>(SlicePixelAt(slice, 2, 0).rgbRed), L"red sits at the X offset");
@@ -7878,7 +7943,7 @@ public:
         const auto origin = _testGetSet->_textBuffer->GetCursor().GetPosition();
         // A 4px-wide image is exactly one 4px cell; X=2 shifts it right by 2px WITHIN that cell.
         _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,f=24,s=4,v=1,X=2,C=1;/wAA/wAA/wAA/wAA\x1b\\");
-        const auto* slice = _testGetSet->_textBuffer->GetRowByOffset(origin.y).GetImageSlice();
+        const auto* slice = DirectImageSlice(*_testGetSet->_textBuffer, origin.y);
         VERIFY_IS_NOT_NULL(slice);
         VERIFY_ARE_EQUAL(1u, slice->ColumnOwner(origin.x), L"the image's single cell is owned");
         VERIFY_ARE_EQUAL(0u, slice->ColumnOwner(origin.x + 1), L"a sub-cell X offset must not extend the placement into a 2nd column");
@@ -7899,20 +7964,20 @@ public:
         const auto parentPos = buf.GetCursor().GetPosition();
         // Parent (id 1, placement 1) at the cursor; C=1 leaves the cursor put.
         _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,p=1,f=24,s=1,v=1,C=1;/wAA\x1b\\"); // red
-        const auto* parentSlice = buf.GetRowByOffset(parentPos.y).GetImageSlice();
+        const auto* parentSlice = DirectImageSlice(buf, parentPos.y);
         VERIFY_IS_NOT_NULL(parentSlice);
         VERIFY_ARE_EQUAL(1u, parentSlice->ColumnOwner(parentPos.x), L"parent owns its cursor cell");
 
         // Child (id 2) +H=2,+V=1 => anchor parent+(2,1).
         _stateMachine->ProcessString(L"\x1b_Ga=T,i=2,p=1,P=1,Q=1,H=2,V=1,f=24,s=1,v=1;AP8A\x1b\\"); // green
         VERIFY_ARE_EQUAL(parentPos, buf.GetCursor().GetPosition(), L"relative placement must not move the cursor");
-        const auto* childSlice = buf.GetRowByOffset(parentPos.y + 1).GetImageSlice();
+        const auto* childSlice = DirectImageSlice(buf, parentPos.y + 1);
         VERIFY_IS_NOT_NULL(childSlice);
         VERIFY_ARE_EQUAL(2u, childSlice->ColumnOwner(parentPos.x + 2), L"+offset child anchored at parent+(2,1)");
 
         // Child (id 3) -H=2,-V=1 => anchor parent+(-2,-1).
         _stateMachine->ProcessString(L"\x1b_Ga=T,i=3,p=1,P=1,Q=1,H=-2,V=-1,f=24,s=1,v=1;AAD/\x1b\\"); // blue
-        const auto* child2Slice = buf.GetRowByOffset(parentPos.y - 1).GetImageSlice();
+        const auto* child2Slice = DirectImageSlice(buf, parentPos.y - 1);
         VERIFY_IS_NOT_NULL(child2Slice);
         VERIFY_ARE_EQUAL(3u, child2Slice->ColumnOwner(parentPos.x - 2), L"-offset child anchored at parent+(-2,-1)");
     }
@@ -7961,13 +8026,13 @@ public:
         _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m"); // fg id 1
         _stateMachine->ProcessString(L"\x1b[58:2::0:0:1m"); // underline = placement id 1
         _stateMachine->ProcessString(L"\xDBFB\xDEEE"); // one U+10EEEE placeholder
-        const auto* phSlice = buf.GetRowByOffset(phPos.y).GetImageSlice();
+        const auto* phSlice = DirectImageSlice(buf, phPos.y);
         VERIFY_IS_NOT_NULL(phSlice);
         VERIFY_ARE_EQUAL(1u, phSlice->ColumnOwner(phPos.x), L"virtual parent placeholder owns its cell");
         // Child relative to the virtual parent, +H=1,+V=1.
         _stateMachine->ProcessString(L"\x1b[38;2;0;0;0m"); // reset fg so the child isn't a placeholder
         _stateMachine->ProcessString(L"\x1b_Ga=T,i=2,p=1,P=1,Q=1,H=1,V=1,f=24,s=1,v=1;AP8A\x1b\\"); // green
-        const auto* childSlice = buf.GetRowByOffset(phPos.y + 1).GetImageSlice();
+        const auto* childSlice = DirectImageSlice(buf, phPos.y + 1);
         VERIFY_IS_NOT_NULL(childSlice);
         VERIFY_ARE_EQUAL(2u, childSlice->ColumnOwner(phPos.x + 1), L"child anchored at virtual-parent min(x,y)+(1,1)");
     }
@@ -8037,16 +8102,16 @@ public:
         _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,p=1,f=24,s=1,v=1,C=1;/wAA\x1b\\");
         _stateMachine->ProcessString(L"\x1b_Ga=T,i=2,p=1,P=1,Q=1,H=1,V=1,f=24,s=1,v=1,C=1;AP8A\x1b\\");
         const til::point oldChild{ oldParent.x + 1, oldParent.y + 1 };
-        VERIFY_ARE_EQUAL(2u, buffer.GetRowByOffset(oldChild.y).GetImageSlice()->ColumnOwner(oldChild.x));
+        VERIFY_ARE_EQUAL(2u, DirectImageSlice(buffer, oldChild.y)->ColumnOwner(oldChild.x));
 
         _pDispatch->CursorPosition(10, 8);
         const auto newParent = buffer.GetCursor().GetPosition();
         _stateMachine->ProcessString(L"\x1b_Ga=p,i=1,p=1,C=1;\x1b\\");
         const til::point newChild{ newParent.x + 1, newParent.y + 1 };
 
-        const auto* oldSlice = buffer.GetRowByOffset(oldChild.y).GetImageSlice();
+        const auto* oldSlice = DirectImageSlice(buffer, oldChild.y);
         VERIFY_IS_TRUE(oldSlice == nullptr || oldSlice->ColumnOwner(oldChild.x) == 0, L"the child's old cells must be erased");
-        const auto* newSlice = buffer.GetRowByOffset(newChild.y).GetImageSlice();
+        const auto* newSlice = DirectImageSlice(buffer, newChild.y);
         VERIFY_IS_NOT_NULL(newSlice);
         VERIFY_ARE_EQUAL(2u, newSlice->ColumnOwner(newChild.x), L"the child must follow its moved parent");
         const auto& child = _kitty()._placements.at({ 2u, 1u });
@@ -8067,7 +8132,7 @@ public:
         _stateMachine->ProcessString(L"\x1b_Ga=T,i=2,p=1,P=1,Q=1,H=1,V=1,f=24,s=1,v=1,C=1;AP8A\x1b\\");
         _stateMachine->ProcessString(L"\x1b_Ga=T,i=3,p=1,P=2,Q=1,H=2,V=1,f=24,s=1,v=1,C=1;AAD/\x1b\\");
         const til::point oldGrandchild{ oldParent.x + 3, oldParent.y + 2 };
-        VERIFY_ARE_EQUAL(3u, buffer.GetRowByOffset(oldGrandchild.y).GetImageSlice()->ColumnOwner(oldGrandchild.x));
+        VERIFY_ARE_EQUAL(3u, DirectImageSlice(buffer, oldGrandchild.y)->ColumnOwner(oldGrandchild.x));
 
         _pDispatch->CursorPosition(12, 9);
         const auto newParent = buffer.GetCursor().GetPosition();
@@ -8075,9 +8140,9 @@ public:
         const til::point newChild{ newParent.x + 1, newParent.y + 1 };
         const til::point newGrandchild{ newChild.x + 2, newChild.y + 1 };
 
-        const auto* oldSlice = buffer.GetRowByOffset(oldGrandchild.y).GetImageSlice();
+        const auto* oldSlice = DirectImageSlice(buffer, oldGrandchild.y);
         VERIFY_IS_TRUE(oldSlice == nullptr || oldSlice->ColumnOwner(oldGrandchild.x) == 0, L"the grandchild's old cells must be erased");
-        const auto* newSlice = buffer.GetRowByOffset(newGrandchild.y).GetImageSlice();
+        const auto* newSlice = DirectImageSlice(buffer, newGrandchild.y);
         VERIFY_IS_NOT_NULL(newSlice);
         VERIFY_ARE_EQUAL(3u, newSlice->ColumnOwner(newGrandchild.x), L"the grandchild must follow its immediate parent");
         const auto& grandchild = _kitty()._placements.at({ 3u, 1u });
@@ -8104,9 +8169,9 @@ public:
         _stateMachine->ProcessString(L"\x1b_Ga=p,i=1,p=1,C=1;\x1b\\");
         const til::point newChild{ newParent.x + 1, newParent.y + 1 };
 
-        const auto* oldSlice = buffer.GetRowByOffset(oldChild.anchorRow).GetImageSlice();
+        const auto* oldSlice = DirectImageSlice(buffer, oldChild.anchorRow);
         VERIFY_IS_TRUE(oldSlice == nullptr || oldSlice->ColumnOwner(oldChild.anchorCol) == 0);
-        const auto* newSlice = buffer.GetRowByOffset(newChild.y).GetImageSlice();
+        const auto* newSlice = DirectImageSlice(buffer, newChild.y);
         VERIFY_IS_NOT_NULL(newSlice);
         VERIFY_ARE_EQUAL(2u, newSlice->ColumnOwner(newChild.x));
         VERIFY_ARE_EQUAL(newChild.x, _kitty()._anonymousPlacements.front().anchorCol);
@@ -8134,7 +8199,7 @@ public:
         const til::point firstChild{ newParent.x + 1, newParent.y };
         const til::point secondChild{ newParent.x + 3, newParent.y };
 
-        const auto* slice = buffer.GetRowByOffset(newParent.y).GetImageSlice();
+        const auto* slice = DirectImageSlice(buffer, newParent.y);
         VERIFY_IS_NOT_NULL(slice);
         VERIFY_ARE_EQUAL(2u, slice->ColumnOwner(firstChild.x), L"the first sibling must survive the second sibling's old-cell erase");
         VERIFY_ARE_EQUAL(2u, slice->ColumnOwner(secondChild.x), L"the second sibling must be redrawn at its new anchor");
@@ -8158,7 +8223,7 @@ public:
         _stateMachine->ProcessString(L"\x1b_Ga=p,i=1,p=1,C=1;\x1b\\");
         const til::point newChild{ newParent.x + 1, newParent.y };
 
-        const auto* slice = buffer.GetRowByOffset(newParent.y).GetImageSlice();
+        const auto* slice = DirectImageSlice(buffer, newParent.y);
         VERIFY_IS_NOT_NULL(slice);
         VERIFY_ARE_EQUAL(1u, slice->ColumnOwner(newParent.x), L"the child's stale erase must not punch a hole in the parent");
         VERIFY_ARE_EQUAL(1u, slice->ColumnOwner(newChild.x), L"the same-image child must move after the restored parent");
@@ -8176,8 +8241,8 @@ public:
         _stateMachine->ProcessString(L"\x1b_Ga=T,i=2,p=1,P=1,Q=1,H=1,V=1,f=24,s=1,v=1,C=1;AP8A\x1b\\");
         const auto childLayer = _kitty()._placements.at({ 2u, 1u }).layerId;
         buffer.ScrollRows(originalParent.y, 2, 1);
-        buffer.GetMutableRowByOffset(originalParent.y).SetImageSlice(nullptr);
-        VERIFY_IS_TRUE(buffer.GetRowByOffset(originalParent.y + 2).GetImageSlice()->ContainsPlacement(childLayer));
+        buffer.GetMutableImages().EraseArea({ 0, originalParent.y, buffer.GetSize().Width(), originalParent.y + 1 });
+        VERIFY_IS_TRUE(DirectImageSlice(buffer, originalParent.y + 2)->ContainsPlacement(childLayer));
 
         // The registry still contains the creation-time anchor. Re-put at that same coordinate
         // must compare against the retained layer's scrolled position and move the child back.
@@ -8185,9 +8250,9 @@ public:
         _stateMachine->ProcessString(L"\x1b_Ga=p,i=1,p=1,C=1;\x1b\\");
         const til::point expectedChild{ originalParent.x + 1, originalParent.y + 1 };
 
-        const auto* oldSlice = buffer.GetRowByOffset(originalParent.y + 2).GetImageSlice();
+        const auto* oldSlice = DirectImageSlice(buffer, originalParent.y + 2);
         VERIFY_IS_TRUE(oldSlice == nullptr || !oldSlice->ContainsPlacement(childLayer));
-        const auto* newSlice = buffer.GetRowByOffset(expectedChild.y).GetImageSlice();
+        const auto* newSlice = DirectImageSlice(buffer, expectedChild.y);
         VERIFY_IS_NOT_NULL(newSlice);
         VERIFY_IS_TRUE(newSlice->PlacementCoversColumn(childLayer, expectedChild.x));
     }
@@ -8202,12 +8267,12 @@ public:
         const auto originalParent = buffer.GetCursor().GetPosition();
         _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,p=1,f=24,s=1,v=1,C=1;/wAA\x1b\\");
         buffer.ScrollRows(originalParent.y, 1, 1);
-        buffer.GetMutableRowByOffset(originalParent.y).SetImageSlice(nullptr);
+        buffer.GetMutableImages().EraseArea({ 0, originalParent.y, buffer.GetSize().Width(), originalParent.y + 1 });
         _stateMachine->ProcessString(L"\x1b_Ga=T,i=2,p=1,P=1,Q=1,H=1,V=1,f=24,s=1,v=1,C=1;AP8A\x1b\\");
 
         const til::point expectedChild{ originalParent.x + 1, originalParent.y + 2 };
         const auto childLayer = _kitty()._placements.at({ 2u, 1u }).layerId;
-        const auto* slice = buffer.GetRowByOffset(expectedChild.y).GetImageSlice();
+        const auto* slice = DirectImageSlice(buffer, expectedChild.y);
         VERIFY_IS_NOT_NULL(slice);
         VERIFY_IS_TRUE(slice->PlacementCoversColumn(childLayer, expectedChild.x), L"relative resolution must use the parent's retained scrolled layer");
     }
@@ -8229,7 +8294,7 @@ public:
         _stateMachine->ProcessString(L"\x1b_Ga=p,i=1,p=1,C=1;\x1b\\");
         const til::point newChild{ newParent.x, newParent.y + 1 };
 
-        const auto* slice = buffer.GetRowByOffset(newChild.y).GetImageSlice();
+        const auto* slice = DirectImageSlice(buffer, newChild.y);
         VERIFY_IS_NOT_NULL(slice);
         VERIFY_ARE_EQUAL(0, static_cast<int>(SlicePixelAt(slice, 0, 0).rgbGreen), L"the retained X/Y gutter remains transparent");
         VERIFY_ARE_EQUAL(255, static_cast<int>(SlicePixelAt(slice, 2, 1).rgbGreen), L"the child retains its scaled, shifted pixels");
@@ -8338,7 +8403,7 @@ public:
         const auto& placement = _kitty()._placements.at({ 2u, 1u });
         VERIFY_ARE_EQUAL(0, placement.anchorCol);
         VERIFY_ARE_EQUAL(0, placement.anchorRow);
-        const auto* slice = _testGetSet->_textBuffer->GetRowByOffset(0).GetImageSlice();
+        const auto* slice = DirectImageSlice(*_testGetSet->_textBuffer, 0);
         VERIFY_IS_NOT_NULL(slice);
         VERIFY_ARE_EQUAL(2u, slice->ColumnOwner(0));
     }
@@ -8383,7 +8448,7 @@ public:
         const auto& child = _kitty()._placements.at({ 2u, 1u });
         VERIFY_ARE_EQUAL(minX + 1, child.anchorCol, L"child x = min(all placeholder x) + H");
         VERIFY_ARE_EQUAL(minY + 1, child.anchorRow, L"child y = min(all placeholder y) + V");
-        const auto* childSlice = buf.GetRowByOffset(minY + 1).GetImageSlice();
+        const auto* childSlice = DirectImageSlice(buf, minY + 1);
         VERIFY_IS_NOT_NULL(childSlice);
         VERIFY_ARE_EQUAL(2u, childSlice->ColumnOwner(minX + 1));
     }
@@ -8432,7 +8497,7 @@ public:
         _pDispatch->CursorPosition(4, 4);
         const auto posA = buf.GetCursor().GetPosition();
         _stateMachine->ProcessString(L"\x1b_Ga=p,i=1,p=1,C=1;\x1b\\"); // put at A
-        const auto* firstSlice = buf.GetRowByOffset(posA.y).GetImageSlice();
+        const auto* firstSlice = DirectImageSlice(buf, posA.y);
         VERIFY_IS_NOT_NULL(firstSlice);
         VERIFY_ARE_EQUAL(1u, firstSlice->ColumnOwner(posA.x), L"A owns the placement after the first put");
 
@@ -8441,9 +8506,9 @@ public:
         _stateMachine->ProcessString(L"\x1b_Ga=p,i=1,p=1,C=1;\x1b\\"); // re-put at B
         VERIFY_ARE_EQUAL(static_cast<size_t>(1), _kitty()._placements.size(), L"re-put replaces, not appends");
 
-        const auto* sliceA = buf.GetRowByOffset(posA.y).GetImageSlice();
+        const auto* sliceA = DirectImageSlice(buf, posA.y);
         VERIFY_IS_TRUE(sliceA == nullptr || sliceA->ColumnOwner(posA.x) == 0, L"the prior position's pixels must be erased on re-put");
-        const auto* sliceB = buf.GetRowByOffset(posB.y).GetImageSlice();
+        const auto* sliceB = DirectImageSlice(buf, posB.y);
         VERIFY_IS_NOT_NULL(sliceB);
         VERIFY_ARE_EQUAL(1u, sliceB->ColumnOwner(posB.x), L"the new position holds the re-put placement");
         VERIFY_IS_TRUE(SliceContainsColor(sliceB, 255, 0, 0), L"the re-put placement still shows the image color");
@@ -8472,14 +8537,14 @@ public:
         _stateMachine->ProcessString(L"\x1b_Ga=p,i=1,p=1,C=1;\x1b\\"); // re-put (1,1) to C
         VERIFY_ARE_EQUAL(static_cast<size_t>(2), _kitty()._placements.size());
 
-        const auto* sliceB = buf.GetRowByOffset(posB.y).GetImageSlice();
+        const auto* sliceB = DirectImageSlice(buf, posB.y);
         VERIFY_IS_NOT_NULL(sliceB);
         VERIFY_ARE_EQUAL(1u, sliceB->ColumnOwner(posB.x), L"the sibling placement (1,2) must be intact after re-putting (1,1)");
 
-        const auto* sliceA = buf.GetRowByOffset(posA.y).GetImageSlice();
+        const auto* sliceA = DirectImageSlice(buf, posA.y);
         VERIFY_IS_TRUE(sliceA == nullptr || sliceA->ColumnOwner(posA.x) == 0, L"the old (1,1) position must be erased");
 
-        const auto* sliceC = buf.GetRowByOffset(posC.y).GetImageSlice();
+        const auto* sliceC = DirectImageSlice(buf, posC.y);
         VERIFY_IS_NOT_NULL(sliceC);
         VERIFY_ARE_EQUAL(1u, sliceC->ColumnOwner(posC.x), L"the re-put (1,1) now lives at C");
     }
@@ -8502,7 +8567,7 @@ public:
         buffer.ScrollRows(origin.y, 1, 1);
         _stateMachine->ProcessString(L"\x1b_Ga=d,d=i,i=1,p=1;\x1b\\");
 
-        const auto* slice = buffer.GetRowByOffset(origin.y + 1).GetImageSlice();
+        const auto* slice = DirectImageSlice(buffer, origin.y + 1);
         VERIFY_IS_NOT_NULL(slice);
         VERIFY_IS_FALSE(slice->ContainsPlacement(firstLayer), L"delete follows the first placement after it scrolls");
         VERIFY_IS_TRUE(slice->ContainsPlacement(secondLayer), L"same-image/same-z sibling survives exact deletion");
@@ -8523,13 +8588,13 @@ public:
         buffer.GetCursor().SetPosition({ 0, origin.y });
         _stateMachine->ProcessString(L"\x1b[@");
         _pDispatch->CopyRectangularArea(vtRow, 2, vtRow, 2, 1, vtRow, 6, 1);
-        auto* slice = buffer.GetMutableRowByOffset(origin.y).GetMutableImageSlice();
+        const auto* slice = DirectImageSlice(buffer, origin.y);
         VERIFY_IS_NOT_NULL(slice);
         VERIFY_IS_TRUE(slice->PlacementCoversColumn(layerId, 1), L"ICH moves the placement identity");
         VERIFY_IS_TRUE(slice->PlacementCoversColumn(layerId, 5), L"DECCRA copies the placement identity");
 
         _stateMachine->ProcessString(L"\x1b_Ga=d,d=i,i=1,p=1;\x1b\\");
-        slice = buffer.GetMutableRowByOffset(origin.y).GetMutableImageSlice();
+        slice = DirectImageSlice(buffer, origin.y);
         VERIFY_IS_TRUE(slice == nullptr || !slice->ContainsPlacement(layerId), L"exact delete removes every copied cell");
     }
 
@@ -8548,7 +8613,7 @@ public:
         auto found = false;
         for (auto row = 0; row < reflowed->GetSize().Height(); ++row)
         {
-            const auto* slice = reflowed->GetRowByOffset(row).GetImageSlice();
+            const auto* slice = DirectImageSlice(*reflowed, row);
             found |= slice && slice->ContainsPlacement(layerId);
         }
         VERIFY_IS_TRUE(found, L"reflow preserves the retained placement identity");
@@ -8573,13 +8638,13 @@ public:
         // Anonymous relative child (image 2, NO p=) at parent+(1,1).
         _stateMachine->ProcessString(L"\x1b_Ga=T,i=2,P=1,Q=1,H=1,V=1,f=24,s=1,v=1;AP8A\x1b\\"); // green
         VERIFY_ARE_EQUAL(static_cast<size_t>(1), _kitty()._anonymousPlacements.size(), L"an anonymous relative placement is tracked for cascade");
-        const auto* childSlice = buf.GetRowByOffset(parentPos.y + 1).GetImageSlice();
+        const auto* childSlice = DirectImageSlice(buf, parentPos.y + 1);
         VERIFY_IS_NOT_NULL(childSlice);
         VERIFY_ARE_EQUAL(2u, childSlice->ColumnOwner(parentPos.x + 1), L"anonymous child drew at parent+(1,1)");
 
         _stateMachine->ProcessString(L"\x1b_Ga=d,d=i,i=1;\x1b\\"); // delete parent image 1
         VERIFY_IS_TRUE(_kitty()._anonymousPlacements.empty(), L"deleting the parent removes the anonymous child tracking");
-        const auto* gone = buf.GetRowByOffset(parentPos.y + 1).GetImageSlice();
+        const auto* gone = DirectImageSlice(buf, parentPos.y + 1);
         VERIFY_IS_TRUE(gone == nullptr || gone->ColumnOwner(parentPos.x + 1) == 0, L"the anonymous child's pixels must be erased");
 
         _testGetSet->_response.clear();
@@ -8602,7 +8667,7 @@ public:
         _stateMachine->ProcessString(L"\x1b_Ga=T,i=2,p=1,P=1,Q=1,H=1,V=0,f=24,s=1,v=1,C=1;AP8A\x1b\\");
         const auto relChildCol = parentPos.x + 1;
         const auto relChildRow = parentPos.y;
-        const auto* relSlice = buf.GetRowByOffset(relChildRow).GetImageSlice();
+        const auto* relSlice = DirectImageSlice(buf, relChildRow);
         VERIFY_IS_NOT_NULL(relSlice);
         VERIFY_ARE_EQUAL(2u, relSlice->ColumnOwner(relChildCol), L"relative child of image 2 drew next to parent");
 
@@ -8610,7 +8675,7 @@ public:
         _pDispatch->CursorPosition(9, 9);
         const auto indepPos = buf.GetCursor().GetPosition();
         _stateMachine->ProcessString(L"\x1b_Ga=p,i=2,p=2,C=1;\x1b\\");
-        const auto* indepSlice = buf.GetRowByOffset(indepPos.y).GetImageSlice();
+        const auto* indepSlice = DirectImageSlice(buf, indepPos.y);
         VERIFY_IS_NOT_NULL(indepSlice);
         VERIFY_ARE_EQUAL(2u, indepSlice->ColumnOwner(indepPos.x), L"independent placement of image 2 drew at the cursor");
         VERIFY_ARE_EQUAL(static_cast<size_t>(3), _kitty()._placements.size());
@@ -8620,10 +8685,10 @@ public:
         VERIFY_ARE_EQUAL(static_cast<size_t>(0), _kitty()._placements.count({ 2u, 1u }), L"the relative child placement is removed");
         VERIFY_ARE_EQUAL(static_cast<size_t>(1), _kitty()._placements.count({ 2u, 2u }), L"the independent placement survives");
 
-        const auto* relGone = buf.GetRowByOffset(relChildRow).GetImageSlice();
+        const auto* relGone = DirectImageSlice(buf, relChildRow);
         VERIFY_IS_TRUE(relGone == nullptr || relGone->ColumnOwner(relChildCol) == 0, L"the relative child's pixels must be erased");
 
-        const auto* indepStill = buf.GetRowByOffset(indepPos.y).GetImageSlice();
+        const auto* indepStill = DirectImageSlice(buf, indepPos.y);
         VERIFY_IS_NOT_NULL(indepStill);
         VERIFY_ARE_EQUAL(2u, indepStill->ColumnOwner(indepPos.x), L"the independent placement of image 2 must survive");
     }
@@ -8671,7 +8736,7 @@ public:
         const auto pos1 = buf.GetCursor().GetPosition();
         // image1 (1,1): 1px red scaled to 4 cells => owns cols [pos1.x, pos1.x+4).
         _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,p=1,f=24,s=1,v=1,c=4,C=1;/wAA\x1b\\");
-        const auto* row1 = buf.GetRowByOffset(pos1.y).GetImageSlice();
+        const auto* row1 = DirectImageSlice(buf, pos1.y);
         VERIFY_IS_NOT_NULL(row1);
         VERIFY_ARE_EQUAL(1u, row1->ColumnOwner(pos1.x), L"image1 owns its left cell");
         VERIFY_ARE_EQUAL(1u, row1->ColumnOwner(pos1.x + 3), L"image1 owns its right cell");
@@ -8681,14 +8746,14 @@ public:
         _pDispatch->CursorPosition(3, 5); // 0-based col pos1.x+1
         const auto pos2 = buf.GetCursor().GetPosition();
         _stateMachine->ProcessString(L"\x1b_Ga=T,i=2,p=1,f=24,s=1,v=1,c=2,C=1;AP8A\x1b\\");
-        const auto* row2 = buf.GetRowByOffset(pos2.y).GetImageSlice();
+        const auto* row2 = DirectImageSlice(buf, pos2.y);
         VERIFY_IS_NOT_NULL(row2);
         VERIFY_ARE_EQUAL(2u, row2->ColumnOwner(pos1.x + 1), L"image2 took over the middle cells");
         VERIFY_ARE_EQUAL(2u, row2->ColumnOwner(pos1.x + 2), L"image2 took over the middle cells");
 
         // Delete image1's placement: only image1's cells must be erased; image2's must survive.
         _stateMachine->ProcessString(L"\x1b_Ga=d,d=i,i=1,p=1;\x1b\\");
-        const auto* after = buf.GetRowByOffset(pos1.y).GetImageSlice();
+        const auto* after = DirectImageSlice(buf, pos1.y);
         VERIFY_IS_NOT_NULL(after, L"the slice survives because image2 still owns cells in it");
         VERIFY_ARE_EQUAL(0u, after->ColumnOwner(pos1.x), L"image1's left cell was erased");
         VERIFY_ARE_EQUAL(0u, after->ColumnOwner(pos1.x + 3), L"image1's right cell was erased");
@@ -8747,7 +8812,7 @@ public:
         VERIFY_IS_TRUE(_kitty()._placements.size() <= KittyParser::MaxPlacements, L"the placement registry must stay bounded");
         VERIFY_ARE_EQUAL(static_cast<size_t>(0), _kitty()._placements.count({ 1u, 1u }), L"the parent (1,1) was evicted at the cap");
         VERIFY_ARE_EQUAL(static_cast<size_t>(0), _kitty()._placements.count({ 2u, 1u }), L"the evicted parent's relative child must be cascaded, not left dangling");
-        const auto* ghost = buf.GetRowByOffset(parentPos.y).GetImageSlice();
+        const auto* ghost = DirectImageSlice(buf, parentPos.y);
         VERIFY_IS_TRUE(ghost == nullptr || ghost->ColumnOwner(parentPos.x) == 0, L"the evicted parent's drawn cell must be erased (no ghost pixels)");
     }
 
@@ -8768,10 +8833,10 @@ public:
         _stateMachine->ProcessString(L"\x1b_Ga=p,i=1,p=2,C=1;\x1b\\"); // (1,2) at B
         VERIFY_ARE_EQUAL(static_cast<size_t>(2), _kitty()._placements.size());
 
-        const auto* sliceA = buf.GetRowByOffset(posA.y).GetImageSlice();
+        const auto* sliceA = DirectImageSlice(buf, posA.y);
         VERIFY_IS_NOT_NULL(sliceA);
         VERIFY_ARE_EQUAL(1u, sliceA->ColumnOwner(posA.x));
-        const auto* sliceB = buf.GetRowByOffset(posB.y).GetImageSlice();
+        const auto* sliceB = DirectImageSlice(buf, posB.y);
         VERIFY_IS_NOT_NULL(sliceB);
         VERIFY_ARE_EQUAL(1u, sliceB->ColumnOwner(posB.x));
 
@@ -8780,9 +8845,9 @@ public:
         VERIFY_ARE_EQUAL(static_cast<size_t>(0), _kitty()._placements.count({ 1u, 1u }), L"placement (1,1) is removed");
         VERIFY_ARE_EQUAL(static_cast<size_t>(1), _kitty()._placements.count({ 1u, 2u }), L"placement (1,2) survives");
 
-        const auto* goneA = buf.GetRowByOffset(posA.y).GetImageSlice();
+        const auto* goneA = DirectImageSlice(buf, posA.y);
         VERIFY_IS_TRUE(goneA == nullptr || goneA->ColumnOwner(posA.x) == 0, L"placement (1,1) pixels must be erased");
-        const auto* stillB = buf.GetRowByOffset(posB.y).GetImageSlice();
+        const auto* stillB = DirectImageSlice(buf, posB.y);
         VERIFY_IS_NOT_NULL(stillB);
         VERIFY_ARE_EQUAL(1u, stillB->ColumnOwner(posB.x), L"placement (1,2) pixels must survive");
 
@@ -8801,13 +8866,13 @@ public:
         const auto pos = buf.GetCursor().GetPosition();
         _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,p=1,f=24,s=1,v=1,C=1;/wAA\x1b\\"); // only placement (1,1)
         VERIFY_ARE_EQUAL(static_cast<size_t>(1), _kitty()._placements.size());
-        const auto* slice = buf.GetRowByOffset(pos.y).GetImageSlice();
+        const auto* slice = DirectImageSlice(buf, pos.y);
         VERIFY_IS_NOT_NULL(slice);
         VERIFY_ARE_EQUAL(1u, slice->ColumnOwner(pos.x));
 
         _stateMachine->ProcessString(L"\x1b_Ga=d,d=I,i=1,p=1;\x1b\\"); // delete the only placement
         VERIFY_IS_TRUE(_kitty()._placements.empty());
-        const auto* gone = buf.GetRowByOffset(pos.y).GetImageSlice();
+        const auto* gone = DirectImageSlice(buf, pos.y);
         VERIFY_IS_TRUE(gone == nullptr || gone->ColumnOwner(pos.x) == 0, L"the placement's pixels must be erased");
 
         _testGetSet->_response.clear();
@@ -8829,14 +8894,14 @@ public:
         VERIFY_ARE_EQUAL(static_cast<size_t>(2), _kitty()._placements.size());
 
         const auto childCol = parentPos.x + 1;
-        const auto* childSlice = buf.GetRowByOffset(parentPos.y).GetImageSlice();
+        const auto* childSlice = DirectImageSlice(buf, parentPos.y);
         VERIFY_IS_NOT_NULL(childSlice);
         VERIFY_ARE_EQUAL(2u, childSlice->ColumnOwner(childCol));
 
         _stateMachine->ProcessString(L"\x1b_Ga=d,d=I,i=1,p=1;\x1b\\"); // delete (1,1) -> cascades to its child
         VERIFY_IS_TRUE(_kitty()._placements.empty(), L"deleting the parent placement cascades to its relative child");
 
-        const auto* erased = buf.GetRowByOffset(parentPos.y).GetImageSlice();
+        const auto* erased = DirectImageSlice(buf, parentPos.y);
         VERIFY_IS_TRUE(erased == nullptr || erased->ColumnOwner(parentPos.x) == 0, L"the parent placement's pixels must be erased");
         VERIFY_IS_TRUE(erased == nullptr || erased->ColumnOwner(childCol) == 0, L"the child placement's pixels must be erased");
 
@@ -8864,9 +8929,9 @@ public:
         _stateMachine->ProcessString(L"\x1b_Ga=d,d=I,i=1;\x1b\\"); // no p= -> whole-image delete
         VERIFY_IS_TRUE(_kitty()._placements.empty(), L"delete by id without p removes all of the image's placements");
 
-        const auto* goneA = buf.GetRowByOffset(posA.y).GetImageSlice();
+        const auto* goneA = DirectImageSlice(buf, posA.y);
         VERIFY_IS_TRUE(goneA == nullptr || goneA->ColumnOwner(posA.x) == 0);
-        const auto* goneB = buf.GetRowByOffset(posB.y).GetImageSlice();
+        const auto* goneB = DirectImageSlice(buf, posB.y);
         VERIFY_IS_TRUE(goneB == nullptr || goneB->ColumnOwner(posB.x) == 0);
 
         _testGetSet->_response.clear();
@@ -8894,7 +8959,7 @@ public:
         _stateMachine->ProcessString(L"\x1b_Ga=T,i=2,p=1,z=-1073741824,f=24,s=1,v=1,C=1;AP8A\x1b\\");
         _stateMachine->ProcessString(L"\x1b_Ga=T,i=3,p=1,z=0,f=24,s=1,v=1,C=1;AAD/\x1b\\");
 
-        const auto* slice = _testGetSet->_textBuffer->GetRowByOffset(origin.y).GetImageSlice();
+        const auto* slice = DirectImageSlice(*_testGetSet->_textBuffer, origin.y);
         VERIFY_IS_NOT_NULL(slice);
         const auto x = origin.x - slice->ColumnOffset();
         const auto behindBackground = SlicePixelAt(slice, ImageSlice::RenderPosition::BehindBackground, x, 0);
@@ -8913,7 +8978,7 @@ public:
         _stateMachine->ProcessString(L"\x1b_Ga=T,i=2,p=1,z=7,f=24,s=1,v=1,C=1;AP8A\x1b\\");
         _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,p=1,z=7,f=24,s=1,v=1,C=1;/wAA\x1b\\");
 
-        const auto* slice = _testGetSet->_textBuffer->GetRowByOffset(origin.y).GetImageSlice();
+        const auto* slice = DirectImageSlice(*_testGetSet->_textBuffer, origin.y);
         VERIFY_IS_NOT_NULL(slice);
         const auto pixel = SlicePixelAt(slice, ImageSlice::RenderPosition::AboveText, origin.x - slice->ColumnOffset(), 0);
         VERIFY_IS_TRUE(pixel.rgbRed == 0 && pixel.rgbGreen == 255 && pixel.rgbBlue == 0, L"higher image id must be on top at equal z");
@@ -8927,7 +8992,7 @@ public:
         _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,p=1,z=-1,f=32,s=1,v=1,C=1;/wAAgA==\x1b\\");
         _stateMachine->ProcessString(L"\x1b_Ga=T,i=2,p=1,z=-1,f=32,s=1,v=1,C=1;AP8AgA==\x1b\\");
 
-        const auto* slice = _testGetSet->_textBuffer->GetRowByOffset(origin.y).GetImageSlice();
+        const auto* slice = DirectImageSlice(*_testGetSet->_textBuffer, origin.y);
         VERIFY_IS_NOT_NULL(slice);
         const auto pixel = SlicePixelAt(slice, ImageSlice::RenderPosition::BehindText, origin.x - slice->ColumnOffset(), 0);
         VERIFY_ARE_EQUAL(static_cast<BYTE>(64), pixel.rgbRed);
@@ -8945,7 +9010,7 @@ public:
         _stateMachine->ProcessString(L"\x1b_Ga=T,i=2,p=1,z=2,f=24,s=1,v=1,C=1;AP8A\x1b\\");
         _stateMachine->ProcessString(L"\x1b_Ga=d,d=I,i=2;\x1b\\");
 
-        const auto* slice = _testGetSet->_textBuffer->GetRowByOffset(origin.y).GetImageSlice();
+        const auto* slice = DirectImageSlice(*_testGetSet->_textBuffer, origin.y);
         VERIFY_IS_NOT_NULL(slice);
         const auto pixel = SlicePixelAt(slice, ImageSlice::RenderPosition::AboveText, origin.x - slice->ColumnOffset(), 0);
         VERIFY_IS_TRUE(pixel.rgbRed == 255 && pixel.rgbGreen == 0 && pixel.rgbBlue == 0, L"deleting the top layer must reveal the lower layer");
@@ -8960,7 +9025,7 @@ public:
         _stateMachine->ProcessString(L"\x1b_Ga=T,i=2,z=2,f=24,s=1,v=1,C=1;AP8A\x1b\\");
         _stateMachine->ProcessString(L"\x1b_Ga=d,d=z,z=2;\x1b\\");
 
-        const auto* slice = _testGetSet->_textBuffer->GetRowByOffset(origin.y).GetImageSlice();
+        const auto* slice = DirectImageSlice(*_testGetSet->_textBuffer, origin.y);
         VERIFY_IS_NOT_NULL(slice);
         const auto x = origin.x - slice->ColumnOffset();
         VERIFY_ARE_EQUAL(static_cast<BYTE>(255), SlicePixelAt(slice, ImageSlice::RenderPosition::BehindText, x, 0).rgbRed);
@@ -9001,7 +9066,7 @@ public:
 
         _stateMachine->ProcessString(L"\x1b_Ga=d,d=q,x=1,y=1,z=3;\x1b\\");
 
-        const auto* slice = buffer.GetRowByOffset(row).GetImageSlice();
+        const auto* slice = DirectImageSlice(buffer, row);
         VERIFY_IS_NOT_NULL(slice);
         VERIFY_IS_FALSE(slice->Contains(1), L"d=q must delete the matching image/z placement");
         VERIFY_IS_TRUE(slice->Contains(2), L"d=q must preserve the same z at another cell");
@@ -9025,7 +9090,7 @@ public:
 
         _stateMachine->ProcessString(L"\x1b_Ga=d,d=q,x=1,y=1,z=3;\x1b\\");
 
-        const auto* slice = buffer.GetRowByOffset(row).GetImageSlice();
+        const auto* slice = DirectImageSlice(buffer, row);
         VERIFY_IS_NOT_NULL(slice);
         VERIFY_IS_FALSE(slice->ContainsPlacement(firstLayer));
         VERIFY_IS_TRUE(slice->ContainsPlacement(secondLayer), L"d=q preserves a non-intersecting placement with the same image and z");
@@ -9050,7 +9115,7 @@ public:
 
         _stateMachine->ProcessString(L"\x1b_Ga=d,d=q,x=1,y=1,z=6;\x1b\\");
 
-        const auto* slice = buffer.GetRowByOffset(row).GetImageSlice();
+        const auto* slice = DirectImageSlice(buffer, row);
         VERIFY_IS_NOT_NULL(slice);
         VERIFY_IS_FALSE(slice->ContainsPlacement(firstLayer));
         VERIFY_IS_TRUE(slice->ContainsPlacement(secondLayer), L"anonymous p=0 placements receive distinct internal identities");
@@ -9087,7 +9152,7 @@ public:
         _stateMachine->ProcessString(L"\x1b_Ga=d,d=z,z=5;\x1b\\");
         _stateMachine->ProcessString(L"\x1b_Ga=d,d=Q,x=" + std::to_wstring(x) + L",y=" + std::to_wstring(y) + L",z=5;\x1b\\");
 
-        const auto* slice = _testGetSet->_textBuffer->GetRowByOffset(origin.y).GetImageSlice();
+        const auto* slice = DirectImageSlice(*_testGetSet->_textBuffer, origin.y);
         VERIFY_IS_NOT_NULL(slice);
         VERIFY_IS_TRUE(slice->Contains(1), L"z-based selectors must not affect virtual placements");
         VERIFY_ARE_EQUAL(static_cast<size_t>(1), _kitty()._virtualIds.count({ 1u, 1u }));
@@ -9108,7 +9173,7 @@ public:
 
         _stateMachine->ProcessString(L"\x1b_Ga=d,d=Z,z=3;\x1b\\");
 
-        const auto* slice = buffer.GetRowByOffset(origin.y).GetImageSlice();
+        const auto* slice = DirectImageSlice(buffer, origin.y);
         VERIFY_IS_NOT_NULL(slice);
         VERIFY_IS_TRUE(slice->ColumnOwner(origin.x) != 1, L"the physical z=3 placement must be deleted");
         VERIFY_IS_TRUE(slice->ColumnOwner(origin.x + 2) == 1, L"the coexisting virtual z=5 placement must survive");
@@ -9155,7 +9220,7 @@ public:
         buffer.GetCursor().SetPosition({ origin.x, origin.y + 1 });
         _stateMachine->ProcessString(L"\x1b[@");
 
-        const auto* slice = buffer.GetRowByOffset(origin.y + 1).GetImageSlice();
+        const auto* slice = DirectImageSlice(buffer, origin.y + 1);
         VERIFY_IS_NOT_NULL(slice);
         const auto oldPixel = SlicePixelAt(slice, ImageSlice::RenderPosition::BehindText, origin.x - slice->ColumnOffset(), 0);
         const auto movedPixel = SlicePixelAt(slice, ImageSlice::RenderPosition::BehindText, origin.x + 1 - slice->ColumnOffset(), 0);
@@ -9174,6 +9239,9 @@ public:
         const til::point origin{ sixelSlice->ColumnOffset(), sixelRow };
         buffer.GetCursor().SetPosition(origin);
         _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,z=1,f=24,s=1,v=1,C=1;AP8A\x1b\\");
+        const auto* originalKitty = DirectImageSlice(buffer, origin.y);
+        VERIFY_IS_NOT_NULL(originalKitty);
+        VERIFY_ARE_EQUAL(1u, originalKitty->ColumnOwner(origin.x));
         const auto* original = buffer.GetRowByOffset(origin.y).GetImageSlice();
         VERIFY_IS_NOT_NULL(original);
         const auto originalSixel = *original->Pixels(origin.x);
@@ -9181,6 +9249,10 @@ public:
 
         buffer.GetCursor().SetPosition(origin);
         _stateMachine->ProcessString(L"\x1b[@");
+        const auto* movedKitty = DirectImageSlice(buffer, origin.y);
+        VERIFY_IS_NOT_NULL(movedKitty);
+        VERIFY_ARE_EQUAL(0u, movedKitty->ColumnOwner(origin.x));
+        VERIFY_ARE_EQUAL(1u, movedKitty->ColumnOwner(origin.x + 1));
         const auto* moved = buffer.GetRowByOffset(origin.y).GetImageSlice();
         VERIFY_IS_NOT_NULL(moved);
         const auto movedSixel = *moved->Pixels(origin.x + 1);
@@ -9191,6 +9263,7 @@ public:
         VERIFY_IS_NOT_NULL(slice);
         const auto pixel = *slice->Pixels(origin.x + 1);
         VERIFY_IS_TRUE(pixel.rgbRed == 255 && pixel.rgbGreen == 0, L"deleting moved Kitty pixels must not erase co-moved Sixel pixels");
+        VERIFY_IS_NULL(DirectImageSlice(buffer, origin.y));
     }
 
     TEST_METHOD(KittyGraphicsOmittedZIndexDefaultsAboveText)
@@ -9200,7 +9273,7 @@ public:
         const auto origin = _testGetSet->_textBuffer->GetCursor().GetPosition();
         _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,f=24,s=1,v=1,C=1;/wAA\x1b\\");
 
-        const auto* slice = _testGetSet->_textBuffer->GetRowByOffset(origin.y).GetImageSlice();
+        const auto* slice = DirectImageSlice(*_testGetSet->_textBuffer, origin.y);
         VERIFY_IS_NOT_NULL(slice);
         const auto x = origin.x - slice->ColumnOffset();
         VERIFY_ARE_EQUAL(static_cast<BYTE>(255), SlicePixelAt(slice, ImageSlice::RenderPosition::AboveText, x, 0).rgbRed);
@@ -9218,7 +9291,7 @@ public:
         _stateMachine->ProcessString(L"\x1b[58:2::0:0:1m");
         _stateMachine->ProcessString(Placeholder() + L"\x0305" + L"\x0305");
 
-        const auto* slice = _testGetSet->_textBuffer->GetRowByOffset(origin.y).GetImageSlice();
+        const auto* slice = DirectImageSlice(*_testGetSet->_textBuffer, origin.y);
         VERIFY_IS_NOT_NULL(slice);
         const auto pixel = SlicePixelAt(slice, ImageSlice::RenderPosition::BehindText, origin.x - slice->ColumnOffset(), 0);
         VERIFY_ARE_EQUAL(static_cast<BYTE>(255), pixel.rgbRed);
@@ -9234,7 +9307,7 @@ public:
         _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,p=1,f=24,s=1,v=1,C=1;/wAA\x1b\\");
         _stateMachine->ProcessString(L"\x1b_Ga=T,i=2,p=1,P=1,Q=1,H=1,z=-1,f=24,s=1,v=1,C=1;AP8A\x1b\\");
 
-        const auto* slice = buffer.GetRowByOffset(origin.y).GetImageSlice();
+        const auto* slice = DirectImageSlice(buffer, origin.y);
         VERIFY_IS_NOT_NULL(slice);
         const auto pixel = SlicePixelAt(slice, ImageSlice::RenderPosition::BehindText, origin.x + 1 - slice->ColumnOffset(), 0);
         VERIFY_ARE_EQUAL(static_cast<BYTE>(255), pixel.rgbGreen);
@@ -9251,7 +9324,7 @@ public:
         _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,z=-1,f=24,s=1,v=1,C=1;/wAA\x1b\\");
         _pDispatch->CopyRectangularArea(vtRow, origin.x + 1, vtRow, origin.x + 1, 1, vtRow, origin.x + 6, 1);
 
-        const auto* slice = buffer.GetRowByOffset(origin.y).GetImageSlice();
+        const auto* slice = DirectImageSlice(buffer, origin.y);
         VERIFY_IS_NOT_NULL(slice);
         const auto copied = SlicePixelAt(slice, ImageSlice::RenderPosition::BehindText, origin.x + 5 - slice->ColumnOffset(), 0);
         VERIFY_ARE_EQUAL(static_cast<BYTE>(255), copied.rgbRed);
@@ -9266,7 +9339,7 @@ public:
         _stateMachine->ProcessString(L"\x1b_Ga=T,i=2,z=1,f=24,s=1,v=1,C=1;AP8A\x1b\\");
         _stateMachine->ProcessString(L"\x1b_Ga=d,d=A;\x1b\\");
 
-        const auto* slice = _testGetSet->_textBuffer->GetRowByOffset(origin.y).GetImageSlice();
+        const auto* slice = DirectImageSlice(*_testGetSet->_textBuffer, origin.y);
         VERIFY_IS_TRUE(slice == nullptr || (!slice->Contains(1) && !slice->Contains(2)));
     }
 
@@ -9296,12 +9369,12 @@ public:
         const auto origin = _testGetSet->_textBuffer->GetCursor().GetPosition();
         _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,z=-1,f=32,s=1,v=1,C=1;AAAAAA==\x1b\\");
 
-        const auto* slice = _testGetSet->_textBuffer->GetRowByOffset(origin.y).GetImageSlice();
+        const auto* slice = DirectImageSlice(*_testGetSet->_textBuffer, origin.y);
         VERIFY_IS_NOT_NULL(slice);
         VERIFY_IS_TRUE(slice->Contains(1), L"transparent placement cells still participate in deletion");
         VERIFY_IS_FALSE(slice->HasPixels(ImageSlice::RenderPosition::BehindText));
         _stateMachine->ProcessString(L"\x1b_Ga=d,d=I,i=1;\x1b\\");
-        slice = _testGetSet->_textBuffer->GetRowByOffset(origin.y).GetImageSlice();
+        slice = DirectImageSlice(*_testGetSet->_textBuffer, origin.y);
         VERIFY_IS_TRUE(slice == nullptr || !slice->Contains(1));
     }
 
@@ -9321,7 +9394,7 @@ public:
         auto found = false;
         for (auto row = 0; row < reflowed->GetSize().Height() && !found; ++row)
         {
-            if (const auto* slice = reflowed->GetRowByOffset(row).GetImageSlice())
+            if (const auto* slice = DirectImageSlice(*reflowed, row))
             {
                 for (const auto& pixel : slice->Pixels(ImageSlice::RenderPosition::BehindText))
                 {
@@ -9347,7 +9420,7 @@ public:
         buffer.GetCursor().SetPosition(placeholderPosition);
         _stateMachine->ProcessString(Placeholder() + L"\x0305" + L"\x0305");
         const auto virtualLayer = _kitty()._placements.at({ 1u, 1u }).layerId;
-        const auto* placeholderSlice = buffer.GetRowByOffset(placeholderPosition.y).GetImageSlice();
+        const auto* placeholderSlice = DirectImageSlice(buffer, placeholderPosition.y);
         VERIFY_IS_NOT_NULL(placeholderSlice);
         VERIFY_IS_TRUE(placeholderSlice->Contains(1));
         VERIFY_IS_TRUE(placeholderSlice->ContainsPlacement(virtualLayer));
@@ -9356,7 +9429,7 @@ public:
         const auto physicalLayer = _kitty()._placements.at({ 1u, 2u }).layerId;
         buffer.GetCursor().SetPosition(placeholderPosition);
         _stateMachine->ProcessString(L"\x1b_Ga=T,i=2,p=1,z=2,f=24,s=1,v=1,C=1;AP8A\x1b\\");
-        const auto* sourceSlice = buffer.GetRowByOffset(placeholderPosition.y).GetImageSlice();
+        const auto* sourceSlice = DirectImageSlice(buffer, placeholderPosition.y);
         VERIFY_IS_NOT_NULL(sourceSlice);
         VERIFY_IS_TRUE(sourceSlice->Contains(1));
         VERIFY_IS_TRUE(sourceSlice->Contains(2));
@@ -9372,7 +9445,7 @@ public:
         for (auto y = 0; y < reflowed->GetSize().Height(); ++y)
         {
             const auto& row = reflowed->GetRowByOffset(y);
-            const auto* slice = row.GetImageSlice();
+            const auto* slice = DirectImageSlice(*reflowed, y);
             foundOverlappingImage |= slice && slice->Contains(2);
             foundOverlappingPlacement |= slice && slice->ContainsPlacement(physicalLayer);
             for (auto x = 0; x < reflowed->GetSize().Width(); ++x)
@@ -9431,7 +9504,7 @@ public:
         for (auto y = 0; y < reflowed->GetSize().Height(); ++y)
         {
             const auto& row = reflowed->GetRowByOffset(y);
-            const auto* slice = row.GetImageSlice();
+            const auto* slice = DirectImageSlice(*reflowed, y);
             foundPhysicalLayer |= slice && slice->ContainsPlacement(physicalLayer);
             for (auto x = 0; x < reflowed->GetSize().Width(); ++x)
             {
@@ -9479,7 +9552,7 @@ public:
         _stateMachine->ProcessString(L"\x1b[0m");
 
         const auto& row = buffer.GetRowByOffset(origin.y);
-        const auto* slice = row.GetImageSlice();
+        const auto* slice = DirectImageSlice(buffer, origin.y);
         VERIFY_IS_NOT_NULL(slice);
         auto sawInsideGrid = false;
         auto sawOutsideGrid = false;
@@ -9513,7 +9586,7 @@ public:
         for (auto y = 0; y < reflowed->GetSize().Height(); ++y)
         {
             const auto& reflowedRow = reflowed->GetRowByOffset(y);
-            const auto* reflowedSlice = reflowedRow.GetImageSlice();
+            const auto* reflowedSlice = DirectImageSlice(*reflowed, y);
             for (auto x = 0; x < reflowed->GetSize().Width(); ++x)
             {
                 const auto* metadata = reflowedRow.GetImageCellRef(x);
@@ -9716,7 +9789,7 @@ public:
         auto foundBoth = false;
         for (auto y = 0; y < reflowed->GetSize().Height(); ++y)
         {
-            if (const auto* slice = reflowed->GetRowByOffset(y).GetImageSlice())
+            if (const auto* slice = DirectImageSlice(*reflowed, y))
             {
                 foundBoth |= slice->Contains(1) && slice->Contains(2);
             }
@@ -9724,7 +9797,7 @@ public:
         VERIFY_IS_TRUE(foundBoth, L"layers from both rows must survive when widening joins wrapped rows");
     }
 
-    TEST_METHOD(KittyGraphicsLayerCountIsBoundedAndReleased)
+    TEST_METHOD(SixelLayerCountIsBoundedAndReleased)
     {
         const auto availableBefore = ImageSlice::LayerBytesAvailable();
         {
@@ -9790,7 +9863,7 @@ public:
         _stateMachine->ProcessString(L"\x1b_Ga=a,i=1,c=2,s=1;\x1b\\");
         _stateMachine->ProcessString(L"\x1b_Ga=f,i=1,f=24,s=1,v=1,r=2,X=1;AAD/\x1b\\");
 
-        const auto* slice = _testGetSet->_textBuffer->GetRowByOffset(origin.y).GetImageSlice();
+        const auto* slice = DirectImageSlice(*_testGetSet->_textBuffer, origin.y);
         VERIFY_IS_NOT_NULL(slice);
         const auto pixel = SlicePixelAt(slice, ImageSlice::RenderPosition::AboveText, origin.x - slice->ColumnOffset(), 0);
         VERIFY_ARE_EQUAL(static_cast<BYTE>(255), pixel.rgbBlue, L"editing the displayed frame refreshes retained placements");
@@ -9809,14 +9882,14 @@ public:
         _pDispatch->ResetMode(DispatchTypes::ModeParams::DECPCCM_PageCursorCouplingMode);
         _pDispatch->PagePositionAbsolute(2);
         _stateMachine->ProcessString(L"\x1b_Ga=a,i=1,c=2,s=1;\x1b\\");
-        auto* slice = firstPageBuffer.GetRowByOffset(origin.y).GetImageSlice();
+        auto* slice = DirectImageSlice(firstPageBuffer, origin.y);
         VERIFY_IS_NOT_NULL(slice);
         auto pixel = SlicePixelAt(slice, ImageSlice::RenderPosition::AboveText, origin.x - slice->ColumnOffset(), 0);
         VERIFY_ARE_EQUAL(static_cast<BYTE>(255), pixel.rgbGreen, L"the visible page must animate while a decoupled background page is active");
         VERIFY_ARE_EQUAL(static_cast<BYTE>(0), pixel.rgbRed);
         _pDispatch->PagePositionAbsolute(1);
 
-        slice = firstPageBuffer.GetRowByOffset(origin.y).GetImageSlice();
+        slice = DirectImageSlice(firstPageBuffer, origin.y);
         VERIFY_IS_NOT_NULL(slice);
         pixel = SlicePixelAt(slice, ImageSlice::RenderPosition::AboveText, origin.x - slice->ColumnOffset(), 0);
         VERIFY_ARE_EQUAL(static_cast<BYTE>(255), pixel.rgbGreen, L"reactivating a page must refresh it to the animation's current frame");
@@ -9871,9 +9944,10 @@ public:
         auto& buffer = *_testGetSet->_textBuffer;
         const auto origin = buffer.GetCursor().GetPosition();
         _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,f=24,s=1,v=1,C=1;/wAA\x1b\\");
-        const auto* slice = buffer.GetRowByOffset(origin.y).GetImageSlice();
+        const auto* slice = DirectImageSlice(buffer, origin.y);
         VERIFY_IS_NOT_NULL(slice);
-        const auto revision = slice->Revision();
+        const auto surface = buffer.GetImages().All().front().SurfacePointer();
+        const auto revision = surface->Revision();
 
         _stateMachine->ProcessString(L"\x1b_Ga=t,i=2,f=24,s=1,v=1;/wAA\x1b\\");
         _stateMachine->ProcessString(L"\x1b_Ga=f,i=2,f=24,s=1,v=1,z=1;AP8A\x1b\\");
@@ -9881,28 +9955,28 @@ public:
         auto& image = _kitty()._images.at(2);
         VERIFY_IS_TRUE(_kitty()._advanceImage(2, image, std::chrono::steady_clock::now()));
 
-        slice = buffer.GetRowByOffset(origin.y).GetImageSlice();
+        slice = DirectImageSlice(buffer, origin.y);
         VERIFY_IS_NOT_NULL(slice);
-        VERIFY_ARE_EQUAL(revision, slice->Revision(), L"an animation with no rendered placements must not scan or invalidate unrelated retained layers");
+        VERIFY_ARE_EQUAL(surface.get(), buffer.GetImages().All().front().SurfacePointer().get());
+        VERIFY_ARE_EQUAL(revision, surface->Revision(), L"an unplaced animation must not refresh another image's shared surface");
     }
 
-    TEST_METHOD(KittyAnimationClearsRenderedHintAfterLastLayerIsErased)
+    TEST_METHOD(KittyAnimationDeleteReleasesSharedSurface)
     {
         _testGetSet->PrepData();
         _testGetSet->_cellSize = { 1, 1 };
         auto& buffer = *_testGetSet->_textBuffer;
-        const auto origin = buffer.GetCursor().GetPosition();
         _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,f=24,s=1,v=1,C=1;/wAA\x1b\\");
         _stateMachine->ProcessString(L"\x1b_Ga=f,i=1,f=24,s=1,v=1,z=1;AP8A\x1b\\");
         _stateMachine->ProcessString(L"\x1b_Ga=a,i=1,r=1,z=1,c=1,s=3;\x1b\\");
-        auto& image = _kitty()._images.at(1);
-        VERIFY_IS_TRUE(image.hasRenderedPlacements);
+        const std::weak_ptr surface{ _kitty()._images.at(1).surface };
 
-        buffer.GetMutableRowByOffset(origin.y).SetImageSlice(nullptr);
-        VERIFY_IS_TRUE(_kitty()._advanceImage(1, image, std::chrono::steady_clock::now()));
-        VERIFY_IS_FALSE(image.hasRenderedPlacements, L"the first empty scan must disable future full-page animation scans");
-        VERIFY_IS_TRUE(buffer.GetImages().Empty(), L"orphaned rectangular placements are pruned with their compatibility layers");
-        VERIFY_IS_NULL(image.surface.get());
+        _stateMachine->ProcessString(L"\x1b_Ga=d,d=I,i=1;\x1b\\");
+
+        VERIFY_IS_TRUE(buffer.GetImages().Empty());
+        VERIFY_IS_FALSE(_kitty()._images.contains(1));
+        VERIFY_IS_TRUE(surface.expired(), L"deleting the final placement and image must release its shared surface");
+        VerifyNoDirectImageLayers(buffer);
     }
 
     TEST_METHOD(KittyAnimationRefreshKeepsLastPresentedGaplessFrame)
@@ -9922,7 +9996,7 @@ public:
         VERIFY_ARE_EQUAL(1u, image.presentedFrame);
         _pDispatch->NotifyFontChanged();
 
-        const auto* slice = buffer.GetRowByOffset(origin.y).GetImageSlice();
+        const auto* slice = DirectImageSlice(buffer, origin.y);
         VERIFY_IS_NOT_NULL(slice);
         const auto pixel = SlicePixelAt(slice, ImageSlice::RenderPosition::AboveText, origin.x - slice->ColumnOffset(), 0);
         VERIFY_ARE_EQUAL(static_cast<BYTE>(255), pixel.rgbRed, L"lifecycle refresh must restore the last presented frame");
@@ -9930,7 +10004,7 @@ public:
 
         _stateMachine->ProcessString(L"\x1b_Ga=a,i=1,r=2,z=20;\x1b\\");
         VERIFY_ARE_EQUAL(2u, image.presentedFrame, L"giving the skipped current frame a duration must present it before scheduling");
-        slice = buffer.GetRowByOffset(origin.y).GetImageSlice();
+        slice = DirectImageSlice(buffer, origin.y);
         VERIFY_IS_NOT_NULL(slice);
         const auto resumedPixel = SlicePixelAt(slice, ImageSlice::RenderPosition::AboveText, origin.x - slice->ColumnOffset(), 0);
         VERIFY_ARE_EQUAL(static_cast<BYTE>(255), resumedPixel.rgbGreen);
@@ -9947,7 +10021,7 @@ public:
         _stateMachine->ProcessString(L"\x1b_Ga=a,i=1,c=2,s=1;\x1b\\");
         _stateMachine->ProcessString(L"\x1b_Ga=p,i=1,C=1;\x1b\\");
 
-        const auto* slice = _testGetSet->_textBuffer->GetRowByOffset(origin.y).GetImageSlice();
+        const auto* slice = DirectImageSlice(*_testGetSet->_textBuffer, origin.y);
         VERIFY_IS_NOT_NULL(slice);
         const auto pixel = SlicePixelAt(slice, ImageSlice::RenderPosition::AboveText, origin.x - slice->ColumnOffset(), 0);
         VERIFY_ARE_EQUAL(static_cast<BYTE>(255), pixel.rgbGreen);
@@ -10045,7 +10119,7 @@ public:
         VERIFY_ARE_EQUAL(2u, image.currentFrame);
         VERIFY_ARE_EQUAL(75, image.animationFrames.front().gapMilliseconds);
         VERIFY_ARE_EQUAL(1u, image.animationState);
-        const auto* slice = _testGetSet->_textBuffer->GetRowByOffset(origin.y).GetImageSlice();
+        const auto* slice = DirectImageSlice(*_testGetSet->_textBuffer, origin.y);
         VERIFY_IS_NOT_NULL(slice);
         const auto pixel = SlicePixelAt(slice, ImageSlice::RenderPosition::AboveText, origin.x - slice->ColumnOffset(), 0);
         VERIFY_ARE_EQUAL(static_cast<BYTE>(255), pixel.rgbGreen);
@@ -10191,7 +10265,7 @@ public:
         _stateMachine->ProcessString(L"\x1b[@");
         _stateMachine->ProcessString(L"\x1b_Ga=a,i=1,c=2,s=1;\x1b\\");
 
-        const auto* slice = buffer.GetRowByOffset(origin.y + 1).GetImageSlice();
+        const auto* slice = DirectImageSlice(buffer, origin.y + 1);
         VERIFY_IS_NOT_NULL(slice);
         const auto inserted = SlicePixelAt(slice, ImageSlice::RenderPosition::AboveText, origin.x - slice->ColumnOffset(), 0);
         const auto moved = SlicePixelAt(slice, ImageSlice::RenderPosition::AboveText, origin.x + 1 - slice->ColumnOffset(), 0);
@@ -10211,12 +10285,13 @@ public:
         auto reflowed = std::make_unique<TextBuffer>(til::size{ 5, 600 }, TextAttribute{}, 0, false, &_testGetSet->_renderer);
         TextBuffer::Reflow(buffer, *reflowed);
         const std::vector<RGBQUAD> green{ RGBQUAD{ 0, 255, 0, 255 } };
+        VERIFY_IS_FALSE(reflowed->GetImages().Empty());
+        reflowed->GetImages().All().front().SurfacePointer()->UpdatePixels(green);
         auto found = false;
         for (auto row = 0; row < reflowed->GetSize().Height(); ++row)
         {
-            if (auto* slice = reflowed->GetMutableRowByOffset(row).GetMutableImageSlice())
+            if (const auto* slice = DirectImageSlice(*reflowed, row))
             {
-                slice->UpdateImage(1, green);
                 found |= SliceContainsColor(slice, 0, 255, 0);
             }
         }
@@ -10239,7 +10314,7 @@ public:
 
         _stateMachine->ProcessString(L"\x1b_Ga=f,i=1,f=24,s=1,v=1;AP8A\x1b\\");
         _stateMachine->ProcessString(L"\x1b_Ga=a,i=1,c=2,s=1;\x1b\\");
-        auto* slice = buffer.GetMutableRowByOffset(row).GetMutableImageSlice();
+        const auto* slice = DirectImageSlice(buffer, row);
         VERIFY_IS_NOT_NULL(slice);
         VERIFY_IS_TRUE(slice->ContainsPlacement(firstLayer));
         VERIFY_IS_TRUE(slice->ContainsPlacement(secondLayer));
@@ -10247,7 +10322,7 @@ public:
         VERIFY_ARE_EQUAL(static_cast<BYTE>(255), SlicePixelAt(slice, ImageSlice::RenderPosition::AboveText, 3, 0).rgbGreen);
 
         _stateMachine->ProcessString(L"\x1b_Ga=d,d=i,i=1,p=1;\x1b\\");
-        slice = buffer.GetMutableRowByOffset(row).GetMutableImageSlice();
+        slice = DirectImageSlice(buffer, row);
         VERIFY_IS_NOT_NULL(slice);
         VERIFY_IS_FALSE(slice->ContainsPlacement(firstLayer));
         VERIFY_IS_TRUE(slice->ContainsPlacement(secondLayer), L"animation updates do not merge placement ownership");

@@ -688,6 +688,324 @@ try
 }
 CATCH_RETURN();
 
+namespace
+{
+    struct DirectImageTarget
+    {
+        int64_t left;
+        int64_t top;
+        int64_t right;
+        int64_t bottom;
+    };
+
+    int64_t scaleImagePixels(const uint64_t value, const int64_t numerator, const int64_t denominator) noexcept
+    {
+        if (denominator <= 0 || numerator <= 0)
+        {
+            return 0;
+        }
+        const auto limit = static_cast<uint64_t>(INT64_MAX / numerator);
+        if (value > limit)
+        {
+            return INT64_MAX;
+        }
+        return static_cast<int64_t>(value * numerator / denominator);
+    }
+
+    DirectImageTarget resolveImageTarget(const ImagePlacement& placement, const til::size cellSize, const til::point viewportOrigin) noexcept
+    {
+        const auto bounds = placement.OriginalCellBounds();
+        const auto& geometry = placement.Geometry();
+        const auto left = (static_cast<int64_t>(bounds.left) - viewportOrigin.x) * cellSize.width +
+                          static_cast<int64_t>(geometry.offset.x) * cellSize.width / geometry.cellSize.width;
+        const auto top = (static_cast<int64_t>(bounds.top) - viewportOrigin.y) * cellSize.height +
+                         static_cast<int64_t>(geometry.offset.y) * cellSize.height / geometry.cellSize.height;
+        return {
+            left,
+            top,
+            left + scaleImagePixels(geometry.targetWidth, cellSize.width, geometry.cellSize.width),
+            top + scaleImagePixels(geometry.targetHeight, cellSize.height, geometry.cellSize.height),
+        };
+    }
+
+    LONG clampToLong(const int64_t value) noexcept
+    {
+        return static_cast<LONG>(std::clamp<int64_t>(value, LONG_MIN, LONG_MAX));
+    }
+}
+
+[[nodiscard]] HRESULT GdiEngine::PrepareImageFrame(const ImageFrameInfo info) noexcept
+try
+{
+    _frameImagePlacements.assign(info.placements.begin(), info.placements.end());
+    _imageViewportOrigin = info.viewportOrigin;
+
+    for (const auto& surface : info.surfaces)
+    {
+        RETURN_IF_FAILED(_PrepareImageSurface(surface));
+    }
+
+    for (auto it = _imageSurfaces.begin(); it != _imageSurfaces.end();)
+    {
+        const auto active = std::any_of(_frameImagePlacements.begin(), _frameImagePlacements.end(), [&](const auto& placement) {
+            return placement.SurfacePointer().get() == it->first;
+        });
+        if (active)
+        {
+            ++it;
+        }
+        else
+        {
+            it = _imageSurfaces.erase(it);
+        }
+    }
+    return S_OK;
+}
+CATCH_RETURN();
+
+[[nodiscard]] HRESULT GdiEngine::_PrepareImageSurface(const ImageFrameInfo::Surface& surface) noexcept
+try
+{
+    const auto& image = surface.image;
+    RETURN_HR_IF(E_INVALIDARG, !image);
+    RETURN_HR_IF(E_INVALIDARG, !surface.pixels);
+    auto& cached = _imageSurfaces.try_emplace(image.get()).first->second;
+    cached.image = image;
+
+    const auto size = image->PixelSize();
+    if (!cached.context)
+    {
+        cached.context.reset(CreateCompatibleDC(nullptr));
+        RETURN_LAST_ERROR_IF_NULL(cached.context.get());
+    }
+    if (!cached.bitmap || cached.size != size)
+    {
+        const BITMAPINFO info{
+            .bmiHeader = {
+                .biSize = sizeof(BITMAPINFOHEADER),
+                .biWidth = size.width,
+                .biHeight = -size.height,
+                .biPlanes = 1,
+                .biBitCount = 32,
+                .biCompression = BI_RGB,
+            }
+        };
+        void* bits = nullptr;
+        wil::unique_hbitmap bitmap{ CreateDIBSection(cached.context.get(), &info, DIB_RGB_COLORS, &bits, nullptr, 0) };
+        RETURN_LAST_ERROR_IF_NULL(bitmap.get());
+        RETURN_LAST_ERROR_IF_NULL(SelectObject(cached.context.get(), bitmap.get()));
+        cached.bitmap = std::move(bitmap);
+        cached.bits = static_cast<RGBQUAD*>(bits);
+        cached.size = size;
+        cached.revision = 0;
+    }
+
+    if (cached.revision != surface.revision)
+    {
+        const auto pixels = std::span{ *surface.pixels };
+        RETURN_HR_IF(E_INVALIDARG, pixels.size() != static_cast<size_t>(size.width) * size.height);
+        memcpy(cached.bits, pixels.data(), pixels.size_bytes());
+        cached.allOpaque = true;
+        cached.allTransparent = true;
+        for (const auto& pixel : pixels)
+        {
+            cached.allOpaque &= pixel.rgbReserved == 0xff;
+            cached.allTransparent &= pixel.rgbReserved == 0;
+        }
+        cached.revision = surface.revision;
+    }
+    return S_OK;
+}
+CATCH_RETURN();
+
+[[nodiscard]] HRESULT GdiEngine::_PaintDirectImage(const ImagePlacement& placement, const RECT& clip) noexcept
+try
+{
+    const auto found = _imageSurfaces.find(placement.SurfacePointer().get());
+    RETURN_HR_IF(HRESULT_FROM_WIN32(ERROR_INVALID_STATE), found == _imageSurfaces.end());
+    const auto& cached = found->second;
+    RETURN_HR_IF(S_OK, cached.allTransparent);
+
+    const auto cellSize = _GetFontSize();
+    const auto target = resolveImageTarget(placement, cellSize, _imageViewportOrigin);
+    const auto targetWidth = target.right - target.left;
+    const auto targetHeight = target.bottom - target.top;
+    RETURN_HR_IF(S_OK, targetWidth <= 0 || targetHeight <= 0);
+
+    const auto saved = SaveDC(_hdcMemoryContext);
+    RETURN_LAST_ERROR_IF(saved == 0);
+    const auto restore = wil::scope_exit([&]() {
+        RestoreDC(_hdcMemoryContext, saved);
+    });
+    RETURN_HR_IF(S_OK, IntersectClipRect(_hdcMemoryContext, clip.left, clip.top, clip.right, clip.bottom) == NULLREGION);
+
+    const auto source = placement.SourceInPixels();
+    const auto x = clampToLong(target.left);
+    const auto y = clampToLong(target.top);
+    const auto width = clampToLong(targetWidth);
+    const auto height = clampToLong(targetHeight);
+    if (cached.allOpaque)
+    {
+        SetStretchBltMode(_hdcMemoryContext, COLORONCOLOR);
+        RETURN_HR_IF(E_FAIL, !StretchBlt(_hdcMemoryContext,
+                                        x,
+                                        y,
+                                        width,
+                                        height,
+                                        cached.context.get(),
+                                        source.left,
+                                        source.top,
+                                        source.width(),
+                                        source.height(),
+                                        SRCCOPY));
+    }
+    else
+    {
+        constexpr BLENDFUNCTION blend{ .BlendOp = AC_SRC_OVER, .BlendFlags = 0, .SourceConstantAlpha = 255, .AlphaFormat = AC_SRC_ALPHA };
+        RETURN_HR_IF(E_FAIL, !GdiAlphaBlend(_hdcMemoryContext,
+                                           x,
+                                           y,
+                                           width,
+                                           height,
+                                           cached.context.get(),
+                                           source.left,
+                                           source.top,
+                                           source.width(),
+                                           source.height(),
+                                           blend));
+    }
+    return S_OK;
+}
+CATCH_RETURN();
+
+void GdiEngine::_MarkDirectImageUnderlay(const ImagePlacement& placement,
+                                         const til::CoordType targetRow,
+                                         const std::span<const uint8_t> defaultBackgroundMask) noexcept
+{
+    const auto found = _imageSurfaces.find(placement.SurfacePointer().get());
+    if (found == _imageSurfaces.end() || found->second.allTransparent)
+    {
+        return;
+    }
+
+    const auto cellSize = _GetFontSize();
+    const auto target = resolveImageTarget(placement, cellSize, _imageViewportOrigin);
+    const auto rowTop = static_cast<int64_t>(targetRow) * cellSize.height;
+    const auto rowBottom = rowTop + cellSize.height;
+    if (target.bottom <= rowTop || target.top >= rowBottom)
+    {
+        return;
+    }
+
+    const auto bounds = placement.CellBounds();
+    const auto left = std::max(bounds.left, _imageViewportOrigin.x);
+    const auto right = std::min(bounds.right, _imageViewportOrigin.x + gsl::narrow_cast<til::CoordType>(_underlayColumns.size()));
+    for (auto column = left; column < right; ++column)
+    {
+        const auto index = gsl::narrow_cast<size_t>(column - _imageViewportOrigin.x);
+        const auto cellLeft = static_cast<int64_t>(column - _imageViewportOrigin.x) * cellSize.width;
+        const auto cellRight = cellLeft + cellSize.width;
+        if (target.right <= cellLeft || target.left >= cellRight)
+        {
+            continue;
+        }
+        if (placement.Position() == ImagePlacement::RenderPosition::BehindBackground &&
+            (index >= defaultBackgroundMask.size() || til::at(defaultBackgroundMask, index) == 0))
+        {
+            continue;
+        }
+        til::at(_underlayColumns, index) = 1;
+    }
+}
+
+void GdiEngine::_MarkSliceUnderlay(const ImageSlice& imageSlice, const til::CoordType viewportLeft) noexcept
+{
+    const auto cellWidth = imageSlice.CellSize().width;
+    if (cellWidth <= 0 || !imageSlice.HasPixels(ImageSlice::RenderPosition::BehindText))
+    {
+        return;
+    }
+    const auto columns = imageSlice.PixelWidth() / cellWidth;
+    for (auto column = 0; column < columns; ++column)
+    {
+        const auto index = imageSlice.ColumnOffset() - viewportLeft + column;
+        if (index >= 0 && gsl::narrow_cast<size_t>(index) < _underlayColumns.size())
+        {
+            til::at(_underlayColumns, gsl::narrow_cast<size_t>(index)) = 1;
+        }
+    }
+}
+
+[[nodiscard]] HRESULT GdiEngine::_PaintDirectImages(const ImagePlacement::RenderPosition position,
+                                                    const til::CoordType targetRow,
+                                                    const std::span<const uint8_t> defaultBackgroundMask,
+                                                    const bool markUnderlay) noexcept
+try
+{
+    const auto cellSize = _GetFontSize();
+    const auto bufferRow = targetRow + _imageViewportOrigin.y;
+    for (const auto& placement : _frameImagePlacements)
+    {
+        const auto bounds = placement.CellBounds();
+        if (placement.Position() != position || bufferRow < bounds.top || bufferRow >= bounds.bottom)
+        {
+            continue;
+        }
+        if (markUnderlay)
+        {
+            _MarkDirectImageUnderlay(placement, targetRow, defaultBackgroundMask);
+        }
+
+        const auto left = std::max(bounds.left, _imageViewportOrigin.x);
+        const auto right = bounds.right;
+        if (left >= right)
+        {
+            continue;
+        }
+        const auto topPx = targetRow * cellSize.height;
+        const auto bottomPx = topPx + cellSize.height;
+        if (position == ImagePlacement::RenderPosition::BehindBackground)
+        {
+            RETURN_HR_IF(S_OK, defaultBackgroundMask.empty());
+            auto run = left;
+            while (run < right)
+            {
+                while (run < right && til::at(defaultBackgroundMask, gsl::narrow_cast<size_t>(run - _imageViewportOrigin.x)) == 0)
+                {
+                    ++run;
+                }
+                const auto runBegin = run;
+                while (run < right && til::at(defaultBackgroundMask, gsl::narrow_cast<size_t>(run - _imageViewportOrigin.x)) != 0)
+                {
+                    ++run;
+                }
+                if (runBegin < run)
+                {
+                    const RECT clip{
+                        (runBegin - _imageViewportOrigin.x) * cellSize.width,
+                        topPx,
+                        (run - _imageViewportOrigin.x) * cellSize.width,
+                        bottomPx,
+                    };
+                    RETURN_IF_FAILED(_PaintDirectImage(placement, clip));
+                }
+            }
+        }
+        else
+        {
+            const RECT clip{
+                (left - _imageViewportOrigin.x) * cellSize.width,
+                topPx,
+                (right - _imageViewportOrigin.x) * cellSize.width,
+                bottomPx,
+            };
+            RETURN_IF_FAILED(_PaintDirectImage(placement, clip));
+        }
+    }
+    return S_OK;
+}
+CATCH_RETURN();
+
 [[nodiscard]] HRESULT GdiEngine::_PaintImagePlane(const ImageSlice& imageSlice,
                                                  const ImageSlice::RenderPosition position,
                                                  const til::CoordType targetRow,
@@ -714,7 +1032,7 @@ try
     const auto columnCount = srcWidth / srcCellSize.width;
 
     auto plane = imageSlice.Pixels(position);
-    if (defaultBackgroundMask.size() == gsl::narrow_cast<size_t>(columnCount))
+    if (!defaultBackgroundMask.empty())
     {
         // Content below the background is only visible through cells whose
         // background is the default one. Blanking the rest makes it transparent
@@ -722,7 +1040,12 @@ try
         _imagePlane.assign(plane.begin(), plane.end());
         for (auto column = 0; column < columnCount; column++)
         {
-            if (til::at(defaultBackgroundMask, gsl::narrow_cast<size_t>(column)) != 0)
+            const auto maskIndex = defaultBackgroundMask.size() == gsl::narrow_cast<size_t>(columnCount) ?
+                                       column :
+                                       imageSlice.ColumnOffset() - viewportLeft + column;
+            if (maskIndex >= 0 &&
+                gsl::narrow_cast<size_t>(maskIndex) < defaultBackgroundMask.size() &&
+                til::at(defaultBackgroundMask, gsl::narrow_cast<size_t>(maskIndex)) != 0)
             {
                 continue;
             }
@@ -742,8 +1065,13 @@ try
     {
         for (auto column = 0; column < columnCount; column++)
         {
-            const auto slot = gsl::narrow_cast<size_t>(column);
-            if (slot >= _underlayColumns.size() || til::at(_underlayColumns, slot) != 0)
+            const auto screenColumn = imageSlice.ColumnOffset() - viewportLeft + column;
+            if (screenColumn < 0 || gsl::narrow_cast<size_t>(screenColumn) >= _underlayColumns.size())
+            {
+                continue;
+            }
+            const auto slot = gsl::narrow_cast<size_t>(screenColumn);
+            if (til::at(_underlayColumns, slot) != 0)
             {
                 continue;
             }
@@ -855,7 +1183,7 @@ CATCH_RETURN();
     return S_OK;
 }
 
-[[nodiscard]] HRESULT GdiEngine::BeginRowImages(const ImageSlice& imageSlice,
+[[nodiscard]] HRESULT GdiEngine::BeginRowImages(const ImageSlice* const imageSlice,
                                                 const til::CoordType targetRow,
                                                 const til::CoordType viewportLeft,
                                                 const std::span<const uint8_t> defaultBackgroundMask,
@@ -866,29 +1194,44 @@ try
     // only this row's text can end up above what we're about to paint.
     LOG_IF_FAILED(_FlushBufferLines());
 
-    const auto srcCellSize = imageSlice.CellSize();
-    _underlayColumns.clear();
-    _underlayColumnOffset = imageSlice.ColumnOffset();
+    _underlayColumns.assign(defaultBackgroundMask.size(), uint8_t{ 0 });
+    _underlayColumnOffset = viewportLeft;
     // The rendition is already baked into the slice's own geometry, but the
     // text's coordinates are not, so runs get scaled up to match.
     _underlayScale = _currentLineRendition != LineRendition::SingleWidth ? 1 : 0;
-    if (srcCellSize.width > 0)
-    {
-        _underlayColumns.assign(gsl::narrow_cast<size_t>(imageSlice.PixelWidth() / srcCellSize.width), uint8_t{ 0 });
-    }
-
     // The slice already accounts for line rendition in its own geometry, so it
     // is painted untransformed. The row's text still needs the transform.
     const auto rendition = _currentLineRendition;
     LOG_IF_FAILED(ResetLineTransform());
 
-    LOG_IF_FAILED(_PaintImagePlane(imageSlice, ImageSlice::RenderPosition::BehindBackground, targetRow, viewportLeft, defaultBackgroundMask, true));
+    if (imageSlice)
+    {
+        LOG_IF_FAILED(_PaintImagePlane(*imageSlice, ImageSlice::RenderPosition::BehindBackground, targetRow, viewportLeft, defaultBackgroundMask, true));
+        _MarkSliceUnderlay(*imageSlice, viewportLeft);
+    }
+    LOG_IF_FAILED(_PaintDirectImages(ImagePlacement::RenderPosition::BehindBackground, targetRow, defaultBackgroundMask, true));
+    for (const auto& placement : _frameImagePlacements)
+    {
+        if (placement.Position() == ImagePlacement::RenderPosition::BehindText)
+        {
+            const auto bounds = placement.CellBounds();
+            const auto bufferRow = targetRow + _imageViewportOrigin.y;
+            if (bufferRow >= bounds.top && bufferRow < bounds.bottom)
+            {
+                _MarkDirectImageUnderlay(placement, targetRow, {});
+            }
+        }
+    }
     // Content between the background and the text has to be composited over the
     // cell's own background, and the text pass will not paint one for any cell
     // this row's images cover. Lay it down now, in the one window where the plane
     // below the background is already painted and the plane above it is not.
-    LOG_IF_FAILED(_FillImageRowCellBackgrounds(imageSlice, targetRow, viewportLeft, defaultBackgroundMask, cellBackgrounds));
-    LOG_IF_FAILED(_PaintImagePlane(imageSlice, ImageSlice::RenderPosition::BehindText, targetRow, viewportLeft, {}, true));
+    LOG_IF_FAILED(_FillImageRowCellBackgrounds(targetRow, defaultBackgroundMask, cellBackgrounds));
+    if (imageSlice)
+    {
+        LOG_IF_FAILED(_PaintImagePlane(*imageSlice, ImageSlice::RenderPosition::BehindText, targetRow, viewportLeft, {}, true));
+    }
+    LOG_IF_FAILED(_PaintDirectImages(ImagePlacement::RenderPosition::BehindText, targetRow, {}, false));
 
     // Withholding ETO_OPAQUE stops the text filling its background *rectangle*,
     // but a device context also fills the box behind every individual glyph
@@ -905,7 +1248,7 @@ try
 
     LOG_IF_FAILED(PrepareLineTransform(rendition, targetRow, viewportLeft));
 
-    _rowImageSlice = &imageSlice;
+    _rowImageSlice = imageSlice;
     _rowImageTargetRow = targetRow;
     _rowImageViewportLeft = viewportLeft;
 
@@ -1006,43 +1349,33 @@ bool GdiEngine::_UnderlayCoversAnyOf(const til::CoordType columnBegin, const til
 // - cellBackgrounds - one color per slice column
 // Return Value:
 // - S_OK, or E_FAIL if GDI failed.
-[[nodiscard]] HRESULT GdiEngine::_FillImageRowCellBackgrounds(const ImageSlice& imageSlice,
-                                                              const til::CoordType targetRow,
-                                                              const til::CoordType viewportLeft,
+[[nodiscard]] HRESULT GdiEngine::_FillImageRowCellBackgrounds(const til::CoordType targetRow,
                                                               const std::span<const uint8_t> defaultBackgroundMask,
                                                               const std::span<const COLORREF> cellBackgrounds) noexcept
 try
 {
-    // Only content between the background and the text composites over the cell's
-    // background. The plane below the background is masked to the cells that have
-    // none, and the plane above the text is painted after the text pass has filled
-    // whatever it was going to fill.
-    if (!imageSlice.HasPixels(ImageSlice::RenderPosition::BehindText))
-    {
-        return S_OK;
-    }
-
-    const auto srcCellSize = imageSlice.CellSize();
-    RETURN_HR_IF(S_OK, srcCellSize.width <= 0);
-    const auto columnCount = gsl::narrow_cast<size_t>(imageSlice.PixelWidth() / srcCellSize.width);
+    const auto columnCount = _underlayColumns.size();
     RETURN_HR_IF(S_OK, cellBackgrounds.size() != columnCount || defaultBackgroundMask.size() != columnCount);
 
     const auto dstCellSize = _GetFontSize();
     RETURN_HR_IF(S_OK, dstCellSize.width <= 0 || dstCellSize.height <= 0);
     const auto top = targetRow * dstCellSize.height;
-    const auto left = (imageSlice.ColumnOffset() - viewportLeft) * dstCellSize.width;
+    const auto left = 0;
 
     // Adjacent cells usually share a colour, so they are filled as one rectangle.
     for (size_t column = 0; column < columnCount;)
     {
-        if (til::at(defaultBackgroundMask, column) != 0)
+        if (til::at(defaultBackgroundMask, column) != 0 || til::at(_underlayColumns, column) == 0)
         {
             column++;
             continue;
         }
         const auto color = til::at(cellBackgrounds, column);
         auto end = column + 1;
-        while (end < columnCount && til::at(defaultBackgroundMask, end) == 0 && til::at(cellBackgrounds, end) == color)
+        while (end < columnCount &&
+               til::at(defaultBackgroundMask, end) == 0 &&
+               til::at(_underlayColumns, end) != 0 &&
+               til::at(cellBackgrounds, end) == color)
         {
             end++;
         }
@@ -1065,6 +1398,7 @@ CATCH_RETURN();
 [[nodiscard]] HRESULT GdiEngine::EndRowImages() noexcept
 try
 {
+    const auto rendition = _currentLineRendition;
     // Push the row's text out over whatever was painted below it...
     _underlayColumns.clear();
     LOG_IF_FAILED(_FlushBufferLines());
@@ -1077,12 +1411,16 @@ try
     // ...and only then put the above-text content on top of all of it.
     if (_rowImageSlice)
     {
-        const auto rendition = _currentLineRendition;
         LOG_IF_FAILED(ResetLineTransform());
         LOG_IF_FAILED(_PaintImagePlane(*_rowImageSlice, ImageSlice::RenderPosition::AboveText, _rowImageTargetRow, _rowImageViewportLeft, {}, false));
-        LOG_IF_FAILED(PrepareLineTransform(rendition, _rowImageTargetRow, _rowImageViewportLeft));
-        _rowImageSlice = nullptr;
     }
+    else
+    {
+        LOG_IF_FAILED(ResetLineTransform());
+    }
+    LOG_IF_FAILED(_PaintDirectImages(ImagePlacement::RenderPosition::AboveText, _rowImageTargetRow, {}, false));
+    LOG_IF_FAILED(PrepareLineTransform(rendition, _rowImageTargetRow, _rowImageViewportLeft));
+    _rowImageSlice = nullptr;
 
     return S_OK;
 }

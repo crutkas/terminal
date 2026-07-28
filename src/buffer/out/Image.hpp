@@ -18,7 +18,9 @@ class Image final
 {
 public:
     using Pointer = std::shared_ptr<Image>;
-    using PixelStorage = std::shared_ptr<std::vector<RGBQUAD>>;
+    using PixelStorage = std::shared_ptr<const std::vector<RGBQUAD>>;
+    // D2D and the minimum D3D feature level supported by Atlas both guarantee 8192px textures.
+    static constexpr til::CoordType MaximumDimension = 8192;
 
     Image(til::size pixelSize, std::vector<RGBQUAD> pixels);
     Image(til::size pixelSize, PixelStorage pixels);

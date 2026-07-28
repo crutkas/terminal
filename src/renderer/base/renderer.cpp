@@ -501,6 +501,7 @@ DWORD Renderer::_timerToMillis(TimerRepr t) noexcept
         _updateCursorInfo();
         _invalidateCurrentCursor(); // NOTE: This now refers to the updated cursor position.
         _prepareNewComposition();
+        _prepareImageFrame();
 
         for (const auto pEngine : _engines)
         {
@@ -553,12 +554,18 @@ try
 
     // C. Prepare the engine with additional information before we start drawing.
     RETURN_IF_FAILED(_PrepareRenderInfo(pEngine));
+    const auto imageFrameResult = pEngine->PrepareImageFrame({
+        .placements = _imagePlacements,
+        .surfaces = _imageSurfaces,
+        .viewportOrigin = _viewport.Origin(),
+    });
+    RETURN_IF_FAILED(imageFrameResult);
 
     // 1. Paint Background
     RETURN_IF_FAILED(_PaintBackground(pEngine));
 
     // 2. Paint Rows of Text
-    _PaintBufferOutput(pEngine);
+    _PaintBufferOutput(pEngine, imageFrameResult == S_OK);
 
     // 4. Paint Selection
     _PaintSelection(pEngine);
@@ -1105,7 +1112,7 @@ bool Renderer::IsGlyphWideByFont(const std::wstring_view glyph)
 // - <none>
 // Return Value:
 // - <none>
-void Renderer::_PaintBufferOutput(_In_ IRenderEngine* const pEngine)
+void Renderer::_PaintBufferOutput(_In_ IRenderEngine* const pEngine, const bool directImagesSupported)
 {
     // This is the subsection of the entire screen buffer that is currently being presented.
     // It can move left/right or top/bottom depending on how the viewport is scrolled
@@ -1119,24 +1126,6 @@ void Renderer::_PaintBufferOutput(_In_ IRenderEngine* const pEngine)
     LOG_IF_FAILED(pEngine->GetDirtyArea(dirtyAreas));
 
     auto& buffer = _pData->GetTextBuffer();
-    const auto visibleImages = buffer.GetImages().IntersectingRows(_viewport.Top(), _viewport.BottomExclusive());
-    til::small_vector<ImageSlice::ImageUpdate, 16> visibleImageUpdates;
-    visibleImageUpdates.reserve(visibleImages.size());
-    for (const auto placement : visibleImages)
-    {
-        const auto& surface = placement->Surface();
-        visibleImageUpdates.emplace_back(placement->Identity().imageId, surface.Pixels(), surface.Revision());
-    }
-    std::sort(visibleImageUpdates.begin(), visibleImageUpdates.end(), [](const auto& lhs, const auto& rhs) {
-        return lhs.imageId != rhs.imageId ? lhs.imageId < rhs.imageId : lhs.sourceRevision > rhs.sourceRevision;
-    });
-    const auto uniqueEnd = std::unique(visibleImageUpdates.begin(), visibleImageUpdates.end(), [](const auto& lhs, const auto& rhs) {
-        return lhs.imageId == rhs.imageId;
-    });
-    const auto imageUpdates = std::span<const ImageSlice::ImageUpdate>{
-        visibleImageUpdates.data(),
-        static_cast<size_t>(std::distance(visibleImageUpdates.begin(), uniqueEnd)),
-    };
 
     // This is to make sure any transforms are reset when this paint is finished.
     auto resetLineTransform = wil::scope_exit([&]() {
@@ -1204,15 +1193,27 @@ void Renderer::_PaintBufferOutput(_In_ IRenderEngine* const pEngine)
 
             // Image content is painted around the text so that it can sit below
             // it. The engine decides how; all we do is bracket the text.
-            _syncImageSurfaces(r, imageUpdates);
             const auto imageSlice = r.GetImageSlice();
-            const auto hasImages = imageSlice && (imageSlice->HasPixels(ImageSlice::RenderPosition::BehindBackground) ||
-                                                  imageSlice->HasPixels(ImageSlice::RenderPosition::BehindText) ||
-                                                  imageSlice->HasPixels(ImageSlice::RenderPosition::AboveText));
+            const auto hasSliceImages = imageSlice && (imageSlice->HasPixels(ImageSlice::RenderPosition::BehindBackground) ||
+                                                       imageSlice->HasPixels(ImageSlice::RenderPosition::BehindText) ||
+                                                       imageSlice->HasPixels(ImageSlice::RenderPosition::AboveText));
+            ImagePlacement::RenderPosition directUnderlay{};
+            const auto hasDirectImages = directImagesSupported && _rowHasDirectImages(row, &directUnderlay);
+            const auto hasImages = hasSliceImages || hasDirectImages;
             if (hasImages) [[unlikely]]
             {
-                _buildImageRowBackgrounds(r, *imageSlice);
-                LOG_IF_FAILED(pEngine->BeginRowImages(*imageSlice, screenPosition.y, _viewport.Left(), _backgroundMask, _backgroundColors));
+                const auto hasSliceUnderlay = imageSlice && (imageSlice->HasPixels(ImageSlice::RenderPosition::BehindBackground) ||
+                                                             imageSlice->HasPixels(ImageSlice::RenderPosition::BehindText));
+                if (hasSliceUnderlay || (hasDirectImages && directUnderlay != ImagePlacement::RenderPosition::AboveText))
+                {
+                    _buildImageRowBackgrounds(r);
+                }
+                else
+                {
+                    _backgroundMask.clear();
+                    _backgroundColors.clear();
+                }
+                LOG_IF_FAILED(pEngine->BeginRowImages(hasSliceImages ? imageSlice : nullptr, screenPosition.y, _viewport.Left(), _backgroundMask, _backgroundColors));
             }
 
             // Painting text can throw, and an engine left mid-row would keep
@@ -1230,40 +1231,73 @@ void Renderer::_PaintBufferOutput(_In_ IRenderEngine* const pEngine)
     }
 }
 
-void Renderer::_syncImageSurfaces(const ROW& row, const std::span<const ImageSlice::ImageUpdate> updates)
+void Renderer::_prepareImageFrame()
 {
-    const auto source = row.GetImageSlice();
-    if (!source)
+    _imagePlacements.clear();
+    _imageSurfaces.clear();
+    const auto bounds = _viewport.ToExclusive();
+    const auto placements = _pData->GetTextBuffer().GetImages().IntersectingRows(bounds.top, bounds.bottom);
+    _imagePlacements.reserve(placements.size());
+    for (const auto placement : placements)
     {
-        return;
+        if (auto cropped = placement->Crop(bounds))
+        {
+            _imagePlacements.emplace_back(std::move(*cropped));
+        }
     }
-
-    const_cast<ImageSlice*>(source)->UpdateImages(updates);
+    std::stable_sort(_imagePlacements.begin(), _imagePlacements.end(), [](const auto& lhs, const auto& rhs) {
+        return std::tuple{ lhs.ZIndex(), lhs.Identity().imageId } <
+               std::tuple{ rhs.ZIndex(), rhs.Identity().imageId };
+    });
+    _imageSurfaces.reserve(_imagePlacements.size());
+    for (const auto& placement : _imagePlacements)
+    {
+        const auto& image = placement.SurfacePointer();
+        const auto found = std::ranges::find(_imageSurfaces, image.get(), [](const auto& surface) {
+            return surface.image.get();
+        });
+        if (found == _imageSurfaces.end())
+        {
+            _imageSurfaces.emplace_back(ImageFrameInfo::Surface{
+                .image = image,
+                .pixels = image->Storage(),
+                .revision = image->Revision(),
+            });
+        }
+    }
 }
 
-// Resolves, for each column of `imageSlice`, whether the cell's background is the
+bool Renderer::_rowHasDirectImages(const til::CoordType row, ImagePlacement::RenderPosition* const underlay) const noexcept
+{
+    auto found = false;
+    auto firstPosition = ImagePlacement::RenderPosition::AboveText;
+    for (const auto& placement : _imagePlacements)
+    {
+        const auto bounds = placement.CellBounds();
+        if (row >= bounds.top && row < bounds.bottom)
+        {
+            found = true;
+            firstPosition = std::min(firstPosition, placement.Position());
+        }
+    }
+    if (underlay)
+    {
+        *underlay = firstPosition;
+    }
+    return found;
+}
+
+// Resolves, for each visible screen column, whether the cell's background is the
 // default one - content below the background only shows through where it is - and
 // what that background's color is, which content above the background has to be
 // composited over. Both are left empty when the slice has nothing to draw beneath
 // the text, which is the case for every image that predates layering.
-void Renderer::_buildImageRowBackgrounds(const ROW& r, const ImageSlice& imageSlice)
+void Renderer::_buildImageRowBackgrounds(const ROW& r)
 {
     _backgroundMask.clear();
     _backgroundColors.clear();
 
-    if (!imageSlice.HasPixels(ImageSlice::RenderPosition::BehindBackground) &&
-        !imageSlice.HasPixels(ImageSlice::RenderPosition::BehindText))
-    {
-        return;
-    }
-
-    const auto cellWidth = imageSlice.CellSize().width;
-    if (cellWidth <= 0)
-    {
-        return;
-    }
-
-    const auto columnCount = gsl::narrow_cast<size_t>(imageSlice.PixelWidth() / cellWidth);
+    const auto columnCount = gsl::narrow_cast<size_t>(_viewport.Width());
     // Reused across rows and frames; painting is hot and this would otherwise
     // be a heap allocation per row per frame. Columns we can't resolve keep the
     // default background, which hides content below it rather than letting it
@@ -1278,8 +1312,8 @@ void Renderer::_buildImageRowBackgrounds(const ROW& r, const ImageSlice& imageSl
     const auto readableColumns = r.GetReadableColumnCount();
     for (size_t column = 0; column < columnCount; column++)
     {
-        const auto sliceColumn = imageSlice.ColumnOffset() + gsl::narrow_cast<til::CoordType>(column);
-        const auto bufferColumn = sliceColumn >> scale;
+        const auto screenColumn = _viewport.Left() + gsl::narrow_cast<til::CoordType>(column);
+        const auto bufferColumn = screenColumn >> scale;
         if (bufferColumn >= 0 && bufferColumn < readableColumns)
         {
             const auto attributes = r.GetAttrByColumn(bufferColumn);

@@ -37,13 +37,14 @@ namespace Microsoft::Console::Render
                                              const size_t centeringHint) noexcept override;
 
         [[nodiscard]] HRESULT PrepareRenderInfo(RenderFrameInfo info) noexcept override;
+        [[nodiscard]] HRESULT PrepareImageFrame(ImageFrameInfo info) noexcept override;
 
         [[nodiscard]] HRESULT ResetLineTransform() noexcept override;
         [[nodiscard]] HRESULT PrepareLineTransform(const LineRendition lineRendition,
                                                    const til::CoordType targetRow,
                                                    const til::CoordType viewportLeft) noexcept override;
 
-        [[nodiscard]] HRESULT BeginRowImages(const ImageSlice& imageSlice,
+        [[nodiscard]] HRESULT BeginRowImages(const ImageSlice* imageSlice,
                                              til::CoordType targetRow,
                                              til::CoordType viewportLeft,
                                              std::span<const uint8_t> defaultBackgroundMask,

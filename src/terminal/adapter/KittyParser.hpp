@@ -16,7 +16,6 @@ Abstract:
 #include "DispatchTypes.hpp"
 #include "ITermDispatch.hpp"
 #include "../../buffer/out/Image.hpp"
-#include "../../buffer/out/ImageSlice.hpp"
 
 #include <deque>
 #include <map>
@@ -57,10 +56,8 @@ namespace Microsoft::Console::VirtualTerminal
         // given comes due.
         void AdvanceAnimations(std::chrono::steady_clock::time_point now);
 
-        // Re-pushes every placement's pixels into the active page's buffer. The
-        // registry outlives the buffer it drew into, so anything that swaps the
-        // buffer under it has to ask for the layers again.
-        void RefreshImageLayers();
+        // Refreshes animated shared surfaces after a page or buffer transition.
+        void RefreshImageSurfaces();
 
         // Drops every image, every placement, and any transfer in progress.
         void HardReset() noexcept;
@@ -121,9 +118,11 @@ namespace Microsoft::Console::VirtualTerminal
             bool havePlacementId = false;    // true if p= was present (so p= is echoed in the ack)
             bool haveParent = false;         // true if P= was present (a relative placement was requested)
         };
+        using FramePixelStorage = ::Image::PixelStorage;
+
         struct AnimationFrame
         {
-            ::Image::PixelStorage pixels;
+            FramePixelStorage pixels;
             int32_t gapMilliseconds = 0;
         };
         // A stored Kitty image. Frame 1 is the root pixel vector; additional
@@ -133,7 +132,7 @@ namespace Microsoft::Console::VirtualTerminal
             uint32_t number = 0;
             uint32_t width = 0;
             uint32_t height = 0;
-            ::Image::PixelStorage pixels;
+            FramePixelStorage pixels;
             int32_t rootGapMilliseconds = 0;
             std::vector<AnimationFrame> animationFrames;
             uint32_t currentFrame = 1;
@@ -248,11 +247,11 @@ namespace Microsoft::Console::VirtualTerminal
         static RGBQUAD _rgbaColor(uint32_t rgba) noexcept;
         static void _compositePixels(std::span<RGBQUAD> destination, std::span<const RGBQUAD> source, bool replace) noexcept;
         static size_t _frameCount(const Image& image) noexcept;
-        static std::vector<RGBQUAD>* _framePixels(Image& image, uint32_t frameNumber) noexcept;
         static const std::vector<RGBQUAD>* _framePixels(const Image& image, uint32_t frameNumber) noexcept;
-        static const ::Image::PixelStorage* _frameStorage(const Image& image, uint32_t frameNumber) noexcept;
+        static FramePixelStorage* _frameStorage(Image& image, uint32_t frameNumber) noexcept;
+        static const FramePixelStorage* _frameStorage(const Image& image, uint32_t frameNumber) noexcept;
         static int32_t* _frameGap(Image& image, uint32_t frameNumber) noexcept;
-        void _updateImageLayers(uint32_t imageId, const ::Image::PixelStorage& pixels);
+        void _updateImageSurface(uint32_t imageId, const FramePixelStorage& pixels);
         void _scheduleAnimation(uint32_t imageId, Image& image, std::chrono::steady_clock::time_point now);
         void _scheduleAnimationTimer();
         bool _advanceImage(uint32_t imageId, Image& image, std::chrono::steady_clock::time_point now);
@@ -263,7 +262,7 @@ namespace Microsoft::Console::VirtualTerminal
         uint32_t _assignImageId();
         bool _registerImage(const uint32_t id, Image&& image);
         void _eraseImage(const uint32_t id);
-        void _eraseImageRows(const uint32_t imageId);
+        void _eraseImagePlacements(const uint32_t imageId);
         void _clearImages() noexcept;
         BufferState _takeBufferState() noexcept;
         void _restoreBufferState(BufferState&& state) noexcept;
@@ -271,21 +270,20 @@ namespace Microsoft::Console::VirtualTerminal
         void _releaseImageSurface(Image& image) noexcept;
         void _storeVirtualPlacement(const uint32_t id, uint32_t placementId, const Image& image, const uint32_t cols, const uint32_t rows, const uint32_t srcX, const uint32_t srcY, const uint32_t srcW, const uint32_t srcH, const int32_t zIndex, uint64_t layerId);
         static TargetSize _targetPixels(const int64_t cropW, const int64_t cropH, const uint32_t cols, const uint32_t rows, const int64_t cellWidth, const int64_t cellHeight) noexcept;
-        bool _placementFitsMemory(const Image& image, uint32_t imageId, uint64_t layerId, uint32_t cols, uint32_t rows, uint32_t srcX, uint32_t srcY, uint32_t srcW, uint32_t srcH, int32_t zIndex, std::optional<til::point> anchor = std::nullopt) const noexcept;
         til::size _placeImage(const Image& image, bool moveCursor, uint32_t imageId, uint64_t layerId, uint32_t cols = 0, uint32_t rows = 0, uint32_t srcX = 0, uint32_t srcY = 0, uint32_t srcW = 0, uint32_t srcH = 0, uint32_t cellOffsetX = 0, uint32_t cellOffsetY = 0, int32_t zIndex = 0, std::optional<til::point> anchor = std::nullopt);
         // Relative placement registry helpers.
         // Protocol: https://sw.kovidgoyal.net/kitty/graphics-protocol/#relative-placements
         void _registerPlacement(const Placement& placement);
         // Re-anchor and redraw every relative descendant after a registered parent moves.
         bool _movePlacementChildren(const std::pair<uint32_t, uint32_t>& parent, til::point parentAnchor, bool apply, std::wstring_view& code);
-        // Erases one placement's retained layer by its internal identity. The identity follows
+        // Erases one collection placement by its internal identity. The identity follows
         // cells through scroll, reflow, and block copies, so this never depends on a stale anchor.
         // Protocol: https://sw.kovidgoyal.net/kitty/graphics-protocol/#relative-placements
         void _erasePlacementCells(const Placement& placement);
         void _erasePlacementsForImage(const uint32_t imageId);
         // True if any tracked placement (registered or anonymous) still references this image id.
         bool _imageHasPlacements(const uint32_t id) const noexcept;
-        bool _imageHasRenderedLayers(uint32_t id) const;
+        bool _imageHasRenderedPlacements(uint32_t id) const;
         // Cascade-deletes the relative children of each removed placement key (registered +
         // anonymous), deleting any orphaned image except `keepImageId`, which the caller deletes.
         void _cascadePlacementChildren(std::deque<std::pair<uint32_t, uint32_t>>& removed, const uint32_t keepImageId);

@@ -23,6 +23,7 @@ namespace
     size_t checkedPixelCount(const til::size size)
     {
         THROW_HR_IF(E_INVALIDARG, size.width <= 0 || size.height <= 0);
+        THROW_HR_IF(E_INVALIDARG, size.width > Image::MaximumDimension || size.height > Image::MaximumDimension);
         const auto width = static_cast<size_t>(size.width);
         const auto height = static_cast<size_t>(size.height);
         THROW_HR_IF(E_INVALIDARG, width > SIZE_MAX / height);
@@ -56,7 +57,7 @@ namespace
 }
 
 Image::Image(const til::size pixelSize, std::vector<RGBQUAD> pixels) :
-    Image{ pixelSize, std::make_shared<std::vector<RGBQUAD>>(std::move(pixels)) }
+    Image{ pixelSize, std::make_shared<const std::vector<RGBQUAD>>(std::move(pixels)) }
 {
 }
 
@@ -91,8 +92,7 @@ const Image::PixelStorage& Image::Storage() const noexcept
 void Image::UpdatePixels(const std::span<const RGBQUAD> pixels)
 {
     THROW_HR_IF(E_INVALIDARG, pixels.size() != _pixels->size());
-    std::copy(pixels.begin(), pixels.end(), _pixels->begin());
-    _revision = nextRevision();
+    UpdatePixels(std::make_shared<const std::vector<RGBQUAD>>(pixels.begin(), pixels.end()));
 }
 
 void Image::UpdatePixels(PixelStorage pixels)

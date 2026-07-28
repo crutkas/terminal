@@ -1738,7 +1738,7 @@ void AdaptDispatch::NotifyFontChanged()
 {
     if (_kittyParser)
     {
-        _kittyParser->RefreshImageLayers();
+        _kittyParser->RefreshImageSurfaces();
     }
 }
 
@@ -1752,7 +1752,7 @@ void AdaptDispatch::PagePositionAbsolute(const VTInt page)
     _pages.MoveTo(page, _modes.test(Mode::PageCursorCoupling));
     if (_kittyParser)
     {
-        _kittyParser->RefreshImageLayers();
+        _kittyParser->RefreshImageSurfaces();
     }
 }
 
@@ -1766,7 +1766,7 @@ void AdaptDispatch::PagePositionRelative(const VTInt pageCount)
     _pages.MoveRelative(pageCount, _modes.test(Mode::PageCursorCoupling));
     if (_kittyParser)
     {
-        _kittyParser->RefreshImageLayers();
+        _kittyParser->RefreshImageSurfaces();
     }
 }
 
@@ -1780,7 +1780,7 @@ void AdaptDispatch::PagePositionBack(const VTInt pageCount)
     _pages.MoveRelative(-pageCount, _modes.test(Mode::PageCursorCoupling));
     if (_kittyParser)
     {
-        _kittyParser->RefreshImageLayers();
+        _kittyParser->RefreshImageSurfaces();
     }
 }
 

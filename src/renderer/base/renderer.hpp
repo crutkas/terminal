@@ -135,11 +135,12 @@ namespace Microsoft::Console::Render
         bool _CheckViewportAndScroll();
         void _scheduleRenditionBlink();
         [[nodiscard]] HRESULT _PaintBackground(_In_ IRenderEngine* const pEngine);
-        void _PaintBufferOutput(_In_ IRenderEngine* const pEngine);
+        void _PaintBufferOutput(_In_ IRenderEngine* const pEngine, bool directImagesSupported);
         ROW* _PaintBufferOutputComposition(TextBuffer& buffer, const ROW& r, const Composition& activeComposition);
         void _PaintBufferOutputHelper(_In_ IRenderEngine* const pEngine, TextBufferCellIterator it, const til::point target);
-        void _syncImageSurfaces(const ROW& row, std::span<const ImageSlice::ImageUpdate> updates);
-        void _buildImageRowBackgrounds(const ROW& r, const ImageSlice& imageSlice);
+        void _prepareImageFrame();
+        void _buildImageRowBackgrounds(const ROW& r);
+        bool _rowHasDirectImages(til::CoordType row, ImagePlacement::RenderPosition* underlay = nullptr) const noexcept;
         void _PaintBufferOutputGridLineHelper(_In_ IRenderEngine* const pEngine, const TextAttribute textAttribute, const size_t cchLine, const til::point coordTarget);
         bool _isHoveredHyperlink(const TextAttribute& textAttribute) const noexcept;
         void _PaintSelection(_In_ IRenderEngine* const pEngine);
@@ -193,6 +194,8 @@ namespace Microsoft::Console::Render
         std::vector<Cluster> _clusterBuffer;
         std::vector<uint8_t> _backgroundMask;
         std::vector<COLORREF> _backgroundColors;
+        std::vector<ImagePlacement> _imagePlacements;
+        std::vector<ImageFrameInfo::Surface> _imageSurfaces;
         std::function<void()> _pfnBackgroundColorChanged;
         std::function<void()> _pfnFrameColorChanged;
         std::function<void()> _pfnRendererEnteredErrorState;

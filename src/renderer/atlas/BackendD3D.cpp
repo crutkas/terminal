@@ -78,7 +78,8 @@ BackendD3D::BackendD3D(const RenderingPayload& p)
             { "renditionScale", 0, DXGI_FORMAT_R8G8_UINT, 1, offsetof(QuadInstance, renditionScale), D3D11_INPUT_PER_INSTANCE_DATA, 1 },
             { "position", 0, DXGI_FORMAT_R16G16_SINT, 1, offsetof(QuadInstance, position), D3D11_INPUT_PER_INSTANCE_DATA, 1 },
             { "size", 0, DXGI_FORMAT_R16G16_UINT, 1, offsetof(QuadInstance, size), D3D11_INPUT_PER_INSTANCE_DATA, 1 },
-            { "texcoord", 0, DXGI_FORMAT_R16G16_UINT, 1, offsetof(QuadInstance, texcoord), D3D11_INPUT_PER_INSTANCE_DATA, 1 },
+            { "texcoord", 0, DXGI_FORMAT_R32G32_FLOAT, 1, offsetof(QuadInstance, texcoord), D3D11_INPUT_PER_INSTANCE_DATA, 1 },
+            { "textureSize", 0, DXGI_FORMAT_R32G32_FLOAT, 1, offsetof(QuadInstance, textureSize), D3D11_INPUT_PER_INSTANCE_DATA, 1 },
             { "color", 0, DXGI_FORMAT_R8G8B8A8_UNORM, 1, offsetof(QuadInstance, color), D3D11_INPUT_PER_INSTANCE_DATA, 1 },
         };
         THROW_IF_FAILED(p.device->CreateInputLayout(&layout[0], std::size(layout), &shader_vs[0], sizeof(shader_vs), _inputLayout.addressof()));
@@ -205,6 +206,7 @@ void BackendD3D::ReleaseResources() noexcept
 {
     _renderTargetView.reset();
     _customRenderTargetView.reset();
+    _imageCache.clear();
     // Ensure _handleSettingsUpdate() is called so that _renderTarget gets recreated.
     _generation = {};
 }
@@ -817,6 +819,7 @@ void BackendD3D::_resetGlyphAtlas(const RenderingPayload& p, u32 minWidth, u32 m
         glyphs.clear();
     }
     _glyphAtlasBitmaps.clear();
+    _imageCache.clear();
 
     _d2dBeginDrawing();
     _d2dRenderTarget->Clear();
@@ -1111,6 +1114,7 @@ void BackendD3D::_drawText(RenderingPayload& p)
     {
         _resetGlyphAtlas(p, 0, 0);
     }
+    _pruneImageCache(p);
 
     til::CoordType dirtyTop = til::CoordTypeMax;
     til::CoordType dirtyBottom = til::CoordTypeMin;
@@ -1146,6 +1150,7 @@ void BackendD3D::_drawText(RenderingPayload& p)
             {
                 _drawBitmap(p, underlay, y);
             }
+            _drawImages(p, *row, y, static_cast<ImagePlacement::RenderPosition>(i));
         }
 
         for (const auto& m : row->mappings)
@@ -1199,7 +1204,10 @@ void BackendD3D::_drawText(RenderingPayload& p)
                         .renditionScale = renditionScale,
                         .position = { static_cast<i16>(l), static_cast<i16>(t) },
                         .size = glyphEntry->size,
-                        .texcoord = glyphEntry->texcoord,
+                        .texcoord = {
+                            static_cast<f32>(glyphEntry->texcoord.x),
+                            static_cast<f32>(glyphEntry->texcoord.y),
+                        },
                         .color = row->colors[x],
                     };
 
@@ -1224,6 +1232,7 @@ void BackendD3D::_drawText(RenderingPayload& p)
         {
             _drawBitmap(p, overlay, y);
         }
+        _drawImages(p, *row, y, ImagePlacement::RenderPosition::AboveText);
 
         if (p.invalidatedRows.contains(y))
         {
@@ -1902,6 +1911,226 @@ void BackendD3D::_drawGridlines(const RenderingPayload& p, u16 y)
     }
 }
 
+void BackendD3D::_pruneImageCache(const RenderingPayload& p)
+{
+    const auto hasStaleEntry = std::any_of(_imageCache.begin(), _imageCache.end(), [&](const auto& entry) {
+        for (const auto row : p.rows)
+        {
+            if (std::any_of(row->images.begin(), row->images.end(), [&](const auto& placement) {
+                    return placement.SurfacePointer().get() == entry.first;
+                }))
+            {
+                return false;
+            }
+        }
+        return true;
+    });
+    if (hasStaleEntry)
+    {
+        _resetGlyphAtlas(p, 0, 0);
+    }
+}
+
+void BackendD3D::_uploadImage(const RenderingPayload& p, const ImageFrameInfo::Surface& surface)
+{
+    const auto& image = surface.image;
+    THROW_HR_IF(E_UNEXPECTED, !image || !surface.pixels);
+    auto found = _imageCache.find(image.get());
+    if (found == _imageCache.end())
+    {
+        const auto size = image->PixelSize();
+        THROW_HR_IF(E_UNEXPECTED, size.width > Image::MaximumDimension || size.height > Image::MaximumDimension);
+        stbrp_rect rect{
+            .w = gsl::narrow_cast<stbrp_coord>(size.width),
+            .h = gsl::narrow_cast<stbrp_coord>(size.height),
+        };
+        _drawGlyphAtlasAllocate(p, rect);
+        auto& cached = _imageCache[image.get()];
+        cached.image = image;
+        cached.size = {
+            gsl::narrow_cast<u16>(size.width),
+            gsl::narrow_cast<u16>(size.height),
+        };
+        cached.texcoord = {
+            gsl::narrow_cast<u16>(rect.x),
+            gsl::narrow_cast<u16>(rect.y),
+        };
+        found = _imageCache.find(image.get());
+    }
+
+    auto& cached = found->second;
+    if (cached.revision == surface.revision)
+    {
+        return;
+    }
+
+    _d2dBeginDrawing();
+    const auto size = image->PixelSize();
+    const auto pixels = std::span{ *surface.pixels };
+    THROW_HR_IF(E_UNEXPECTED, pixels.size() != static_cast<size_t>(size.width) * size.height);
+    const D2D1_SIZE_U bitmapSize{
+        gsl::narrow_cast<UINT32>(size.width),
+        gsl::narrow_cast<UINT32>(size.height),
+    };
+    const D2D1_BITMAP_PROPERTIES properties{
+        .pixelFormat = { DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED },
+        .dpiX = static_cast<f32>(p.s->font->dpi),
+        .dpiY = static_cast<f32>(p.s->font->dpi),
+    };
+    wil::com_ptr<ID2D1Bitmap> bitmap;
+    THROW_IF_FAILED(_d2dRenderTarget->CreateBitmap(bitmapSize,
+                                                   pixels.data(),
+                                                   gsl::narrow_cast<UINT32>(size.width * sizeof(RGBQUAD)),
+                                                   &properties,
+                                                   bitmap.put()));
+    const D2D1_RECT_F destination{
+        static_cast<f32>(cached.texcoord.x),
+        static_cast<f32>(cached.texcoord.y),
+        static_cast<f32>(cached.texcoord.x + cached.size.x),
+        static_cast<f32>(cached.texcoord.y + cached.size.y),
+    };
+    _d2dRenderTarget->SetPrimitiveBlend(D2D1_PRIMITIVE_BLEND_COPY);
+    _d2dRenderTarget->DrawBitmap(bitmap.get(), &destination, 1, D2D1_BITMAP_INTERPOLATION_MODE_NEAREST_NEIGHBOR);
+    _d2dRenderTarget->SetPrimitiveBlend(D2D1_PRIMITIVE_BLEND_SOURCE_OVER);
+    cached.revision = surface.revision;
+}
+
+void BackendD3D::_drawImage(const RenderingPayload& p, const ImagePlacement& placement, const i32r& clip)
+{
+    const auto& image = placement.SurfacePointer();
+    const auto snapshot = std::ranges::find(p.imageSurfaces, image.get(), [](const auto& surface) {
+        return surface.image.get();
+    });
+    THROW_HR_IF(E_UNEXPECTED, snapshot == p.imageSurfaces.end());
+    _uploadImage(p, *snapshot);
+    const auto& cached = _imageCache.at(image.get());
+
+    const auto cellWidth = static_cast<int64_t>(p.s->font->cellSize.x);
+    const auto cellHeight = static_cast<int64_t>(p.s->font->cellSize.y);
+    const auto original = placement.OriginalCellBounds();
+    const auto fragment = placement.CellBounds();
+    const auto& geometry = placement.Geometry();
+    const auto targetLeft = (static_cast<int64_t>(original.left) - p.scrollOffsetX) * cellWidth +
+                            static_cast<int64_t>(geometry.offset.x) * cellWidth / geometry.cellSize.width;
+    const auto targetTop = static_cast<int64_t>(clip.top) -
+                           static_cast<int64_t>(fragment.top - original.top) * cellHeight +
+                           static_cast<int64_t>(geometry.offset.y) * cellHeight / geometry.cellSize.height;
+    const auto widthLimit = static_cast<uint64_t>(INT64_MAX / cellWidth);
+    const auto heightLimit = static_cast<uint64_t>(INT64_MAX / cellHeight);
+    const auto targetWidth = geometry.targetWidth > widthLimit ? INT64_MAX : static_cast<int64_t>(geometry.targetWidth * cellWidth / geometry.cellSize.width);
+    const auto targetHeight = geometry.targetHeight > heightLimit ? INT64_MAX : static_cast<int64_t>(geometry.targetHeight * cellHeight / geometry.cellSize.height);
+    if (targetWidth <= 0 || targetHeight <= 0)
+    {
+        return;
+    }
+    const auto targetRight = targetLeft > INT64_MAX - targetWidth ? INT64_MAX : targetLeft + targetWidth;
+    const auto targetBottom = targetTop > INT64_MAX - targetHeight ? INT64_MAX : targetTop + targetHeight;
+    const auto left = std::max<int64_t>(clip.left, targetLeft);
+    const auto top = std::max<int64_t>(clip.top, targetTop);
+    const auto right = std::min<int64_t>(clip.right, targetRight);
+    const auto bottom = std::min<int64_t>(clip.bottom, targetBottom);
+    if (left >= right || top >= bottom)
+    {
+        return;
+    }
+
+    const auto source = placement.SourceInPixels();
+    const auto sourceLeft = static_cast<double>(source.left) + static_cast<double>(left - targetLeft) * source.width() / targetWidth;
+    const auto sourceTop = static_cast<double>(source.top) + static_cast<double>(top - targetTop) * source.height() / targetHeight;
+    const auto sourceRight = static_cast<double>(source.left) + static_cast<double>(right - targetLeft) * source.width() / targetWidth;
+    const auto sourceBottom = static_cast<double>(source.top) + static_cast<double>(bottom - targetTop) * source.height() / targetHeight;
+    if (sourceLeft >= sourceRight || sourceTop >= sourceBottom)
+    {
+        return;
+    }
+
+    _appendQuad() = {
+        .shadingType = static_cast<u16>(ShadingType::TextPassthrough),
+        .renditionScale = { 1, 1 },
+        .position = {
+            gsl::narrow_cast<i16>(left),
+            gsl::narrow_cast<i16>(top),
+        },
+        .size = {
+            gsl::narrow_cast<u16>(right - left),
+            gsl::narrow_cast<u16>(bottom - top),
+        },
+        .texcoord = {
+            static_cast<f32>(cached.texcoord.x + sourceLeft),
+            static_cast<f32>(cached.texcoord.y + sourceTop),
+        },
+        .textureSize = {
+            static_cast<f32>(sourceRight - sourceLeft),
+            static_cast<f32>(sourceBottom - sourceTop),
+        },
+    };
+}
+
+void BackendD3D::_drawImages(const RenderingPayload& p, const ShapedRow& row, const u16 y, const ImagePlacement::RenderPosition position)
+{
+    const auto cellWidth = p.s->font->cellSize.x;
+    const auto cellHeight = p.s->font->cellSize.y;
+    const auto rowTop = y * cellHeight;
+    const auto rowBottom = rowTop + cellHeight;
+    for (const auto& placement : row.images)
+    {
+        if (placement.Position() != position)
+        {
+            continue;
+        }
+        const auto bounds = placement.CellBounds();
+        auto left = bounds.left;
+        const auto right = bounds.right;
+        if (position == ImagePlacement::RenderPosition::BehindBackground)
+        {
+            while (left < right)
+            {
+                while (left < right)
+                {
+                    const auto index = left - p.scrollOffsetX;
+                    if (index >= 0 && gsl::narrow_cast<size_t>(index) < row.imageDefaultBackground.size() && row.imageDefaultBackground[index] != 0)
+                    {
+                        break;
+                    }
+                    ++left;
+                }
+                const auto runBegin = left;
+                while (left < right)
+                {
+                    const auto index = left - p.scrollOffsetX;
+                    if (index < 0 || gsl::narrow_cast<size_t>(index) >= row.imageDefaultBackground.size() || row.imageDefaultBackground[index] == 0)
+                    {
+                        break;
+                    }
+                    ++left;
+                }
+                if (runBegin < left)
+                {
+                    _drawImage(p,
+                               placement,
+                               {
+                                   (runBegin - p.scrollOffsetX) * cellWidth,
+                                   rowTop,
+                                   (left - p.scrollOffsetX) * cellWidth,
+                                   rowBottom,
+                               });
+                }
+            }
+        }
+        else
+        {
+            _drawImage(p,
+                       placement,
+                       {
+                           (left - p.scrollOffsetX) * cellWidth,
+                           rowTop,
+                           (right - p.scrollOffsetX) * cellWidth,
+                           rowBottom,
+                       });
+        }
+    }
+}
+
 void BackendD3D::_drawBitmap(const RenderingPayload& p, const Bitmap& b, u16 y)
 {
     auto ab = _glyphAtlasBitmaps.lookup(b.revision);
@@ -1949,7 +2178,10 @@ void BackendD3D::_drawBitmap(const RenderingPayload& p, const Bitmap& b, u16 y)
         .renditionScale = { 1, 1 },
         .position = { static_cast<i16>(left), static_cast<i16>(top) },
         .size = ab->size,
-        .texcoord = ab->texcoord,
+        .texcoord = {
+            static_cast<f32>(ab->texcoord.x),
+            static_cast<f32>(ab->texcoord.y),
+        },
     };
 }
 
@@ -2248,6 +2480,7 @@ size_t BackendD3D::_drawCursorForegroundSlowPath(const CursorRect& c, size_t off
         const auto& cutout = cutouts[i];
         auto& target = _instances[offset + i];
 
+        target = it;
         target.shadingType = it.shadingType;
         target.renditionScale.x = it.renditionScale.x;
         target.renditionScale.y = it.renditionScale.y;
@@ -2255,8 +2488,8 @@ size_t BackendD3D::_drawCursorForegroundSlowPath(const CursorRect& c, size_t off
         target.position.y = static_cast<i16>(cutout.top);
         target.size.x = static_cast<u16>(cutout.right - cutout.left);
         target.size.y = static_cast<u16>(cutout.bottom - cutout.top);
-        target.texcoord.x = static_cast<u16>(it.texcoord.x + cutout.left - instanceL);
-        target.texcoord.y = static_cast<u16>(it.texcoord.y + cutout.top - instanceT);
+        target.texcoord.x = it.texcoord.x + cutout.left - instanceL;
+        target.texcoord.y = it.texcoord.y + cutout.top - instanceT;
         target.color = it.color;
     }
 
@@ -2267,6 +2500,7 @@ size_t BackendD3D::_drawCursorForegroundSlowPath(const CursorRect& c, size_t off
     // we don't append a new quad, but rather reuse the one that already exists (cutoutCount == 0).
     auto& target = cutoutCount ? _appendQuad() : _instances[offset];
 
+    target = it;
     target.shadingType = it.shadingType;
     target.renditionScale.x = it.renditionScale.x;
     target.renditionScale.y = it.renditionScale.y;
@@ -2274,8 +2508,8 @@ size_t BackendD3D::_drawCursorForegroundSlowPath(const CursorRect& c, size_t off
     target.position.y = static_cast<i16>(intersectionT);
     target.size.x = static_cast<u16>(intersectionR - intersectionL);
     target.size.y = static_cast<u16>(intersectionB - intersectionT);
-    target.texcoord.x = static_cast<u16>(it.texcoord.x + intersectionL - instanceL);
-    target.texcoord.y = static_cast<u16>(it.texcoord.y + intersectionT - instanceT);
+    target.texcoord.x = it.texcoord.x + intersectionL - instanceL;
+    target.texcoord.y = it.texcoord.y + intersectionT - instanceT;
     target.color = color;
 
     return addedInstances;

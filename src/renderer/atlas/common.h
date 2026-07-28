@@ -476,6 +476,8 @@ namespace Microsoft::Console::Render::Atlas
             {
                 bitmap.active = false;
             }
+            images.clear();
+            imageDefaultBackground.clear();
             gridLineRanges.clear();
             lineRendition = LineRendition::SingleWidth;
             dirtyTop = y * cellHeight;
@@ -495,6 +497,8 @@ namespace Microsoft::Console::Render::Atlas
         std::vector<u32> colors;
 
         std::array<Bitmap, ImageSlice::RenderPositionCount> bitmaps;
+        std::vector<ImagePlacement> images;
+        std::vector<uint8_t> imageDefaultBackground;
         std::vector<GridLineRange> gridLineRanges;
         LineRendition lineRendition = LineRendition::SingleWidth;
         til::CoordType dirtyTop = 0;
@@ -574,6 +578,7 @@ namespace Microsoft::Console::Render::Atlas
         // A generation of 1 ensures that the backends redraw the background on the first Present().
         // The 1st entry in this array corresponds to the background and the 2nd to the foreground bitmap.
         std::array<til::generation_t, 3> colorBitmapGenerations{ 1, 1, 1 };
+        std::vector<ImageFrameInfo::Surface> imageSurfaces;
         // In columns/rows.
         til::rect cursorRect;
         // The viewport/SwapChain area to be presented. In pixel.
