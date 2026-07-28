@@ -4,7 +4,6 @@
 #include "precomp.h"
 
 #include "Image.hpp"
-#include "ImageSlice.hpp"
 
 namespace
 {
@@ -23,7 +22,7 @@ namespace
     size_t checkedPixelCount(const til::size size)
     {
         THROW_HR_IF(E_INVALIDARG, size.width <= 0 || size.height <= 0);
-        THROW_HR_IF(E_INVALIDARG, size.width > Image::MaximumDimension || size.height > Image::MaximumDimension);
+        THROW_HR_IF(E_NOTIMPL, size.width > Image::MaximumDimension || size.height > Image::MaximumDimension);
         const auto width = static_cast<size_t>(size.width);
         const auto height = static_cast<size_t>(size.height);
         THROW_HR_IF(E_INVALIDARG, width > SIZE_MAX / height);
@@ -40,6 +39,10 @@ namespace
         if (lhs->ZIndex() != rhs->ZIndex())
         {
             return lhs->ZIndex() < rhs->ZIndex();
+        }
+        if (lhs->Identity().protocol != rhs->Identity().protocol)
+        {
+            return lhs->Identity().protocol < rhs->Identity().protocol;
         }
         if (lhs->Identity().imageId != rhs->Identity().imageId)
         {
@@ -89,15 +92,50 @@ const Image::PixelStorage& Image::Storage() const noexcept
     return _pixels;
 }
 
+void Image::Resize(const til::size pixelSize)
+{
+    const auto pixelCount = checkedPixelCount(pixelSize);
+    if (pixelSize == _pixelSize)
+    {
+        return;
+    }
+
+    auto pixels = std::make_shared<std::vector<RGBQUAD>>(pixelCount);
+    const auto copyWidth = std::min(pixelSize.width, _pixelSize.width);
+    const auto copyHeight = std::min(pixelSize.height, _pixelSize.height);
+    for (auto y = 0; y < copyHeight; ++y)
+    {
+        const auto source = _pixels->begin() + gsl::narrow<size_t>(y) * gsl::narrow<size_t>(_pixelSize.width);
+        const auto target = pixels->begin() + gsl::narrow<size_t>(y) * gsl::narrow<size_t>(pixelSize.width);
+        std::copy_n(source, copyWidth, target);
+    }
+    UpdatePixels(pixelSize, std::move(pixels));
+}
+
 void Image::UpdatePixels(const std::span<const RGBQUAD> pixels)
 {
-    THROW_HR_IF(E_INVALIDARG, pixels.size() != _pixels->size());
-    UpdatePixels(std::make_shared<const std::vector<RGBQUAD>>(pixels.begin(), pixels.end()));
+    UpdatePixels(_pixelSize, pixels);
 }
 
 void Image::UpdatePixels(PixelStorage pixels)
 {
-    THROW_HR_IF(E_INVALIDARG, !pixels || pixels->size() != _pixels->size());
+    UpdatePixels(_pixelSize, std::move(pixels));
+}
+
+void Image::UpdatePixels(const til::size pixelSize, const std::span<const RGBQUAD> pixels)
+{
+    THROW_HR_IF(E_INVALIDARG, pixels.size() != checkedPixelCount(pixelSize));
+    UpdatePixels(pixelSize, std::make_shared<const std::vector<RGBQUAD>>(pixels.begin(), pixels.end()));
+}
+
+void Image::UpdatePixels(const til::size pixelSize, PixelStorage pixels)
+{
+    const auto pixelCount = checkedPixelCount(pixelSize);
+    THROW_HR_IF(E_INVALIDARG, !pixels || pixels->size() != pixelCount);
+
+    // All validation and allocation happens before changing either field, so a
+    // rejected resize leaves every placement with its prior valid surface.
+    _pixelSize = pixelSize;
     _pixels = std::move(pixels);
     _revision = nextRevision();
 }
@@ -251,79 +289,6 @@ ImagePlacement ImagePlacement::Translated(const til::point delta) const
     };
 }
 
-bool ImagePlacement::RasterizeRow(const til::CoordType row,
-                                  til::CoordType columnBegin,
-                                  til::CoordType columnEnd,
-                                  ImageSlice& destination) const
-{
-    if (row < _cellBounds.top || row >= _cellBounds.bottom || destination.CellSize() != _geometry.cellSize)
-    {
-        return false;
-    }
-
-    columnBegin = std::max(columnBegin, _cellBounds.left);
-    columnEnd = std::min(columnEnd, _cellBounds.right);
-    if (columnBegin >= columnEnd)
-    {
-        return false;
-    }
-
-    destination.BumpRevision();
-    auto dst = destination.MutablePixels(columnBegin, columnEnd, { _key.imageId, _key.layerId }, _zIndex);
-    auto sourceIndices = destination.MutableSourceIndices(columnBegin, columnEnd, { _key.imageId, _key.layerId }, _zIndex);
-    const auto surfaceSize = _image->PixelSize();
-    const auto surfacePixels = _image->Pixels();
-    const auto cellWidth = _geometry.cellSize.width;
-    const auto cellHeight = _geometry.cellSize.height;
-    const auto pixelWidth = (columnEnd - columnBegin) * cellWidth;
-    const auto rowInPlacement = static_cast<int64_t>(row) - _originalCellBounds.top;
-
-    for (auto pixelRow = 0; pixelRow < cellHeight; ++pixelRow)
-    {
-        const auto destinationY = rowInPlacement * cellHeight + pixelRow;
-        const auto targetY = destinationY - _geometry.offset.y;
-        const auto yInImage = targetY >= 0 && static_cast<uint64_t>(targetY) < _geometry.targetHeight;
-        const auto sourceY = yInImage ?
-                                 _sourceInPixels.top + std::min<int64_t>(_sourceInPixels.height() - 1,
-                                                                        targetY * _sourceInPixels.height() / gsl::narrow_cast<int64_t>(_geometry.targetHeight)) :
-                                 0;
-
-        for (auto pixelColumn = 0; pixelColumn < pixelWidth; ++pixelColumn)
-        {
-            const auto destinationX = (static_cast<int64_t>(columnBegin) - _originalCellBounds.left) * cellWidth + pixelColumn;
-            const auto targetX = destinationX - _geometry.offset.x;
-            RGBQUAD pixel{};
-            auto sourceIndex = ImageSlice::NoSourceIndex;
-            if (yInImage && targetX >= 0 && static_cast<uint64_t>(targetX) < _geometry.targetWidth)
-            {
-                const auto sourceX = _sourceInPixels.left + std::min<int64_t>(_sourceInPixels.width() - 1,
-                                                                              targetX * _sourceInPixels.width() / gsl::narrow_cast<int64_t>(_geometry.targetWidth));
-                const auto index = gsl::narrow_cast<size_t>(sourceY) * gsl::narrow_cast<size_t>(surfaceSize.width) +
-                                   gsl::narrow_cast<size_t>(sourceX);
-                if (index < surfacePixels.size())
-                {
-                    pixel = surfacePixels[index];
-                    if (index <= UINT32_MAX)
-                    {
-                        sourceIndex = static_cast<uint32_t>(index);
-                    }
-                }
-            }
-
-            til::at(dst, pixelColumn) = pixel;
-            til::at(sourceIndices, pixelColumn) = sourceIndex;
-        }
-
-        if (pixelRow + 1 < cellHeight)
-        {
-            std::advance(dst, destination.PixelWidth());
-            std::advance(sourceIndices, destination.PixelWidth());
-        }
-    }
-
-    return true;
-}
-
 ImageCollection::LogicalPlacement::LogicalPlacement(const ImagePlacement* const placement,
                                                     const til::CoordType rowOffset,
                                                     const til::CoordType bufferHeight) noexcept :
@@ -382,15 +347,6 @@ std::optional<ImagePlacement> ImageCollection::LogicalPlacement::Crop(const til:
     return logical.Crop(cellBounds & CellBounds());
 }
 
-bool ImageCollection::LogicalPlacement::RasterizeRow(const til::CoordType row,
-                                                     const til::CoordType columnBegin,
-                                                     const til::CoordType columnEnd,
-                                                     ImageSlice& destination) const
-{
-    const auto storedRow = gsl::narrow<til::CoordType>(static_cast<int64_t>(row) - _rowOffset);
-    return _placement->RasterizeRow(storedRow, columnBegin, columnEnd, destination);
-}
-
 struct ImageCollection::RowIndex
 {
     using Tree = interval_tree::IntervalTree<uint64_t, size_t>;
@@ -407,6 +363,16 @@ ImageCollection::ImageCollection() = default;
 ImageCollection::~ImageCollection() = default;
 ImageCollection::ImageCollection(ImageCollection&&) noexcept = default;
 ImageCollection& ImageCollection::operator=(ImageCollection&&) noexcept = default;
+
+ImageCollection ImageCollection::Snapshot() const
+{
+    ImageCollection snapshot;
+    snapshot._images = _images;
+    snapshot._rowEpoch = _rowEpoch;
+    snapshot._lastPurgeEpoch = _lastPurgeEpoch;
+    snapshot._bufferHeight = _bufferHeight;
+    return snapshot;
+}
 
 std::vector<ImagePlacement> ImageCollection::_eraseAreas(const std::span<const ImagePlacement> images, const std::span<const til::rect> areas)
 {
@@ -471,22 +437,36 @@ void ImageCollection::AddOrReplace(ImagePlacement image)
 {
     const auto key = image.Identity();
     image._rowEpoch = _rowEpoch;
-    const auto existing = std::find_if(_images.begin(), _images.end(), [&](const auto& candidate) {
+    const auto current = All();
+    std::vector<ImagePlacement> images{ current.begin(), current.end() };
+    std::erase_if(images, [&](const auto& candidate) {
         return candidate.Identity() == key;
     });
-    if (existing != _images.end())
-    {
-        *existing = std::move(image);
-        const auto duplicates = std::remove_if(std::next(existing), _images.end(), [&](const auto& candidate) {
-            return candidate.Identity() == key;
-        });
-        _images.erase(duplicates, _images.end());
-    }
-    else
-    {
-        _images.emplace_back(std::move(image));
-    }
-    _markIndexDirty();
+    images.emplace_back(std::move(image));
+    _replace(std::move(images));
+}
+
+void ImageCollection::AddOrReplace(ImagePlacement image,
+                                   const Image::Pointer& surface,
+                                   const til::size pixelSize,
+                                   Image::PixelStorage pixels)
+{
+    THROW_HR_IF(E_INVALIDARG, !surface);
+    image._image = surface;
+    image._rowEpoch = _rowEpoch;
+
+    const auto key = image.Identity();
+    const auto current = All();
+    std::vector<ImagePlacement> images{ current.begin(), current.end() };
+    std::erase_if(images, [&](const auto& candidate) {
+        return candidate.Identity() == key;
+    });
+    images.emplace_back(std::move(image));
+
+    // The replacement collection has already allocated successfully. Updating
+    // the surface is transactional, and the final vector swap cannot fail.
+    surface->UpdatePixels(pixelSize, std::move(pixels));
+    _replace(std::move(images));
 }
 
 void ImageCollection::AddOrReplaceArea(ImagePlacement image)
@@ -526,6 +506,18 @@ void ImageCollection::Clear() noexcept
     }
 }
 
+size_t ImageCollection::EraseProtocol(const ImagePlacement::Key::Protocol protocol) noexcept
+{
+    const auto removed = std::erase_if(_images, [&](const auto& image) {
+        return image.Identity().protocol == protocol;
+    });
+    if (removed != 0)
+    {
+        _markIndexDirty();
+    }
+    return removed;
+}
+
 bool ImageCollection::Erase(const ImagePlacement::Key key)
 {
     const auto oldSize = _images.size();
@@ -540,11 +532,12 @@ bool ImageCollection::Erase(const ImagePlacement::Key key)
     return erased;
 }
 
-size_t ImageCollection::EraseImage(const uint32_t imageId)
+size_t ImageCollection::EraseImage(const ImagePlacement::Key::Protocol protocol, const uint32_t imageId)
 {
     const auto oldSize = _images.size();
     std::erase_if(_images, [&](const auto& image) {
-        return image.Identity().imageId == imageId;
+        const auto key = image.Identity();
+        return key.protocol == protocol && key.imageId == imageId;
     });
     const auto erased = oldSize - _images.size();
     if (erased != 0)

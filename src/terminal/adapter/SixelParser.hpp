@@ -13,6 +13,7 @@ Abstract:
 
 #include "til.h"
 #include "DispatchTypes.hpp"
+#include "../buffer/out/Image.hpp"
 
 class Cursor;
 class TextBuffer;
@@ -74,6 +75,7 @@ namespace Microsoft::Console::VirtualTerminal
         void _updateRasterAttributes(const VTParameters& rasterAttributes);
         void _scrollTextBuffer(Page& page, const int scrollAmount);
         void _updateTextCursor(Cursor& cursor) noexcept;
+        void _releaseImageState(const bool restoreCursorVisibility) noexcept;
 
         const til::size _cellSize;
         bool _displayMode = true;
@@ -118,6 +120,8 @@ namespace Microsoft::Console::VirtualTerminal
         void _maybeFlushImageBuffer(const bool endOfSequence = false);
 
         std::vector<IndexedPixel> _imageBuffer;
+        Image::Pointer _imageSurface;
+        ImagePlacement::Key _imageKey;
         til::point _imageOriginCell;
         til::point _imageCursor;
         til::CoordType _imageWidth = 0;

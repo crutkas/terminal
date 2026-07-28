@@ -578,7 +578,6 @@ void TextBuffer::Replace(til::CoordType row, const TextAttribute& attributes, Ro
     r.ReplaceText(state);
     r.ReplaceAttributes(state.columnBegin, state.columnEnd, attributes);
     _images.EraseArea({ state.columnBegin, row, state.columnEnd, row + 1 });
-    ImageSlice::EraseCells(r, state.columnBegin, state.columnEnd);
     TriggerRedraw(Viewport::FromExclusive({ state.columnBeginDirty, row, state.columnEndDirty, row + 1 }));
 }
 
@@ -612,12 +611,9 @@ void TextBuffer::Insert(til::CoordType row, const TextAttribute& attributes, Row
             { state.columnBegin, row, state.columnBegin + copyAmount, row + 1 },
             { restoreState.columnBegin, row },
             _images);
-        // If there is any image content, that needs to be copied too.
-        ImageSlice::CopyCells(r, state.columnBegin, r, restoreState.columnBegin, restoreState.columnEnd);
     }
     // Image content at the insert position needs to be erased.
     _images.EraseArea({ state.columnBegin, row, restoreState.columnBegin, row + 1 });
-    ImageSlice::EraseCells(r, state.columnBegin, restoreState.columnBegin);
 
     TriggerRedraw(Viewport::FromExclusive({ state.columnBeginDirty, row, restoreState.columnEndDirty, row + 1 }));
 }
@@ -674,7 +670,6 @@ void TextBuffer::FillRect(const til::rect& rect, const std::wstring_view& fill, 
             auto& r = GetMutableRowByOffset(y);
             r.CopyTextFrom(state);
             r.ReplaceAttributes(rect.left, rect.right, attributes);
-            ImageSlice::EraseCells(r, rect.left, rect.right);
             TriggerRedraw(Viewport::FromExclusive({ state.columnBeginDirty, y, state.columnEndDirty, y + 1 }));
         }
     }
@@ -759,6 +754,7 @@ OutputCellIterator TextBuffer::WriteLine(const OutputCellIterator givenIt,
     // Take the cell distance written and notify that it needs to be repainted.
     const auto written = newIt.GetCellDistance(givenIt);
     const auto paint = Viewport::FromDimensions(target, { written, 1 });
+    _images.EraseArea(paint.ToExclusive());
     TriggerRedraw(paint);
 
     return newIt;
@@ -947,7 +943,6 @@ void TextBuffer::_copyRowData(const til::CoordType srcRowIndex, const til::Coord
     auto& dstRow = dstBuffer.GetMutableRowByOffset(dstRowIndex);
     const auto& srcRow = GetRowByOffset(srcRowIndex);
     dstRow.CopyFrom(srcRow);
-    ImageSlice::CopyRow(srcRow, dstRow);
 }
 
 Cursor& TextBuffer::GetCursor() noexcept
@@ -991,8 +986,6 @@ void TextBuffer::SetCurrentLineRendition(const LineRendition lineRendition, cons
         row.SetLineRendition(lineRendition);
         // If the line rendition has changed, the row can no longer be wrapped.
         row.SetWrapForced(false);
-        // And all image content on the row is removed.
-        row.SetImageSlice(nullptr);
         // And if it's no longer single width, the right half of the row should be erased.
         if (lineRendition != LineRendition::SingleWidth)
         {
@@ -2992,35 +2985,6 @@ void TextBuffer::Reflow(TextBuffer& oldBuffer, TextBuffer& newBuffer, const View
             };
             newRow.CopyTextFrom(state);
 
-            // If we're at the start of the old row, copy its image content.
-            if (oldX == 0)
-            {
-                auto preservedSlice = ImageSlice::Pointer{};
-                if (state.columnBegin != 0)
-                {
-                    if (const auto slice = newRow.GetMutableImageSlice())
-                    {
-                        preservedSlice = std::make_unique<ImageSlice>(std::move(*slice));
-                    }
-                }
-                ImageSlice::CopyRow(oldRow, newRow);
-                for (auto column = 0; column < oldRowLimit; ++column)
-                {
-                    if (oldRow.GetImageCellRef(column))
-                    {
-                        const auto layerId = imageCellRefLayerId(oldRow, column);
-                        if (layerId != 0)
-                        {
-                            ImageSlice::EraseLayerCells(newRow, column, column + 1, { imageCellRefImageId(oldRow, column), layerId });
-                        }
-                    }
-                }
-                if (preservedSlice)
-                {
-                    ImageSlice::MergePreservedCells(std::move(preservedSlice), newRow);
-                }
-            }
-
             const auto mappedColumns = std::min(state.sourceColumnEnd - oldX, state.columnEnd - newX);
             const auto mappedSourceEnd = oldX + std::max(mappedColumns, til::CoordType{ 0 });
             if (mappedSourceEnd > oldX)
@@ -3111,20 +3075,6 @@ void TextBuffer::Reflow(TextBuffer& oldBuffer, TextBuffer& newBuffer, const View
         auto& newAttr = newRow.Attributes();
         newAttr = oldRow.Attributes();
         newAttr.resize_trailing_extent(newWidthU16);
-    }
-
-    // Relocate pixels only after every whole-row clone so wrapped rows
-    // joining cannot overwrite an earlier move.
-    for (const auto& move : imageCellMoves)
-    {
-        auto& destinationRow = newBuffer.GetMutableRowByOffset(move.destination.y);
-        if (destinationRow.GetImageCellRef(move.destination.x) &&
-            imageCellRefImageId(destinationRow, move.destination.x) == move.imageId &&
-            imageCellRefLayerId(destinationRow, move.destination.x) == move.layerId)
-        {
-            const auto& sourceRow = oldBuffer.GetRowByOffset(move.source.y);
-            ImageSlice::CopyLayerCells(sourceRow, move.source.x, destinationRow, move.destination.x, move.destination.x + 1, { move.imageId, move.layerId });
-        }
     }
 
     // Since we didn't use IncrementCircularBuffer() we need to compute the proper

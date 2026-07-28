@@ -249,8 +249,6 @@ static FillConsoleResult FillConsoleImpl(SCREEN_INFORMATION& screenInfo, FillCon
         result.lengthRead = done.GetInputDistance(it);
         result.cellsModified = done.GetCellDistance(it);
 
-        // If we've overwritten image content, it needs to be erased.
-        ImageSlice::EraseCells(screenInfo.GetTextBuffer(), startingCoordinate, result.cellsModified);
     }
 
     if (result.cellsModified > 0)

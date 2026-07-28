@@ -95,6 +95,8 @@ static void _CopyRectangle(SCREEN_INFORMATION& screenInfo,
     //    erase the source material before it can be copied/moved to the new location.
     {
         const auto target = Viewport::FromDimensions(targetOrigin, source.Dimensions());
+        auto& textBuffer = screenInfo.GetTextBuffer();
+        const auto sourceImages = textBuffer.GetImages().Snapshot();
         const auto walkDirection = Viewport::DetermineWalkDirection(source, target);
 
         auto sourcePos = source.GetWalkOrigin(walkDirection);
@@ -112,8 +114,7 @@ static void _CopyRectangle(SCREEN_INFORMATION& screenInfo,
             screenInfo.GetTextBuffer().WriteLine(OutputCellIterator({ &current, 1 }), targetPos);
         } while (target.WalkInBounds(targetPos, walkDirection));
 
-        auto& textBuffer = screenInfo.GetTextBuffer();
-        ImageSlice::CopyBlock(textBuffer, source.ToExclusive(), textBuffer, target.ToExclusive());
+        sourceImages.CopyArea(source.ToExclusive(), targetOrigin, textBuffer.GetMutableImages());
     }
 }
 
@@ -417,9 +418,6 @@ void ScrollRegion(SCREEN_INFORMATION& screenInfo,
     {
         const auto& view = remaining.at(i);
         screenInfo.WriteRect(fillData, view);
-
-        // If the region has image content it needs to be erased.
-        ImageSlice::EraseBlock(screenInfo.GetTextBuffer(), view.ToExclusive());
 
         // If we're scrolling an area that encompasses the full buffer width,
         // then the filled rows should also have their line rendition reset.

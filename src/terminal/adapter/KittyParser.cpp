@@ -1491,14 +1491,10 @@ void KittyParser::_eraseImage(const uint32_t id)
     }
 }
 
-// Clears the entire image registry and its direct-renderer placements. Sixel row
-// slices are independent and remain untouched.
+// Clears the entire Kitty image registry and its direct-renderer placements.
 void KittyParser::_clearImages() noexcept
 try
 {
-    auto page = _dispatcher._pages.ActivePage();
-    auto& buffer = page.Buffer();
-    const auto hadPlacements = !buffer.GetImages().Empty();
     _images.clear();
     _imageNumbers.clear();
     _imageOrder.clear();
@@ -1507,11 +1503,15 @@ try
     _anonymousPlacements.clear();
     _totalPixelBytes = 0;
     _scheduleAnimationTimer();
-    buffer.GetMutableImages().Clear();
-    if (hadPlacements)
-    {
-        buffer.TriggerRedraw(Viewport::FromExclusive({ 0, 0, page.Width(), page.Bottom() }));
-    }
+    const auto visiblePageNumber = _dispatcher._pages.VisiblePage().Number();
+    _dispatcher._pages.ForEachPage([&](const Page page) {
+        auto& buffer = page.Buffer();
+        const auto removed = buffer.GetMutableImages().EraseProtocol(ImagePlacement::Key::Protocol::Kitty);
+        if (removed != 0 && page.Number() == visiblePageNumber)
+        {
+            buffer.TriggerRedraw(Viewport::FromExclusive({ 0, 0, page.Width(), page.Bottom() }));
+        }
+    });
 }
 catch (...)
 {
@@ -1706,7 +1706,8 @@ void KittyParser::_updateImageSurface(const uint32_t imageId, const FramePixelSt
         auto lastRow = 0;
         for (const auto& placement : buffer.GetImages().All())
         {
-            if (placement.Identity().imageId == imageId)
+            const auto key = placement.Identity();
+            if (key.protocol == ImagePlacement::Key::Protocol::Kitty && key.imageId == imageId)
             {
                 foundPlacement = true;
                 surface = surface ? surface : placement.SurfacePointer();
@@ -2897,7 +2898,8 @@ bool KittyParser::_imageHasRenderedPlacements(const uint32_t id) const
         }
         for (const auto& placement : page.Buffer().GetImages().All())
         {
-            if (placement.Identity().imageId == id)
+            const auto key = placement.Identity();
+            if (key.protocol == ImagePlacement::Key::Protocol::Kitty && key.imageId == id)
             {
                 found = true;
                 return;
@@ -3084,16 +3086,17 @@ void KittyParser::_deleteImagesIntersecting(const til::CoordType left, const til
     std::vector<uint32_t> affected;
     const til::rect target{ colBegin, rowBegin, colEnd, rowEnd };
     const auto isPhysical = [&](const ImagePlacement::Key key) {
-        return std::any_of(_placements.begin(), _placements.end(), [&](const auto& entry) {
-                   return !entry.second.isVirtual &&
-                          entry.second.imageId == key.imageId &&
-                          entry.second.layerId == key.layerId;
+        return key.protocol == ImagePlacement::Key::Protocol::Kitty &&
+               (std::any_of(_placements.begin(), _placements.end(), [&](const auto& entry) {
+                  return !entry.second.isVirtual &&
+                         entry.second.imageId == key.imageId &&
+                         entry.second.layerId == key.layerId;
                }) ||
                std::any_of(_anonymousPlacements.begin(), _anonymousPlacements.end(), [&](const auto& placement) {
                    return !placement.isVirtual &&
                           placement.imageId == key.imageId &&
                           placement.layerId == key.layerId;
-               });
+               }));
     };
     for (const auto& placement : buffer.GetImages().IntersectingRows(rowBegin, rowEnd))
     {
@@ -3191,7 +3194,8 @@ void KittyParser::_deletePlacementsByZ(const int32_t zIndex, const bool freeData
             {
                 const auto key = image.Identity();
                 const auto bounds = image.CellBounds();
-                if (image.ZIndex() == zIndex &&
+                if (key.protocol == ImagePlacement::Key::Protocol::Kitty &&
+                    image.ZIndex() == zIndex &&
                     bounds.left <= cell->x && cell->x < bounds.right &&
                     bounds.top <= cell->y && cell->y < bounds.bottom)
                 {
@@ -3823,7 +3827,7 @@ void KittyParser::RenderPlaceholders(const std::wstring_view segment, const til:
 }
 
 
-// Erases every direct placement of an image. Sixel row slices are independent.
+// Erases every direct Kitty placement of an image.
 void KittyParser::_eraseImagePlacements(const uint32_t imageId)
 {
     if (imageId == 0)
@@ -3837,14 +3841,15 @@ void KittyParser::_eraseImagePlacements(const uint32_t imageId)
         auto lastRow = 0;
         for (const auto& placement : buffer.GetImages().All())
         {
-            if (placement.Identity().imageId == imageId)
+            const auto key = placement.Identity();
+            if (key.protocol == ImagePlacement::Key::Protocol::Kitty && key.imageId == imageId)
             {
                 firstRow = std::min(firstRow, placement.CellBounds().top);
                 lastRow = std::max(lastRow, placement.CellBounds().bottom - 1);
             }
         }
         auto& images = buffer.GetMutableImages();
-        images.EraseImage(imageId);
+        images.EraseImage(ImagePlacement::Key::Protocol::Kitty, imageId);
         if (page.Number() == visiblePageNumber && firstRow <= lastRow)
         {
             buffer.TriggerRedraw(Viewport::FromExclusive({ 0, firstRow, page.Width(), lastRow + 1 }));

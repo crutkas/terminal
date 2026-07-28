@@ -259,17 +259,6 @@ try
 {
     _flushBufferLine();
 
-    for (const auto r : _p.rows)
-    {
-        for (auto& bitmap : r->bitmaps)
-        {
-            if (bitmap.revision != 0 && !bitmap.active)
-            {
-                bitmap = {};
-            }
-        }
-    }
-
     // PaintCursor() is only called when the cursor is visible, but we need to invalidate the cursor area
     // even if it isn't. Otherwise, a transition from a visible to an invisible cursor wouldn't be rendered.
     if (const auto r = _api.invalidatedCursorArea; r.non_empty())
@@ -561,7 +550,7 @@ CATCH_RETURN()
 // cellBackgrounds is unused here: this engine draws the whole row's backgrounds in
 // its own pass before any of the image quads it appends below, so content between
 // the background and the text already composites over the right color.
-[[nodiscard]] HRESULT AtlasEngine::BeginRowImages(const ImageSlice* const imageSlice, const til::CoordType targetRow, const til::CoordType viewportLeft, const std::span<const uint8_t> defaultBackgroundMask, const std::span<const COLORREF> /*cellBackgrounds*/) noexcept
+[[nodiscard]] HRESULT AtlasEngine::BeginRowImages(const til::CoordType targetRow, const til::CoordType /*viewportLeft*/, const std::span<const uint8_t> defaultBackgroundMask, const std::span<const COLORREF> /*cellBackgrounds*/) noexcept
 try
 {
     const auto y = clamp<til::CoordType>(targetRow, 0, _p.s->viewportCellCount.y - 1);
@@ -581,85 +570,6 @@ try
         }
     }
 
-    if (imageSlice)
-    {
-        const auto srcWidth = std::max(0, imageSlice->PixelWidth());
-        const auto srcCellSize = imageSlice->CellSize();
-        if (srcCellSize.width <= 0)
-        {
-            return S_OK;
-        }
-        const auto columnCount = srcWidth / srcCellSize.width;
-
-        for (size_t i = 0; i < ImageSlice::RenderPositionCount; i++)
-        {
-            const auto position = static_cast<ImageSlice::RenderPosition>(i);
-            if (!imageSlice->HasPixels(position))
-            {
-                continue;
-            }
-
-            auto revision = imageSlice->Revision(position);
-            const auto maskOffset = imageSlice->ColumnOffset() - viewportLeft;
-            const auto masked = position == ImageSlice::RenderPosition::BehindBackground &&
-                                maskOffset >= 0 &&
-                                maskOffset + columnCount <= gsl::narrow_cast<til::CoordType>(defaultBackgroundMask.size());
-            if (masked)
-            {
-                for (auto column = 0; column < columnCount; ++column)
-                {
-                    revision = (revision ^ til::at(defaultBackgroundMask, gsl::narrow_cast<size_t>(maskOffset + column))) * 0x100000001b3ull;
-                }
-                revision |= 0x8000000000000000ull;
-            }
-
-            auto& b = til::at(row->bitmaps, i);
-
-            if (b.revision != revision)
-            {
-                const auto srcHeight = std::max(0, srcCellSize.height);
-                const auto pixels = imageSlice->Pixels(position);
-                const auto expectedSize = gsl::narrow_cast<size_t>(srcWidth) * gsl::narrow_cast<size_t>(srcHeight);
-
-                if (pixels.size() != expectedSize)
-                {
-                    assert(false);
-                    continue;
-                }
-
-                if (b.source.size() != pixels.size())
-                {
-                    b.source = Buffer<u32, 32>{ pixels.size() };
-                }
-
-                memcpy(b.source.data(), pixels.data(), pixels.size_bytes());
-
-                if (masked)
-                {
-                    for (auto column = 0; column < columnCount; column++)
-                    {
-                        if (til::at(defaultBackgroundMask, gsl::narrow_cast<size_t>(maskOffset + column)) != 0)
-                        {
-                            continue;
-                        }
-                        for (auto pixelRow = 0; pixelRow < srcHeight; pixelRow++)
-                        {
-                            const auto first = b.source.data() + gsl::narrow_cast<size_t>(pixelRow) * srcWidth + gsl::narrow_cast<size_t>(column) * srcCellSize.width;
-                            std::fill_n(first, srcCellSize.width, 0u);
-                        }
-                    }
-                }
-
-                b.revision = revision;
-                b.sourceSize.x = srcWidth;
-                b.sourceSize.y = srcHeight;
-            }
-
-            b.targetOffset = (imageSlice->ColumnOffset() - viewportLeft);
-            b.targetWidth = columnCount;
-            b.active = true;
-        }
-    }
     return S_OK;
 }
 CATCH_RETURN()

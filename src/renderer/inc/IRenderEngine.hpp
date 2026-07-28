@@ -23,7 +23,6 @@ Author(s):
 #include "RenderSettings.hpp"
 #include "../../buffer/out/LineRendition.hpp"
 #include "../../buffer/out/Image.hpp"
-#include "../../buffer/out/ImageSlice.hpp"
 
 #pragma warning(push)
 #pragma warning(disable : 4100) // '...': unreferenced formal parameter
@@ -46,6 +45,7 @@ namespace Microsoft::Console::Render
         {
             Image::Pointer image;
             Image::PixelStorage pixels;
+            til::size size;
             uint64_t revision = 0;
         };
 
@@ -102,7 +102,7 @@ namespace Microsoft::Console::Render
         [[nodiscard]] virtual HRESULT PaintBackground() noexcept = 0;
         [[nodiscard]] virtual HRESULT PaintBufferLine(std::span<const Cluster> clusters, til::point coord, bool fTrimLeft) noexcept = 0;
         [[nodiscard]] virtual HRESULT PaintBufferGridLines(GridLineSet lines, COLORREF gridlineColor, COLORREF underlineColor, size_t cchLine, til::point coordTarget) noexcept = 0;
-        [[nodiscard]] virtual HRESULT BeginRowImages(const ImageSlice* imageSlice, til::CoordType targetRow, til::CoordType viewportLeft, std::span<const uint8_t> defaultBackgroundMask, std::span<const COLORREF> cellBackgrounds) noexcept = 0;
+        [[nodiscard]] virtual HRESULT BeginRowImages(til::CoordType targetRow, til::CoordType viewportLeft, std::span<const uint8_t> defaultBackgroundMask, std::span<const COLORREF> cellBackgrounds) noexcept = 0;
         [[nodiscard]] virtual HRESULT EndRowImages() noexcept = 0;
         [[nodiscard]] virtual HRESULT PaintSelection(const til::rect& rect) noexcept = 0;
         [[nodiscard]] virtual HRESULT PaintCursor(const CursorOptions& options) noexcept = 0;

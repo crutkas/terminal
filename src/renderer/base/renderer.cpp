@@ -1193,18 +1193,12 @@ void Renderer::_PaintBufferOutput(_In_ IRenderEngine* const pEngine, const bool 
 
             // Image content is painted around the text so that it can sit below
             // it. The engine decides how; all we do is bracket the text.
-            const auto imageSlice = r.GetImageSlice();
-            const auto hasSliceImages = imageSlice && (imageSlice->HasPixels(ImageSlice::RenderPosition::BehindBackground) ||
-                                                       imageSlice->HasPixels(ImageSlice::RenderPosition::BehindText) ||
-                                                       imageSlice->HasPixels(ImageSlice::RenderPosition::AboveText));
             ImagePlacement::RenderPosition directUnderlay{};
             const auto hasDirectImages = directImagesSupported && _rowHasDirectImages(row, &directUnderlay);
-            const auto hasImages = hasSliceImages || hasDirectImages;
+            const auto hasImages = hasDirectImages;
             if (hasImages) [[unlikely]]
             {
-                const auto hasSliceUnderlay = imageSlice && (imageSlice->HasPixels(ImageSlice::RenderPosition::BehindBackground) ||
-                                                             imageSlice->HasPixels(ImageSlice::RenderPosition::BehindText));
-                if (hasSliceUnderlay || (hasDirectImages && directUnderlay != ImagePlacement::RenderPosition::AboveText))
+                if (directUnderlay != ImagePlacement::RenderPosition::AboveText)
                 {
                     _buildImageRowBackgrounds(r);
                 }
@@ -1213,7 +1207,7 @@ void Renderer::_PaintBufferOutput(_In_ IRenderEngine* const pEngine, const bool 
                     _backgroundMask.clear();
                     _backgroundColors.clear();
                 }
-                LOG_IF_FAILED(pEngine->BeginRowImages(hasSliceImages ? imageSlice : nullptr, screenPosition.y, _viewport.Left(), _backgroundMask, _backgroundColors));
+                LOG_IF_FAILED(pEngine->BeginRowImages(screenPosition.y, _viewport.Left(), _backgroundMask, _backgroundColors));
             }
 
             // Painting text can throw, and an engine left mid-row would keep
@@ -1246,8 +1240,10 @@ void Renderer::_prepareImageFrame()
         }
     }
     std::stable_sort(_imagePlacements.begin(), _imagePlacements.end(), [](const auto& lhs, const auto& rhs) {
-        return std::tuple{ lhs.ZIndex(), lhs.Identity().imageId } <
-               std::tuple{ rhs.ZIndex(), rhs.Identity().imageId };
+        const auto lhsKey = lhs.Identity();
+        const auto rhsKey = rhs.Identity();
+        return std::tuple{ lhs.ZIndex(), lhsKey.protocol, lhsKey.imageId, lhsKey.layerId } <
+               std::tuple{ rhs.ZIndex(), rhsKey.protocol, rhsKey.imageId, rhsKey.layerId };
     });
     _imageSurfaces.reserve(_imagePlacements.size());
     for (const auto& placement : _imagePlacements)
@@ -1261,6 +1257,7 @@ void Renderer::_prepareImageFrame()
             _imageSurfaces.emplace_back(ImageFrameInfo::Surface{
                 .image = image,
                 .pixels = image->Storage(),
+                .size = image->PixelSize(),
                 .revision = image->Revision(),
             });
         }

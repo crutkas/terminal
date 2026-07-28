@@ -29,7 +29,6 @@ namespace Microsoft::Console::Render::Atlas
         ATLAS_ATTR_COLD void _drawTextResetLineRendition(const ShapedRow* row) const noexcept;
         ATLAS_ATTR_COLD f32r _getGlyphRunDesignBounds(const DWRITE_GLYPH_RUN& glyphRun, f32 baselineX, f32 baselineY);
         ATLAS_ATTR_COLD void _drawGridlineRow(const RenderingPayload& p, const ShapedRow* row, u16 y);
-        ATLAS_ATTR_COLD void _drawBitmap(const RenderingPayload& p, const Bitmap& bitmap, u16 y) const;
         void _drawImages(const RenderingPayload& p, const ShapedRow& row, u16 y, ImagePlacement::RenderPosition position);
         void _drawImage(const RenderingPayload& p, const ImagePlacement& placement, const D2D1_RECT_F& clip);
         void _pruneImageCache(const RenderingPayload& p);
@@ -72,6 +71,7 @@ namespace Microsoft::Console::Render::Atlas
         {
             Image::Pointer image;
             uint64_t revision = 0;
+            til::size size;
             wil::com_ptr<ID2D1Bitmap> bitmap;
         };
         std::unordered_map<const Image*, CachedImage> _imageCache;

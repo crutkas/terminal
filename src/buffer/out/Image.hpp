@@ -10,8 +10,6 @@
 #include <span>
 #include <vector>
 
-class ImageSlice;
-
 // Pixel storage that maps directly to one renderer/GPU surface. Placements and
 // fragments share this object, so splitting an image never duplicates pixels.
 class Image final
@@ -29,8 +27,11 @@ public:
     uint64_t Revision() const noexcept;
     std::span<const RGBQUAD> Pixels() const noexcept;
     const PixelStorage& Storage() const noexcept;
+    void Resize(til::size pixelSize);
     void UpdatePixels(std::span<const RGBQUAD> pixels);
     void UpdatePixels(PixelStorage pixels);
+    void UpdatePixels(til::size pixelSize, std::span<const RGBQUAD> pixels);
+    void UpdatePixels(til::size pixelSize, PixelStorage pixels);
 
 private:
     til::size _pixelSize;
@@ -46,8 +47,15 @@ class ImagePlacement final
 public:
     struct Key
     {
+        enum class Protocol : uint8_t
+        {
+            Sixel,
+            Kitty,
+        };
+
         uint32_t imageId = 0;
         uint64_t layerId = 0;
+        Protocol protocol = Protocol::Kitty;
 
         constexpr bool operator==(const Key&) const noexcept = default;
     };
@@ -95,7 +103,6 @@ public:
 
     std::optional<ImagePlacement> Crop(til::rect cellBounds) const;
     ImagePlacement Translated(til::point delta) const;
-    bool RasterizeRow(til::CoordType row, til::CoordType columnBegin, til::CoordType columnEnd, ImageSlice& destination) const;
 
 private:
     ImagePlacement(Key key,
@@ -135,7 +142,6 @@ public:
         int32_t ZIndex() const noexcept;
         ImagePlacement::RenderPosition Position() const noexcept;
         std::optional<ImagePlacement> Crop(til::rect cellBounds) const;
-        bool RasterizeRow(til::CoordType row, til::CoordType columnBegin, til::CoordType columnEnd, ImageSlice& destination) const;
 
     private:
         friend class ImageCollection;
@@ -158,10 +164,12 @@ public:
 
     void Add(ImagePlacement image);
     void AddOrReplace(ImagePlacement image);
+    void AddOrReplace(ImagePlacement image, const Image::Pointer& surface, til::size pixelSize, Image::PixelStorage pixels);
     void AddOrReplaceArea(ImagePlacement image);
     void Clear() noexcept;
+    size_t EraseProtocol(ImagePlacement::Key::Protocol protocol) noexcept;
     bool Erase(ImagePlacement::Key key);
-    size_t EraseImage(uint32_t imageId);
+    size_t EraseImage(ImagePlacement::Key::Protocol protocol, uint32_t imageId);
     void EraseArea(til::rect area);
     void EraseAreas(std::span<const til::rect> areas);
     void CopyArea(til::rect source, til::point target, ImageCollection& destination) const;
@@ -169,6 +177,7 @@ public:
     void ClipArea(til::rect area);
     void AdvanceRows(til::CoordType rowCount, til::CoordType bufferHeight);
     void PrepareRowIndex() const;
+    ImageCollection Snapshot() const;
 
     // Preparing the index after a batch of mutations keeps its allocations out
     // of the render query. RowQuery entries and All() spans are frame-local and

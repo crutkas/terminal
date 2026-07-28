@@ -228,13 +228,8 @@ void BackendD2D::_drawText(RenderingPayload& p)
         auto baselineX = 0.0f;
         auto baselineY = static_cast<f32>(p.s->font->cellSize.y * y + p.s->font->baseline);
 
-        for (size_t i = 0; i < static_cast<size_t>(ImageSlice::RenderPosition::AboveText); i++)
+        for (size_t i = 0; i < static_cast<size_t>(ImagePlacement::RenderPosition::AboveText); i++)
         {
-            const auto& underlay = til::at(row->bitmaps, i);
-            if (underlay.revision != 0)
-            {
-                _drawBitmap(p, underlay, y);
-            }
             _drawImages(p, *row, y, static_cast<ImagePlacement::RenderPosition>(i));
         }
 
@@ -335,11 +330,6 @@ void BackendD2D::_drawText(RenderingPayload& p)
             _drawTextResetLineRendition(row);
         }
 
-        const auto& overlay = til::at(row->bitmaps, static_cast<size_t>(ImageSlice::RenderPosition::AboveText));
-        if (overlay.revision != 0)
-        {
-            _drawBitmap(p, overlay, y);
-        }
         _drawImages(p, *row, y, ImagePlacement::RenderPosition::AboveText);
 
         if (p.invalidatedRows.contains(y))
@@ -824,52 +814,13 @@ void BackendD2D::_drawGridlineRow(const RenderingPayload& p, const ShapedRow* ro
     }
 }
 
-void BackendD2D::_drawBitmap(const RenderingPayload& p, const Bitmap& b, u16 y) const
-{
-    // TODO: This could use some caching logic like BackendD3D.
-    const D2D1_SIZE_U size{
-        gsl::narrow_cast<UINT32>(b.sourceSize.x),
-        gsl::narrow_cast<UINT32>(b.sourceSize.y),
-    };
-    const D2D1_BITMAP_PROPERTIES bitmapProperties{
-        .pixelFormat = { DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED },
-        .dpiX = static_cast<f32>(p.s->font->dpi),
-        .dpiY = static_cast<f32>(p.s->font->dpi),
-    };
-    wil::com_ptr<ID2D1Bitmap> bitmap;
-    THROW_IF_FAILED(_renderTarget->CreateBitmap(size, b.source.data(), static_cast<UINT32>(b.sourceSize.x) * 4, &bitmapProperties, bitmap.addressof()));
-
-    const i32 cellWidth = p.s->font->cellSize.x;
-    const i32 cellHeight = p.s->font->cellSize.y;
-    const auto left = (b.targetOffset - p.scrollOffsetX) * cellWidth;
-    const auto right = left + b.targetWidth * cellWidth;
-    const auto top = y * cellHeight;
-    const auto bottom = top + cellHeight;
-
-    const D2D1_RECT_F rectF{
-        static_cast<f32>(left),
-        static_cast<f32>(top),
-        static_cast<f32>(right),
-        static_cast<f32>(bottom),
-    };
-    _renderTarget->DrawBitmap(bitmap.get(), &rectF, 1, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
-}
-
 void BackendD2D::_pruneImageCache(const RenderingPayload& p)
 {
     for (auto it = _imageCache.begin(); it != _imageCache.end();)
     {
-        auto active = false;
-        for (const auto row : p.rows)
-        {
-            active = std::any_of(row->images.begin(), row->images.end(), [&](const auto& placement) {
-                return placement.SurfacePointer().get() == it->first;
-            });
-            if (active)
-            {
-                break;
-            }
-        }
+        const auto active = std::ranges::any_of(p.imageSurfaces, [&](const auto& surface) {
+            return surface.image.get() == it->first;
+        });
         it = active ? std::next(it) : _imageCache.erase(it);
     }
 }
@@ -947,9 +898,9 @@ void BackendD2D::_drawImage(const RenderingPayload& p, const ImagePlacement& pla
     THROW_HR_IF(E_UNEXPECTED, snapshot == p.imageSurfaces.end() || !snapshot->pixels);
     auto& cached = _imageCache[image.get()];
     cached.image = image;
-    if (!cached.bitmap)
+    const auto size = snapshot->size;
+    if (!cached.bitmap || cached.size != size)
     {
-        const auto size = image->PixelSize();
         const D2D1_SIZE_U bitmapSize{
             gsl::narrow_cast<UINT32>(size.width),
             gsl::narrow_cast<UINT32>(size.height),
@@ -960,10 +911,11 @@ void BackendD2D::_drawImage(const RenderingPayload& p, const ImagePlacement& pla
             .dpiY = static_cast<f32>(p.s->font->dpi),
         };
         THROW_IF_FAILED(_renderTarget->CreateBitmap(bitmapSize, nullptr, 0, &properties, cached.bitmap.put()));
+        cached.size = size;
+        cached.revision = 0;
     }
     if (cached.revision != snapshot->revision)
     {
-        const auto size = image->PixelSize();
         const auto pixels = std::span{ *snapshot->pixels };
         THROW_HR_IF(E_UNEXPECTED, pixels.size() != static_cast<size_t>(size.width) * size.height);
         THROW_IF_FAILED(cached.bitmap->CopyFromMemory(nullptr, pixels.data(), gsl::narrow_cast<UINT32>(size.width * sizeof(RGBQUAD))));

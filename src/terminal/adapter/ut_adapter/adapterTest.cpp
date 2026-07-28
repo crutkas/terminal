@@ -9,11 +9,212 @@
 
 #include "adaptDispatch.hpp"
 #include "KittyParser.hpp"
-#include "../../../buffer/out/ImageSlice.hpp"
+#include "../../../buffer/out/Image.hpp"
 
 using namespace WEX::Common;
 using namespace WEX::Logging;
 using namespace WEX::TestExecution;
+
+// Test-only compositor for inspecting shared rectangular placements. Production
+// code intentionally has no row-owned image representation.
+class TestImageRow final
+{
+public:
+    using RenderPosition = ImagePlacement::RenderPosition;
+    static constexpr size_t RenderPositionCount = 3;
+
+    TestImageRow(const til::size cellSize, const til::CoordType columnOffset, const til::CoordType columnCount) :
+        _cellSize{ cellSize },
+        _columnOffset{ columnOffset },
+        _pixelWidth{ columnCount * cellSize.width },
+        _columnOwners(gsl::narrow<size_t>(columnCount)),
+        _columnLayers(gsl::narrow<size_t>(columnCount))
+    {
+        const auto pixelCount = gsl::narrow<size_t>(_pixelWidth) * gsl::narrow<size_t>(_cellSize.height);
+        for (auto& plane : _planes)
+        {
+            plane.resize(pixelCount);
+        }
+    }
+
+    til::size CellSize() const noexcept
+    {
+        return _cellSize;
+    }
+
+    til::CoordType ColumnOffset() const noexcept
+    {
+        return _columnOffset;
+    }
+
+    til::CoordType PixelWidth() const noexcept
+    {
+        return _pixelWidth;
+    }
+
+    std::span<const RGBQUAD> Pixels(const RenderPosition position) const noexcept
+    {
+        return _planes.at(static_cast<size_t>(position));
+    }
+
+    std::span<const RGBQUAD> Pixels() const noexcept
+    {
+        return Pixels(RenderPosition::AboveText);
+    }
+
+    const RGBQUAD* Pixels(const til::CoordType column) const noexcept
+    {
+        const auto index = column - _columnOffset;
+        if (index < 0 || gsl::narrow<size_t>(index) >= _columnOwners.size())
+        {
+            return nullptr;
+        }
+        return Pixels().data() + gsl::narrow<size_t>(index) * gsl::narrow<size_t>(_cellSize.width);
+    }
+
+    uint32_t ColumnOwner(const til::CoordType column) const noexcept
+    {
+        const auto index = column - _columnOffset;
+        return index >= 0 && gsl::narrow<size_t>(index) < _columnOwners.size() ?
+                   til::at(_columnOwners, gsl::narrow<size_t>(index)) :
+                   0;
+    }
+
+    bool HasPixels(const RenderPosition position) const noexcept
+    {
+        return std::ranges::any_of(_planes.at(static_cast<size_t>(position)), [](const RGBQUAD pixel) {
+            return pixel.rgbReserved != 0;
+        });
+    }
+
+    bool Contains(const uint32_t imageId) const noexcept
+    {
+        return _imageIds.contains(imageId);
+    }
+
+    bool ContainsPlacement(const uint64_t layerId) const noexcept
+    {
+        return _layerIds.contains(layerId);
+    }
+
+    bool PlacementCoversColumn(const uint64_t layerId, const til::CoordType column) const noexcept
+    {
+        const auto index = column - _columnOffset;
+        return index >= 0 &&
+               gsl::narrow<size_t>(index) < _columnLayers.size() &&
+               til::at(_columnLayers, gsl::narrow<size_t>(index)).contains(layerId);
+    }
+
+    std::span<const uint8_t> LayersAtColumn(const til::CoordType) const noexcept
+    {
+        return {};
+    }
+
+    bool Rasterize(const ImagePlacement& placement,
+                   const til::CoordType row,
+                   til::CoordType columnBegin,
+                   til::CoordType columnEnd)
+    {
+        const auto bounds = placement.CellBounds();
+        if (row < bounds.top || row >= bounds.bottom)
+        {
+            return false;
+        }
+
+        columnBegin = std::max({ columnBegin, bounds.left, _columnOffset });
+        columnEnd = std::min({ columnEnd, bounds.right, _columnOffset + _pixelWidth / _cellSize.width });
+        if (columnBegin >= columnEnd)
+        {
+            return false;
+        }
+
+        const auto position = placement.Position();
+        const auto positionIndex = static_cast<size_t>(position);
+        _positions.at(positionIndex) = true;
+        const auto key = placement.Identity();
+        _imageIds.emplace(key.imageId);
+        _layerIds.emplace(key.layerId);
+
+        auto& destination = _planes.at(positionIndex);
+        const auto geometry = placement.Geometry();
+        const auto originalBounds = placement.OriginalCellBounds();
+        const auto sourceRect = placement.SourceInPixels();
+        const auto surfaceSize = placement.Surface().PixelSize();
+        const auto sourcePixels = placement.Surface().Pixels();
+
+        for (auto outputY = 0; outputY < _cellSize.height; ++outputY)
+        {
+            const auto placementY = (static_cast<int64_t>(row) - originalBounds.top) * geometry.cellSize.height +
+                                    static_cast<int64_t>(outputY) * geometry.cellSize.height / _cellSize.height;
+            const auto targetY = placementY - geometry.offset.y;
+            if (targetY < 0 || static_cast<uint64_t>(targetY) >= geometry.targetHeight)
+            {
+                continue;
+            }
+            const auto sourceY = sourceRect.top + std::min<int64_t>(
+                                                       sourceRect.height() - 1,
+                                                       targetY * sourceRect.height() / gsl::narrow_cast<int64_t>(geometry.targetHeight));
+
+            for (auto column = columnBegin; column < columnEnd; ++column)
+            {
+                til::at(_columnLayers, gsl::narrow<size_t>(column - _columnOffset)).emplace(key.layerId);
+                if (key.protocol == ImagePlacement::Key::Protocol::Kitty)
+                {
+                    til::at(_columnOwners, gsl::narrow<size_t>(column - _columnOffset)) = key.imageId;
+                }
+                for (auto outputX = 0; outputX < _cellSize.width; ++outputX)
+                {
+                    const auto placementX = (static_cast<int64_t>(column) - originalBounds.left) * geometry.cellSize.width +
+                                            static_cast<int64_t>(outputX) * geometry.cellSize.width / _cellSize.width;
+                    const auto targetX = placementX - geometry.offset.x;
+                    if (targetX < 0 || static_cast<uint64_t>(targetX) >= geometry.targetWidth)
+                    {
+                        continue;
+                    }
+                    const auto sourceX = sourceRect.left + std::min<int64_t>(
+                                                               sourceRect.width() - 1,
+                                                               targetX * sourceRect.width() / gsl::narrow_cast<int64_t>(geometry.targetWidth));
+                    const auto sourceIndex = gsl::narrow<size_t>(sourceY) * gsl::narrow<size_t>(surfaceSize.width) +
+                                             gsl::narrow<size_t>(sourceX);
+                    const auto destinationIndex = gsl::narrow<size_t>(outputY) * gsl::narrow<size_t>(_pixelWidth) +
+                                                  gsl::narrow<size_t>(column - _columnOffset) * gsl::narrow<size_t>(_cellSize.width) +
+                                                  gsl::narrow<size_t>(outputX);
+                    if (sourceIndex < sourcePixels.size() && destinationIndex < destination.size())
+                    {
+                        const auto source = til::at(sourcePixels, sourceIndex);
+                        if (source.rgbReserved == 0xff)
+                        {
+                            til::at(destination, destinationIndex) = source;
+                        }
+                        else if (source.rgbReserved != 0)
+                        {
+                            auto& target = til::at(destination, destinationIndex);
+                            const auto inverseAlpha = 255 - source.rgbReserved;
+                            target.rgbBlue = gsl::narrow_cast<BYTE>(source.rgbBlue + (target.rgbBlue * inverseAlpha + 127) / 255);
+                            target.rgbGreen = gsl::narrow_cast<BYTE>(source.rgbGreen + (target.rgbGreen * inverseAlpha + 127) / 255);
+                            target.rgbRed = gsl::narrow_cast<BYTE>(source.rgbRed + (target.rgbRed * inverseAlpha + 127) / 255);
+                            target.rgbReserved = gsl::narrow_cast<BYTE>(source.rgbReserved + (target.rgbReserved * inverseAlpha + 127) / 255);
+                        }
+                    }
+                }
+            }
+        }
+        return true;
+    }
+
+private:
+    til::size _cellSize;
+    til::CoordType _columnOffset = 0;
+    til::CoordType _pixelWidth = 0;
+    std::array<std::vector<RGBQUAD>, RenderPositionCount> _planes;
+    std::array<bool, RenderPositionCount> _positions{};
+    std::vector<uint32_t> _columnOwners;
+    std::vector<std::unordered_set<uint64_t>> _columnLayers;
+    std::unordered_set<uint32_t> _imageIds;
+    std::unordered_set<uint64_t> _layerIds;
+};
+
+using ImageSlice = TestImageRow;
 
 namespace Microsoft
 {
@@ -4257,20 +4458,12 @@ public:
         _testGetSet->ValidateInputEvent(L"\x1b]4;0;rgb:0c0c/0c0c/0c0c\x1b\\");
     }
 
-    // Scans the whole buffer for the first row that carries an image slice.
+    // Scans the whole buffer for the first row covered by a shared placement.
     // Sixel images are written at the cursor position, so the exact row depends
     // on cursor/viewport state; scanning keeps these tests position-independent.
     static const ImageSlice* FindFirstImageSlice(const TextBuffer& buffer, til::CoordType& outRow)
     {
         const auto height = buffer.GetSize().Height();
-        for (til::CoordType y = 0; y < height; y++)
-        {
-            if (const auto slice = buffer.GetRowByOffset(y).GetImageSlice())
-            {
-                outRow = y;
-                return slice;
-            }
-        }
         for (til::CoordType y = 0; y < height; y++)
         {
             if (const auto slice = DirectImageSlice(buffer, y))
@@ -4309,8 +4502,7 @@ public:
         const auto height = buffer.GetSize().Height();
         for (til::CoordType y = 0; y < height; y++)
         {
-            if (SliceContainsColor(buffer.GetRowByOffset(y).GetImageSlice(), r, g, b) ||
-                SliceContainsColor(DirectImageSlice(buffer, y), r, g, b))
+            if (SliceContainsColor(DirectImageSlice(buffer, y), r, g, b))
             {
                 return true;
             }
@@ -4324,9 +4516,7 @@ public:
         const auto height = buffer.GetSize().Height();
         for (til::CoordType y = 0; y < height; y++)
         {
-            VerifyNoDirectImageLayers(buffer, y);
-            if (buffer.GetRowByOffset(y).GetImageSlice() ||
-                !buffer.GetImages().IntersectingRows(y, y + 1).empty())
+            if (!buffer.GetImages().IntersectingRows(y, y + 1).empty())
             {
                 count++;
             }
@@ -4336,15 +4526,9 @@ public:
 
     static void VerifyNoDirectImageLayers(const TextBuffer& buffer, const til::CoordType row)
     {
-        const auto slice = buffer.GetRowByOffset(row).GetImageSlice();
-        if (!slice)
+        for (const auto placement : buffer.GetImages().IntersectingRows(row, row + 1))
         {
-            return;
-        }
-
-        for (til::CoordType x = 0; x < buffer.GetSize().Width(); ++x)
-        {
-            VERIFY_IS_TRUE(slice->LayersAtColumn(x).empty(), L"Kitty must not create row-local ImageSlice layers");
+            VERIFY_IS_FALSE(placement->Surface().Pixels().empty(), L"all image pixels must be owned by shared surfaces");
         }
     }
 
@@ -4356,9 +4540,8 @@ public:
         }
     }
 
-    // Adapter tests inspect the collection through the same legacy rasterizer that
-    // previously populated rows. The synthesized slice is test-only and never
-    // becomes part of the TextBuffer.
+    // Adapter tests inspect the collection through a test-only rectangular
+    // compositor that never becomes part of TextBuffer.
     static const ImageSlice* DirectImageSlice(const TextBuffer& buffer, const til::CoordType row)
     {
         VerifyNoDirectImageLayers(buffer, row);
@@ -4374,12 +4557,19 @@ public:
         {
             slices.erase(slices.begin());
         }
-        auto slice = std::make_unique<ImageSlice>(placements.front()->Geometry().cellSize);
+        auto left = buffer.GetSize().Width();
+        auto right = til::CoordType{ 0 };
+        for (const auto placement : placements)
+        {
+            left = std::min(left, placement->CellBounds().left);
+            right = std::max(right, placement->CellBounds().right);
+        }
+        auto slice = std::make_unique<ImageSlice>(placements.front()->Geometry().cellSize, left, right - left);
         const auto width = buffer.GetSize().Width();
         for (const auto& placement : placements)
         {
-            VERIFY_ARE_EQUAL(slice->CellSize(), placement->Geometry().cellSize);
-            VERIFY_IS_TRUE(placement->RasterizeRow(row, 0, width, *slice));
+            const auto fragment = placement.Crop(placement->CellBounds());
+            VERIFY_IS_TRUE(fragment && slice->Rasterize(*fragment, row, 0, width));
         }
 
         const auto result = slice.get();
@@ -4670,33 +4860,17 @@ public:
         VERIFY_IS_TRUE(tallRows > shortRows, L"A taller image should occupy more rows than a shorter one.");
     }
 
-    // Regression: a row may already hold an ImageSlice with a DIFFERENT cell size
-    // (e.g. placed by another image protocol such as Kitty graphics). Sixel must
-    // replace it rather than write past its (smaller) buffer with Sixel's cell stride.
-    TEST_METHOD(SixelReplacesMismatchedCellSizeSlice)
+    TEST_METHOD(SixelUsesSharedSurfaceWithProtocolIdentity)
     {
-        // Learn the row and cell size a normal Sixel uses.
         _testGetSet->PrepData();
         _stateMachine->ProcessString(L"\x1bPq#0;2;100;0;0~\x1b\\");
-        til::CoordType row = -1;
-        const auto baseline = FindFirstImageSlice(*_testGetSet->_textBuffer, row);
-        VERIFY_IS_NOT_NULL(baseline);
-        const auto sixelCell = baseline->CellSize();
 
-        // Inject a foreign, smaller-cell slice on that row, then render Sixel over it.
-        _testGetSet->PrepData();
-        const til::size foreignCell{ std::max(1, sixelCell.width - 3), std::max(1, sixelCell.height - 4) };
-        _testGetSet->_textBuffer->GetMutableRowByOffset(row).SetImageSlice(std::make_unique<ImageSlice>(foreignCell));
-        _stateMachine->ProcessString(L"\x1bPq#0;2;0;0;100~~~~\x1b\\"); // blue, several columns
-
-        const auto replaced = _testGetSet->_textBuffer->GetRowByOffset(row).GetImageSlice();
-        VERIFY_IS_NOT_NULL(replaced);
-        // The guard compares the FULL cell size (`CellSize() != _cellSize`), so assert BOTH
-        // dimensions were replaced -- a width-only mismatch must trigger it too. Without the
-        // guard the foreign slice would survive and these would report its shrunken size.
-        VERIFY_ARE_EQUAL(sixelCell.width, replaced->CellSize().width, L"Sixel must replace a mismatched-cell slice with its own cell width.");
-        VERIFY_ARE_EQUAL(sixelCell.height, replaced->CellSize().height, L"Sixel must replace a mismatched-cell slice with its own cell height.");
-        VERIFY_IS_TRUE(SliceContainsColor(replaced, 0, 0, 255), L"The Sixel image must render after replacing the slice (no overflow).");
+        const auto& images = _testGetSet->_textBuffer->GetImages().All();
+        VERIFY_ARE_EQUAL(size_t{ 1 }, images.size());
+        VERIFY_ARE_EQUAL(ImagePlacement::Key::Protocol::Sixel, images.front().Identity().protocol);
+        VERIFY_ARE_EQUAL(uint32_t{ 0 }, images.front().Identity().imageId);
+        VERIFY_IS_NOT_NULL(images.front().SurfacePointer().get());
+        VERIFY_IS_TRUE(SliceContainsColor(DirectImageSlice(*_testGetSet->_textBuffer, images.front().CellBounds().top), 255, 0, 0));
     }
 
     // Raster attributes (") are parsed; a zero x-aspect (the division-by-zero guard)
@@ -9237,15 +9411,17 @@ public:
         const auto* sixelSlice = FindFirstImageSlice(buffer, sixelRow);
         VERIFY_IS_NOT_NULL(sixelSlice);
         const til::point origin{ sixelSlice->ColumnOffset(), sixelRow };
+        const auto sixelPlacement = std::ranges::find_if(buffer.GetImages().All(), [](const ImagePlacement& placement) {
+            return placement.Identity().protocol == ImagePlacement::Key::Protocol::Sixel;
+        });
+        VERIFY_IS_TRUE(sixelPlacement != buffer.GetImages().All().end());
+        const auto sixelSurface = sixelPlacement->SurfacePointer();
+        VERIFY_IS_TRUE(std::ranges::any_of(sixelSurface->Pixels(), [](const RGBQUAD pixel) { return pixel.rgbRed == 255; }));
         buffer.GetCursor().SetPosition(origin);
         _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,z=1,f=24,s=1,v=1,C=1;AP8A\x1b\\");
         const auto* originalKitty = DirectImageSlice(buffer, origin.y);
         VERIFY_IS_NOT_NULL(originalKitty);
         VERIFY_ARE_EQUAL(1u, originalKitty->ColumnOwner(origin.x));
-        const auto* original = buffer.GetRowByOffset(origin.y).GetImageSlice();
-        VERIFY_IS_NOT_NULL(original);
-        const auto originalSixel = *original->Pixels(origin.x);
-        VERIFY_IS_TRUE(originalSixel.rgbRed == 255 && originalSixel.rgbGreen == 0, L"the co-resident Sixel plane must start red");
 
         buffer.GetCursor().SetPosition(origin);
         _stateMachine->ProcessString(L"\x1b[@");
@@ -9253,17 +9429,16 @@ public:
         VERIFY_IS_NOT_NULL(movedKitty);
         VERIFY_ARE_EQUAL(0u, movedKitty->ColumnOwner(origin.x));
         VERIFY_ARE_EQUAL(1u, movedKitty->ColumnOwner(origin.x + 1));
-        const auto* moved = buffer.GetRowByOffset(origin.y).GetImageSlice();
-        VERIFY_IS_NOT_NULL(moved);
-        const auto movedSixel = *moved->Pixels(origin.x + 1);
-        VERIFY_IS_TRUE(movedSixel.rgbRed == 255 && movedSixel.rgbGreen == 0, L"ICH must move the untagged Sixel plane with the Kitty layer");
         _stateMachine->ProcessString(L"\x1b_Ga=d,d=I,i=1;\x1b\\");
 
-        const auto* slice = buffer.GetRowByOffset(origin.y).GetImageSlice();
+        const auto* slice = DirectImageSlice(buffer, origin.y);
         VERIFY_IS_NOT_NULL(slice);
-        const auto pixel = *slice->Pixels(origin.x + 1);
+        const auto pixel = SlicePixelAt(slice, origin.x + 1 - slice->ColumnOffset(), 0);
         VERIFY_IS_TRUE(pixel.rgbRed == 255 && pixel.rgbGreen == 0, L"deleting moved Kitty pixels must not erase co-moved Sixel pixels");
-        VERIFY_IS_NULL(DirectImageSlice(buffer, origin.y));
+        VERIFY_ARE_EQUAL(0u, slice->ColumnOwner(origin.x + 1));
+        VERIFY_ARE_EQUAL(sixelSurface.get(), std::ranges::find_if(buffer.GetImages().All(), [](const ImagePlacement& placement) {
+            return placement.Identity().protocol == ImagePlacement::Key::Protocol::Sixel;
+        })->SurfacePointer().get());
     }
 
     TEST_METHOD(KittyGraphicsOmittedZIndexDefaultsAboveText)
@@ -9797,19 +9972,131 @@ public:
         VERIFY_IS_TRUE(foundBoth, L"layers from both rows must survive when widening joins wrapped rows");
     }
 
-    TEST_METHOD(SixelLayerCountIsBoundedAndReleased)
+    TEST_METHOD(SixelIncrementalFlushReusesAndGrowsSurface)
     {
-        const auto availableBefore = ImageSlice::LayerBytesAvailable();
+        _testGetSet->PrepData();
+        auto& buffer = *_testGetSet->_textBuffer;
+
+        _stateMachine->ProcessString(L"\x1bP0;1q#0;2;100;0;0~-");
+        VERIFY_ARE_EQUAL(size_t{ 1 }, buffer.GetImages().Size());
+        const auto firstKey = buffer.GetImages().All().front().Identity();
+        const auto surface = buffer.GetImages().All().front().SurfacePointer();
+        const auto firstRevision = surface->Revision();
+        const auto firstSize = surface->PixelSize();
+        VERIFY_IS_TRUE(std::ranges::any_of(surface->Pixels(), [](const RGBQUAD pixel) { return pixel.rgbRed == 255; }));
+
+        _stateMachine->ProcessString(L"#1;2;0;0;100~\x1b\\");
+
+        VERIFY_ARE_EQUAL(size_t{ 1 }, buffer.GetImages().Size());
+        const auto& placement = buffer.GetImages().All().front();
+        VERIFY_ARE_EQUAL(firstKey, placement.Identity());
+        VERIFY_ARE_EQUAL(surface.get(), placement.SurfacePointer().get());
+        VERIFY_ARE_NOT_EQUAL(firstRevision, surface->Revision(), L"one streamed flush must commit a new complete-surface revision");
+        VERIFY_IS_TRUE(surface->PixelSize().height > firstSize.height);
+        VERIFY_IS_TRUE(std::ranges::any_of(surface->Pixels(), [](const RGBQUAD pixel) { return pixel.rgbRed == 255; }),
+                       L"growing the surface must preserve the first flushed band");
+        VERIFY_IS_TRUE(std::ranges::any_of(surface->Pixels(), [](const RGBQUAD pixel) { return pixel.rgbBlue == 255; }),
+                       L"the second flushed band must appear in the same surface");
+    }
+
+    TEST_METHOD(SixelPannedFlushRetainsScrollback)
+    {
+        _testGetSet->PrepData();
+        auto& buffer = *_testGetSet->_textBuffer;
+
+        _stateMachine->ProcessString(L"\x1bP0;1q#0;2;100;0;0~-");
+        VERIFY_ARE_EQUAL(size_t{ 1 }, buffer.GetImages().Size());
+        const auto firstTop = buffer.GetImages().All().front().CellBounds().top;
+
+        ++_testGetSet->_viewport.top;
+        ++_testGetSet->_viewport.bottom;
+        _stateMachine->ProcessString(L"#1;2;0;0;100~\x1b\\");
+
+        VERIFY_ARE_EQUAL(size_t{ 1 }, buffer.GetImages().Size());
+        const auto& placement = buffer.GetImages().All().front();
+        VERIFY_ARE_EQUAL(firstTop, placement.CellBounds().top, L"viewport panning must not discard the flushed band in scrollback");
+        VERIFY_IS_TRUE(std::ranges::any_of(placement.Surface().Pixels(), [](const RGBQUAD pixel) { return pixel.rgbRed == 255; }));
+        VERIFY_IS_TRUE(std::ranges::any_of(placement.Surface().Pixels(), [](const RGBQUAD pixel) { return pixel.rgbBlue == 255; }));
+    }
+
+    TEST_METHOD(SixelOversizeAbortRestoresCursorAndPreservesPlacement)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_textBuffer = std::make_unique<TextBuffer>(til::size{ 2, 500 }, TextAttribute{}, 0, false, &_testGetSet->_renderer);
+        _testGetSet->_viewport = { 0, 0, 1, 499 };
+        auto& buffer = *_testGetSet->_textBuffer;
+        buffer.GetCursor().SetPosition({ 0, 0 });
+        _stateMachine->ProcessString(L"\x1bP0;1q#0;2;100;0;0~\x1b\\");
+        const auto existingKey = buffer.GetImages().All().front().Identity();
+        const auto existingSurface = buffer.GetImages().All().front().SurfacePointer();
+
+        auto& cursor = buffer.GetCursor();
+        cursor.SetIsVisible(true);
+        auto handler = _pDispatch->DefineSixelImage(0, DispatchTypes::SixelBackground::Transparent, {});
+        VERIFY_IS_TRUE(static_cast<bool>(handler));
+
+        auto accepted = true;
+        for (auto line = 0; accepted && line < 700; ++line)
         {
-            ImageSlice slice{ { 1, 1 } };
-            for (auto z = 0; z < static_cast<int32_t>(ImageSlice::MaxLayersPerSlice); ++z)
+            accepted = handler(L'~');
+            if (accepted)
             {
-                slice.MutablePixels(0, 1, { 1, 0 }, z);
+                accepted = handler(L'-');
             }
-            VERIFY_IS_TRUE(slice.WriteMemoryUpperBound(0, 1, { 1, 0 }, INT32_MAX) > ImageSlice::LayerBytesAvailable());
-            VERIFY_THROWS(slice.MutablePixels(0, 1, { 1, 0 }, INT32_MAX), std::bad_alloc);
         }
-        VERIFY_ARE_EQUAL(availableBefore, ImageSlice::LayerBytesAvailable(), L"destroying a slice must return its retained-layer budget");
+
+        VERIFY_IS_FALSE(accepted, L"a surface exceeding the 8192px axis guarantee must be rejected");
+        VERIFY_IS_TRUE(cursor.IsVisible(), L"an aborted Sixel sequence must restore the cursor visibility");
+        const auto existing = std::ranges::find(buffer.GetImages().All(), existingKey, &ImagePlacement::Identity);
+        VERIFY_IS_TRUE(existing != buffer.GetImages().All().end());
+        if (existing != buffer.GetImages().All().end())
+        {
+            VERIFY_ARE_EQUAL(existingSurface.get(), existing->SurfacePointer().get(), L"an oversized replacement must leave prior output intact");
+        }
+    }
+
+    TEST_METHOD(SixelFinalizationReleasesParserSurface)
+    {
+        _testGetSet->PrepData();
+        auto& buffer = *_testGetSet->_textBuffer;
+        _stateMachine->ProcessString(L"\x1bPq#0;2;100;0;0~\x1b\\");
+
+        std::weak_ptr<Image> surface = buffer.GetImages().All().front().SurfacePointer();
+        buffer.GetMutableImages().Clear();
+        VERIFY_IS_TRUE(buffer.GetImages().All().empty());
+        VERIFY_IS_TRUE(surface.expired(), L"completed output must be owned by placements, not retained by the parser");
+    }
+
+    TEST_METHOD(MixedGraphicsHardResetPreservesSixelAndUniqueIdentity)
+    {
+        _testGetSet->PrepData();
+        auto& buffer = *_testGetSet->_textBuffer;
+        _stateMachine->ProcessString(L"\x1bPq#0;2;100;0;0~\x1b\\");
+        const auto firstKey = buffer.GetImages().All().front().Identity();
+        const auto firstSurface = buffer.GetImages().All().front().SurfacePointer();
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,f=24,s=1,v=1,C=1;AP8A\x1b\\");
+
+        _pDispatch->HardReset(false);
+
+        auto images = buffer.GetImages().All();
+        VERIFY_ARE_EQUAL(size_t{ 1 }, images.size(), L"a Kitty reset must remove only Kitty placements");
+        VERIFY_ARE_EQUAL(firstKey, images.front().Identity());
+        VERIFY_ARE_EQUAL(firstSurface.get(), images.front().SurfacePointer().get());
+
+        buffer.GetCursor().SetPosition({ 10, 25 });
+        _stateMachine->ProcessString(L"\x1bPq#0;2;0;0;100~\x1b\\");
+        images = buffer.GetImages().All();
+        VERIFY_ARE_EQUAL(size_t{ 2 }, images.size());
+        const auto second = std::ranges::find_if(images, [&](const auto& placement) {
+            return placement.Identity().protocol == ImagePlacement::Key::Protocol::Sixel && placement.Identity() != firstKey;
+        });
+        VERIFY_IS_TRUE(second != images.end(), L"parser recreation must allocate a new Sixel collection identity");
+        const auto first = std::ranges::find(images, firstKey, &ImagePlacement::Identity);
+        VERIFY_IS_TRUE(first != images.end());
+        if (first != images.end())
+        {
+            VERIFY_ARE_EQUAL(firstSurface.get(), first->SurfacePointer().get(), L"new Sixel output must not replace preserved output");
+        }
     }
 
     TEST_METHOD(KittyAnimationFrameTransferCreatesFullFrame)

@@ -5,7 +5,6 @@
 
 #include "SixelParser.hpp"
 #include "adaptDispatch.hpp"
-#include "../buffer/out/ImageSlice.hpp"
 #include "../parser/ascii.hpp"
 #include "../renderer/base/renderer.hpp"
 #include "../types/inc/colorTable.hpp"
@@ -16,6 +15,15 @@ using namespace Microsoft::Console::Utils;
 using namespace Microsoft::Console::VirtualTerminal;
 using namespace std::chrono;
 using namespace std::chrono_literals;
+
+namespace
+{
+    til::CoordType pixelExtent(const til::CoordType cells, const til::CoordType cellSize) noexcept
+    {
+        const auto extent = static_cast<int64_t>(std::max(cells, til::CoordType{ 0 })) * cellSize;
+        return gsl::narrow_cast<til::CoordType>(std::min(extent, static_cast<int64_t>(til::CoordTypeMax)));
+    }
+}
 
 til::size SixelParser::CellSizeForLevel(const VTInt conformanceLevel) noexcept
 {
@@ -82,30 +90,35 @@ void SixelParser::SetDisplayMode(const bool enabled) noexcept
 
 std::function<bool(wchar_t)> SixelParser::DefineImage(const VTInt macroParameter, const DispatchTypes::SixelBackground backgroundSelect, const VTParameter backgroundColor)
 {
-    if (_initTextBufferBoundaries())
+    try
     {
-        _initRasterAttributes(macroParameter, backgroundSelect);
-        _initColorMap(backgroundColor);
-        _initImageBuffer();
-        _state = States::Normal;
-        _parameters.clear();
-        return [&](const auto ch) {
-            try
-            {
-                _parseCommandChar(ch);
-            }
-            catch (...)
-            {
-                // Ignore all further content.
-                return false;
-            }
-            return true;
-        };
+        if (_initTextBufferBoundaries())
+        {
+            _initRasterAttributes(macroParameter, backgroundSelect);
+            _initColorMap(backgroundColor);
+            _initImageBuffer();
+            _state = States::Normal;
+            _parameters.clear();
+            return [&](const auto ch) {
+                try
+                {
+                    _parseCommandChar(ch);
+                }
+                catch (...)
+                {
+                    _releaseImageState(true);
+                    return false;
+                }
+                return true;
+            };
+        }
     }
-    else
+    catch (...)
     {
-        return nullptr;
+        _releaseImageState(true);
+        throw;
     }
+    return nullptr;
 }
 
 void SixelParser::_parseCommandChar(const wchar_t ch)
@@ -274,8 +287,8 @@ bool SixelParser::_initTextBufferBoundaries()
         // and the starting cursor position is the top left of the page.
         _textMargins = { 0, page.Top(), page.Width(), page.Bottom() };
         _textCursor = _textMargins.origin();
-        _availablePixelWidth = page.Width() * _cellSize.width;
-        _availablePixelHeight = page.Height() * _cellSize.height;
+        _availablePixelWidth = pixelExtent(page.Width(), _cellSize.width);
+        _availablePixelHeight = pixelExtent(page.Height(), _cellSize.height);
     }
     else
     {
@@ -287,15 +300,15 @@ bool SixelParser::_initTextBufferBoundaries()
         const auto [leftMargin, rightMargin] = _dispatcher._GetHorizontalMargins(page.Width());
         _textMargins = til::rect{ leftMargin, topMargin, rightMargin + 1, bottomMargin + 1 };
         _textCursor = page.Cursor().GetPosition();
-        _availablePixelWidth = (_textMargins.right - _textCursor.x) * _cellSize.width;
-        _availablePixelHeight = (_textMargins.bottom - _textCursor.y) * _cellSize.height;
+        _availablePixelWidth = pixelExtent(_textMargins.right - _textCursor.x, _cellSize.width);
+        _availablePixelHeight = pixelExtent(_textMargins.bottom - _textCursor.y, _cellSize.height);
         validOrigin = _textCursor.x >= leftMargin && _textCursor.x <= rightMargin && _textCursor.y <= bottomMargin;
     }
     _pendingTextScrollCount = 0;
 
     // The pixel aspect ratio can't be so large that it would prevent a sixel
     // row from fitting within the margin height, so we need to have a limit.
-    _maxPixelAspectRatio = _textMargins.height() * _cellSize.height / 6;
+    _maxPixelAspectRatio = pixelExtent(_textMargins.height(), _cellSize.height) / 6;
 
     // If the cursor is visible, we need to hide it while the sixel data is
     // being processed. It will be made visible again when we're done.
@@ -475,6 +488,22 @@ void SixelParser::_updateTextCursor(Cursor& cursor) noexcept
     {
         cursor.SetIsVisible(true);
     }
+    _textCursorWasVisible = false;
+}
+
+void SixelParser::_releaseImageState(const bool restoreCursorVisibility) noexcept
+{
+    if (restoreCursorVisibility && _textCursorWasVisible)
+    {
+        try
+        {
+            _dispatcher._pages.ActivePage().Cursor().SetIsVisible(true);
+        }
+        CATCH_LOG()
+    }
+    _textCursorWasVisible = false;
+    _imageSurface.reset();
+    std::vector<IndexedPixel>{}.swap(_imageBuffer);
 }
 
 void SixelParser::_initColorMap(const VTParameter backgroundColor)
@@ -653,10 +682,16 @@ void SixelParser::_updateTextColors()
 void SixelParser::_initImageBuffer()
 {
     _imageBuffer.clear();
+    _imageSurface.reset();
+    _imageKey = { 0, _dispatcher._nextSixelLayerId++, ImagePlacement::Key::Protocol::Sixel };
+    if (_dispatcher._nextSixelLayerId == 0)
+    {
+        _dispatcher._nextSixelLayerId = 1;
+    }
     _imageOriginCell = _textCursor;
     _imageCursor = {};
     _imageWidth = 0;
-    _imageMaxWidth = _availablePixelWidth;
+    _imageMaxWidth = std::min(_availablePixelWidth, Image::MaximumDimension);
     _imageLineCount = 0;
     _resizeImageBuffer(_sixelHeight);
 
@@ -674,8 +709,13 @@ void SixelParser::_initImageBuffer()
 
 void SixelParser::_resizeImageBuffer(const til::CoordType requiredHeight)
 {
-    const auto requiredSize = (_imageCursor.y + requiredHeight) * _imageMaxWidth;
-    if (static_cast<size_t>(requiredSize) > _imageBuffer.size())
+    THROW_HR_IF(E_INVALIDARG, requiredHeight <= 0 || _imageCursor.y < 0 || _imageMaxWidth <= 0);
+    const auto height = static_cast<uint64_t>(_imageCursor.y) + static_cast<uint64_t>(requiredHeight);
+    THROW_HR_IF(E_NOTIMPL, height > Image::MaximumDimension);
+    const auto width = gsl::narrow<size_t>(_imageMaxWidth);
+    THROW_HR_IF(E_INVALIDARG, height > SIZE_MAX / width);
+    const auto requiredSize = gsl::narrow<size_t>(height) * width;
+    if (requiredSize > _imageBuffer.size())
     {
         static constexpr auto transparentPixel = IndexedPixel{ .transparent = true };
         _imageBuffer.resize(requiredSize, transparentPixel);
@@ -693,6 +733,8 @@ void SixelParser::_fillImageBackground()
         // none were given, up to the page boundaries). The actual image output
         // isn't limited by the background dimensions though.
         const auto backgroundHeight = std::min(_backgroundSize.height, _availablePixelHeight);
+        const auto backgroundWidth = std::min(_backgroundSize.width, _availablePixelWidth);
+        THROW_HR_IF(E_NOTIMPL, backgroundWidth > Image::MaximumDimension);
         _resizeImageBuffer(backgroundHeight);
         _fillImageBackground(backgroundHeight);
         // When the image extends beyond the page boundaries, and the screen is
@@ -707,7 +749,7 @@ void SixelParser::_fillImageBackground()
 void SixelParser::_fillImageBackground(const int backgroundHeight)
 {
     static constexpr auto backgroundPixel = IndexedPixel{};
-    const auto backgroundWidth = std::min(_backgroundSize.width, _availablePixelWidth);
+    const auto backgroundWidth = std::min({ _backgroundSize.width, _availablePixelWidth, _imageMaxWidth });
     const auto backgroundOffset = _imageCursor.y * _imageMaxWidth;
     auto dst = std::next(_imageBuffer.begin(), backgroundOffset);
     for (auto i = 0; i < backgroundHeight; i++)
@@ -757,6 +799,11 @@ void SixelParser::_writeToImageBuffer(int sixelValue, int repeatCount)
     // is received. So if we haven't filled it yet, we need to do so now.
     _fillImageBackground();
 
+    if (_availablePixelWidth > Image::MaximumDimension &&
+        repeatCount > Image::MaximumDimension - _imageCursor.x)
+    {
+        THROW_HR(E_NOTIMPL);
+    }
     repeatCount = std::min(repeatCount, _imageMaxWidth - _imageCursor.x);
     if (repeatCount <= 0)
     {
@@ -841,10 +888,16 @@ void SixelParser::_writeToImageBuffer(int sixelValue, int repeatCount)
 
 void SixelParser::_eraseImageBufferRows(const int rowCount, const til::CoordType rowOffset) noexcept
 {
-    const auto pixelCount = rowCount * _cellSize.height;
-    const auto bufferOffset = rowOffset * _cellSize.height * _imageMaxWidth;
-    const auto bufferOffsetEnd = bufferOffset + pixelCount * _imageMaxWidth;
-    if (static_cast<size_t>(bufferOffsetEnd) >= _imageBuffer.size()) [[unlikely]]
+    if (rowCount <= 0 || rowOffset < 0 || _imageMaxWidth <= 0)
+    {
+        return;
+    }
+
+    const auto width = gsl::narrow_cast<size_t>(_imageMaxWidth);
+    const auto height = _imageBuffer.size() / width;
+    const auto pixelCount = gsl::narrow_cast<size_t>(rowCount) * gsl::narrow_cast<size_t>(_cellSize.height);
+    const auto pixelOffset = gsl::narrow_cast<size_t>(rowOffset) * gsl::narrow_cast<size_t>(_cellSize.height);
+    if (pixelOffset >= height || pixelCount >= height - pixelOffset) [[unlikely]]
     {
         _decreaseFilledBackgroundHeight(_imageCursor.y);
         _imageBuffer.clear();
@@ -852,9 +905,11 @@ void SixelParser::_eraseImageBufferRows(const int rowCount, const til::CoordType
     }
     else
     {
-        _decreaseFilledBackgroundHeight(pixelCount);
+        _decreaseFilledBackgroundHeight(gsl::narrow_cast<int>(pixelCount));
+        const auto bufferOffset = pixelOffset * width;
+        const auto bufferOffsetEnd = (pixelOffset + pixelCount) * width;
         _imageBuffer.erase(_imageBuffer.begin() + bufferOffset, _imageBuffer.begin() + bufferOffsetEnd);
-        _imageCursor.y -= pixelCount;
+        _imageCursor.y -= gsl::narrow_cast<til::CoordType>(pixelCount);
     }
 }
 
@@ -870,7 +925,7 @@ void SixelParser::_maybeFlushImageBuffer(const bool endOfSequence)
     // result in the top of the segment being pushed offscreen.
     if (_segmentHeight > _availablePixelHeight && !_displayMode) [[unlikely]]
     {
-        const auto marginPixelHeight = _textMargins.height() * _cellSize.height;
+        const auto marginPixelHeight = pixelExtent(_textMargins.height(), _cellSize.height);
         while (_availablePixelHeight < marginPixelHeight && _segmentHeight >= _availablePixelHeight)
         {
             _pendingTextScrollCount += 1;
@@ -910,71 +965,93 @@ void SixelParser::_maybeFlushImageBuffer(const bool endOfSequence)
         // so the only visible change will be the scrolling.
         if (_imageWidth > 0)
         {
-            const auto columnBegin = _imageOriginCell.x;
-            const auto columnEnd = _imageOriginCell.x + (_imageWidth + _cellSize.width - 1) / _cellSize.width;
-            auto rowOffset = _imageOriginCell.y;
-            auto srcIterator = _imageBuffer.begin();
-            while (srcIterator < _imageBuffer.end() && rowOffset < page.Bottom())
+            const auto imageHeight = gsl::narrow<til::CoordType>(_imageBuffer.size() / gsl::narrow<size_t>(_imageMaxWidth));
+            THROW_HR_IF(E_NOTIMPL, _imageWidth > Image::MaximumDimension || imageHeight > Image::MaximumDimension);
+
+            const auto surfaceSize = til::size{ _imageWidth, imageHeight };
+            const auto pixelCount = gsl::narrow<size_t>(_imageWidth) * gsl::narrow<size_t>(imageHeight);
+            auto pixels = std::make_shared<std::vector<RGBQUAD>>(pixelCount);
+            for (auto y = 0; y < imageHeight; ++y)
             {
-                if (rowOffset >= 0)
+                const auto sourceRow = gsl::narrow<size_t>(y) * gsl::narrow<size_t>(_imageMaxWidth);
+                const auto targetRow = gsl::narrow<size_t>(y) * gsl::narrow<size_t>(_imageWidth);
+                for (auto x = 0; x < _imageWidth; ++x)
                 {
-                    auto& dstRow = page.Buffer().GetMutableRowByOffset(rowOffset);
-                    auto dstSlice = dstRow.GetMutableImageSlice();
-                    // Only reuse an existing slice if it shares our cell size. Another
-                    // image protocol (e.g. Kitty graphics) can place a slice with a
-                    // different cell geometry on this row; writing it with our cell
-                    // stride would overflow the slice buffer, so replace it instead.
-                    if (!dstSlice || dstSlice->CellSize() != _cellSize)
+                    const auto indexedPixel = til::at(_imageBuffer, sourceRow + gsl::narrow<size_t>(x));
+                    if (!indexedPixel.transparent)
                     {
-                        dstSlice = dstRow.SetImageSlice(std::make_unique<ImageSlice>(_cellSize));
-                        __assume(dstSlice != nullptr);
+                        til::at(*pixels, targetRow + gsl::narrow<size_t>(x)) = _makeRGBQUAD(_colorFromIndex(indexedPixel.colorIndex));
                     }
-                    // These cells become Sixel content. Clear any foreign (Kitty)
-                    // pixels+ownership so a transparent Sixel hole can't leave ownerless
-                    // Kitty pixels that a later Kitty delete would skip. Existing Sixel
-                    // (owner 0) overlay is preserved.
-                    dstSlice->ClearLayers(columnBegin, columnEnd);
-                    auto dstIterator = dstSlice->MutablePixels(columnBegin, columnEnd);
-                    for (auto pixelRow = 0; pixelRow < _cellSize.height; pixelRow++)
-                    {
-                        for (auto pixelColumn = 0; pixelColumn < _imageWidth; pixelColumn++)
-                        {
-                            const auto srcPixel = til::at(srcIterator, pixelColumn);
-                            if (!srcPixel.transparent)
-                            {
-                                const auto srcColor = _colorFromIndex(srcPixel.colorIndex);
-                                til::at(dstIterator, pixelColumn) = _makeRGBQUAD(srcColor);
-                            }
-                        }
-                        std::advance(srcIterator, _imageMaxWidth);
-                        if (srcIterator >= _imageBuffer.end())
-                        {
-                            break;
-                        }
-                        std::advance(dstIterator, dstSlice->PixelWidth());
-                    }
+                }
+            }
+
+            const Image::PixelStorage storage = pixels;
+            const auto stagedSurface = std::make_shared<Image>(surfaceSize, storage);
+            auto& images = page.Buffer().GetMutableImages();
+            auto dirtyTop = page.Bottom();
+            auto dirtyBottom = page.Top();
+            for (const auto& placement : images.All())
+            {
+                if (placement.Identity() == _imageKey)
+                {
+                    dirtyTop = std::min(dirtyTop, placement.CellBounds().top);
+                    dirtyBottom = std::max(dirtyBottom, placement.CellBounds().bottom);
+                }
+            }
+
+            const auto cellWidth = (_imageWidth + _cellSize.width - 1) / _cellSize.width;
+            const auto cellHeight = (imageHeight + _cellSize.height - 1) / _cellSize.height;
+            const auto originalBounds = til::rect{
+                _imageOriginCell.x,
+                _imageOriginCell.y,
+                _imageOriginCell.x + cellWidth,
+                _imageOriginCell.y + cellHeight
+            };
+            const auto geometry = ImagePlacement::PixelGeometry{
+                .cellSize = _cellSize,
+                .targetWidth = gsl::narrow<uint32_t>(_imageWidth),
+                .targetHeight = gsl::narrow<uint32_t>(imageHeight),
+            };
+            const auto placement = ImagePlacement{
+                _imageKey,
+                stagedSurface,
+                originalBounds,
+                0,
+                {},
+                geometry
+            };
+            const auto bufferBounds = til::rect{ 0, 0, page.Width(), page.BufferHeight() };
+            if (auto fragment = placement.Crop(bufferBounds))
+            {
+                const auto fragmentBounds = fragment->CellBounds();
+                if (_imageSurface)
+                {
+                    images.AddOrReplace(std::move(*fragment), _imageSurface, surfaceSize, storage);
                 }
                 else
                 {
-                    std::advance(srcIterator, _imageMaxWidth * _cellSize.height);
+                    images.AddOrReplace(std::move(*fragment));
+                    _imageSurface = stagedSurface;
                 }
-                rowOffset++;
+                dirtyTop = std::min(dirtyTop, fragmentBounds.top);
+                dirtyBottom = std::max(dirtyBottom, fragmentBounds.bottom);
             }
-
-            // Trigger a redraw of the affected rows in the renderer.
-            const auto topRowOffset = std::max(_imageOriginCell.y, 0);
-            const auto dirtyView = Viewport::FromExclusive({ 0, topRowOffset, page.Width(), rowOffset });
-            page.Buffer().TriggerRedraw(dirtyView);
-
-            // If the start of the image is now above the top of the page, we
-            // won't be making any further updates to that content, so we can
-            // erase it from our local buffer
-            if (_imageOriginCell.y < page.Top())
+            else
             {
-                const auto rowsToDelete = page.Top() - _imageOriginCell.y;
-                _eraseImageBufferRows(rowsToDelete);
-                _imageOriginCell.y += rowsToDelete;
+                images.Erase(_imageKey);
             }
+
+            if (dirtyTop < dirtyBottom)
+            {
+                const auto visibleTop = std::max(dirtyTop, page.Top());
+                const auto visibleBottom = std::min(dirtyBottom, page.Bottom());
+                if (visibleTop < visibleBottom)
+                {
+                    const auto dirtyView = Viewport::FromExclusive({ 0, visibleTop, page.Width(), visibleBottom });
+                    page.Buffer().TriggerRedraw(dirtyView);
+                }
+            }
+
         }
 
         // On lower conformance levels, we also update the text colors.
@@ -984,6 +1061,7 @@ void SixelParser::_maybeFlushImageBuffer(const bool endOfSequence)
         if (endOfSequence)
         {
             _updateTextCursor(page.Cursor());
+            _releaseImageState(false);
         }
     }
 }

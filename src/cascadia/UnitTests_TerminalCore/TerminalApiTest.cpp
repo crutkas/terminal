@@ -36,6 +36,7 @@ namespace
         ImagePlacement::Key key;
         const Image* surface = nullptr;
         uint64_t revision = 0;
+        til::size surfaceSize;
         til::rect bounds;
         til::rect originalBounds;
         til::rect source;
@@ -190,21 +191,12 @@ namespace
         }
         CATCH_RETURN()
 
-        HRESULT BeginRowImages(const ImageSlice* imageSlice,
-                               const til::CoordType targetRow,
-                               const til::CoordType viewportLeft,
+        HRESULT BeginRowImages(const til::CoordType targetRow,
+                               const til::CoordType /*viewportLeft*/,
                                const std::span<const uint8_t> defaultBackgroundMask,
                                const std::span<const COLORREF> cellBackgrounds) noexcept override
         try
         {
-            if (imageSlice)
-            {
-                for (size_t plane = 0; plane < ImageSlice::RenderPositionCount; ++plane)
-                {
-                    _recordPlane(*imageSlice, static_cast<ImageSlice::RenderPosition>(plane), targetRow, viewportLeft, defaultBackgroundMask, cellBackgrounds);
-                }
-            }
-
             const auto bufferRow = targetRow + _imageViewportOrigin.y;
             for (const auto& placement : _framePlacements)
             {
@@ -224,6 +216,7 @@ namespace
                     .key = placement.Identity(),
                     .surface = &placement.Surface(),
                     .revision = surface->revision,
+                    .surfaceSize = surface->size,
                     .bounds = bounds,
                     .originalBounds = placement.OriginalCellBounds(),
                     .source = placement.SourceInPixels(),
@@ -248,57 +241,6 @@ namespace
         HRESULT EndRowImages() noexcept override
         {
             return S_OK;
-        }
-
-        void _recordPlane(const ImageSlice& imageSlice,
-                          const ImageSlice::RenderPosition position,
-                          const til::CoordType targetRow,
-                          const til::CoordType viewportLeft,
-                          const std::span<const uint8_t> defaultBackgroundMask,
-                          const std::span<const COLORREF> cellBackgrounds)
-        {
-            PaintedImage image{
-                targetRow,
-                imageSlice.ColumnOffset() - viewportLeft,
-            };
-            image.defaultBackgroundMask.assign(defaultBackgroundMask.begin(), defaultBackgroundMask.end());
-            image.cellBackgrounds.assign(cellBackgrounds.begin(), cellBackgrounds.end());
-
-            const auto columnCount = imageSlice.PixelWidth() / std::max(1, imageSlice.CellSize().width);
-            const auto pixels = imageSlice.Pixels(position);
-            if (pixels.empty())
-            {
-                return;
-            }
-            image.columnOwners.reserve(columnCount);
-            for (til::CoordType i = 0; i < columnCount; ++i)
-            {
-                const auto column = imageSlice.ColumnOffset() + i;
-                image.columnOwners.emplace_back(imageSlice.ColumnOwner(column));
-                auto pixel = std::next(pixels.data(), i * imageSlice.CellSize().width);
-                auto containsRed = false;
-                auto containsGreen = false;
-                for (auto y = 0; y < imageSlice.CellSize().height && !(containsRed && containsGreen); ++y)
-                {
-                    for (auto x = 0; x < imageSlice.CellSize().width; ++x)
-                    {
-                        if (pixel[x].rgbRed == 255 && pixel[x].rgbGreen == 0 && pixel[x].rgbBlue == 0)
-                        {
-                            containsRed = true;
-                        }
-                        if (pixel[x].rgbRed == 0 && pixel[x].rgbGreen == 255 && pixel[x].rgbBlue == 0)
-                        {
-                            containsGreen = true;
-                        }
-                    }
-                    std::advance(pixel, imageSlice.PixelWidth());
-                }
-                image.columnsContainRed.emplace_back(containsRed);
-                image.columnsContainGreen.emplace_back(containsGreen);
-            }
-
-            const auto guard = _lock.lock_exclusive();
-            _images.emplace_back(std::move(image));
         }
 
         HRESULT PaintSelection(const til::rect& /*rect*/) noexcept override
@@ -1033,11 +975,6 @@ void TerminalApiTest::DirectImageRendererPreservesSharedSurfaceGeometryAndLifeti
     }
     VERIFY_IS_TRUE(std::ranges::is_sorted(rowOneZ), L"the renderer must preserve stable z composition across all three phases");
 
-    for (til::CoordType row = 0; row < buffer.GetSize().Height(); ++row)
-    {
-        VERIFY_IS_NULL(buffer.GetRowByOffset(row).GetImageSlice(), L"direct images must not create row-local pixels");
-    }
-
     fixture.terminal.LockConsole();
     auto unlockAfterScroll = wil::scope_exit([&fixture]() {
         fixture.terminal.UnlockConsole();
@@ -1057,18 +994,21 @@ void TerminalApiTest::DirectImageRendererPreservesSharedSurfaceGeometryAndLifeti
         VERIFY_ARE_EQUAL(-1, scrolledFragment->originalBounds.top, L"logical bounds must follow the monotonic row epoch");
     }
 
-    auto changedPixels = std::make_shared<std::vector<RGBQUAD>>(*pixels);
+    auto changedPixels = std::make_shared<std::vector<RGBQUAD>>(15);
     changedPixels->front() = RGBQUAD{ 0, 255, 0, 192 };
     fixture.terminal.LockConsole();
     auto unlockAfterRevision = wil::scope_exit([&fixture]() {
         fixture.terminal.UnlockConsole();
     });
-    surface->UpdatePixels(std::move(changedPixels));
+    surface->UpdatePixels({ 5, 3 }, std::move(changedPixels));
     unlockAfterRevision.reset();
     fixture.Repaint();
     frame = fixture.engine.Snapshot();
     VERIFY_ARE_EQUAL(size_t{ 0 }, frame.surfaceUploads);
     VERIFY_ARE_EQUAL(size_t{ 1 }, frame.surfaceRefreshes, L"a new revision must refresh the existing cached surface");
+    VERIFY_IS_TRUE(std::ranges::all_of(frame.images, [](const auto& image) {
+        return image.surfaceSize == til::size{ 5, 3 };
+    }), L"renderer frames must retain dimensions with their immutable pixel snapshot");
 
     fixture.terminal.LockConsole();
     auto unlockAfterDelete = wil::scope_exit([&fixture]() {
@@ -1101,7 +1041,6 @@ void TerminalApiTest::KittyAnimationSurvivesFontAndRendererRefresh()
     VERIFY_ARE_EQUAL(size_t{ 1 }, placements.size());
     const auto surface = placements.front().SurfacePointer();
     VERIFY_IS_NOT_NULL(surface.get());
-    VERIFY_IS_NULL(buffer.GetRowByOffset(0).GetImageSlice(), L"Kitty must not create a row-local ImageSlice");
 
     // Simulate an out-of-date backend-facing surface while the animation source of
     // truth remains frame 1 (red). A font refresh must update the same shared object.
@@ -1819,10 +1758,6 @@ void TerminalApiTest::KittyPlaceholderRendersInRealTerminal()
         VERIFY_ARE_EQUAL(static_cast<BYTE>(0), pixel.rgbBlue);
         VERIFY_ARE_EQUAL((til::rect{ 0, 0, 1, 1 }), placements.front().CellBounds());
     }
-    for (til::CoordType y = 0; y < 100; ++y)
-    {
-        VERIFY_IS_NULL(tbi.GetRowByOffset(y).GetImageSlice(), L"Kitty placeholders must not allocate row-local image pixels");
-    }
 }
 
 // An engine that withholds the text pass's background fill from the cells an image
@@ -1921,10 +1856,21 @@ void TerminalApiTest::KittyPlaceholderSuppressesGlyphAfterResize()
 
     const til::point oldPosition{ 10, 0 };
     VERIFY_IS_NOT_NULL(initialBuffer.GetRowByOffset(oldPosition.y).GetImageCellRef(oldPosition.x));
-    VERIFY_IS_NULL(initialBuffer.GetRowByOffset(0).GetImageSlice(), L"Kitty must not create row-local image pixels");
-    auto sixelSlice = std::make_unique<ImageSlice>(til::size{ 1, 1 });
-    *sixelSlice->MutablePixels(0, 1) = RGBQUAD{ 255, 0, 0, 0 };
-    initialBuffer.GetMutableRowByOffset(0).SetImageSlice(std::move(sixelSlice));
+    const auto sixelSurface = std::make_shared<Image>(
+        til::size{ 1, 1 },
+        std::vector<RGBQUAD>{ RGBQUAD{ 255, 0, 0, 255 } });
+    initialBuffer.GetMutableImages().Add(ImagePlacement{
+        { 0, 1, ImagePlacement::Key::Protocol::Sixel },
+        sixelSurface,
+        { 0, 0, 1, 1 },
+        0,
+        {},
+        {
+            .cellSize = { 1, 1 },
+            .targetWidth = 1,
+            .targetHeight = 1,
+        },
+    });
     fixture.StartPainting();
 
     fixture.terminal.LockConsole();
@@ -1948,14 +1894,13 @@ void TerminalApiTest::KittyPlaceholderSuppressesGlyphAfterResize()
         const auto attribute = resizedBuffer.GetRowByOffset(movedPosition->y).GetAttrByColumn(movedPosition->x);
         VerifyPlaceholderFrame(fixture.engine.Snapshot(), screenPosition, attribute, 1);
     }
-    const auto resizedFirstSlice = resizedBuffer.GetRowByOffset(0).GetImageSlice();
-    VERIFY_IS_NOT_NULL(resizedFirstSlice, L"relocating Kitty pixels must not drop unowned legacy image data");
-    if (resizedFirstSlice)
-    {
-        const auto pixel = resizedFirstSlice->Pixels(0);
-        VERIFY_ARE_EQUAL(static_cast<BYTE>(255), pixel->rgbBlue, L"the unowned legacy image column must survive Kitty relocation");
-        VERIFY_ARE_EQUAL(0u, resizedFirstSlice->ColumnOwner(0));
-    }
+    const auto resizedImages = resizedBuffer.GetImages().All();
+    const auto resizedSixel = std::ranges::find_if(resizedImages, [](const ImagePlacement& placement) {
+        return placement.Identity().protocol == ImagePlacement::Key::Protocol::Sixel;
+    });
+    VERIFY_IS_TRUE(resizedSixel != resizedImages.end(), L"relocating Kitty pixels must not drop the Sixel placement");
+    VERIFY_ARE_EQUAL(sixelSurface.get(), resizedSixel->SurfacePointer().get());
+    VERIFY_ARE_EQUAL(static_cast<BYTE>(255), resizedSixel->Surface().Pixels().front().rgbBlue);
 
     fixture.terminal.LockConsole();
     auto unlockAfterWiden = wil::scope_exit([&fixture]() {
@@ -1974,14 +1919,12 @@ void TerminalApiTest::KittyPlaceholderSuppressesGlyphAfterResize()
         const auto attribute = widenedBuffer.GetRowByOffset(widenedPosition->y).GetAttrByColumn(widenedPosition->x);
         VerifyPlaceholderFrame(fixture.engine.Snapshot(), *widenedPosition, attribute, 1);
     }
-    const auto widenedFirstSlice = widenedBuffer.GetRowByOffset(0).GetImageSlice();
-    VERIFY_IS_NOT_NULL(widenedFirstSlice, L"joining wrapped rows must preserve unowned legacy image data");
-    if (widenedFirstSlice)
-    {
-        const auto pixel = widenedFirstSlice->Pixels(0);
-        VERIFY_ARE_EQUAL(static_cast<BYTE>(255), pixel->rgbBlue, L"widening must not replace an earlier row's unowned legacy image column");
-        VERIFY_ARE_EQUAL(0u, widenedFirstSlice->ColumnOwner(0));
-    }
+    const auto widenedImages = widenedBuffer.GetImages().All();
+    const auto widenedSixel = std::ranges::find_if(widenedImages, [](const ImagePlacement& placement) {
+        return placement.Identity().protocol == ImagePlacement::Key::Protocol::Sixel;
+    });
+    VERIFY_IS_TRUE(widenedSixel != widenedImages.end(), L"joining wrapped rows must preserve the Sixel placement");
+    VERIFY_ARE_EQUAL(sixelSurface.get(), widenedSixel->SurfacePointer().get());
 }
 
 void TerminalApiTest::KittyPlaceholderSuppressesGlyphAfterScroll()

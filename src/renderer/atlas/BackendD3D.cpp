@@ -1143,13 +1143,8 @@ void BackendD3D::_drawText(RenderingPayload& p)
             static_cast<u8>(row->lineRendition >= LineRendition::DoubleHeightTop ? 2 : 1),
         };
 
-        for (size_t i = 0; i < static_cast<size_t>(ImageSlice::RenderPosition::AboveText); i++)
+        for (size_t i = 0; i < static_cast<size_t>(ImagePlacement::RenderPosition::AboveText); i++)
         {
-            const auto& underlay = til::at(row->bitmaps, i);
-            if (underlay.revision != 0)
-            {
-                _drawBitmap(p, underlay, y);
-            }
             _drawImages(p, *row, y, static_cast<ImagePlacement::RenderPosition>(i));
         }
 
@@ -1227,11 +1222,6 @@ void BackendD3D::_drawText(RenderingPayload& p)
             _drawGridlines(p, y);
         }
 
-        const auto& overlay = til::at(row->bitmaps, static_cast<size_t>(ImageSlice::RenderPosition::AboveText));
-        if (overlay.revision != 0)
-        {
-            _drawBitmap(p, overlay, y);
-        }
         _drawImages(p, *row, y, ImagePlacement::RenderPosition::AboveText);
 
         if (p.invalidatedRows.contains(y))
@@ -1914,20 +1904,30 @@ void BackendD3D::_drawGridlines(const RenderingPayload& p, u16 y)
 void BackendD3D::_pruneImageCache(const RenderingPayload& p)
 {
     const auto hasStaleEntry = std::any_of(_imageCache.begin(), _imageCache.end(), [&](const auto& entry) {
-        for (const auto row : p.rows)
-        {
-            if (std::any_of(row->images.begin(), row->images.end(), [&](const auto& placement) {
-                    return placement.SurfacePointer().get() == entry.first;
-                }))
-            {
-                return false;
-            }
-        }
-        return true;
+        return std::ranges::none_of(p.imageSurfaces, [&](const auto& surface) {
+            return surface.image.get() == entry.first;
+        });
     });
-    if (hasStaleEntry)
+    const auto hasResizedEntry = std::ranges::any_of(p.imageSurfaces, [&](const auto& surface) {
+        const auto cached = _imageCache.find(surface.image.get());
+        if (cached == _imageCache.end())
+        {
+            return false;
+        }
+        const auto size = surface.size;
+        return cached->second.size.x != size.width || cached->second.size.y != size.height;
+    });
+    if (hasStaleEntry || hasResizedEntry)
     {
-        _resetGlyphAtlas(p, 0, 0);
+        u32 minWidth = 0;
+        u32 minHeight = 0;
+        for (const auto& surface : p.imageSurfaces)
+        {
+            const auto size = surface.size;
+            minWidth = std::max(minWidth, gsl::narrow_cast<u32>(size.width));
+            minHeight = std::max(minHeight, gsl::narrow_cast<u32>(size.height));
+        }
+        _resetGlyphAtlas(p, minWidth, minHeight);
     }
 }
 
@@ -1938,7 +1938,7 @@ void BackendD3D::_uploadImage(const RenderingPayload& p, const ImageFrameInfo::S
     auto found = _imageCache.find(image.get());
     if (found == _imageCache.end())
     {
-        const auto size = image->PixelSize();
+        const auto size = surface.size;
         THROW_HR_IF(E_UNEXPECTED, size.width > Image::MaximumDimension || size.height > Image::MaximumDimension);
         stbrp_rect rect{
             .w = gsl::narrow_cast<stbrp_coord>(size.width),
@@ -1965,7 +1965,7 @@ void BackendD3D::_uploadImage(const RenderingPayload& p, const ImageFrameInfo::S
     }
 
     _d2dBeginDrawing();
-    const auto size = image->PixelSize();
+    const auto size = surface.size;
     const auto pixels = std::span{ *surface.pixels };
     THROW_HR_IF(E_UNEXPECTED, pixels.size() != static_cast<size_t>(size.width) * size.height);
     const D2D1_SIZE_U bitmapSize{
@@ -2129,60 +2129,6 @@ void BackendD3D::_drawImages(const RenderingPayload& p, const ShapedRow& row, co
                        });
         }
     }
-}
-
-void BackendD3D::_drawBitmap(const RenderingPayload& p, const Bitmap& b, u16 y)
-{
-    auto ab = _glyphAtlasBitmaps.lookup(b.revision);
-    if (!ab)
-    {
-        stbrp_rect rect{
-            .w = p.s->font->cellSize.x * b.targetWidth,
-            .h = p.s->font->cellSize.y,
-        };
-        _drawGlyphAtlasAllocate(p, rect);
-        _d2dBeginDrawing();
-
-        const D2D1_SIZE_U size{
-            static_cast<UINT32>(b.sourceSize.x),
-            static_cast<UINT32>(b.sourceSize.y),
-        };
-        const D2D1_BITMAP_PROPERTIES bitmapProperties{
-            .pixelFormat = { DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED },
-            .dpiX = static_cast<f32>(p.s->font->dpi),
-            .dpiY = static_cast<f32>(p.s->font->dpi),
-        };
-        wil::com_ptr<ID2D1Bitmap> bitmap;
-        THROW_IF_FAILED(_d2dRenderTarget->CreateBitmap(size, b.source.data(), static_cast<UINT32>(b.sourceSize.x) * 4, &bitmapProperties, bitmap.addressof()));
-
-        const D2D1_RECT_F rectF{
-            static_cast<f32>(rect.x),
-            static_cast<f32>(rect.y),
-            static_cast<f32>(rect.x + rect.w),
-            static_cast<f32>(rect.y + rect.h),
-        };
-        _d2dRenderTarget->DrawBitmap(bitmap.get(), &rectF, 1, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
-
-        ab = _glyphAtlasBitmaps.insert(b.revision).first;
-        ab->size.x = static_cast<u16>(rect.w);
-        ab->size.y = static_cast<u16>(rect.h);
-        ab->texcoord.x = static_cast<u16>(rect.x);
-        ab->texcoord.y = static_cast<u16>(rect.y);
-    }
-
-    const auto left = p.s->font->cellSize.x * (b.targetOffset - p.scrollOffsetX);
-    const auto top = p.s->font->cellSize.y * y;
-
-    _appendQuad() = {
-        .shadingType = static_cast<u16>(ShadingType::TextPassthrough),
-        .renditionScale = { 1, 1 },
-        .position = { static_cast<i16>(left), static_cast<i16>(top) },
-        .size = ab->size,
-        .texcoord = {
-            static_cast<f32>(ab->texcoord.x),
-            static_cast<f32>(ab->texcoord.y),
-        },
-    };
 }
 
 void BackendD3D::_drawCursorBackground(const RenderingPayload& p)

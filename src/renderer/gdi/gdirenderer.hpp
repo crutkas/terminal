@@ -56,8 +56,7 @@ namespace Microsoft::Console::Render
                                                    const size_t cchLine,
                                                    const til::point coordTarget) noexcept override;
         [[nodiscard]] HRESULT PrepareImageFrame(ImageFrameInfo info) noexcept override;
-        [[nodiscard]] HRESULT BeginRowImages(const ImageSlice* imageSlice,
-                                             til::CoordType targetRow,
+        [[nodiscard]] HRESULT BeginRowImages(til::CoordType targetRow,
                                              til::CoordType viewportLeft,
                                              std::span<const uint8_t> defaultBackgroundMask,
                                              std::span<const COLORREF> cellBackgrounds) noexcept override;
@@ -181,7 +180,6 @@ namespace Microsoft::Console::Render
         std::pmr::vector<std::pmr::wstring> _polyStrings;
         std::pmr::vector<std::pmr::vector<int>> _polyWidths;
 
-        std::vector<RGBQUAD> _imagePlane;
         struct CachedImageSurface
         {
             Image::Pointer image;
@@ -203,7 +201,6 @@ namespace Microsoft::Console::Render
         wil::unique_hdc _hdcImageSource;
         til::size _szImageSource;
         RGBQUAD* _imageSourceBits = nullptr;
-        const ImageSlice* _rowImageSlice = nullptr;
         til::CoordType _rowImageTargetRow = 0;
         til::CoordType _rowImageViewportLeft = 0;
         // One flag per screen column of the current row's slice, set where
@@ -226,16 +223,9 @@ namespace Microsoft::Console::Render
         void _MarkDirectImageUnderlay(const ImagePlacement& placement,
                                       til::CoordType targetRow,
                                       std::span<const uint8_t> defaultBackgroundMask) noexcept;
-        void _MarkSliceUnderlay(const ImageSlice& imageSlice,
-                                til::CoordType viewportLeft) noexcept;
-        [[nodiscard]] HRESULT _PaintImagePlane(const ImageSlice& imageSlice,
-                                               ImageSlice::RenderPosition position,
-                                               til::CoordType targetRow,
-                                               til::CoordType viewportLeft,
-                                               std::span<const uint8_t> defaultBackgroundMask,
-                                               bool underText) noexcept;
         [[nodiscard]] HRESULT _PrepareImageSourceSurface(til::size size, _Outptr_result_maybenull_ RGBQUAD** bits) noexcept;
-        bool _UnderlayCoversColumn(til::CoordType column) const noexcept;        bool _UnderlayCoversBufferCell(til::CoordType bufferColumn) const noexcept;
+        bool _UnderlayCoversColumn(til::CoordType column) const noexcept;
+        bool _UnderlayCoversBufferCell(til::CoordType bufferColumn) const noexcept;
         bool _UnderlayCoversAnyOf(til::CoordType columnBegin, til::CoordType columnEnd) const noexcept;
         [[nodiscard]] HRESULT _FillUncoveredRunBackground(const RECT& runRect, til::CoordType fontWidth) noexcept;
         [[nodiscard]] HRESULT _FillImageRowCellBackgrounds(til::CoordType targetRow,

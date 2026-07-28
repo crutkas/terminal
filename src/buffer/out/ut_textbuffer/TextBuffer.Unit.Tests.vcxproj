@@ -12,7 +12,6 @@
   <Import Project="$(SolutionDir)src\common.nugetversions.props" />
   <ItemGroup>
     <ClCompile Include="ImageTests.cpp" />
-    <ClCompile Include="ImageSliceTests.cpp" />
     <ClCompile Include="ReflowTests.cpp" />
     <ClCompile Include="TextColorTests.cpp" />
     <ClCompile Include="TextAttributeTests.cpp" />

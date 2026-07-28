@@ -74,8 +74,7 @@ HRESULT RenderEngineBase::PrepareLineTransform(const LineRendition /*lineRenditi
     return S_FALSE;
 }
 
-HRESULT RenderEngineBase::BeginRowImages(const ImageSlice* /*imageSlice*/,
-                                         const til::CoordType /*targetRow*/,
+HRESULT RenderEngineBase::BeginRowImages(const til::CoordType /*targetRow*/,
                                          const til::CoordType /*viewportLeft*/,
                                          const std::span<const uint8_t> /*defaultBackgroundMask*/,
                                          const std::span<const COLORREF> /*cellBackgrounds*/) noexcept

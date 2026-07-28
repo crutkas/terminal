@@ -6,7 +6,6 @@
 #include "adaptDispatch.hpp"
 #include "SixelParser.hpp"
 #include "KittyParser.hpp"
-#include "../buffer/out/ImageSlice.hpp"
 #include "../../inc/unicode.hpp"
 #include <til/unicode.h>
 #include "../../renderer/base/renderer.hpp"
@@ -617,6 +616,7 @@ void AdaptDispatch::_ScrollRectVertically(const Page& page, const til::rect& scr
             const auto dstOrigin = til::point{ scrollRect.left, top + actualDelta };
             const auto srcView = Viewport::FromDimensions(srcOrigin, { width, height });
             const auto dstView = Viewport::FromDimensions(dstOrigin, { width, height });
+            const auto sourceImages = textBuffer.GetImages().Snapshot();
             const auto walkDirection = Viewport::DetermineWalkDirection(srcView, dstView);
             auto srcPos = srcView.GetWalkOrigin(walkDirection);
             auto dstPos = dstView.GetWalkOrigin(walkDirection);
@@ -631,8 +631,7 @@ void AdaptDispatch::_ScrollRectVertically(const Page& page, const til::rect& scr
                 }
                 srcView.WalkInBounds(srcPos, walkDirection);
             } while (dstView.WalkInBounds(dstPos, walkDirection));
-            // Copy any image content in the affected area.
-            ImageSlice::CopyBlock(textBuffer, srcView.ToExclusive(), textBuffer, dstView.ToExclusive());
+            sourceImages.CopyArea(srcView.ToExclusive(), dstOrigin, textBuffer.GetMutableImages());
         }
     }
 
@@ -669,6 +668,7 @@ void AdaptDispatch::_ScrollRectHorizontally(const Page& page, const til::rect& s
 
         const auto source = Viewport::FromDimensions({ left, top }, { width, height });
         const auto target = Viewport::Offset(source, { actualDelta, 0 });
+        const auto sourceImages = textBuffer.GetImages().Snapshot();
         const auto walkDirection = Viewport::DetermineWalkDirection(source, target);
         auto sourcePos = source.GetWalkOrigin(walkDirection);
         auto targetPos = target.GetWalkOrigin(walkDirection);
@@ -690,8 +690,7 @@ void AdaptDispatch::_ScrollRectHorizontally(const Page& page, const til::rect& s
                 textBuffer.GetMutableRowByOffset(targetPos.y).SetImageCellRef(targetPos.x, currentMetadata);
             }
         } while (target.WalkInBounds(targetPos, walkDirection));
-        // Copy any image content in the affected area.
-        ImageSlice::CopyBlock(textBuffer, source.ToExclusive(), textBuffer, target.ToExclusive());
+        sourceImages.CopyArea(source.ToExclusive(), { left + actualDelta, top }, textBuffer.GetMutableImages());
     }
 
     // Columns revealed by the scroll are filled with standard erase attributes.
@@ -904,7 +903,6 @@ void AdaptDispatch::_SelectiveEraseRect(const Page& page, const til::rect& erase
         {
             auto& rowBuffer = page.Buffer().GetMutableRowByOffset(area.top);
             rowBuffer.ClearCell(area.left);
-            ImageSlice::EraseCells(rowBuffer, area.left, area.right);
             page.Buffer().TriggerRedraw(Viewport::FromDimensions(area.origin(), { 1, 1 }));
         }
     }
@@ -1225,6 +1223,7 @@ void AdaptDispatch::CopyRectangularArea(const VTInt top, const VTInt left, const
         // it needs to be clipped, so we only care about the destination size.
         const auto srcView = Viewport::FromDimensions(srcRect.origin(), dstRect.size());
         const auto dstView = Viewport::FromDimensions(dstRect.origin(), dstRect.size());
+        const auto sourceImages = src.Buffer().GetImages().Snapshot();
         const auto walkDirection = Viewport::DetermineWalkDirection(srcView, dstView);
         auto srcPos = srcView.GetWalkOrigin(walkDirection);
         auto dstPos = dstView.GetWalkOrigin(walkDirection);
@@ -1252,8 +1251,7 @@ void AdaptDispatch::CopyRectangularArea(const VTInt top, const VTInt left, const
                 }
             }
         } while (dstView.WalkInBounds(dstPos, walkDirection));
-        // Copy any image content in the affected area.
-        ImageSlice::CopyBlock(src.Buffer(), srcView.ToExclusive(), dst.Buffer(), dstView.ToExclusive());
+        sourceImages.CopyArea(srcView.ToExclusive(), dstRect.origin(), dst.Buffer().GetMutableImages());
     }
 }
 
