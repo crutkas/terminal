@@ -10019,6 +10019,31 @@ public:
         VERIFY_IS_TRUE(std::ranges::any_of(placement.Surface().Pixels(), [](const RGBQUAD pixel) { return pixel.rgbBlue == 255; }));
     }
 
+    TEST_METHOD(SixelDisplayModeClipsPartialBandAtPageBottom)
+    {
+        _testGetSet->PrepData();
+        auto& buffer = *_testGetSet->_textBuffer;
+        const auto pageBottom = _testGetSet->_viewport.bottom;
+        _stateMachine->ProcessString(L"\x1b[?80h");
+
+        std::wstring sequence{ L"\x1bPq#0;2;100;0;0~" };
+        for (auto band = 1; band < 97; ++band)
+        {
+            sequence.append(L"-~");
+        }
+        sequence.append(L"\x1b\\");
+        _stateMachine->ProcessString(sequence);
+
+        VERIFY_ARE_EQUAL(size_t{ 1 }, buffer.GetImages().Size());
+        const auto& placement = buffer.GetImages().All().front();
+        VERIFY_ARE_EQUAL(pageBottom, placement.CellBounds().bottom, L"DECSDM must clip a partial final band to the page");
+
+        ++_testGetSet->_viewport.top;
+        ++_testGetSet->_viewport.bottom;
+        VERIFY_IS_TRUE(buffer.GetImages().IntersectingRows(pageBottom, pageBottom + 1).empty(),
+                       L"clipped display-mode overflow must not appear after viewport panning");
+    }
+
     TEST_METHOD(SixelOversizeAbortRestoresCursorAndPreservesPlacement)
     {
         _testGetSet->PrepData();

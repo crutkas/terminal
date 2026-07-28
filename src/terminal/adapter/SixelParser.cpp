@@ -1020,7 +1020,8 @@ void SixelParser::_maybeFlushImageBuffer(const bool endOfSequence)
                 {},
                 geometry
             };
-            const auto bufferBounds = til::rect{ 0, 0, page.Width(), page.BufferHeight() };
+            const auto placementBottom = _displayMode ? page.Bottom() : page.BufferHeight();
+            const auto bufferBounds = til::rect{ 0, 0, page.Width(), placementBottom };
             if (auto fragment = placement.Crop(bufferBounds))
             {
                 const auto fragmentBounds = fragment->CellBounds();
