@@ -194,10 +194,8 @@ class Microsoft::Console::VirtualTerminal::StateMachineTest
 
     TEST_METHOD(ApcDataStringsReceivedByHandler);
     TEST_METHOD(ApcIdentifiersAreRoutedToTheEngine);
-    TEST_METHOD(ApcDeclinedByEngineIsIgnored);
-    TEST_METHOD(ApcHandlerCanEndTheStringEarly);
-    TEST_METHOD(ApcWithoutAnIdentifierIsIgnored);
-    TEST_METHOD(ApcEntryIgnoresControlCharacters);
+    TEST_METHOD(ApcHandlerRejectionBehavior);
+    TEST_METHOD(ApcEntryRoutingBehavior);
     TEST_METHOD(ApcDataStringSplitAcrossWrites);
     TEST_METHOD(ApcDataStringIsOpaqueToTheParser);
 
@@ -472,50 +470,55 @@ void StateMachineTest::ApcIdentifiersAreRoutedToTheEngine()
     VERIFY_ARE_EQUAL(L"", engine.printed);
 }
 
-void StateMachineTest::ApcDeclinedByEngineIsIgnored()
+void StateMachineTest::ApcHandlerRejectionBehavior()
 {
-    auto enginePtr{ std::make_unique<TestStateMachineEngine>() };
-    auto& engine{ *enginePtr.get() };
-    StateMachine machine{ std::move(enginePtr) };
+    // A handler can bail out of a string in two ways, and they report different
+    // things back to the app. Declining outright leaves the sequence unclaimed -
+    // an unknown sequence, just as before APC was dispatched at all. Claiming and
+    // then stopping early keeps ownership, so nothing is reported.
+    {
+        auto enginePtr{ std::make_unique<TestStateMachineEngine>() };
+        auto& engine{ *enginePtr.get() };
+        StateMachine machine{ std::move(enginePtr) };
 
-    // An engine that doesn't recognise the application returns no handler. The
-    // string then behaves exactly as it did before APC was dispatched at all:
-    // swallowed up to its terminator, with nothing printed.
-    engine.apcAccepted = false;
-    machine.ProcessString(L"\033_Zdata string\033\\printed text");
+        // An engine that doesn't recognise the application returns no handler. The
+        // string then behaves exactly as it did before APC was dispatched at all:
+        // swallowed up to its terminator, with nothing printed.
+        engine.apcAccepted = false;
+        machine.ProcessString(L"\033_Zdata string\033\\printed text");
 
-    VERIFY_ARE_EQUAL(VTID("Z"), engine.apcId);
-    VERIFY_ARE_EQUAL(size_t{ 1 }, engine.apcDispatchCount);
-    VERIFY_ARE_EQUAL(L"", engine.apcDataString);
-    VERIFY_ARE_EQUAL(L"printed text", engine.printed);
-    // Nobody claimed it, so it really was an unknown sequence - the same thing
-    // that was reported before APC strings were dispatched at all.
-    VERIFY_ARE_EQUAL(size_t{ 1 }, engine.unknownSequenceCount);
+        VERIFY_ARE_EQUAL(VTID("Z"), engine.apcId);
+        VERIFY_ARE_EQUAL(size_t{ 1 }, engine.apcDispatchCount);
+        VERIFY_ARE_EQUAL(L"", engine.apcDataString);
+        VERIFY_ARE_EQUAL(L"printed text", engine.printed);
+        // Nobody claimed it, so it really was an unknown sequence - the same thing
+        // that was reported before APC strings were dispatched at all.
+        VERIFY_ARE_EQUAL(size_t{ 1 }, engine.unknownSequenceCount);
 
-    // And the parser is genuinely back in a good state afterwards.
-    engine.apcAccepted = true;
-    machine.ProcessString(L"\033_Gagain\033\\");
-    VERIFY_ARE_EQUAL(VTID("G"), engine.apcId);
-    VERIFY_ARE_EQUAL(L"again\033", engine.apcDataString);
-}
+        // And the parser is genuinely back in a good state afterwards.
+        engine.apcAccepted = true;
+        machine.ProcessString(L"\033_Gagain\033\\");
+        VERIFY_ARE_EQUAL(VTID("G"), engine.apcId);
+        VERIFY_ARE_EQUAL(L"again\033", engine.apcDataString);
+    }
 
-void StateMachineTest::ApcHandlerCanEndTheStringEarly()
-{
-    auto enginePtr{ std::make_unique<TestStateMachineEngine>() };
-    auto& engine{ *enginePtr.get() };
-    StateMachine machine{ std::move(enginePtr) };
+    {
+        auto enginePtr{ std::make_unique<TestStateMachineEngine>() };
+        auto& engine{ *enginePtr.get() };
+        StateMachine machine{ std::move(enginePtr) };
 
-    // A handler that returns false has given up on the rest of the string. It
-    // must not be called again, and the remainder must not reach the screen.
-    engine.apcAcceptLimit = 4;
-    machine.ProcessString(L"\033_Gdata string\033\\printed text");
+        // A handler that returns false has given up on the rest of the string. It
+        // must not be called again, and the remainder must not reach the screen.
+        engine.apcAcceptLimit = 4;
+        machine.ProcessString(L"\033_Gdata string\033\\printed text");
 
-    VERIFY_ARE_EQUAL(L"data", engine.apcDataString);
-    VERIFY_ARE_EQUAL(L"printed text", engine.printed);
-    // The string was recognised and claimed, so it is not an unknown sequence.
-    // Reporting one would tell conhost its cursor position may be wrong and
-    // force a needless ConPTY resync.
-    VERIFY_ARE_EQUAL(size_t{ 0 }, engine.unknownSequenceCount);
+        VERIFY_ARE_EQUAL(L"data", engine.apcDataString);
+        VERIFY_ARE_EQUAL(L"printed text", engine.printed);
+        // The string was recognised and claimed, so it is not an unknown sequence.
+        // Reporting one would tell conhost its cursor position may be wrong and
+        // force a needless ConPTY resync.
+        VERIFY_ARE_EQUAL(size_t{ 0 }, engine.unknownSequenceCount);
+    }
 }
 
 void StateMachineTest::ApcDataStringSplitAcrossWrites()
@@ -557,35 +560,40 @@ void StateMachineTest::ApcDataStringIsOpaqueToTheParser()
     VERIFY_ARE_EQUAL(size_t{ 1 }, engine.apcDispatchCount);
 }
 
-void StateMachineTest::ApcWithoutAnIdentifierIsIgnored()
+void StateMachineTest::ApcEntryRoutingBehavior()
 {
-    auto enginePtr{ std::make_unique<TestStateMachineEngine>() };
-    auto& engine{ *enginePtr.get() };
-    StateMachine machine{ std::move(enginePtr) };
+    // ApcEntry only routes once it has an identifier byte to route on. With none
+    // at all the string is dropped; a control character can't name an application
+    // either, so it's skipped while we wait for one that can - the same thing
+    // DcsEntry does with them.
+    {
+        auto enginePtr{ std::make_unique<TestStateMachineEngine>() };
+        auto& engine{ *enginePtr.get() };
+        StateMachine machine{ std::move(enginePtr) };
 
-    // There is nothing to route on, so no engine is asked, and the string is
-    // dropped when its terminator arrives.
-    machine.ProcessString(L"\033_\033\\printed text");
+        // There is nothing to route on, so no engine is asked, and the string is
+        // dropped when its terminator arrives.
+        machine.ProcessString(L"\033_\033\\printed text");
 
-    VERIFY_ARE_EQUAL(size_t{ 0 }, engine.apcDispatchCount);
-    VERIFY_ARE_EQUAL(L"printed text", engine.printed);
-}
+        VERIFY_ARE_EQUAL(size_t{ 0 }, engine.apcDispatchCount);
+        VERIFY_ARE_EQUAL(L"printed text", engine.printed);
+    }
 
-void StateMachineTest::ApcEntryIgnoresControlCharacters()
-{
-    auto enginePtr{ std::make_unique<TestStateMachineEngine>() };
-    auto& engine{ *enginePtr.get() };
-    StateMachine machine{ std::move(enginePtr) };
+    {
+        auto enginePtr{ std::make_unique<TestStateMachineEngine>() };
+        auto& engine{ *enginePtr.get() };
+        StateMachine machine{ std::move(enginePtr) };
 
-    // A control character can't name an application, so it's skipped while we
-    // wait for one that can - the same thing DcsEntry does with them.
-    machine.ProcessString(L"\033_\a\177Gdata string\033\\");
+        // The control characters are skipped while we wait for an identifier that
+        // can name an application, then routing proceeds as normal.
+        machine.ProcessString(L"\033_\a\177Gdata string\033\\");
 
-    VERIFY_ARE_EQUAL(VTID("G"), engine.apcId);
-    VERIFY_ARE_EQUAL(size_t{ 1 }, engine.apcDispatchCount);
-    VERIFY_ARE_EQUAL(L"data string\033", engine.apcDataString);
-    VERIFY_ARE_EQUAL(L"", engine.printed);
-    VERIFY_ARE_EQUAL(L"", engine.executed);
+        VERIFY_ARE_EQUAL(VTID("G"), engine.apcId);
+        VERIFY_ARE_EQUAL(size_t{ 1 }, engine.apcDispatchCount);
+        VERIFY_ARE_EQUAL(L"data string\033", engine.apcDataString);
+        VERIFY_ARE_EQUAL(L"", engine.printed);
+        VERIFY_ARE_EQUAL(L"", engine.executed);
+    }
 }
 
 void StateMachineTest::VtParameterSubspanTest()
