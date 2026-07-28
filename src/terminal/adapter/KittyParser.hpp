@@ -15,6 +15,7 @@ Abstract:
 
 #include "DispatchTypes.hpp"
 #include "ITermDispatch.hpp"
+#include "../../buffer/out/Image.hpp"
 #include "../../buffer/out/ImageSlice.hpp"
 
 #include <deque>
@@ -122,7 +123,7 @@ namespace Microsoft::Console::VirtualTerminal
         };
         struct AnimationFrame
         {
-            std::vector<RGBQUAD> pixels;
+            ::Image::PixelStorage pixels;
             int32_t gapMilliseconds = 0;
         };
         // A stored Kitty image. Frame 1 is the root pixel vector; additional
@@ -132,7 +133,7 @@ namespace Microsoft::Console::VirtualTerminal
             uint32_t number = 0;
             uint32_t width = 0;
             uint32_t height = 0;
-            std::vector<RGBQUAD> pixels;
+            ::Image::PixelStorage pixels;
             int32_t rootGapMilliseconds = 0;
             std::vector<AnimationFrame> animationFrames;
             uint32_t currentFrame = 1;
@@ -143,13 +144,14 @@ namespace Microsoft::Console::VirtualTerminal
             bool waitingForFrames = false;
             bool hasRenderedPlacements = false;
             std::chrono::steady_clock::time_point nextFrameTime{};
+            mutable ::Image::Pointer surface;
 
             size_t PixelBytes() const noexcept
             {
-                auto bytes = pixels.size() * sizeof(RGBQUAD);
+                auto bytes = pixels ? pixels->size() * sizeof(RGBQUAD) : 0;
                 for (const auto& frame : animationFrames)
                 {
-                    bytes += frame.pixels.size() * sizeof(RGBQUAD);
+                    bytes += frame.pixels ? frame.pixels->size() * sizeof(RGBQUAD) : 0;
                 }
                 return bytes;
             }
@@ -248,8 +250,9 @@ namespace Microsoft::Console::VirtualTerminal
         static size_t _frameCount(const Image& image) noexcept;
         static std::vector<RGBQUAD>* _framePixels(Image& image, uint32_t frameNumber) noexcept;
         static const std::vector<RGBQUAD>* _framePixels(const Image& image, uint32_t frameNumber) noexcept;
+        static const ::Image::PixelStorage* _frameStorage(const Image& image, uint32_t frameNumber) noexcept;
         static int32_t* _frameGap(Image& image, uint32_t frameNumber) noexcept;
-        void _updateImageLayers(uint32_t imageId, std::span<const RGBQUAD> pixels);
+        void _updateImageLayers(uint32_t imageId, const ::Image::PixelStorage& pixels);
         void _scheduleAnimation(uint32_t imageId, Image& image, std::chrono::steady_clock::time_point now);
         void _scheduleAnimationTimer();
         bool _advanceImage(uint32_t imageId, Image& image, std::chrono::steady_clock::time_point now);
@@ -265,6 +268,7 @@ namespace Microsoft::Console::VirtualTerminal
         BufferState _takeBufferState() noexcept;
         void _restoreBufferState(BufferState&& state) noexcept;
         size_t _retainedPixelBytes() const noexcept;
+        void _releaseImageSurface(Image& image) noexcept;
         void _storeVirtualPlacement(const uint32_t id, uint32_t placementId, const Image& image, const uint32_t cols, const uint32_t rows, const uint32_t srcX, const uint32_t srcY, const uint32_t srcW, const uint32_t srcH, const int32_t zIndex, uint64_t layerId);
         static TargetSize _targetPixels(const int64_t cropW, const int64_t cropH, const uint32_t cols, const uint32_t rows, const int64_t cellWidth, const int64_t cellHeight) noexcept;
         bool _placementFitsMemory(const Image& image, uint32_t imageId, uint64_t layerId, uint32_t cols, uint32_t rows, uint32_t srcX, uint32_t srcY, uint32_t srcW, uint32_t srcH, int32_t zIndex, std::optional<til::point> anchor = std::nullopt) const noexcept;

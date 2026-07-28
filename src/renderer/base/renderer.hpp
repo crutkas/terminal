@@ -138,6 +138,7 @@ namespace Microsoft::Console::Render
         void _PaintBufferOutput(_In_ IRenderEngine* const pEngine);
         ROW* _PaintBufferOutputComposition(TextBuffer& buffer, const ROW& r, const Composition& activeComposition);
         void _PaintBufferOutputHelper(_In_ IRenderEngine* const pEngine, TextBufferCellIterator it, const til::point target);
+        void _syncImageSurfaces(const ROW& row, std::span<const ImageSlice::ImageUpdate> updates);
         void _buildImageRowBackgrounds(const ROW& r, const ImageSlice& imageSlice);
         void _PaintBufferOutputGridLineHelper(_In_ IRenderEngine* const pEngine, const TextAttribute textAttribute, const size_t cchLine, const til::point coordTarget);
         bool _isHoveredHyperlink(const TextAttribute& textAttribute) const noexcept;

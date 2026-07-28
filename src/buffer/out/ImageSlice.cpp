@@ -984,19 +984,32 @@ uint32_t* ImageSlice::MutableSourceIndices(const til::CoordType columnBegin, con
     }
 
     auto& layer = _getLayer(key, zIndex);
+    layer.sourceRevision = 0;
     const auto pixelOffset = (columnBegin - _columnBegin) * _cellSize.width;
     return &til::at(layer.sourceIndices, pixelOffset);
 }
 
-// Re-samples every layer of an image from new pixel data, in place. Only cells
-// that recorded a source index are touched, so cells that were erased or
-// overwritten since the placement stay gone.
-bool ImageSlice::UpdateImage(const uint32_t imageId, const std::span<const RGBQUAD> pixels)
+// Re-samples every matching layer from new pixel data, in place. Only cells that
+// recorded a source index are touched, so cells that were erased or overwritten
+// since the placement stay gone.
+bool ImageSlice::UpdateImages(const std::span<const ImageUpdate> updates)
 {
+    WI_ASSERT(std::is_sorted(updates.begin(), updates.end(), [](const auto& lhs, const auto& rhs) {
+        return lhs.imageId < rhs.imageId;
+    }));
+
     auto changed = false;
     for (auto& layer : _layers)
     {
-        if (layer.key.imageId != imageId || layer.sourceIndices.size() != layer.pixels.size())
+        const auto update = std::lower_bound(updates.begin(), updates.end(), layer.key.imageId, [](const auto& candidate, const auto imageId) {
+            return candidate.imageId < imageId;
+        });
+        if (update == updates.end() || update->imageId != layer.key.imageId ||
+            layer.sourceIndices.size() != layer.pixels.size())
+        {
+            continue;
+        }
+        if (update->sourceRevision != 0 && layer.sourceRevision == update->sourceRevision)
         {
             continue;
         }
@@ -1005,10 +1018,16 @@ bool ImageSlice::UpdateImage(const uint32_t imageId, const std::span<const RGBQU
             const auto sourceIndex = til::at(layer.sourceIndices, i);
             if (sourceIndex != NoSourceIndex)
             {
-                til::at(layer.pixels, i) = sourceIndex < pixels.size() ? pixels[sourceIndex] : RGBQUAD{};
-                changed = true;
+                const auto pixel = sourceIndex < update->pixels.size() ? update->pixels[sourceIndex] : RGBQUAD{};
+                auto& destination = til::at(layer.pixels, i);
+                if (std::memcmp(&destination, &pixel, sizeof(pixel)) != 0)
+                {
+                    destination = pixel;
+                    changed = true;
+                }
             }
         }
+        layer.sourceRevision = update->sourceRevision;
     }
     if (changed)
     {
@@ -1016,6 +1035,12 @@ bool ImageSlice::UpdateImage(const uint32_t imageId, const std::span<const RGBQU
         _invalidateComposites();
     }
     return changed;
+}
+
+bool ImageSlice::UpdateImage(const uint32_t imageId, const std::span<const RGBQUAD> pixels, const uint64_t sourceRevision)
+{
+    const ImageUpdate update{ imageId, pixels, sourceRevision };
+    return UpdateImages(std::span<const ImageUpdate>{ &update, 1 });
 }
 
 size_t ImageSlice::WriteMemoryUpperBound(const til::CoordType columnBegin, const til::CoordType columnEnd, const LayerKey key, const int32_t zIndex) const noexcept

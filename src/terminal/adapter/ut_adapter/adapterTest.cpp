@@ -4844,6 +4844,32 @@ public:
         _testGetSet->ValidateInputEvent(L"\x1b_Gi=5;OK\x1b\\");
     }
 
+    TEST_METHOD(KittyGraphicsDirectPlacementRegistersRectangularImage)
+    {
+        _testGetSet->PrepData();
+        const auto origin = _testGetSet->_textBuffer->GetCursor().GetPosition();
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=5,f=24,s=1,v=1,C=1;/wAA\x1b\\");
+
+        const auto& images = _testGetSet->_textBuffer->GetImages();
+        VERIFY_ARE_EQUAL(size_t{ 1 }, images.Size());
+        const auto& placement = images.All()[0];
+        VERIFY_ARE_EQUAL(5u, placement.Identity().imageId);
+        VERIFY_ARE_NOT_EQUAL(0ull, placement.Identity().layerId);
+        const til::rect expectedBounds{ origin.x, origin.y, origin.x + 1, origin.y + 1 };
+        const til::rect expectedSource{ 0, 0, 1, 1 };
+        VERIFY_ARE_EQUAL(expectedBounds, placement.CellBounds());
+        VERIFY_ARE_EQUAL(expectedSource, placement.SourceInPixels());
+        VERIFY_ARE_EQUAL(1ull, placement.Geometry().targetWidth);
+        VERIFY_ARE_EQUAL(1ull, placement.Geometry().targetHeight);
+        VERIFY_ARE_EQUAL(size_t{ 1 }, placement.Surface().Pixels().size());
+        const auto pixel = placement.Surface().Pixels()[0];
+        VERIFY_ARE_EQUAL(static_cast<BYTE>(255), pixel.rgbRed);
+        VERIFY_ARE_EQUAL(static_cast<BYTE>(0), pixel.rgbGreen);
+        VERIFY_ARE_EQUAL(static_cast<BYTE>(0), pixel.rgbBlue);
+        VERIFY_IS_TRUE(placement.Surface().Storage() == _kitty()._images.at(5).pixels);
+        VERIFY_ARE_EQUAL(sizeof(RGBQUAD), _kitty()._totalPixelBytes, L"the renderer surface shares the budgeted decoded frame");
+    }
+
     // Deleting by id (d=I) removes only the targeted image and frees its data; others survive.
     TEST_METHOD(KittyGraphicsDeleteByIdPreservesOthers)
     {
@@ -4865,11 +4891,17 @@ public:
         _testGetSet->PrepData();
         _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,f=24,s=1,v=1,C=1;/wAA\x1b\\"); // display red
         VERIFY_IS_TRUE(BufferContainsColor(*_testGetSet->_textBuffer, 255, 0, 0));
+        VERIFY_ARE_EQUAL(size_t{ 1 }, _testGetSet->_textBuffer->GetImages().Size());
+        VERIFY_ARE_EQUAL(sizeof(RGBQUAD), _kitty()._totalPixelBytes);
         _stateMachine->ProcessString(L"\x1b_Ga=d,d=i,i=1;\x1b\\"); // lowercase: keep the image data
         VERIFY_IS_FALSE(BufferContainsColor(*_testGetSet->_textBuffer, 255, 0, 0), L"lowercase delete still erases on-screen pixels");
+        VERIFY_IS_TRUE(_testGetSet->_textBuffer->GetImages().Empty());
+        VERIFY_ARE_EQUAL(sizeof(RGBQUAD), _kitty()._totalPixelBytes);
         _testGetSet->_response.clear();
         _stateMachine->ProcessString(L"\x1b_Ga=p,i=1;\x1b\\"); // image data survived -> OK, not ENOENT
         _testGetSet->ValidateInputEvent(L"\x1b_Gi=1;OK\x1b\\");
+        VERIFY_ARE_EQUAL(size_t{ 1 }, _testGetSet->_textBuffer->GetImages().Size());
+        VERIFY_ARE_EQUAL(sizeof(RGBQUAD), _kitty()._totalPixelBytes);
     }
 
     // Lowercase d=n (by number) keeps the image data too; it stays findable by its number.
@@ -5568,14 +5600,14 @@ public:
         VERIFY_IS_TRUE(it != _kitty()._images.end(), L"the o=z transmit must store an image under id 13.");
         VERIFY_ARE_EQUAL(2u, it->second.width);
         VERIFY_ARE_EQUAL(2u, it->second.height);
-        VERIFY_ARE_EQUAL(static_cast<size_t>(4), it->second.pixels.size());
+        VERIFY_ARE_EQUAL(static_cast<size_t>(4), it->second.pixels->size());
         const BYTE expected[4][3]{ { 1, 2, 3 }, { 4, 5, 6 }, { 7, 8, 9 }, { 10, 11, 12 } };
         for (size_t i = 0; i < 4; ++i)
         {
-            VERIFY_ARE_EQUAL(static_cast<int>(expected[i][0]), static_cast<int>(it->second.pixels[i].rgbRed));
-            VERIFY_ARE_EQUAL(static_cast<int>(expected[i][1]), static_cast<int>(it->second.pixels[i].rgbGreen));
-            VERIFY_ARE_EQUAL(static_cast<int>(expected[i][2]), static_cast<int>(it->second.pixels[i].rgbBlue));
-            VERIFY_ARE_EQUAL(255, static_cast<int>(it->second.pixels[i].rgbReserved));
+            VERIFY_ARE_EQUAL(static_cast<int>(expected[i][0]), static_cast<int>((*it->second.pixels)[i].rgbRed));
+            VERIFY_ARE_EQUAL(static_cast<int>(expected[i][1]), static_cast<int>((*it->second.pixels)[i].rgbGreen));
+            VERIFY_ARE_EQUAL(static_cast<int>(expected[i][2]), static_cast<int>((*it->second.pixels)[i].rgbBlue));
+            VERIFY_ARE_EQUAL(255, static_cast<int>((*it->second.pixels)[i].rgbReserved));
         }
     }
 
@@ -5759,9 +5791,9 @@ public:
 
             const auto it = _kitty()._images.find(18);
             VERIFY_IS_TRUE(it != _kitty()._images.end());
-            VERIFY_ARE_EQUAL(static_cast<size_t>(4), it->second.pixels.size());
-            VERIFY_ARE_EQUAL(1, static_cast<int>(it->second.pixels[0].rgbRed));
-            VERIFY_ARE_EQUAL(12, static_cast<int>(it->second.pixels[3].rgbBlue));
+            VERIFY_ARE_EQUAL(static_cast<size_t>(4), it->second.pixels->size());
+            VERIFY_ARE_EQUAL(1, static_cast<int>((*it->second.pixels)[0].rgbRed));
+            VERIFY_ARE_EQUAL(12, static_cast<int>((*it->second.pixels)[3].rgbBlue));
         }
 
         // With S omitted, Windows exposes the mapping's page-rounded zero tail. Locate the
@@ -5778,9 +5810,9 @@ public:
 
             const auto it = _kitty()._images.find(19);
             VERIFY_IS_TRUE(it != _kitty()._images.end());
-            VERIFY_ARE_EQUAL(static_cast<size_t>(4), it->second.pixels.size());
-            VERIFY_ARE_EQUAL(1, static_cast<int>(it->second.pixels[0].rgbRed));
-            VERIFY_ARE_EQUAL(12, static_cast<int>(it->second.pixels[3].rgbBlue));
+            VERIFY_ARE_EQUAL(static_cast<size_t>(4), it->second.pixels->size());
+            VERIFY_ARE_EQUAL(1, static_cast<int>((*it->second.pixels)[0].rgbRed));
+            VERIFY_ARE_EQUAL(12, static_cast<int>((*it->second.pixels)[3].rgbBlue));
         }
     }
 
@@ -5824,8 +5856,8 @@ public:
         VERIFY_IS_TRUE(it != _kitty()._images.end(), L"the o=z f=32 transmit must store an image under id 22.");
         VERIFY_ARE_EQUAL(4u, it->second.width);
         VERIFY_ARE_EQUAL(4u, it->second.height);
-        VERIFY_ARE_EQUAL(static_cast<size_t>(16), it->second.pixels.size());
-        for (const auto& p : it->second.pixels)
+        VERIFY_ARE_EQUAL(static_cast<size_t>(16), it->second.pixels->size());
+        for (const auto& p : *it->second.pixels)
         {
             VERIFY_ARE_EQUAL(114, static_cast<int>(p.rgbRed));
             VERIFY_ARE_EQUAL(114, static_cast<int>(p.rgbGreen));
@@ -9636,7 +9668,7 @@ public:
         const auto& image = _kitty()._images.at(1);
         VERIFY_ARE_EQUAL(static_cast<size_t>(2), _kitty()._frameCount(image));
         VERIFY_ARE_EQUAL(40, image.animationFrames.front().gapMilliseconds, L"new frames default to a 40 ms gap");
-        const auto& frame = image.animationFrames.front().pixels;
+        const auto& frame = *image.animationFrames.front().pixels;
         VERIFY_ARE_EQUAL(static_cast<BYTE>(255), frame[0].rgbGreen);
         VERIFY_ARE_EQUAL(static_cast<BYTE>(255), frame[1].rgbBlue);
     }
@@ -9647,7 +9679,7 @@ public:
         _stateMachine->ProcessString(L"\x1b_Ga=t,i=1,f=24,s=2,v=1;/wAAAP8A\x1b\\"); // red, green
         _stateMachine->ProcessString(L"\x1b_Ga=f,i=1,f=24,s=1,v=1,x=1,y=0,c=1,X=1;AAD/\x1b\\"); // replace pixel 1 with blue
 
-        const auto& frame = _kitty()._images.at(1).animationFrames.front().pixels;
+        const auto& frame = *_kitty()._images.at(1).animationFrames.front().pixels;
         VERIFY_ARE_EQUAL(static_cast<BYTE>(255), frame[0].rgbRed, L"unspecified pixels come from c= background frame");
         VERIFY_ARE_EQUAL(static_cast<BYTE>(255), frame[1].rgbBlue);
         VERIFY_ARE_EQUAL(static_cast<BYTE>(0), frame[1].rgbGreen);
@@ -9660,7 +9692,7 @@ public:
         // Y=0x0000ffff is opaque blue. Source is 50%-alpha red and X=0 selects source-over.
         _stateMachine->ProcessString(L"\x1b_Ga=f,i=1,f=32,s=1,v=1,Y=65535;/wAAgA==\x1b\\");
 
-        const auto& frame = _kitty()._images.at(1).animationFrames.front().pixels;
+        const auto& frame = *_kitty()._images.at(1).animationFrames.front().pixels;
         VERIFY_ARE_EQUAL(static_cast<BYTE>(128), frame[0].rgbRed);
         VERIFY_ARE_EQUAL(static_cast<BYTE>(127), frame[0].rgbBlue);
         VERIFY_ARE_EQUAL(static_cast<BYTE>(255), frame[0].rgbReserved);
@@ -9723,14 +9755,14 @@ public:
         VERIFY_IS_TRUE(_kitty()._images.empty(), L"the alternate buffer starts with isolated graphics state");
         _stateMachine->ProcessString(L"\x1b_Ga=t,i=1,f=24,s=1,v=1;AAD/\x1b\\");
         VERIFY_ARE_EQUAL(static_cast<size_t>(0), _kitty()._images.at(1).animationFrames.size());
-        VERIFY_ARE_EQUAL(static_cast<BYTE>(255), _kitty()._images.at(1).pixels.front().rgbBlue);
+        VERIFY_ARE_EQUAL(static_cast<BYTE>(255), _kitty()._images.at(1).pixels->front().rgbBlue);
 
         _pDispatch->_SetAlternateScreenBufferMode(false);
         const auto& restored = _kitty()._images.at(1);
         VERIFY_ARE_EQUAL(static_cast<size_t>(1), restored.animationFrames.size());
         VERIFY_ARE_EQUAL(2u, restored.currentFrame);
         VERIFY_ARE_EQUAL(2u, restored.presentedFrame);
-        VERIFY_ARE_EQUAL(static_cast<BYTE>(255), restored.animationFrames.front().pixels.front().rgbGreen);
+        VERIFY_ARE_EQUAL(static_cast<BYTE>(255), restored.animationFrames.front().pixels->front().rgbGreen);
     }
 
     TEST_METHOD(KittyGraphicsImageAdmissionIsTransactionalAcrossBuffers)
@@ -9740,11 +9772,11 @@ public:
         _kitty()._mainBufferState->totalPixelBytes = KittyParser::MaxTotalBytes - sizeof(RGBQUAD);
 
         KittyParser::Image existing;
-        existing.pixels.resize(1);
+        existing.pixels = std::make_shared<std::vector<RGBQUAD>>(1);
         VERIFY_IS_TRUE(_kitty()._registerImage(1, std::move(existing)));
 
         KittyParser::Image rejected;
-        rejected.pixels.resize(2);
+        rejected.pixels = std::make_shared<std::vector<RGBQUAD>>(2);
         VERIFY_IS_FALSE(_kitty()._registerImage(2, std::move(rejected)));
         VERIFY_ARE_EQUAL(static_cast<size_t>(1), _kitty()._images.size());
         VERIFY_IS_TRUE(_kitty()._images.contains(1), L"a rejected image must not evict an existing alternate-buffer image");
@@ -9788,6 +9820,8 @@ public:
         buffer.GetMutableRowByOffset(origin.y).SetImageSlice(nullptr);
         VERIFY_IS_TRUE(_kitty()._advanceImage(1, image, std::chrono::steady_clock::now()));
         VERIFY_IS_FALSE(image.hasRenderedPlacements, L"the first empty scan must disable future full-page animation scans");
+        VERIFY_IS_TRUE(buffer.GetImages().Empty(), L"orphaned rectangular placements are pruned with their compatibility layers");
+        VERIFY_IS_NULL(image.surface.get());
     }
 
     TEST_METHOD(KittyAnimationRefreshKeepsLastPresentedGaplessFrame)
@@ -9861,7 +9895,7 @@ public:
         _stateMachine->ProcessString(L"\x1b_Ga=f,m=0;AAD/\x1b\\");
         _testGetSet->ValidateInputEvent(L"\x1b_Gi=1;OK\x1b\\");
 
-        const auto& frame = _kitty()._images.at(1).animationFrames.front().pixels;
+        const auto& frame = *_kitty()._images.at(1).animationFrames.front().pixels;
         VERIFY_ARE_EQUAL(static_cast<BYTE>(255), frame[0].rgbGreen);
         VERIFY_ARE_EQUAL(static_cast<BYTE>(255), frame[1].rgbBlue);
     }
@@ -9883,7 +9917,7 @@ public:
         _stateMachine->ProcessString(L"\x1b_Ga=f,i=1,f=100;iVBORw0K\x1b\\");
         _testGetSet->ValidateInputEvent(L"\x1b_Gi=1;OK\x1b\\");
 
-        const auto& frame = _kitty()._images.at(1).animationFrames.front().pixels;
+        const auto& frame = *_kitty()._images.at(1).animationFrames.front().pixels;
         VERIFY_ARE_EQUAL(static_cast<size_t>(4), frame.size());
         VERIFY_IS_TRUE(std::all_of(frame.begin(), frame.end(), [](const auto& pixel) {
             return pixel.rgbBlue == 255 && pixel.rgbReserved == 255;
@@ -9898,7 +9932,7 @@ public:
         // r=source, c=destination; X/Y are source coordinates and x/y are destination coordinates.
         _stateMachine->ProcessString(L"\x1b_Ga=c,i=1,r=1,c=2,X=2,Y=0,x=0,y=0,w=1,h=1,C=1;\x1b\\");
 
-        const auto& frame = _kitty()._images.at(1).animationFrames.front().pixels;
+        const auto& frame = *_kitty()._images.at(1).animationFrames.front().pixels;
         VERIFY_ARE_EQUAL(static_cast<BYTE>(255), frame[0].rgbBlue, L"root pixel 2 must replace destination pixel 0");
         VERIFY_ARE_EQUAL(static_cast<BYTE>(255), frame[1].rgbGreen, L"pixels outside the destination rectangle survive");
     }
@@ -10167,7 +10201,7 @@ public:
 
         const auto& image = _kitty()._images.at(1);
         VERIFY_ARE_EQUAL(static_cast<size_t>(2), _kitty()._frameCount(image));
-        VERIFY_ARE_EQUAL(static_cast<BYTE>(255), image.animationFrames.front().pixels.front().rgbBlue, L"old frame 3 is renumbered to frame 2");
+        VERIFY_ARE_EQUAL(static_cast<BYTE>(255), image.animationFrames.front().pixels->front().rgbBlue, L"old frame 3 is renumbered to frame 2");
         VERIFY_ARE_EQUAL(bytesBefore - sizeof(RGBQUAD), _kitty()._totalPixelBytes);
     }
 
@@ -10180,9 +10214,9 @@ public:
         _stateMachine->ProcessString(L"\x1b_Ga=d,d=f,i=1;\x1b\\"); // omitted r defaults to frame 1
 
         const auto& image = _kitty()._images.at(1);
-        VERIFY_ARE_EQUAL(static_cast<BYTE>(255), image.pixels.front().rgbGreen);
+        VERIFY_ARE_EQUAL(static_cast<BYTE>(255), image.pixels->front().rgbGreen);
         VERIFY_ARE_EQUAL(63, image.rootGapMilliseconds, L"the promoted frame keeps its gap");
-        VERIFY_ARE_EQUAL(static_cast<BYTE>(255), image.animationFrames.front().pixels.front().rgbBlue);
+        VERIFY_ARE_EQUAL(static_cast<BYTE>(255), image.animationFrames.front().pixels->front().rgbBlue);
     }
 
     TEST_METHOD(KittyAnimationUppercaseDeleteFreesStaticResult)

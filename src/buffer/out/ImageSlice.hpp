@@ -98,7 +98,16 @@ public:
     // can be re-sampled in place when the source image's content changes. The
     // span is laid out exactly like the pixels returned by MutablePixels.
     uint32_t* MutableSourceIndices(const til::CoordType columnBegin, const til::CoordType columnEnd, const LayerKey key, const int32_t zIndex);
-    bool UpdateImage(const uint32_t imageId, const std::span<const RGBQUAD> pixels);
+    struct ImageUpdate
+    {
+        uint32_t imageId = 0;
+        std::span<const RGBQUAD> pixels;
+        uint64_t sourceRevision = 0;
+    };
+    // Updates must be sorted by image id and contain at most one entry per id.
+    // This lets a renderer synchronize every layer in one pass over the slice.
+    bool UpdateImages(std::span<const ImageUpdate> updates);
+    bool UpdateImage(const uint32_t imageId, const std::span<const RGBQUAD> pixels, uint64_t sourceRevision = 0);
     // An upper bound on the bytes a MutablePixels write of this range would add,
     // so a caller can refuse a placement before allocating any of it.
     size_t WriteMemoryUpperBound(const til::CoordType columnBegin, const til::CoordType columnEnd, const LayerKey key, const int32_t zIndex) const noexcept;
@@ -142,6 +151,7 @@ private:
         // Which source-image pixel each entry of `pixels` sampled, so the layer
         // survives its image being redrawn. NoSourceIndex means "not sampled".
         std::vector<uint32_t> sourceIndices;
+        uint64_t sourceRevision = 0;
         // One flag per column in [_columnBegin, _columnEnd) marking the cells
         // this layer actually covers, so an erase can target only those cells
         // without disturbing another layer that overlaps the same range.

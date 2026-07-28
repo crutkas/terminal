@@ -926,7 +926,7 @@ void KittyParser::_ProcessCommand(const Control& command, const std::string_view
                 {
                     image.width = width;
                     image.height = height;
-                    image.pixels = _decodePixels(format, bytes);
+                    image.pixels = std::make_shared<std::vector<RGBQUAD>>(_decodePixels(format, bytes));
                 }
                 else if (format == 100)
                 {
@@ -941,7 +941,7 @@ void KittyParser::_ProcessCommand(const Control& command, const std::string_view
                     {
                         image.width = static_cast<uint32_t>(decodedSize.width);
                         image.height = static_cast<uint32_t>(decodedSize.height);
-                        image.pixels = std::move(decoded);
+                        image.pixels = std::make_shared<std::vector<RGBQUAD>>(std::move(decoded));
                     }
                     else
                     {
@@ -1504,6 +1504,7 @@ try
     _scheduleAnimationTimer();
     auto page = _dispatcher._pages.ActivePage();
     auto& buffer = page.Buffer();
+    buffer.GetMutableImages().Clear();
     auto erased = false;
     for (auto row = 0; row < page.Bottom(); ++row)
     {
@@ -1589,6 +1590,11 @@ size_t KittyParser::_retainedPixelBytes() const noexcept
     return _totalPixelBytes > SIZE_MAX - retained ? SIZE_MAX : _totalPixelBytes + retained;
 }
 
+void KittyParser::_releaseImageSurface(Image& image) noexcept
+{
+    image.surface.reset();
+}
+
 // Discards any in-progress chunked transmission, releasing its payload buffer.
 void KittyParser::_clearChunk() noexcept
 {
@@ -1670,27 +1676,39 @@ void KittyParser::_compositePixels(const std::span<RGBQUAD> destination, const s
 
 size_t KittyParser::_frameCount(const Image& image) noexcept
 {
-    return image.pixels.empty() ? 0 : image.animationFrames.size() + 1;
+    return !image.pixels || image.pixels->empty() ? 0 : image.animationFrames.size() + 1;
 }
 
 std::vector<RGBQUAD>* KittyParser::_framePixels(Image& image, const uint32_t frameNumber) noexcept
 {
     if (frameNumber == 1)
     {
-        return &image.pixels;
+        return image.pixels.get();
     }
     const auto index = static_cast<size_t>(frameNumber) - 2;
-    return index < image.animationFrames.size() ? &image.animationFrames[index].pixels : nullptr;
+    return index < image.animationFrames.size() ? image.animationFrames[index].pixels.get() : nullptr;
 }
 
 const std::vector<RGBQUAD>* KittyParser::_framePixels(const Image& image, const uint32_t frameNumber) noexcept
 {
     if (frameNumber == 1)
     {
-        return &image.pixels;
+        return image.pixels.get();
     }
     const auto index = static_cast<size_t>(frameNumber) - 2;
-    return index < image.animationFrames.size() ? &image.animationFrames[index].pixels : nullptr;
+    return index < image.animationFrames.size() ? image.animationFrames[index].pixels.get() : nullptr;
+}
+
+const ::Image::PixelStorage* KittyParser::_frameStorage(const Image& image, const uint32_t frameNumber) noexcept
+{
+    if (frameNumber == 1)
+    {
+        return image.pixels ? &image.pixels : nullptr;
+    }
+    const auto index = static_cast<size_t>(frameNumber) - 2;
+    return index < image.animationFrames.size() && image.animationFrames[index].pixels ?
+               &image.animationFrames[index].pixels :
+               nullptr;
 }
 
 int32_t* KittyParser::_frameGap(Image& image, const uint32_t frameNumber) noexcept
@@ -1703,10 +1721,19 @@ int32_t* KittyParser::_frameGap(Image& image, const uint32_t frameNumber) noexce
     return index < image.animationFrames.size() ? &image.animationFrames[index].gapMilliseconds : nullptr;
 }
 
-void KittyParser::_updateImageLayers(const uint32_t imageId, const std::span<const RGBQUAD> pixels)
+void KittyParser::_updateImageLayers(const uint32_t imageId, const ::Image::PixelStorage& storage)
 {
     const auto image = _images.find(imageId);
-    if (image == _images.end() || !image->second.hasRenderedPlacements)
+    if (image == _images.end() || !storage)
+    {
+        return;
+    }
+    const std::span<const RGBQUAD> pixels{ *storage };
+    if (image->second.surface)
+    {
+        image->second.surface->UpdatePixels(storage);
+    }
+    if (!image->second.hasRenderedPlacements)
     {
         return;
     }
@@ -1724,7 +1751,8 @@ void KittyParser::_updateImageLayers(const uint32_t imageId, const std::span<con
             {
                 foundLayer = true;
                 auto* mutableSlice = buffer.GetMutableRowByOffset(row).GetMutableImageSlice();
-                if (mutableSlice->UpdateImage(imageId, pixels))
+                const auto surfaceRevision = image->second.surface ? image->second.surface->Revision() : 0;
+                if (mutableSlice->UpdateImage(imageId, pixels, surfaceRevision))
                 {
                     firstRow = std::min(firstRow, row);
                     lastRow = std::max(lastRow, row);
@@ -1739,6 +1767,10 @@ void KittyParser::_updateImageLayers(const uint32_t imageId, const std::span<con
     if (!foundLayer)
     {
         image->second.hasRenderedPlacements = false;
+        _dispatcher._pages.ForEachPage([&](const Page page) {
+            page.Buffer().GetMutableImages().EraseImage(imageId);
+        });
+        _releaseImageSurface(image->second);
     }
 }
 
@@ -1750,7 +1782,7 @@ void KittyParser::RefreshImageLayers()
         {
             continue;
         }
-        if (const auto pixels = _framePixels(image, image.presentedFrame))
+        if (const auto pixels = _frameStorage(image, image.presentedFrame))
         {
             _updateImageLayers(imageId, *pixels);
         }
@@ -1857,7 +1889,7 @@ try
         return false;
     }
 
-    const auto frameBytes = image.pixels.size() * sizeof(RGBQUAD);
+    const auto frameBytes = image.pixels->size() * sizeof(RGBQUAD);
     std::vector<uint32_t> victims;
     if (editFrame == 0)
     {
@@ -1939,7 +1971,7 @@ try
     }
     else
     {
-        canvas.assign(imageIt->second.pixels.size(), _rgbaColor(command.upperY));
+        canvas.assign(imageIt->second.pixels->size(), _rgbaColor(command.upperY));
     }
 
     for (uint32_t row = 0; row < frameHeight; ++row)
@@ -1951,10 +1983,12 @@ try
                               command.upperX == 1);
     }
 
+    auto appendedFrame = ::Image::PixelStorage{};
     if (editFrame == 0)
     {
         // Allocate every fallible part of the append before eviction mutates unrelated
         // images. The subsequent frame move cannot allocate once capacity is reserved.
+        appendedFrame = std::make_shared<std::vector<RGBQUAD>>(std::move(canvas));
         imageIt->second.animationFrames.reserve(imageIt->second.animationFrames.size() + 1);
         for (const auto victimId : victims)
         {
@@ -1984,7 +2018,7 @@ try
     else
     {
         AnimationFrame frame;
-        frame.pixels = std::move(canvas);
+        frame.pixels = std::move(appendedFrame);
         frame.gapMilliseconds = command.haveZ && command.zIndex != 0 ? command.zIndex : 40;
         storedImage.animationFrames.push_back(std::move(frame));
         _totalPixelBytes += frameBytes;
@@ -1993,7 +2027,7 @@ try
 
     if (storedImage.presentedFrame == changedFrame)
     {
-        _updateImageLayers(imageId, *_framePixels(storedImage, changedFrame));
+        _updateImageLayers(imageId, *_frameStorage(storedImage, changedFrame));
     }
     const auto now = std::chrono::steady_clock::now();
     if (storedImage.animationState == 2 && storedImage.waitingForFrames)
@@ -2046,7 +2080,7 @@ bool KittyParser::_processAnimationControl(const Control& command, const uint32_
     {
         image.currentFrame = command.cols;
         image.presentedFrame = image.currentFrame;
-        _updateImageLayers(imageId, *_framePixels(image, image.currentFrame));
+        _updateImageLayers(imageId, *_frameStorage(image, image.currentFrame));
         reschedule = true;
     }
     if (command.rows != 0 && command.haveZ && command.zIndex != 0)
@@ -2150,7 +2184,7 @@ try
     }
     if (image.presentedFrame == destinationFrame)
     {
-        _updateImageLayers(imageId, *destination);
+        _updateImageLayers(imageId, *_frameStorage(image, destinationFrame));
     }
     return true;
 }
@@ -2180,7 +2214,7 @@ void KittyParser::_scheduleAnimation(const uint32_t imageId, Image& image, const
         if (image.presentedFrame != image.currentFrame)
         {
             image.presentedFrame = image.currentFrame;
-            _updateImageLayers(imageId, *_framePixels(image, image.presentedFrame));
+            _updateImageLayers(imageId, *_frameStorage(image, image.presentedFrame));
         }
         image.nextFrameTime = now + std::chrono::milliseconds(*gap);
     }
@@ -2241,7 +2275,7 @@ bool KittyParser::_advanceImage(const uint32_t imageId, Image& image, const std:
         {
             image.waitingForFrames = false;
             image.presentedFrame = image.currentFrame;
-            _updateImageLayers(imageId, *_framePixels(image, image.currentFrame));
+            _updateImageLayers(imageId, *_frameStorage(image, image.currentFrame));
             image.nextFrameTime = now + std::chrono::milliseconds(*gap);
             return true;
         }
@@ -2312,7 +2346,7 @@ void KittyParser::_deleteAnimationFrames(const uint32_t imageId, const uint32_t 
         _scheduleAnimationTimer();
         return;
     }
-    const auto frameBytes = image.pixels.size() * sizeof(RGBQUAD);
+    const auto frameBytes = image.pixels->size() * sizeof(RGBQUAD);
     if (frameNumber == 1)
     {
         auto promoted = std::move(image.animationFrames.front());
@@ -2350,7 +2384,7 @@ void KittyParser::_deleteAnimationFrames(const uint32_t imageId, const uint32_t 
         image.waitingForFrames = false;
         image.nextFrameTime = {};
     }
-    _updateImageLayers(imageId, *_framePixels(image, image.presentedFrame));
+    _updateImageLayers(imageId, *_frameStorage(image, image.presentedFrame));
 
     if (freeData && remaining == 1)
     {
@@ -2367,7 +2401,7 @@ void KittyParser::_deleteAnimationFrames(const uint32_t imageId, const uint32_t 
 
 bool KittyParser::_placementFitsMemory(const Image& image, const uint32_t imageId, const uint64_t layerId, const uint32_t cols, const uint32_t rows, const uint32_t srcX, const uint32_t srcY, const uint32_t srcW, const uint32_t srcH, const int32_t zIndex, const std::optional<til::point> anchor) const noexcept
 {
-    if (image.pixels.empty() || image.width == 0 || image.height == 0)
+    if (!image.pixels || image.pixels->empty() || image.width == 0 || image.height == 0)
     {
         return true;
     }
@@ -2400,7 +2434,6 @@ bool KittyParser::_placementFitsMemory(const Image& image, const uint32_t imageI
     {
         return true;
     }
-
     auto available = ImageSlice::LayerBytesAvailable();
     ImageSlice emptySlice{ clampedCellSize };
     for (auto row = 0; row < rowSpan; ++row)
@@ -2431,7 +2464,8 @@ bool KittyParser::_placementFitsMemory(const Image& image, const uint32_t imageI
 // Protocol: https://sw.kovidgoyal.net/kitty/graphics-protocol/#controlling-displayed-image-layout
 til::size KittyParser::_placeImage(const Image& image, const bool moveCursor, const uint32_t imageId, const uint64_t layerId, const uint32_t cols, const uint32_t rows, const uint32_t srcX, const uint32_t srcY, const uint32_t srcW, const uint32_t srcH, const uint32_t cellOffsetX, const uint32_t cellOffsetY, const int32_t zIndex, const std::optional<til::point> anchor)
 {
-    const auto framePixels = _framePixels(image, image.presentedFrame);
+    const auto frameStorage = _frameStorage(image, image.presentedFrame);
+    const auto framePixels = frameStorage ? frameStorage->get() : nullptr;
     if (!framePixels || framePixels->empty() || image.width == 0 || image.height == 0)
     {
         return {};
@@ -2566,12 +2600,42 @@ til::size KittyParser::_placeImage(const Image& image, const bool moveCursor, co
             }
         }
     }
+    auto redrawTop = std::max(0, origin.y);
+    auto redrawBottom = std::min(origin.y + rowSpan, page.Bottom());
+    const auto drawnColumns = columnEnd - columnBegin;
+    const auto drawnRows = std::max(0, redrawBottom - origin.y);
+    if (drawnColumns > 0 && drawnRows > 0)
+    {
+        auto surface = image.surface;
+        const auto newSurface = !surface;
+        if (newSurface)
+        {
+            surface = std::make_shared<::Image>(til::size{ imageWidth, imageHeight }, *frameStorage);
+        }
+
+        const ImagePlacement::Key key{ imageId, layerId };
+        buffer.GetMutableImages().AddOrReplace(ImagePlacement{
+            key,
+            surface,
+            { columnBegin, origin.y, columnEnd, redrawBottom },
+            zIndex,
+            { cropX, cropY, cropX + cropW, cropY + cropH },
+            {
+                .cellSize = clampedCellSize,
+                .targetWidth = gsl::narrow_cast<uint64_t>(targetW),
+                .targetHeight = gsl::narrow_cast<uint64_t>(targetH),
+                .offset = { offsetX, offsetY },
+            },
+        });
+        if (newSurface)
+        {
+            image.surface = std::move(surface);
+        }
+    }
     for (auto& staged : stagedRows)
     {
         buffer.GetMutableRowByOffset(staged.row).SetImageSlice(std::move(staged.slice));
     }
-    auto redrawTop = std::max(0, origin.y);
-    auto redrawBottom = std::min(origin.y + rowSpan, page.Bottom());
     buffer.TriggerRedraw(Viewport::FromExclusive({ 0, redrawTop, page.Width(), redrawBottom }));
 
     if (moveCursor)
@@ -2583,8 +2647,6 @@ til::size KittyParser::_placeImage(const Image& image, const bool moveCursor, co
 
     // Report the footprint actually drawn (after clamping) so the caller can track this
     // placement's extent and later erase exactly these cells by rectangle.
-    const auto drawnColumns = columnEnd - columnBegin;
-    const auto drawnRows = std::max(0, std::min(origin.y + rowSpan, page.Bottom()) - origin.y);
     if (drawnColumns > 0 && drawnRows > 0)
     {
         // The image is passed in by reference and may not be in the map at all (the
@@ -4018,6 +4080,16 @@ void KittyParser::_eraseImageRows(const uint32_t imageId)
         auto& buffer = page.Buffer();
         auto firstRow = page.Bottom();
         auto lastRow = 0;
+        for (const auto& placement : buffer.GetImages().All())
+        {
+            if (placement.Identity().imageId == imageId)
+            {
+                firstRow = std::min(firstRow, placement.CellBounds().top);
+                lastRow = std::max(lastRow, placement.CellBounds().bottom - 1);
+            }
+        }
+        auto& images = buffer.GetMutableImages();
+        images.EraseImage(imageId);
         for (auto row = 0; row < page.Bottom(); ++row)
         {
             const auto* slice = buffer.GetRowByOffset(row).GetImageSlice();
@@ -4042,6 +4114,7 @@ void KittyParser::_eraseImageRows(const uint32_t imageId)
     if (const auto image = _images.find(imageId); image != _images.end())
     {
         image->second.hasRenderedPlacements = false;
+        _releaseImageSurface(image->second);
     }
 }
 
@@ -4059,6 +4132,17 @@ void KittyParser::_erasePlacementCells(const Placement& placement)
         auto& buffer = page.Buffer();
         auto firstRow = page.Bottom();
         auto lastRow = 0;
+        const ImagePlacement::Key key{ placement.imageId, placement.layerId };
+        for (const auto& image : buffer.GetImages().All())
+        {
+            if (image.Identity() == key)
+            {
+                firstRow = std::min(firstRow, image.CellBounds().top);
+                lastRow = std::max(lastRow, image.CellBounds().bottom - 1);
+            }
+        }
+        auto& images = buffer.GetMutableImages();
+        images.Erase(key);
         for (auto row = 0; row < page.Bottom(); ++row)
         {
             const auto* slice = buffer.GetRowByOffset(row).GetImageSlice();
@@ -4082,6 +4166,13 @@ void KittyParser::_erasePlacementCells(const Placement& placement)
     if (const auto image = _images.find(placement.imageId); image != _images.end())
     {
         image->second.hasRenderedPlacements = _imageHasRenderedLayers(placement.imageId);
+        if (!image->second.hasRenderedPlacements)
+        {
+            _dispatcher._pages.ForEachPage([&](const Page page) {
+                page.Buffer().GetMutableImages().EraseImage(placement.imageId);
+            });
+            _releaseImageSurface(image->second);
+        }
     }
 }
 

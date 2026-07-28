@@ -10,23 +10,29 @@
 #include <span>
 #include <vector>
 
+class ImageSlice;
+
 // Pixel storage that maps directly to one renderer/GPU surface. Placements and
 // fragments share this object, so splitting an image never duplicates pixels.
 class Image final
 {
 public:
     using Pointer = std::shared_ptr<Image>;
+    using PixelStorage = std::shared_ptr<std::vector<RGBQUAD>>;
 
     Image(til::size pixelSize, std::vector<RGBQUAD> pixels);
+    Image(til::size pixelSize, PixelStorage pixels);
 
     til::size PixelSize() const noexcept;
     uint64_t Revision() const noexcept;
     std::span<const RGBQUAD> Pixels() const noexcept;
+    const PixelStorage& Storage() const noexcept;
     void UpdatePixels(std::span<const RGBQUAD> pixels);
+    void UpdatePixels(PixelStorage pixels);
 
 private:
     til::size _pixelSize;
-    std::vector<RGBQUAD> _pixels;
+    PixelStorage _pixels;
     uint64_t _revision = 0;
 };
 
@@ -53,11 +59,20 @@ public:
 
     static constexpr int32_t BackgroundZThreshold = INT32_MIN / 2;
 
+    struct PixelGeometry
+    {
+        til::size cellSize{ 1, 1 };
+        uint64_t targetWidth = 0;
+        uint64_t targetHeight = 0;
+        til::point offset{};
+    };
+
     ImagePlacement(Key key,
                    Image::Pointer image,
                    til::rect cellBounds,
                    int32_t zIndex,
-                   til::rect sourceInPixels = {});
+                   til::rect sourceInPixels = {},
+                   PixelGeometry geometry = {});
 
     Key Identity() const noexcept;
     const Image& Surface() const noexcept;
@@ -65,11 +80,13 @@ public:
     til::rect CellBounds() const noexcept;
     til::rect OriginalCellBounds() const noexcept;
     til::rect SourceInPixels() const noexcept;
+    const PixelGeometry& Geometry() const noexcept;
     int32_t ZIndex() const noexcept;
     RenderPosition Position() const noexcept;
 
     std::optional<ImagePlacement> Crop(til::rect cellBounds) const;
     ImagePlacement Translated(til::point delta) const;
+    bool RasterizeRow(til::CoordType row, til::CoordType columnBegin, til::CoordType columnEnd, ImageSlice& destination) const;
 
 private:
     ImagePlacement(Key key,
@@ -77,7 +94,8 @@ private:
                    til::rect cellBounds,
                    til::rect originalCellBounds,
                    int32_t zIndex,
-                   til::rect sourceInPixels) noexcept;
+                   til::rect sourceInPixels,
+                   PixelGeometry geometry) noexcept;
 
     Key _key;
     Image::Pointer _image;
@@ -85,6 +103,7 @@ private:
     til::rect _originalCellBounds;
     int32_t _zIndex = 0;
     til::rect _sourceInPixels;
+    PixelGeometry _geometry;
 };
 
 class ImageCollection final
@@ -100,6 +119,8 @@ public:
     ImageCollection& operator=(ImageCollection&&) noexcept;
 
     void Add(ImagePlacement image);
+    void AddOrReplace(ImagePlacement image);
+    void Clear() noexcept;
     bool Erase(ImagePlacement::Key key);
     size_t EraseImage(uint32_t imageId);
     void EraseArea(til::rect area);

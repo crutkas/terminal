@@ -1118,6 +1118,26 @@ void Renderer::_PaintBufferOutput(_In_ IRenderEngine* const pEngine)
     std::span<const til::rect> dirtyAreas;
     LOG_IF_FAILED(pEngine->GetDirtyArea(dirtyAreas));
 
+    auto& buffer = _pData->GetTextBuffer();
+    const auto visibleImages = buffer.GetImages().IntersectingRows(_viewport.Top(), _viewport.BottomExclusive());
+    til::small_vector<ImageSlice::ImageUpdate, 16> visibleImageUpdates;
+    visibleImageUpdates.reserve(visibleImages.size());
+    for (const auto placement : visibleImages)
+    {
+        const auto& surface = placement->Surface();
+        visibleImageUpdates.emplace_back(placement->Identity().imageId, surface.Pixels(), surface.Revision());
+    }
+    std::sort(visibleImageUpdates.begin(), visibleImageUpdates.end(), [](const auto& lhs, const auto& rhs) {
+        return lhs.imageId != rhs.imageId ? lhs.imageId < rhs.imageId : lhs.sourceRevision > rhs.sourceRevision;
+    });
+    const auto uniqueEnd = std::unique(visibleImageUpdates.begin(), visibleImageUpdates.end(), [](const auto& lhs, const auto& rhs) {
+        return lhs.imageId == rhs.imageId;
+    });
+    const auto imageUpdates = std::span<const ImageSlice::ImageUpdate>{
+        visibleImageUpdates.data(),
+        static_cast<size_t>(std::distance(visibleImageUpdates.begin(), uniqueEnd)),
+    };
+
     // This is to make sure any transforms are reset when this paint is finished.
     auto resetLineTransform = wil::scope_exit([&]() {
         LOG_IF_FAILED(pEngine->ResetLineTransform());
@@ -1141,8 +1161,6 @@ void Renderer::_PaintBufferOutput(_In_ IRenderEngine* const pEngine)
         // we need to walk through line-by-line and repaint onto the screen.
         const auto redraw = Viewport::Intersect(dirty, _viewport);
 
-        // Retrieve the text buffer so we can read information out of it.
-        auto& buffer = _pData->GetTextBuffer();
         // Now walk through each row of text that we need to redraw.
         for (auto row = redraw.Top(); row < redraw.BottomExclusive(); row++)
         {
@@ -1186,6 +1204,7 @@ void Renderer::_PaintBufferOutput(_In_ IRenderEngine* const pEngine)
 
             // Image content is painted around the text so that it can sit below
             // it. The engine decides how; all we do is bracket the text.
+            _syncImageSurfaces(r, imageUpdates);
             const auto imageSlice = r.GetImageSlice();
             const auto hasImages = imageSlice && (imageSlice->HasPixels(ImageSlice::RenderPosition::BehindBackground) ||
                                                   imageSlice->HasPixels(ImageSlice::RenderPosition::BehindText) ||
@@ -1209,6 +1228,17 @@ void Renderer::_PaintBufferOutput(_In_ IRenderEngine* const pEngine)
             _PaintBufferOutputHelper(pEngine, it, screenPosition);
         }
     }
+}
+
+void Renderer::_syncImageSurfaces(const ROW& row, const std::span<const ImageSlice::ImageUpdate> updates)
+{
+    const auto source = row.GetImageSlice();
+    if (!source)
+    {
+        return;
+    }
+
+    const_cast<ImageSlice*>(source)->UpdateImages(updates);
 }
 
 // Resolves, for each column of `imageSlice`, whether the cell's background is the

@@ -20,8 +20,11 @@ class ImageTests
     TEST_METHOD(RowIndexRebuildsAfterMutation);
     TEST_METHOD(EraseOutsideImageIsNoOp);
     TEST_METHOD(EraseSplitsWithoutCopyingTheSurface);
+    TEST_METHOD(AddOrReplaceCollapsesFragments);
     TEST_METHOD(CopyClipsAndTranslates);
     TEST_METHOD(SurfaceUpdateReachesEveryFragment);
+    TEST_METHOD(BatchSurfaceUpdateResamplesMultipleImages);
+    TEST_METHOD(RasterizeUsesCropScaleAndOffset);
     TEST_METHOD(TextBufferOwnsImagesOutsideRows);
 
     static constexpr til::size CellSize{ 2, 3 };
@@ -38,7 +41,18 @@ class ImageTests
 
     static ImagePlacement MakePlacement(const ImagePlacement::Key key, const til::rect bounds, const int32_t zIndex = 0)
     {
-        return ImagePlacement{ key, MakeSurface(bounds), bounds, zIndex };
+        return ImagePlacement{
+            key,
+            MakeSurface(bounds),
+            bounds,
+            zIndex,
+            {},
+            {
+                .cellSize = CellSize,
+                .targetWidth = gsl::narrow_cast<uint64_t>(bounds.width() * CellSize.width),
+                .targetHeight = gsl::narrow_cast<uint64_t>(bounds.height() * CellSize.height),
+            },
+        };
     }
 };
 
@@ -109,6 +123,23 @@ void ImageTests::EraseSplitsWithoutCopyingTheSurface()
     VERIFY_ARE_EQUAL(size_t{ 32 }, area);
 }
 
+void ImageTests::AddOrReplaceCollapsesFragments()
+{
+    ImageCollection images;
+    images.Add(MakePlacement({ 1, 1 }, { 0, 0, 6, 6 }));
+    images.EraseArea({ 2, 2, 4, 4 });
+    VERIFY_ARE_EQUAL(size_t{ 4 }, images.Size());
+
+    auto replacement = MakePlacement({ 1, 1 }, { 10, 10, 12, 12 });
+    const auto replacementSurface = replacement.SurfacePointer();
+    images.AddOrReplace(std::move(replacement));
+
+    VERIFY_ARE_EQUAL(size_t{ 1 }, images.Size());
+    const til::rect expected{ 10, 10, 12, 12 };
+    VERIFY_ARE_EQUAL(expected, images.All()[0].CellBounds());
+    VERIFY_ARE_EQUAL(replacementSurface.get(), images.All()[0].SurfacePointer().get());
+}
+
 void ImageTests::CopyClipsAndTranslates()
 {
     ImageCollection source;
@@ -146,6 +177,62 @@ void ImageTests::SurfaceUpdateReachesEveryFragment()
         VERIFY_ARE_EQUAL(surface->Revision(), fragment.Surface().Revision());
         VERIFY_ARE_EQUAL(1, static_cast<int>(fragment.Surface().Pixels()[0].rgbBlue));
     }
+}
+
+void ImageTests::BatchSurfaceUpdateResamplesMultipleImages()
+{
+    ImageSlice row{ { 1, 1 } };
+    *row.MutablePixels(0, 1, { 1, 1 }, 0) = {};
+    *row.MutableSourceIndices(0, 1, { 1, 1 }, 0) = 0;
+    *row.MutablePixels(1, 2, { 2, 2 }, 0) = {};
+    *row.MutableSourceIndices(1, 2, { 2, 2 }, 0) = 0;
+
+    const std::array first{ RGBQUAD{ 1, 0, 0, 255 } };
+    const std::array second{ RGBQUAD{ 2, 0, 0, 255 } };
+    const std::array updates{
+        ImageSlice::ImageUpdate{ 1, first, 10 },
+        ImageSlice::ImageUpdate{ 2, second, 11 },
+    };
+
+    VERIFY_IS_TRUE(row.UpdateImages(updates));
+    const auto rendered = row.Pixels(ImageSlice::RenderPosition::AboveText);
+    VERIFY_ARE_EQUAL(1, static_cast<int>(rendered[0].rgbBlue));
+    VERIFY_ARE_EQUAL(2, static_cast<int>(rendered[1].rgbBlue));
+    VERIFY_IS_FALSE(row.UpdateImages(updates));
+}
+
+void ImageTests::RasterizeUsesCropScaleAndOffset()
+{
+    const std::vector<RGBQUAD> pixels{
+        RGBQUAD{ 1, 0, 0, 255 },
+        RGBQUAD{ 2, 0, 0, 255 },
+        RGBQUAD{ 3, 0, 0, 255 },
+        RGBQUAD{ 4, 0, 0, 255 },
+    };
+    const auto surface = std::make_shared<Image>(til::size{ 4, 1 }, pixels);
+    const ImagePlacement placement{
+        { 1, 1 },
+        surface,
+        { 2, 3, 4, 4 },
+        0,
+        { 1, 0, 4, 1 },
+        {
+            .cellSize = { 2, 1 },
+            .targetWidth = 3,
+            .targetHeight = 1,
+            .offset = { 1, 0 },
+        },
+    };
+    ImageSlice row{ { 2, 1 } };
+
+    VERIFY_IS_TRUE(placement.RasterizeRow(3, 2, 4, row));
+
+    const auto rendered = row.Pixels(ImageSlice::RenderPosition::AboveText);
+    VERIFY_ARE_EQUAL(size_t{ 4 }, rendered.size());
+    VERIFY_ARE_EQUAL(0, static_cast<int>(rendered[0].rgbBlue));
+    VERIFY_ARE_EQUAL(2, static_cast<int>(rendered[1].rgbBlue));
+    VERIFY_ARE_EQUAL(3, static_cast<int>(rendered[2].rgbBlue));
+    VERIFY_ARE_EQUAL(4, static_cast<int>(rendered[3].rgbBlue));
 }
 
 void ImageTests::TextBufferOwnsImagesOutsideRows()
