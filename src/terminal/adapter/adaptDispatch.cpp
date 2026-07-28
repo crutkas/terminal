@@ -886,21 +886,26 @@ void AdaptDispatch::_SelectiveEraseRect(const Page& page, const til::rect& erase
 {
     if (eraseRect)
     {
+        std::vector<til::rect> areas;
         for (auto row = eraseRect.top; row < eraseRect.bottom; row++)
         {
-            auto& rowBuffer = page.Buffer().GetMutableRowByOffset(row);
+            const auto& rowBuffer = page.Buffer().GetRowByOffset(row);
             for (auto col = eraseRect.left; col < eraseRect.right; col++)
             {
-                // Only unprotected cells are affected.
                 if (!rowBuffer.GetAttrByColumn(col).IsProtected())
                 {
-                    // The text is cleared but the attributes are left as is.
-                    rowBuffer.ClearCell(col);
-                    // Any image content also needs to be erased.
-                    ImageSlice::EraseCells(rowBuffer, col, col + 1);
-                    page.Buffer().TriggerRedraw(Viewport::FromDimensions({ col, row }, { 1, 1 }));
+                    areas.emplace_back(col, row, col + 1, row + 1);
                 }
             }
+        }
+
+        page.Buffer().GetMutableImages().EraseAreas(areas);
+        for (const auto area : areas)
+        {
+            auto& rowBuffer = page.Buffer().GetMutableRowByOffset(area.top);
+            rowBuffer.ClearCell(area.left);
+            ImageSlice::EraseCells(rowBuffer, area.left, area.right);
+            page.Buffer().TriggerRedraw(Viewport::FromDimensions(area.origin(), { 1, 1 }));
         }
     }
 }

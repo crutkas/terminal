@@ -7175,6 +7175,7 @@ public:
         _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,f=24,s=2,v=2,c=2,r=2;/wAAAP8AAAD/////\x1b\\");
         _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m");
         _stateMachine->ProcessString(Placeholder() + L"\x030D" + L"\x0305"); // (1,0) blue
+        const auto surface = buffer.GetImages().All()[0].SurfacePointer();
 
         buffer.ScrollRows(origin.y, 1, 1);
         buffer.GetCursor().SetPosition({ 10, origin.y + 2 });
@@ -7185,6 +7186,22 @@ public:
         const auto* slice = buffer.GetRowByOffset(origin.y + 1).GetImageSlice();
         VERIFY_IS_TRUE(SlicePixelIs(slice, 0, 0, 0, 0, 255), L"the explicit blue cell moved with the row");
         VERIFY_IS_TRUE(SlicePixelIs(slice, 1, 0, 255, 255, 255), L"the moved metadata resolves the adjacent omission as (1,1) white");
+        const auto* metadata = buffer.GetRowByOffset(origin.y + 1).GetImageCellRef(origin.x);
+        VERIFY_IS_NOT_NULL(metadata);
+        const til::rect expectedOriginal{ origin.x, origin.y, origin.x + 2, origin.y + 2 };
+        auto movedFragments = size_t{ 0 };
+        for (const auto& fragment : buffer.GetImages().All())
+        {
+            const auto bounds = fragment.CellBounds();
+            if (fragment.Identity() == ImagePlacement::Key{ 1, metadata->layerId } &&
+                bounds.top == origin.y + 1 && bounds.left >= origin.x && bounds.right <= origin.x + 2)
+            {
+                ++movedFragments;
+                VERIFY_ARE_EQUAL(expectedOriginal, fragment.OriginalCellBounds());
+                VERIFY_ARE_EQUAL(surface.get(), fragment.SurfacePointer().get());
+            }
+        }
+        VERIFY_ARE_EQUAL(size_t{ 2 }, movedFragments, L"the collection follows both moved placeholder cells");
     }
 
     // ICH moves cells horizontally through AdaptDispatch's cell-walking scroll path. The image
@@ -7239,6 +7256,21 @@ public:
         VERIFY_IS_NOT_NULL(slice);
         VERIFY_IS_TRUE(SlicePixelIs(slice, 0, 0, 0, 0, 255), L"the explicit blue cell moved down with the partial-width scroll");
         VERIFY_IS_TRUE(SlicePixelIs(slice, 1, 0, 255, 255, 255), L"the adjacent omission inherits (1,1) white after the move");
+        const auto* metadata = buffer.GetRowByOffset(origin.y + 1).GetImageCellRef(origin.x);
+        VERIFY_IS_NOT_NULL(metadata);
+        const til::rect expectedOriginal{ origin.x, origin.y, origin.x + 2, origin.y + 2 };
+        auto movedFragments = size_t{ 0 };
+        for (const auto& fragment : buffer.GetImages().All())
+        {
+            const auto bounds = fragment.CellBounds();
+            if (fragment.Identity() == ImagePlacement::Key{ 1, metadata->layerId } &&
+                bounds.top == origin.y + 1 && bounds.left >= origin.x && bounds.right <= origin.x + 2)
+            {
+                ++movedFragments;
+                VERIFY_ARE_EQUAL(expectedOriginal, fragment.OriginalCellBounds());
+            }
+        }
+        VERIFY_ARE_EQUAL(size_t{ 2 }, movedFragments);
     }
 
     // DECCRA copies cells through the same WriteLine-plus-CopyBlock pattern. Copying explicit
@@ -7256,14 +7288,42 @@ public:
         _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m");
         _stateMachine->ProcessString(Placeholder() + L"\x0305" + L"\x030D"); // explicit (0,1) green
 
+        const auto* sourceSlice = buffer.GetRowByOffset(origin.y).GetImageSlice();
+        const auto* sourceMetadata = buffer.GetRowByOffset(origin.y).GetImageCellRef(origin.x);
+        VERIFY_IS_NOT_NULL(sourceMetadata);
+        VERIFY_ARE_NOT_EQUAL(0u, sourceMetadata->layerId);
+        VERIFY_ARE_EQUAL(size_t{ 1 }, buffer.GetImages().Size());
+        VERIFY_IS_NOT_NULL(sourceSlice);
+        const auto sourcePixel = SlicePixelAt(sourceSlice, 0, 0);
+        VERIFY_ARE_EQUAL(static_cast<BYTE>(0), sourcePixel.rgbRed);
+        VERIFY_ARE_EQUAL(static_cast<BYTE>(255), sourcePixel.rgbGreen);
+        VERIFY_ARE_EQUAL(static_cast<BYTE>(0), sourcePixel.rgbBlue);
         _pDispatch->CopyRectangularArea(vtRow, 1, vtRow, 1, 1, vtRow, 6, 1); // copy x=0 to x=5
         buffer.GetCursor().SetPosition({ 6, origin.y });
         _stateMachine->ProcessString(Placeholder()); // inherit (0,2) from copied x=5
 
         const auto* slice = buffer.GetRowByOffset(origin.y).GetImageSlice();
         VERIFY_IS_NOT_NULL(slice);
-        VERIFY_IS_TRUE(SlicePixelIs(slice, 5, 0, 0, 255, 0), L"DECCRA copied the explicit grid-col-1 cell (green)");
+        const auto copiedPixel = SlicePixelAt(slice, 5, 0);
+        VERIFY_ARE_EQUAL(static_cast<BYTE>(0), copiedPixel.rgbRed);
+        VERIFY_ARE_EQUAL(static_cast<BYTE>(255), copiedPixel.rgbGreen, L"DECCRA copied the explicit grid-col-1 cell (green)");
+        VERIFY_ARE_EQUAL(static_cast<BYTE>(0), copiedPixel.rgbBlue);
         VERIFY_IS_TRUE(SlicePixelIs(slice, 6, 0, 0, 0, 255), L"the adjacent omission inherits grid col 2 (blue)");
+        const auto* metadata = buffer.GetRowByOffset(origin.y).GetImageCellRef(5);
+        VERIFY_IS_NOT_NULL(metadata);
+        const til::rect expectedOriginal{ 4, origin.y, 7, origin.y + 1 };
+        auto copiedFragments = size_t{ 0 };
+        for (const auto& fragment : buffer.GetImages().All())
+        {
+            const auto bounds = fragment.CellBounds();
+            if (fragment.Identity() == ImagePlacement::Key{ 1, metadata->layerId } &&
+                bounds.top == origin.y && bounds.left >= 5 && bounds.right <= 7)
+            {
+                ++copiedFragments;
+                VERIFY_ARE_EQUAL(expectedOriginal, fragment.OriginalCellBounds());
+            }
+        }
+        VERIFY_ARE_EQUAL(size_t{ 2 }, copiedFragments);
     }
 
     // Reflow copies text in cell ranges rather than moving whole ROW objects. The resolved
@@ -7278,6 +7338,8 @@ public:
         _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m");
         buffer.GetCursor().SetPosition({ 10, origin.y });
         _stateMachine->ProcessString(Placeholder() + L"\x030D" + L"\x030D"); // explicit (1,1)
+        const auto sourceSurface = buffer.GetImages().All()[0].SurfacePointer();
+        const auto sourceMetadata = *buffer.GetRowByOffset(origin.y).GetImageCellRef(10);
 
         auto reflowed = std::make_unique<TextBuffer>(til::size{ 5, 600 }, TextAttribute{}, 0, false, &_testGetSet->_renderer);
         TextBuffer::Reflow(buffer, *reflowed);
@@ -7303,6 +7365,19 @@ public:
         VERIFY_IS_TRUE(found, L"reflowed placeholder retains its resolved metadata");
         const til::point oldPosition{ 10, origin.y };
         VERIFY_IS_TRUE(movedTo != oldPosition, L"metadata moved with the text rather than staying at its old absolute position");
+        const til::rect expectedOriginal{ movedTo.x - 1, movedTo.y - 1, movedTo.x + 1, movedTo.y + 1 };
+        auto foundPlacement = false;
+        for (const auto& fragment : reflowed->GetImages().All())
+        {
+            if (fragment.Identity() == ImagePlacement::Key{ 1, sourceMetadata.layerId } &&
+                fragment.CellBounds() == til::rect{ movedTo.x, movedTo.y, movedTo.x + 1, movedTo.y + 1 })
+            {
+                foundPlacement = true;
+                VERIFY_ARE_EQUAL(expectedOriginal, fragment.OriginalCellBounds());
+                VERIFY_ARE_EQUAL(sourceSurface.get(), fragment.SurfacePointer().get());
+            }
+        }
+        VERIFY_IS_TRUE(foundPlacement, L"the collection fragment follows the exact placeholder cell");
     }
 
     // Two placeholder cells of a multi-COLUMN grid sent in SEPARATE writes on the same
@@ -8464,7 +8539,7 @@ public:
         _testGetSet->_cellSize = { 1, 1 };
         auto& buffer = *_testGetSet->_textBuffer;
         const auto origin = buffer.GetCursor().GetPosition();
-        buffer.GetCursor().SetPosition({ 10, origin.y });
+        buffer.GetCursor().SetPosition({ 3, origin.y });
         _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,p=1,f=24,s=1,v=1,C=1;/wAA\x1b\\");
         const auto layerId = _kitty()._placements.at({ 1u, 1u }).layerId;
 
@@ -8477,6 +8552,10 @@ public:
             found |= slice && slice->ContainsPlacement(layerId);
         }
         VERIFY_IS_TRUE(found, L"reflow preserves the retained placement identity");
+        VERIFY_ARE_EQUAL(size_t{ 1 }, reflowed->GetImages().Size());
+        const auto& placement = reflowed->GetImages().All()[0];
+        VERIFY_ARE_EQUAL(ImagePlacement::Key({ 1, layerId }), placement.Identity());
+        VERIFY_ARE_EQUAL(3, placement.CellBounds().left, L"an unwrapped direct placement follows its source cells");
     }
 
     // Bug #28: an anonymous relative placement (no p=) must be cascade-deleted with its parent and
@@ -9232,9 +9311,9 @@ public:
         _testGetSet->_cellSize = { 1, 1 };
         auto& buffer = *_testGetSet->_textBuffer;
         const auto origin = buffer.GetCursor().GetPosition();
-        buffer.GetCursor().SetPosition({ 10, origin.y });
+        buffer.GetCursor().SetPosition({ 3, origin.y });
         _stateMachine->ProcessString(L"X");
-        buffer.GetCursor().SetPosition({ 10, origin.y });
+        buffer.GetCursor().SetPosition({ 3, origin.y });
         _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,z=-1,f=24,s=1,v=1,C=1;/wAA\x1b\\");
 
         auto reflowed = std::make_unique<TextBuffer>(til::size{ 5, 600 }, TextAttribute{}, 0, false, &_testGetSet->_renderer);
@@ -9251,9 +9330,10 @@ public:
             }
         }
         VERIFY_IS_TRUE(found, L"reflow must preserve negative-z layer pixels");
+        VERIFY_ARE_EQUAL(3, reflowed->GetImages().All()[0].CellBounds().left);
     }
 
-    TEST_METHOD(KittyGraphicsPlaceholderReflowLeavesOverlappingLayerInPlace)
+    TEST_METHOD(KittyGraphicsPlaceholderReflowPreservesOverlappingDirectMapping)
     {
         _testGetSet->PrepData();
         _testGetSet->_cellSize = { 1, 1 };
@@ -9309,16 +9389,17 @@ public:
                 VERIFY_IS_NOT_NULL(slice);
                 VERIFY_IS_TRUE(slice->Contains(1), L"the placeholder's image follows its reflowed text cell");
                 VERIFY_IS_TRUE(slice->ContainsPlacement(virtualLayer), L"the placeholder's exact placement follows its reflowed text cell");
-                VERIFY_IS_FALSE(slice->ContainsPlacement(physicalLayer), L"another placement of the same image must not follow the placeholder");
-                VERIFY_IS_FALSE(slice->Contains(2), L"an unrelated overlapping layer must not follow the placeholder");
+                VERIFY_IS_TRUE(slice->ContainsPlacement(physicalLayer), L"another direct placement follows its own mapped source cell");
+                VERIFY_IS_TRUE(slice->Contains(2), L"an unrelated direct layer follows its own mapped source cell");
                 const auto pixel = SlicePixelAt(slice, ImageSlice::RenderPosition::BehindText, x - slice->ColumnOffset(), 0);
                 VERIFY_ARE_EQUAL(static_cast<BYTE>(255), pixel.rgbRed);
             }
         }
 
         VERIFY_IS_TRUE(foundPlaceholder);
-        VERIFY_IS_TRUE(foundOverlappingPlacement, L"the same image's unrelated placement remains attached to the cloned source row");
-        VERIFY_IS_TRUE(foundOverlappingImage, L"the unrelated layer remains attached to the cloned source row");
+        VERIFY_IS_TRUE(foundOverlappingPlacement, L"the overlapping direct placement follows the same exact source-cell mapping");
+        VERIFY_IS_TRUE(foundOverlappingImage, L"the unrelated direct layer follows its own source cells");
+        VERIFY_ARE_EQUAL(size_t{ 3 }, reflowed->GetImages().Size());
     }
 
     TEST_METHOD(KittyGraphicsUnresolvedPlaceholderDoesNotMoveOverlappingLayer)
@@ -9338,7 +9419,7 @@ public:
         VERIFY_IS_NOT_NULL(metadata);
         VERIFY_ARE_EQUAL(0u, metadata->layerId, L"an unresolved placement has no retained-layer identity");
 
-        buffer.GetCursor().SetPosition(placeholderPosition);
+        buffer.GetCursor().SetPosition({ 3, placeholderPosition.y });
         _stateMachine->ProcessString(L"\x1b_Ga=p,i=1,p=1,z=1,C=1;\x1b\\");
         const auto physicalLayer = _kitty()._placements.at({ 1u, 1u }).layerId;
 
@@ -10124,7 +10205,7 @@ public:
         _testGetSet->_cellSize = { 1, 1 };
         auto& buffer = *_testGetSet->_textBuffer;
         const auto origin = buffer.GetCursor().GetPosition();
-        buffer.GetCursor().SetPosition({ 10, origin.y });
+        buffer.GetCursor().SetPosition({ 3, origin.y });
         _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,f=24,s=1,v=1,C=1;/wAA\x1b\\");
 
         auto reflowed = std::make_unique<TextBuffer>(til::size{ 5, 600 }, TextAttribute{}, 0, false, &_testGetSet->_renderer);

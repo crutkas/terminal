@@ -29,7 +29,8 @@ namespace
         return width * height;
     }
 
-    bool imageLess(const ImagePlacement* lhs, const ImagePlacement* rhs) noexcept
+    template<typename T>
+    bool imageLess(const T& lhs, const T& rhs) noexcept
     {
         if (lhs->Position() != rhs->Position())
         {
@@ -139,20 +140,41 @@ ImagePlacement::ImagePlacement(const Key key,
     THROW_HR_IF(E_INVALIDARG, _geometry.targetWidth > INT64_MAX || _geometry.targetHeight > INT64_MAX);
 }
 
+ImagePlacement ImagePlacement::FromFragment(const Key key,
+                                            Image::Pointer image,
+                                            const til::rect cellBounds,
+                                            const til::rect originalCellBounds,
+                                            const int32_t zIndex,
+                                            const til::rect sourceInPixels,
+                                            const PixelGeometry geometry)
+{
+    THROW_HR_IF(E_INVALIDARG, originalCellBounds.right <= originalCellBounds.left ||
+                                      originalCellBounds.bottom <= originalCellBounds.top ||
+                                      cellBounds.left < originalCellBounds.left ||
+                                      cellBounds.top < originalCellBounds.top ||
+                                      cellBounds.right > originalCellBounds.right ||
+                                      cellBounds.bottom > originalCellBounds.bottom);
+    auto placement = ImagePlacement{ key, std::move(image), cellBounds, zIndex, sourceInPixels, geometry };
+    placement._originalCellBounds = originalCellBounds;
+    return placement;
+}
+
 ImagePlacement::ImagePlacement(const Key key,
                                Image::Pointer image,
                                const til::rect cellBounds,
                                const til::rect originalCellBounds,
                                const int32_t zIndex,
                                const til::rect sourceInPixels,
-                               const PixelGeometry geometry) noexcept :
+                               const PixelGeometry geometry,
+                               const uint64_t rowEpoch) noexcept :
     _key{ key },
     _image{ std::move(image) },
     _cellBounds{ cellBounds },
     _originalCellBounds{ originalCellBounds },
     _zIndex{ zIndex },
     _sourceInPixels{ sourceInPixels },
-    _geometry{ geometry }
+    _geometry{ geometry },
+    _rowEpoch{ rowEpoch }
 {
 }
 
@@ -212,7 +234,7 @@ std::optional<ImagePlacement> ImagePlacement::Crop(const til::rect cellBounds) c
     {
         return std::nullopt;
     }
-    return ImagePlacement{ _key, _image, clipped, _originalCellBounds, _zIndex, _sourceInPixels, _geometry };
+    return ImagePlacement{ _key, _image, clipped, _originalCellBounds, _zIndex, _sourceInPixels, _geometry, _rowEpoch };
 }
 
 ImagePlacement ImagePlacement::Translated(const til::point delta) const
@@ -225,6 +247,7 @@ ImagePlacement ImagePlacement::Translated(const til::point delta) const
         _zIndex,
         _sourceInPixels,
         _geometry,
+        _rowEpoch,
     };
 }
 
@@ -301,20 +324,80 @@ bool ImagePlacement::RasterizeRow(const til::CoordType row,
     return true;
 }
 
+ImageCollection::LogicalPlacement::LogicalPlacement(const ImagePlacement* const placement,
+                                                    const til::CoordType rowOffset,
+                                                    const til::CoordType bufferHeight) noexcept :
+    _placement{ placement },
+    _rowOffset{ rowOffset },
+    _bufferHeight{ bufferHeight }
+{
+}
+
+const ImageCollection::LogicalPlacement* ImageCollection::LogicalPlacement::operator->() const noexcept
+{
+    return this;
+}
+
+ImagePlacement::Key ImageCollection::LogicalPlacement::Identity() const noexcept
+{
+    return _placement->Identity();
+}
+
+const Image& ImageCollection::LogicalPlacement::Surface() const noexcept
+{
+    return _placement->Surface();
+}
+
+til::rect ImageCollection::LogicalPlacement::CellBounds() const noexcept
+{
+    auto bounds = _placement->CellBounds() + til::point{ 0, _rowOffset };
+    bounds.top = std::max(bounds.top, til::CoordType{ 0 });
+    bounds.bottom = std::min(bounds.bottom, _bufferHeight);
+    return bounds;
+}
+
+til::rect ImageCollection::LogicalPlacement::OriginalCellBounds() const noexcept
+{
+    return _placement->OriginalCellBounds() + til::point{ 0, _rowOffset };
+}
+
+const ImagePlacement::PixelGeometry& ImageCollection::LogicalPlacement::Geometry() const noexcept
+{
+    return _placement->Geometry();
+}
+
+int32_t ImageCollection::LogicalPlacement::ZIndex() const noexcept
+{
+    return _placement->ZIndex();
+}
+
+ImagePlacement::RenderPosition ImageCollection::LogicalPlacement::Position() const noexcept
+{
+    return _placement->Position();
+}
+
+std::optional<ImagePlacement> ImageCollection::LogicalPlacement::Crop(const til::rect cellBounds) const
+{
+    const auto logical = _placement->Translated({ 0, _rowOffset });
+    return logical.Crop(cellBounds & CellBounds());
+}
+
+bool ImageCollection::LogicalPlacement::RasterizeRow(const til::CoordType row,
+                                                     const til::CoordType columnBegin,
+                                                     const til::CoordType columnEnd,
+                                                     ImageSlice& destination) const
+{
+    const auto storedRow = gsl::narrow<til::CoordType>(static_cast<int64_t>(row) - _rowOffset);
+    return _placement->RasterizeRow(storedRow, columnBegin, columnEnd, destination);
+}
+
 struct ImageCollection::RowIndex
 {
-    using Tree = interval_tree::IntervalTree<til::CoordType, size_t>;
+    using Tree = interval_tree::IntervalTree<uint64_t, size_t>;
 
-    explicit RowIndex(const std::vector<ImagePlacement>& images)
+    explicit RowIndex(Tree::interval_vector intervals) :
+        tree{ std::move(intervals) }
     {
-        Tree::interval_vector intervals;
-        intervals.reserve(images.size());
-        for (size_t i = 0; i < images.size(); ++i)
-        {
-            const auto bounds = images[i].CellBounds();
-            intervals.emplace_back(bounds.top, bounds.bottom - 1, i);
-        }
-        tree = Tree{ std::move(intervals) };
     }
 
     Tree tree;
@@ -325,8 +408,61 @@ ImageCollection::~ImageCollection() = default;
 ImageCollection::ImageCollection(ImageCollection&&) noexcept = default;
 ImageCollection& ImageCollection::operator=(ImageCollection&&) noexcept = default;
 
+std::vector<ImagePlacement> ImageCollection::_eraseAreas(const std::span<const ImagePlacement> images, const std::span<const til::rect> areas)
+{
+    std::vector<ImagePlacement> remaining{ images.begin(), images.end() };
+    for (const auto area : areas)
+    {
+        if (area.empty())
+        {
+            continue;
+        }
+
+        const auto intersects = [&](const auto& image) {
+            return !(image.CellBounds() & area).empty();
+        };
+        if (std::none_of(remaining.begin(), remaining.end(), intersects))
+        {
+            continue;
+        }
+
+        std::vector<ImagePlacement> next;
+        next.reserve(remaining.size());
+        for (const auto& image : remaining)
+        {
+            const auto bounds = image.CellBounds();
+            if ((bounds & area).empty())
+            {
+                next.emplace_back(image);
+                continue;
+            }
+
+            for (const auto fragment : bounds - area)
+            {
+                if (auto cropped = image.Crop(fragment))
+                {
+                    next.emplace_back(std::move(*cropped));
+                }
+            }
+        }
+        remaining = std::move(next);
+    }
+    return remaining;
+}
+
+void ImageCollection::_replace(std::vector<ImagePlacement> images) noexcept
+{
+    for (auto& image : images)
+    {
+        image._rowEpoch = _rowEpoch;
+    }
+    _images = std::move(images);
+    _markIndexDirty();
+}
+
 void ImageCollection::Add(ImagePlacement image)
 {
+    image._rowEpoch = _rowEpoch;
     _images.emplace_back(std::move(image));
     _markIndexDirty();
 }
@@ -334,6 +470,7 @@ void ImageCollection::Add(ImagePlacement image)
 void ImageCollection::AddOrReplace(ImagePlacement image)
 {
     const auto key = image.Identity();
+    image._rowEpoch = _rowEpoch;
     const auto existing = std::find_if(_images.begin(), _images.end(), [&](const auto& candidate) {
         return candidate.Identity() == key;
     });
@@ -350,6 +487,34 @@ void ImageCollection::AddOrReplace(ImagePlacement image)
         _images.emplace_back(std::move(image));
     }
     _markIndexDirty();
+}
+
+void ImageCollection::AddOrReplaceArea(ImagePlacement image)
+{
+    const auto key = image.Identity();
+    const auto area = image.CellBounds();
+    const auto current = All();
+    std::vector<ImagePlacement> remaining;
+    remaining.reserve(current.size() + 1);
+    for (const auto& candidate : current)
+    {
+        const auto bounds = candidate.CellBounds();
+        if (candidate.Identity() != key || (bounds & area).empty())
+        {
+            remaining.emplace_back(candidate);
+            continue;
+        }
+
+        for (const auto fragment : bounds - area)
+        {
+            if (auto cropped = candidate.Crop(fragment))
+            {
+                remaining.emplace_back(std::move(*cropped));
+            }
+        }
+    }
+    remaining.emplace_back(std::move(image));
+    _replace(std::move(remaining));
 }
 
 void ImageCollection::Clear() noexcept
@@ -391,41 +556,29 @@ size_t ImageCollection::EraseImage(const uint32_t imageId)
 
 void ImageCollection::EraseArea(const til::rect area)
 {
-    if (area.empty() || _images.empty())
+    const std::array areas{ area };
+    EraseAreas(areas);
+}
+
+void ImageCollection::EraseAreas(const std::span<const til::rect> areas)
+{
+    if (areas.empty() || _images.empty())
     {
         return;
     }
 
-    const auto intersects = [&](const auto& image) {
-        return !(image.CellBounds() & area).empty();
-    };
-    if (std::none_of(_images.begin(), _images.end(), intersects))
+    const auto current = All();
+    const auto intersects = std::any_of(current.begin(), current.end(), [&](const auto& image) {
+        return std::any_of(areas.begin(), areas.end(), [&](const auto area) {
+            return !area.empty() && !(image.CellBounds() & area).empty();
+        });
+    });
+    if (!intersects)
     {
         return;
     }
 
-    std::vector<ImagePlacement> remaining;
-    remaining.reserve(_images.size());
-    for (auto& image : _images)
-    {
-        const auto bounds = image.CellBounds();
-        if ((bounds & area).empty())
-        {
-            remaining.emplace_back(std::move(image));
-            continue;
-        }
-
-        for (const auto fragment : bounds - area)
-        {
-            if (auto cropped = image.Crop(fragment))
-            {
-                remaining.emplace_back(std::move(*cropped));
-            }
-        }
-    }
-
-    _images = std::move(remaining);
-    _markIndexDirty();
+    _replace(_eraseAreas(current, areas));
 }
 
 void ImageCollection::CopyArea(const til::rect source, const til::point target, ImageCollection& destination) const
@@ -437,9 +590,9 @@ void ImageCollection::CopyArea(const til::rect source, const til::point target, 
 
     std::vector<ImagePlacement> copied;
     const til::point delta{ target.x - source.left, target.y - source.top };
-    for (const auto& image : _images)
+    for (const auto image : IntersectingRows(source.top, source.bottom))
     {
-        if (auto fragment = image.Crop(source))
+        if (auto fragment = image->Crop(source))
         {
             copied.emplace_back(fragment->Translated(delta));
         }
@@ -451,11 +604,23 @@ void ImageCollection::CopyArea(const til::rect source, const til::point target, 
         target.x + source.width(),
         target.y + source.height(),
     };
-    destination.EraseArea(targetArea);
-    for (auto& image : copied)
+    const auto destinationCandidates = destination.IntersectingRows(targetArea.top, targetArea.bottom);
+    const auto destinationIntersects = std::any_of(
+        destinationCandidates.begin(),
+        destinationCandidates.end(),
+        [&](const auto& image) {
+            return !(image->CellBounds() & targetArea).empty();
+        });
+    if (copied.empty() && !destinationIntersects)
     {
-        destination.Add(std::move(image));
+        return;
     }
+
+    const std::array targetAreas{ targetArea };
+    auto remaining = _eraseAreas(destination.All(), targetAreas);
+    remaining.reserve(remaining.size() + copied.size());
+    std::move(copied.begin(), copied.end(), std::back_inserter(remaining));
+    destination._replace(std::move(remaining));
 }
 
 void ImageCollection::Translate(const til::point delta)
@@ -465,32 +630,85 @@ void ImageCollection::Translate(const til::point delta)
         return;
     }
 
-    for (auto& image : _images)
+    const auto current = All();
+    std::vector<ImagePlacement> translated;
+    translated.reserve(current.size());
+    for (const auto& image : current)
     {
-        image = image.Translated(delta);
+        translated.emplace_back(image.Translated(delta));
     }
-    _markIndexDirty();
+    _replace(std::move(translated));
 }
 
 void ImageCollection::ClipArea(const til::rect area)
 {
+    const auto current = All();
     std::vector<ImagePlacement> clipped;
-    clipped.reserve(_images.size());
-    for (const auto& image : _images)
+    clipped.reserve(current.size());
+    auto changed = false;
+    for (const auto& image : current)
     {
         if (auto fragment = image.Crop(area))
         {
+            changed = changed || fragment->CellBounds() != image.CellBounds();
             clipped.emplace_back(std::move(*fragment));
+        }
+        else
+        {
+            changed = true;
         }
     }
 
-    if (clipped.size() != _images.size() ||
-        !std::equal(clipped.begin(), clipped.end(), _images.begin(), [](const auto& lhs, const auto& rhs) {
-            return lhs.CellBounds() == rhs.CellBounds();
-        }))
+    if (changed)
     {
-        _images = std::move(clipped);
-        _markIndexDirty();
+        _replace(std::move(clipped));
+    }
+}
+
+void ImageCollection::AdvanceRows(const til::CoordType rowCount, const til::CoordType bufferHeight)
+{
+    if (rowCount <= 0)
+    {
+        return;
+    }
+    THROW_HR_IF(E_INVALIDARG, bufferHeight <= 0);
+
+    const auto count = static_cast<uint64_t>(rowCount);
+    constexpr auto coordinateHeadroom = static_cast<uint64_t>(til::CoordTypeMax);
+    if (_rowEpoch > std::numeric_limits<uint64_t>::max() - coordinateHeadroom - count)
+    {
+        auto rebased = std::vector<ImagePlacement>{};
+        if (!_images.empty())
+        {
+            const auto current = All();
+            rebased.assign(current.begin(), current.end());
+        }
+        _rowEpoch = 0;
+        _lastPurgeEpoch = 0;
+        _images = std::move(rebased);
+        for (auto& image : _images)
+        {
+            image._rowEpoch = 0;
+        }
+        _rowIndexDirty = true;
+    }
+    _rowEpoch += count;
+    _bufferHeight = bufferHeight;
+    _markLogicalImagesDirty();
+
+    if (_rowEpoch - _lastPurgeEpoch >= static_cast<uint64_t>(bufferHeight))
+    {
+        const auto oldSize = _images.size();
+        std::erase_if(_images, [&](const auto& image) {
+            const auto bounds = image.CellBounds();
+            return image._rowEpoch > _rowEpoch ||
+                   _rowEpoch - image._rowEpoch >= static_cast<uint64_t>(bounds.bottom);
+        });
+        _lastPurgeEpoch = _rowEpoch;
+        if (_images.size() != oldSize)
+        {
+            _rowIndexDirty = true;
+        }
     }
 }
 
@@ -502,44 +720,134 @@ void ImageCollection::PrepareRowIndex() const
 ImageCollection::RowQuery ImageCollection::IntersectingRows(const til::CoordType rowBegin, const til::CoordType rowEnd) const
 {
     RowQuery result;
-    if (rowBegin >= rowEnd || _images.empty())
+    if (rowBegin < 0 || rowBegin >= rowEnd || _images.empty())
     {
         return result;
     }
 
     _ensureRowIndex();
-    _rowIndex->tree.visit_overlapping(rowBegin, rowEnd - 1, [&](const auto& interval) {
-        result.emplace_back(&_images[interval.value]);
+    const auto absoluteBegin = _rowEpoch + static_cast<uint64_t>(rowBegin);
+    const auto absoluteEnd = _rowEpoch + static_cast<uint64_t>(rowEnd);
+    _rowIndex->tree.visit_overlapping(absoluteBegin, absoluteEnd - 1, [&](const auto& interval) {
+        const auto& image = _images[interval.value];
+        if (const auto rowOffset = _logicalRowOffset(image))
+        {
+            result.push_back(LogicalPlacement{ &image, *rowOffset, _bufferHeight });
+        }
     });
-    std::sort(result.begin(), result.end(), imageLess);
+    std::sort(result.begin(), result.end(), [](const auto& lhs, const auto& rhs) {
+        return imageLess(lhs, rhs);
+    });
     return result;
 }
 
-std::span<const ImagePlacement> ImageCollection::All() const noexcept
+std::span<const ImagePlacement> ImageCollection::All() const
 {
-    return _images;
+    _ensureLogicalImages();
+    return _logicalImages;
 }
 
 size_t ImageCollection::Size() const noexcept
 {
-    return _images.size();
+    return std::count_if(_images.begin(), _images.end(), [&](const auto& image) {
+        return _logicalRowOffset(image).has_value();
+    });
 }
 
 bool ImageCollection::Empty() const noexcept
 {
-    return _images.empty();
+    return std::none_of(_images.begin(), _images.end(), [&](const auto& image) {
+        return _logicalRowOffset(image).has_value();
+    });
+}
+
+uint64_t ImageCollection::RowEpoch() const noexcept
+{
+    return _rowEpoch;
+}
+
+std::optional<til::CoordType> ImageCollection::_logicalRowOffset(const ImagePlacement& image) const noexcept
+{
+    if (image._rowEpoch > _rowEpoch)
+    {
+        return std::nullopt;
+    }
+
+    const auto elapsedRows = _rowEpoch - image._rowEpoch;
+    if (elapsedRows > static_cast<uint64_t>(til::CoordTypeMax))
+    {
+        return std::nullopt;
+    }
+
+    const auto offset = -static_cast<til::CoordType>(elapsedRows);
+    const auto bounds = image.CellBounds();
+    const auto logicalTop = static_cast<int64_t>(bounds.top) + offset;
+    const auto logicalBottom = static_cast<int64_t>(bounds.bottom) + offset;
+    if (logicalBottom <= 0 || logicalTop >= _bufferHeight)
+    {
+        return std::nullopt;
+    }
+    return offset;
+}
+
+void ImageCollection::_markLogicalImagesDirty() noexcept
+{
+    _logicalImagesDirty = true;
 }
 
 void ImageCollection::_markIndexDirty() noexcept
 {
+    _markLogicalImagesDirty();
     _rowIndexDirty = true;
+}
+
+void ImageCollection::_ensureLogicalImages() const
+{
+    if (_logicalImagesDirty)
+    {
+        std::vector<ImagePlacement> logicalImages;
+        logicalImages.reserve(_images.size());
+        for (const auto& image : _images)
+        {
+            const auto rowOffset = _logicalRowOffset(image);
+            if (!rowOffset)
+            {
+                continue;
+            }
+
+            auto logical = image.Translated({ 0, *rowOffset });
+            const auto bounds = logical.CellBounds();
+            logical = *logical.Crop({
+                bounds.left,
+                std::max(bounds.top, til::CoordType{ 0 }),
+                bounds.right,
+                std::min(bounds.bottom, _bufferHeight),
+            });
+            logical._rowEpoch = _rowEpoch;
+            logicalImages.emplace_back(std::move(logical));
+        }
+        _logicalImages = std::move(logicalImages);
+        _logicalImagesDirty = false;
+    }
 }
 
 void ImageCollection::_ensureRowIndex() const
 {
     if (_rowIndexDirty)
     {
-        _rowIndex = std::make_unique<RowIndex>(_images);
+        RowIndex::Tree::interval_vector intervals;
+        intervals.reserve(_images.size());
+        for (size_t i = 0; i < _images.size(); ++i)
+        {
+            const auto& image = _images[i];
+            const auto bounds = image.CellBounds();
+            THROW_HR_IF(E_UNEXPECTED, image._rowEpoch > std::numeric_limits<uint64_t>::max() - static_cast<uint64_t>(bounds.bottom));
+            intervals.emplace_back(
+                image._rowEpoch + static_cast<uint64_t>(bounds.top),
+                image._rowEpoch + static_cast<uint64_t>(bounds.bottom) - 1,
+                i);
+        }
+        _rowIndex = std::make_unique<RowIndex>(std::move(intervals));
         _rowIndexDirty = false;
     }
 }

@@ -247,26 +247,54 @@ RGBQUAD* ImageSlice::MutablePixels(const til::CoordType columnBegin, const til::
 
 void ImageSlice::CopyBlock(const TextBuffer& srcBuffer, const til::rect srcRect, TextBuffer& dstBuffer, const til::rect dstRect)
 {
-    // If the top of the source is less than the top of the destination, we copy
-    // the rows from the bottom upwards, to avoid the possibility of the source
-    // being overwritten if it were to overlap the destination range.
-    if (srcRect.top < dstRect.top)
+    struct StagedRow
     {
-        for (auto y = srcRect.height(); y-- > 0;)
+        til::CoordType row = 0;
+        ImageSlice::Pointer slice;
+    };
+
+    std::vector<StagedRow> stagedRows;
+    stagedRows.reserve(srcRect.height());
+    for (auto y = 0; y < srcRect.height(); ++y)
+    {
+        const auto& srcRow = srcBuffer.GetRowByOffset(srcRect.top + y);
+        const auto& dstRow = dstBuffer.GetRowByOffset(dstRect.top + y);
+        const auto srcSlice = srcRow.GetImageSlice();
+        const auto dstExisting = dstRow.GetImageSlice();
+        auto staged = dstExisting ? std::make_unique<ImageSlice>(*dstExisting) : nullptr;
+
+        if (!srcSlice || srcRow.GetLineRendition() != dstRow.GetLineRendition() ||
+            (dstExisting && dstExisting->CellSize() != srcSlice->CellSize()))
         {
-            const auto& srcRow = srcBuffer.GetRowByOffset(srcRect.top + y);
-            auto& dstRow = dstBuffer.GetMutableRowByOffset(dstRect.top + y);
-            CopyCells(srcRow, srcRect.left, dstRow, dstRect.left, dstRect.right);
+            if (staged)
+            {
+                const auto scale = dstRow.GetLineRendition() != LineRendition::SingleWidth ? 1 : 0;
+                if (staged->_eraseCells(dstRect.left << scale, dstRect.right << scale))
+                {
+                    staged.reset();
+                }
+            }
         }
+        else
+        {
+            if (!staged)
+            {
+                staged = std::make_unique<ImageSlice>(srcSlice->CellSize());
+            }
+            const auto scale = srcRow.GetLineRendition() != LineRendition::SingleWidth ? 1 : 0;
+            if (staged->_copyCells(*srcSlice, srcRect.left << scale, dstRect.left << scale, dstRect.right << scale))
+            {
+                staged.reset();
+            }
+        }
+
+        stagedRows.push_back({ dstRect.top + y, std::move(staged) });
     }
-    else
+
+    srcBuffer.GetImages().CopyArea(srcRect, dstRect.origin(), dstBuffer.GetMutableImages());
+    for (auto& staged : stagedRows)
     {
-        for (auto y = 0; y < srcRect.height(); y++)
-        {
-            const auto& srcRow = srcBuffer.GetRowByOffset(srcRect.top + y);
-            auto& dstRow = dstBuffer.GetMutableRowByOffset(dstRect.top + y);
-            CopyCells(srcRow, srcRect.left, dstRow, dstRect.left, dstRect.right);
-        }
+        dstBuffer.GetMutableRowByOffset(staged.row).SetImageSlice(std::move(staged.slice));
     }
 }
 
@@ -383,6 +411,7 @@ bool ImageSlice::_copyCells(const ImageSlice& srcSlice, const til::CoordType src
 
 void ImageSlice::EraseBlock(TextBuffer& buffer, const til::rect rect)
 {
+    buffer.GetMutableImages().EraseArea(rect);
     for (auto y = rect.top; y < rect.bottom; y++)
     {
         auto& row = buffer.GetMutableRowByOffset(y);
@@ -392,16 +421,24 @@ void ImageSlice::EraseBlock(TextBuffer& buffer, const til::rect rect)
 
 void ImageSlice::EraseCells(TextBuffer& buffer, const til::point at, const til::CoordType distance)
 {
+    std::vector<til::rect> areas;
     auto x = at.x;
     auto y = at.y;
     auto distanceRemaining = distance;
     while (distanceRemaining > 0)
     {
-        auto& row = buffer.GetMutableRowByOffset(y);
-        EraseCells(row, x, x + distanceRemaining);
-        distanceRemaining -= (static_cast<til::CoordType>(row.size()) - x);
+        const auto& row = buffer.GetRowByOffset(y);
+        const auto available = static_cast<til::CoordType>(row.size()) - x;
+        const auto width = std::min(distanceRemaining, available);
+        areas.emplace_back(x, y, x + width, y + 1);
+        distanceRemaining -= available;
         x = 0;
         y++;
+    }
+    buffer.GetMutableImages().EraseAreas(areas);
+    for (const auto area : areas)
+    {
+        EraseCells(buffer.GetMutableRowByOffset(area.top), area.left, area.right);
     }
 }
 

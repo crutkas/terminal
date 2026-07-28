@@ -73,6 +73,13 @@ public:
                    int32_t zIndex,
                    til::rect sourceInPixels = {},
                    PixelGeometry geometry = {});
+    static ImagePlacement FromFragment(Key key,
+                                       Image::Pointer image,
+                                       til::rect cellBounds,
+                                       til::rect originalCellBounds,
+                                       int32_t zIndex,
+                                       til::rect sourceInPixels = {},
+                                       PixelGeometry geometry = {});
 
     Key Identity() const noexcept;
     const Image& Surface() const noexcept;
@@ -95,7 +102,10 @@ private:
                    til::rect originalCellBounds,
                    int32_t zIndex,
                    til::rect sourceInPixels,
-                   PixelGeometry geometry) noexcept;
+                   PixelGeometry geometry,
+                   uint64_t rowEpoch) noexcept;
+
+    friend class ImageCollection;
 
     Key _key;
     Image::Pointer _image;
@@ -104,12 +114,38 @@ private:
     int32_t _zIndex = 0;
     til::rect _sourceInPixels;
     PixelGeometry _geometry;
+    uint64_t _rowEpoch = 0;
 };
 
 class ImageCollection final
 {
 public:
-    using RowQuery = til::small_vector<const ImagePlacement*, 16>;
+    class LogicalPlacement final
+    {
+    public:
+        const LogicalPlacement* operator->() const noexcept;
+
+        ImagePlacement::Key Identity() const noexcept;
+        const Image& Surface() const noexcept;
+        til::rect CellBounds() const noexcept;
+        til::rect OriginalCellBounds() const noexcept;
+        const ImagePlacement::PixelGeometry& Geometry() const noexcept;
+        int32_t ZIndex() const noexcept;
+        ImagePlacement::RenderPosition Position() const noexcept;
+        std::optional<ImagePlacement> Crop(til::rect cellBounds) const;
+        bool RasterizeRow(til::CoordType row, til::CoordType columnBegin, til::CoordType columnEnd, ImageSlice& destination) const;
+
+    private:
+        friend class ImageCollection;
+
+        LogicalPlacement(const ImagePlacement* placement, til::CoordType rowOffset, til::CoordType bufferHeight) noexcept;
+
+        const ImagePlacement* _placement = nullptr;
+        til::CoordType _rowOffset = 0;
+        til::CoordType _bufferHeight = til::CoordTypeMax;
+    };
+
+    using RowQuery = til::small_vector<LogicalPlacement, 16>;
 
     ImageCollection();
     ~ImageCollection();
@@ -120,29 +156,44 @@ public:
 
     void Add(ImagePlacement image);
     void AddOrReplace(ImagePlacement image);
+    void AddOrReplaceArea(ImagePlacement image);
     void Clear() noexcept;
     bool Erase(ImagePlacement::Key key);
     size_t EraseImage(uint32_t imageId);
     void EraseArea(til::rect area);
+    void EraseAreas(std::span<const til::rect> areas);
     void CopyArea(til::rect source, til::point target, ImageCollection& destination) const;
     void Translate(til::point delta);
     void ClipArea(til::rect area);
+    void AdvanceRows(til::CoordType rowCount, til::CoordType bufferHeight);
     void PrepareRowIndex() const;
 
     // Preparing the index after a batch of mutations keeps its allocations out
-    // of the render query. Returned pointers remain valid until the next mutation.
+    // of the render query. RowQuery entries and All() spans are frame-local and
+    // remain valid only until the next collection mutation.
     RowQuery IntersectingRows(til::CoordType rowBegin, til::CoordType rowEnd) const;
-    std::span<const ImagePlacement> All() const noexcept;
+    std::span<const ImagePlacement> All() const;
     size_t Size() const noexcept;
     bool Empty() const noexcept;
+    uint64_t RowEpoch() const noexcept;
 
 private:
     struct RowIndex;
 
+    static std::vector<ImagePlacement> _eraseAreas(std::span<const ImagePlacement> images, std::span<const til::rect> areas);
+    void _replace(std::vector<ImagePlacement> images) noexcept;
+    std::optional<til::CoordType> _logicalRowOffset(const ImagePlacement& image) const noexcept;
+    void _markLogicalImagesDirty() noexcept;
     void _markIndexDirty() noexcept;
+    void _ensureLogicalImages() const;
     void _ensureRowIndex() const;
 
     std::vector<ImagePlacement> _images;
+    uint64_t _rowEpoch = 0;
+    uint64_t _lastPurgeEpoch = 0;
+    til::CoordType _bufferHeight = til::CoordTypeMax;
+    mutable std::vector<ImagePlacement> _logicalImages;
     mutable std::unique_ptr<RowIndex> _rowIndex;
+    mutable bool _logicalImagesDirty = true;
     mutable bool _rowIndexDirty = true;
 };

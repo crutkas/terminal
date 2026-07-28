@@ -3827,12 +3827,11 @@ bool KittyParser::_placeImageCellRef(const Image& image, const uint32_t imageId,
         LOG_HR(E_OUTOFMEMORY);
         return false;
     }
-    auto& dstRow = buffer.GetMutableRowByOffset(row);
-    auto dstSlice = dstRow.GetMutableImageSlice();
-    if (!dstSlice || dstSlice->CellSize() != clampedCellSize)
-    {
-        dstSlice = dstRow.SetImageSlice(std::make_unique<ImageSlice>(clampedCellSize));
-    }
+
+    auto stagedSlice = existingSlice && existingSlice->CellSize() == clampedCellSize ?
+                           std::make_unique<ImageSlice>(*existingSlice) :
+                           std::make_unique<ImageSlice>(clampedCellSize);
+    auto dstSlice = stagedSlice.get();
     auto dstIterator = dstSlice->MutablePixels(column, column + 1, { imageId, place.layerId }, place.zIndex);
     auto sourceIterator = dstSlice->MutableSourceIndices(column, column + 1, { imageId, place.layerId }, place.zIndex);
     for (auto pixelRow = 0; pixelRow < cellHeight; ++pixelRow)
@@ -3863,6 +3862,43 @@ bool KittyParser::_placeImageCellRef(const Image& image, const uint32_t imageId,
             std::advance(sourceIterator, dstSlice->PixelWidth());
         }
     }
+
+    auto surface = image.surface;
+    const auto newSurface = !surface;
+    if (newSurface)
+    {
+        surface = std::make_shared<::Image>(
+            til::size{ gsl::narrow_cast<til::CoordType>(image.width), gsl::narrow_cast<til::CoordType>(image.height) },
+            *framePixels);
+    }
+
+    const auto originalLeft = gsl::narrow<til::CoordType>(static_cast<int64_t>(column) - cellCol);
+    const auto originalTop = gsl::narrow<til::CoordType>(static_cast<int64_t>(row) - cellRow);
+    const til::rect originalBounds{
+        originalLeft,
+        originalTop,
+        gsl::narrow<til::CoordType>(static_cast<int64_t>(originalLeft) + gridCols),
+        gsl::narrow<til::CoordType>(static_cast<int64_t>(originalTop) + gridRows),
+    };
+    auto fragment = ImagePlacement::FromFragment(
+        { imageId, place.layerId },
+        surface,
+        { column, row, column + 1, row + 1 },
+        originalBounds,
+        place.zIndex,
+        { cropX, cropY, cropX + cropW, cropY + cropH },
+        {
+            .cellSize = clampedCellSize,
+            .targetWidth = gsl::narrow_cast<uint64_t>(targetW),
+            .targetHeight = gsl::narrow_cast<uint64_t>(targetH),
+        }
+    );
+    buffer.GetMutableImages().AddOrReplaceArea(std::move(fragment));
+    if (newSurface)
+    {
+        image.surface = std::move(surface);
+    }
+    buffer.GetMutableRowByOffset(row).SetImageSlice(std::move(stagedSlice));
     return true;
 }
 

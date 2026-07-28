@@ -58,6 +58,73 @@ static uint64_t imageCellRefLayerId(const ROW& row, const til::CoordType column)
     return metadata ? metadata->layerId : 0;
 }
 
+struct StagedImageRow
+{
+    til::CoordType row = 0;
+    ImageSlice::Pointer slice;
+};
+
+static std::vector<StagedImageRow> stageImageSlices(TextBuffer& buffer,
+                                                   const ImageCollection& images,
+                                                   const std::span<const ImagePlacement> previousImages)
+{
+    std::vector<ImagePlacement::Key> keys;
+    keys.reserve(previousImages.size());
+    for (const auto& image : previousImages)
+    {
+        keys.emplace_back(image.Identity());
+    }
+    std::sort(keys.begin(), keys.end(), [](const auto lhs, const auto rhs) {
+        return std::tie(lhs.imageId, lhs.layerId) < std::tie(rhs.imageId, rhs.layerId);
+    });
+    keys.erase(std::unique(keys.begin(), keys.end()), keys.end());
+
+    std::vector<StagedImageRow> stagedRows;
+    images.PrepareRowIndex();
+    const auto height = buffer.GetSize().Height();
+    for (auto rowIndex = 0; rowIndex < height; ++rowIndex)
+    {
+        const auto placements = images.IntersectingRows(rowIndex, rowIndex + 1);
+        const auto existing = buffer.GetRowByOffset(rowIndex).GetImageSlice();
+        const auto removesPlacement = existing && std::any_of(keys.begin(), keys.end(), [&](const auto key) {
+            return existing->Contains({ key.imageId, key.layerId });
+        });
+        if (!removesPlacement && placements.empty())
+        {
+            continue;
+        }
+
+        auto staged = existing ? std::make_unique<ImageSlice>(*existing) : nullptr;
+        for (const auto key : keys)
+        {
+            if (staged && staged->Contains({ key.imageId, key.layerId }) && staged->EraseLayer({ key.imageId, key.layerId }))
+            {
+                staged.reset();
+            }
+        }
+        for (const auto placement : placements)
+        {
+            if (!staged || staged->CellSize() != placement->Geometry().cellSize)
+            {
+                auto replacement = std::make_unique<ImageSlice>(placement->Geometry().cellSize);
+                staged = std::move(replacement);
+            }
+            const auto bounds = placement->CellBounds();
+            THROW_HR_IF(E_UNEXPECTED, !placement->RasterizeRow(rowIndex, bounds.left, bounds.right, *staged));
+        }
+        stagedRows.push_back({ rowIndex, std::move(staged) });
+    }
+    return stagedRows;
+}
+
+static void commitImageSlices(TextBuffer& buffer, std::vector<StagedImageRow> stagedRows) noexcept
+{
+    for (auto& staged : stagedRows)
+    {
+        buffer.GetMutableRowByOffset(staged.row).SetImageSlice(std::move(staged.slice));
+    }
+}
+
 static std::atomic<uint64_t> s_lastMutationIdInitialValue;
 
 // Routine Description:
@@ -170,6 +237,7 @@ __declspec(noinline) void TextBuffer::_commit(const std::byte* row)
 // You can use this (or rather the Reset() method) to fully clear the TextBuffer.
 void TextBuffer::_decommit() noexcept
 {
+    _images.Clear();
     _destroy();
     VirtualFree(_buffer.get(), 0, MEM_DECOMMIT);
     _commitWatermark = _buffer.get();
@@ -576,6 +644,7 @@ void TextBuffer::Replace(til::CoordType row, const TextAttribute& attributes, Ro
     auto& r = GetMutableRowByOffset(row);
     r.ReplaceText(state);
     r.ReplaceAttributes(state.columnBegin, state.columnEnd, attributes);
+    _images.EraseArea({ state.columnBegin, row, state.columnEnd, row + 1 });
     ImageSlice::EraseCells(r, state.columnBegin, state.columnEnd);
     TriggerRedraw(Viewport::FromExclusive({ state.columnBeginDirty, row, state.columnEndDirty, row + 1 }));
 }
@@ -606,10 +675,15 @@ void TextBuffer::Insert(til::CoordType row, const TextAttribute& attributes, Row
         const auto restoreAttr = scratchAttr.slice(gsl::narrow<uint16_t>(state.columnBegin), gsl::narrow<uint16_t>(state.columnBegin + copyAmount));
         rowAttr.replace(gsl::narrow<uint16_t>(restoreState.columnBegin), gsl::narrow<uint16_t>(restoreState.columnEnd), restoreAttr);
         r.CopyImageCellRefs(scratch, state.columnBegin, restoreState.columnBegin, restoreState.columnEnd);
+        _images.CopyArea(
+            { state.columnBegin, row, state.columnBegin + copyAmount, row + 1 },
+            { restoreState.columnBegin, row },
+            _images);
         // If there is any image content, that needs to be copied too.
         ImageSlice::CopyCells(r, state.columnBegin, r, restoreState.columnBegin, restoreState.columnEnd);
     }
     // Image content at the insert position needs to be erased.
+    _images.EraseArea({ state.columnBegin, row, restoreState.columnBegin, row + 1 });
     ImageSlice::EraseCells(r, state.columnBegin, restoreState.columnBegin);
 
     TriggerRedraw(Viewport::FromExclusive({ state.columnBeginDirty, row, restoreState.columnEndDirty, row + 1 }));
@@ -622,6 +696,8 @@ void TextBuffer::FillRect(const til::rect& rect, const std::wstring_view& fill, 
     {
         return;
     }
+
+    _images.EraseArea(rect);
 
     auto& scratchpad = GetScratchpadRow(attributes);
 
@@ -766,6 +842,8 @@ void TextBuffer::IncrementCircularBuffer(const TextAttribute& fillAttributes)
     // Prune hyperlinks to delete obsolete references
     _PruneHyperlinks();
 
+    _images.AdvanceRows(1, _height);
+
     // Second, clean out the old "first row" as it will become the "last row" of the buffer after the circle is performed.
     GetMutableRowByOffset(0).Reset(fillAttributes);
     {
@@ -841,6 +919,11 @@ void TextBuffer::_SetFirstRowIndex(const til::CoordType FirstRowIndex) noexcept
 
 void TextBuffer::ScrollRows(const til::CoordType firstRow, til::CoordType size, const til::CoordType delta)
 {
+    _scrollRows(firstRow, size, delta, true);
+}
+
+void TextBuffer::_scrollRows(const til::CoordType firstRow, til::CoordType size, const til::CoordType delta, const bool copyImages)
+{
     if (delta == 0)
     {
         return;
@@ -905,16 +988,38 @@ void TextBuffer::ScrollRows(const til::CoordType firstRow, til::CoordType size, 
 
     for (; y != end; y += step)
     {
-        CopyRow(y, y + delta, *this);
+        if (copyImages)
+        {
+            CopyRow(y, y + delta, *this);
+        }
+        else
+        {
+            _copyRowData(y, y + delta, *this);
+        }
     }
 }
 
 void TextBuffer::CopyRow(const til::CoordType srcRowIndex, const til::CoordType dstRowIndex, TextBuffer& dstBuffer) const
 {
+    const auto width = std::min<til::CoordType>(_width, dstBuffer._width);
+    _images.CopyArea(
+        { 0, srcRowIndex, width, srcRowIndex + 1 },
+        { 0, dstRowIndex },
+        dstBuffer._images);
+    _copyRowData(srcRowIndex, dstRowIndex, dstBuffer);
+}
+
+void TextBuffer::_copyRowData(const til::CoordType srcRowIndex, const til::CoordType dstRowIndex, TextBuffer& dstBuffer) const
+{
     auto& dstRow = dstBuffer.GetMutableRowByOffset(dstRowIndex);
     const auto& srcRow = GetRowByOffset(srcRowIndex);
     dstRow.CopyFrom(srcRow);
     ImageSlice::CopyRow(srcRow, dstRow);
+}
+
+void TextBuffer::_rebuildImageSlices(const std::span<const ImagePlacement> previousImages)
+{
+    commitImageSlices(*this, stageImageSlices(*this, _images, previousImages));
 }
 
 Cursor& TextBuffer::GetCursor() noexcept
@@ -954,6 +1059,7 @@ void TextBuffer::SetCurrentLineRendition(const LineRendition lineRendition, cons
     auto& row = GetMutableRowByOffset(rowIndex);
     if (row.GetLineRendition() != lineRendition)
     {
+        _images.EraseArea({ 0, rowIndex, _width, rowIndex + 1 });
         row.SetLineRendition(lineRendition);
         // If the line rendition has changed, the row can no longer be wrapped.
         row.SetWrapForced(false);
@@ -1046,6 +1152,13 @@ void TextBuffer::ClearScrollback(const til::CoordType newFirstRow, const til::Co
         return;
     }
 
+    ImageCollection retainedImages;
+    _images.CopyArea(
+        { 0, newFirstRow, _width, newFirstRow + rowsToKeep },
+        {},
+        retainedImages);
+    retainedImages.ClipArea({ 0, 0, _width, rowsToKeep });
+
     ClearMarksInRange(til::point{ 0, 0 }, til::point{ _width, std::max(0, newFirstRow - 1) });
 
     // Our goal is to move the viewport to the absolute start of the underlying memory buffer so that we can
@@ -1056,13 +1169,14 @@ void TextBuffer::ClearScrollback(const til::CoordType newFirstRow, const til::Co
     // operates modulo the buffer height and so the possibly-too-large startAbsolute won't be an issue.
     const auto startAbsolute = _firstRow + newFirstRow;
     _firstRow = 0;
-    ScrollRows(startAbsolute, rowsToKeep, -startAbsolute);
+    _scrollRows(startAbsolute, rowsToKeep, -startAbsolute, false);
 
     const auto end = _estimateOffsetOfLastCommittedRow();
     for (auto y = rowsToKeep; y <= end; ++y)
     {
         GetMutableRowByOffset(y).Reset(_initialAttributes);
     }
+    _images = std::move(retainedImages);
 }
 
 // Routine Description:
@@ -1078,6 +1192,7 @@ void TextBuffer::ResizeTraditional(til::size newSize)
     newSize.height = std::max(newSize.height, 1);
 
     TextBuffer newBuffer{ newSize, _currentAttributes, 0, false, _renderer };
+    const auto oldImages = _images.All();
     const auto cursorRow = GetCursor().GetPosition().y;
     const auto copyableRows = std::min<til::CoordType>(_height, newSize.height);
     til::CoordType srcRow = 0;
@@ -1092,8 +1207,11 @@ void TextBuffer::ResizeTraditional(til::size newSize)
     {
         CopyRow(srcRow, dstRow, newBuffer);
     }
+    newBuffer._images.ClipArea({ 0, 0, newSize.width, newSize.height });
+    newBuffer._rebuildImageSlices(oldImages);
 
     // NOTE: Keep this in sync with _reserve().
+    _images = std::move(newBuffer._images);
     _buffer = std::move(newBuffer._buffer);
     _bufferEnd = newBuffer._bufferEnd;
     _commitWatermark = newBuffer._commitWatermark;
@@ -2755,6 +2873,7 @@ void TextBuffer::Reflow(TextBuffer& oldBuffer, TextBuffer& newBuffer, const View
 {
     const auto& oldCursor = oldBuffer.GetCursor();
     auto& newCursor = newBuffer.GetCursor();
+    const auto oldImages = oldBuffer._images.All();
 
     til::point oldCursorPos = oldCursor.GetPosition();
     til::point newCursorPos;
@@ -2779,7 +2898,12 @@ void TextBuffer::Reflow(TextBuffer& oldBuffer, TextBuffer& newBuffer, const View
     til::CoordType newWidth = newBuffer.GetSize().Width();
     til::CoordType newYLimit = til::CoordTypeMax;
 
-    const auto oldHeight = std::max(lastRowWithText, oldCursorPos.y) + 1;
+    auto imageRowsEnd = til::CoordType{ 0 };
+    for (const auto& image : oldImages)
+    {
+        imageRowsEnd = std::max(imageRowsEnd, std::clamp(image.CellBounds().bottom, til::CoordType{ 0 }, static_cast<til::CoordType>(oldBuffer._height)));
+    }
+    const auto oldHeight = std::max(std::max(lastRowWithText, oldCursorPos.y) + 1, imageRowsEnd);
     const auto newHeight = newBuffer.GetSize().Height();
     const auto newWidthU16 = gsl::narrow_cast<uint16_t>(newWidth);
 
@@ -2791,6 +2915,12 @@ void TextBuffer::Reflow(TextBuffer& oldBuffer, TextBuffer& newBuffer, const View
         uint64_t layerId = 0;
     };
     std::vector<ImageCellMove> imageCellMoves;
+    struct ImageSegmentMove
+    {
+        til::rect source;
+        til::point destination;
+    };
+    std::vector<ImageSegmentMove> imageSegmentMoves;
 
     // Copy oldBuffer into newBuffer until oldBuffer has been fully consumed.
     for (; oldY < oldHeight && newY < newYLimit; ++oldY)
@@ -2820,6 +2950,30 @@ void TextBuffer::Reflow(TextBuffer& oldBuffer, TextBuffer& newBuffer, const View
 
             newRow.CopyFrom(oldRow);
             newRow.SetWrapForced(false);
+            const auto copiedColumns = std::min(oldRow.GetReadableColumnCount(), newRow.GetReadableColumnCount());
+            if (copiedColumns > 0)
+            {
+                imageSegmentMoves.push_back({
+                    .source = { 0, oldY, copiedColumns, oldY + 1 },
+                    .destination = { 0, newY },
+                });
+            }
+            for (auto column = 0; column < copiedColumns; ++column)
+            {
+                if (oldRow.GetImageCellRef(column))
+                {
+                    const auto layerId = imageCellRefLayerId(oldRow, column);
+                    if (layerId != 0)
+                    {
+                        imageCellMoves.push_back({
+                            .source = { column, oldY },
+                            .destination = { column, newY },
+                            .imageId = imageCellRefImageId(oldRow, column),
+                            .layerId = layerId,
+                        });
+                    }
+                }
+            }
 
             if (oldY == oldCursorPos.y)
             {
@@ -2843,6 +2997,10 @@ void TextBuffer::Reflow(TextBuffer& oldBuffer, TextBuffer& newBuffer, const View
         // Rows don't store any information for what column the last written character is in.
         // We simply truncate all trailing whitespace in this implementation.
         auto oldRowLimit = oldRow.MeasureRight();
+        for (const auto placement : oldBuffer._images.IntersectingRows(oldY, oldY + 1))
+        {
+            oldRowLimit = std::max(oldRowLimit, std::min(placement->CellBounds().right, oldRow.GetReadableColumnCount()));
+        }
         if (oldY == oldCursorPos.y)
         {
             // REFLOW_JANK_CURSOR_WRAP:
@@ -2937,7 +3095,17 @@ void TextBuffer::Reflow(TextBuffer& oldBuffer, TextBuffer& newBuffer, const View
                 }
             }
 
-            for (auto sourceColumn = oldX; sourceColumn < state.sourceColumnEnd; ++sourceColumn)
+            const auto mappedColumns = std::min(state.sourceColumnEnd - oldX, state.columnEnd - newX);
+            const auto mappedSourceEnd = oldX + std::max(mappedColumns, til::CoordType{ 0 });
+            if (mappedSourceEnd > oldX)
+            {
+                imageSegmentMoves.push_back({
+                    .source = { oldX, oldY, mappedSourceEnd, oldY + 1 },
+                    .destination = { newX, newY },
+                });
+            }
+
+            for (auto sourceColumn = oldX; sourceColumn < mappedSourceEnd; ++sourceColumn)
             {
                 if (oldRow.GetImageCellRef(sourceColumn))
                 {
@@ -3046,6 +3214,105 @@ void TextBuffer::Reflow(TextBuffer& oldBuffer, TextBuffer& newBuffer, const View
         newCursorPos.y = (newCursorPos.y - newBuffer._firstRow + newHeight) % newHeight;
     }
 
+    const auto firstRetainedRow = newY > newHeight ? newY - newHeight : 0;
+    const til::rect newBounds{ 0, 0, newWidth, newHeight };
+    const auto finalDestination = [&](const til::point destination) -> std::optional<til::point> {
+        if (destination.x < 0 || destination.x >= newWidth ||
+            destination.y < firstRetainedRow || destination.y >= firstRetainedRow + newHeight)
+        {
+            return std::nullopt;
+        }
+        return til::point{ destination.x, destination.y - firstRetainedRow };
+    };
+
+    std::vector<ImagePlacement::Key> placeholderKeys;
+    placeholderKeys.reserve(imageCellMoves.size());
+    for (const auto& move : imageCellMoves)
+    {
+        placeholderKeys.push_back({ move.imageId, move.layerId });
+    }
+    std::sort(placeholderKeys.begin(), placeholderKeys.end(), [](const auto lhs, const auto rhs) {
+        return std::tie(lhs.imageId, lhs.layerId) < std::tie(rhs.imageId, rhs.layerId);
+    });
+    placeholderKeys.erase(std::unique(placeholderKeys.begin(), placeholderKeys.end()), placeholderKeys.end());
+    const auto isPlaceholder = [&](const ImagePlacement::Key key) {
+        return std::binary_search(placeholderKeys.begin(), placeholderKeys.end(), key, [](const auto lhs, const auto rhs) {
+            return std::tie(lhs.imageId, lhs.layerId) < std::tie(rhs.imageId, rhs.layerId);
+        });
+    };
+
+    ImageCollection reflowedImages;
+    // Direct placements follow the exact source-cell segments copied by reflow.
+    // Wrapping can split one rectangle into multiple fragments with the same key.
+    for (const auto& move : imageSegmentMoves)
+    {
+        const auto destination = finalDestination(move.destination);
+        if (!destination)
+        {
+            continue;
+        }
+
+        for (const auto placement : oldBuffer._images.IntersectingRows(move.source.top, move.source.bottom))
+        {
+            if (isPlaceholder(placement->Identity()))
+            {
+                continue;
+            }
+
+            if (auto sourceFragment = placement->Crop(move.source))
+            {
+                const auto translated = sourceFragment->Translated(*destination - move.source.origin());
+                if (auto clipped = translated.Crop(newBounds))
+                {
+                    reflowedImages.Add(std::move(*clipped));
+                }
+            }
+        }
+    }
+
+    // Placeholder-backed fragments follow the exact text-cell move. Cropping
+    // the old one-cell fragment before translating retains its source-grid
+    // identity and original sampling transform.
+    for (const auto& move : imageCellMoves)
+    {
+        const auto destination = finalDestination(move.destination);
+        if (!destination)
+        {
+            continue;
+        }
+
+        const auto& destinationRow = newBuffer.GetRowByOffset(destination->y);
+        if (!destinationRow.GetImageCellRef(destination->x) ||
+            imageCellRefImageId(destinationRow, destination->x) != move.imageId ||
+            imageCellRefLayerId(destinationRow, destination->x) != move.layerId)
+        {
+            continue;
+        }
+
+        for (const auto placement : oldBuffer._images.IntersectingRows(move.source.y, move.source.y + 1))
+        {
+            const auto bounds = placement->CellBounds();
+            if (placement->Identity() != ImagePlacement::Key{ move.imageId, move.layerId } ||
+                move.source.x < bounds.left || move.source.x >= bounds.right)
+            {
+                continue;
+            }
+
+            if (auto sourceFragment = placement->Crop({ move.source.x, move.source.y, move.source.x + 1, move.source.y + 1 }))
+            {
+                auto translated = sourceFragment->Translated(*destination - move.source);
+                if (auto clipped = translated.Crop(newBounds))
+                {
+                    reflowedImages.Add(std::move(*clipped));
+                }
+            }
+            break;
+        }
+    }
+
+    auto stagedImageRows = stageImageSlices(newBuffer, reflowedImages, oldImages);
+    newBuffer._images = std::move(reflowedImages);
+    commitImageSlices(newBuffer, std::move(stagedImageRows));
     newBuffer.CopyProperties(oldBuffer);
     newBuffer.CopyHyperlinkMaps(oldBuffer);
 
