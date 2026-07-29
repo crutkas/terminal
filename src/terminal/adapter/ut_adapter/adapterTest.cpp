@@ -10139,6 +10139,42 @@ public:
         VERIFY_IS_TRUE(cursor.IsVisible(), L"a completed long Sixel sequence must restore cursor visibility");
     }
 
+    TEST_METHOD(SixelNewlineOnlyScrollingStreamPrunesStaging)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_textBuffer = std::make_unique<TextBuffer>(til::size{ 4, 600 }, TextAttribute{}, 0, false, &_testGetSet->_renderer);
+        _testGetSet->_viewport = { 0, 0, 4, 10 };
+        auto& buffer = *_testGetSet->_textBuffer;
+        auto& cursor = buffer.GetCursor();
+        cursor.SetPosition({ 0, 0 });
+        cursor.SetIsVisible(true);
+        _stateMachine->ProcessString(L"\x1b[?80l");
+
+        auto handler = _pDispatch->DefineSixelImage(0, DispatchTypes::SixelBackground::Transparent, {});
+        VERIFY_IS_TRUE(static_cast<bool>(handler));
+
+        constexpr auto bandCount = 700;
+        static_assert(bandCount * 12 > Image::MaximumDimension);
+        for (auto line = 0; line < bandCount; ++line)
+        {
+            VERIFY_IS_TRUE(handler(L'-'), L"a newline-only scrolling stream must not abort");
+        }
+
+        const auto& parser = *_pDispatch->_sixelParser;
+        VERIFY_ARE_EQUAL(til::CoordType{ 0 }, parser._imageWidth);
+        VERIFY_IS_TRUE(buffer.GetImages().Empty(), L"newlines without sixel values must not publish placements");
+        VERIFY_IS_TRUE(parser._imageBuffer.size() <=
+                           static_cast<size_t>(Image::MaximumDimension) * parser._imageMaxWidth,
+                       L"scrolled-off newline-only staging rows must be pruned");
+        VERIFY_IS_TRUE(parser._textMargins.top > 0, L"the long stream must scroll the viewport");
+        VERIFY_IS_TRUE(parser._imageOriginCell.y > 0, L"staging origin must advance when scrolled rows are pruned");
+        VERIFY_IS_TRUE(parser._imageOriginCell.y <= parser._textMargins.top);
+
+        VERIFY_IS_TRUE(handler(L'\x1b'));
+        VERIFY_IS_TRUE(cursor.IsVisible(), L"a completed newline-only sequence must restore cursor visibility");
+        VERIFY_ARE_EQUAL(_testGetSet->_viewport.bottom, cursor.GetPosition().y, L"the cursor must remain aligned with the next sixel row after scrolling");
+    }
+
     TEST_METHOD(ViewportPanResetErasesOnlyNewImageRow)
     {
         _testGetSet->PrepData();

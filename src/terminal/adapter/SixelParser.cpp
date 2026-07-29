@@ -1232,16 +1232,16 @@ void SixelParser::_maybeFlushImageBuffer(const bool endOfSequence, const bool fo
                     }
                 }
             }
+        }
 
-            // Committed tiles now own scrollback pixels. Rows above the page can
-            // be dropped from the parser staging buffer exactly as they were in
-            // the former row-owned implementation.
-            if (!_displayMode && _imageOriginCell.y < page.Top())
-            {
-                const auto rowsToDelete = page.Top() - _imageOriginCell.y;
-                _eraseImageBufferRows(rowsToDelete);
-                _imageOriginCell.y += rowsToDelete;
-            }
+        // Committed tiles now own scrollback pixels. Rows above the page can
+        // be dropped from parser staging even when a stream contains only
+        // graphics-newline commands and has no visible pixels to publish.
+        if (!_displayMode && _imageOriginCell.y < page.Top())
+        {
+            const auto rowsToDelete = page.Top() - _imageOriginCell.y;
+            _eraseImageBufferRows(rowsToDelete);
+            _imageOriginCell.y += rowsToDelete;
         }
 
         // On lower conformance levels, we also update the text colors.
