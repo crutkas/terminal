@@ -30,6 +30,11 @@ public:
         ChecksumReport,
         ClipboardWrite,
         DesktopNotification,
+        // The Kitty graphics transmission media that name a local resource -- t=f
+        // (file), t=t (temporary file, which the terminal also deletes), and t=s
+        // (shared memory). They let whatever is writing to the terminal choose a
+        // path or kernel object name, so they are off unless the host opts in.
+        KittyLocalMedia,
     };
 
 #pragma warning(push)

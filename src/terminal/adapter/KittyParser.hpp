@@ -235,6 +235,9 @@ namespace Microsoft::Console::VirtualTerminal
             std::vector<Placement> anonymousPlacements;
         };
         static Control _ParseControl(const std::wstring_view control) noexcept;
+        // True when the host has opted into the transmission media that name a local
+        // resource (t=f, t=t, t=s). Off by default; t=d is always available.
+        bool _localMediaAllowed() const noexcept;
         void _HandleSequence(const std::wstring_view control, const std::string_view payload, const bool controlValid, const bool payloadValid, const bool payloadTooLarge);
         void _ProcessCommand(const Control& command, const std::string_view payload, const bool payloadValid, const bool payloadTooLarge);
         void _clearChunk() noexcept;

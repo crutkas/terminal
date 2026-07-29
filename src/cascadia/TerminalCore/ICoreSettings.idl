@@ -122,6 +122,7 @@ namespace Microsoft.Terminal.Core
 
         Boolean ForceVTInput { get; };
         Boolean AllowKittyKeyboardMode { get; };
+        Boolean AllowKittyLocalMedia { get; };
         Boolean AllowVtChecksumReport { get; };
         Boolean AllowVtClipboardWrite { get; };
         Boolean AllowOscNotifications { get; };

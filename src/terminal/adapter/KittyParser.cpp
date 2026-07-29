@@ -380,6 +380,16 @@ void KittyParser::_HandleSequence(const std::wstring_view control, const std::st
     _ProcessCommand(command, payload, payloadValid, payloadTooLarge);
 }
 
+// t=f, t=t, and t=s hand the terminal a name -- a file path, a temporary file to read
+// and then delete, or a shared memory object -- that came off the output stream, and ask
+// it to go touch the machine. Only the host knows whether that is acceptable for a given
+// session, so it is an opt-in capability rather than a protocol constant. Inline t=d
+// carries its own bytes and needs no permission.
+bool KittyParser::_localMediaAllowed() const noexcept
+{
+    return _dispatcher._optionalFeatures.test(ITermDispatch::OptionalFeature::KittyLocalMedia);
+}
+
 // Validates and applies a fully-assembled Kitty graphics command, then emits the
 // acknowledgement. Ids are re-emitted as decimal only. Actions: a=t/T transmit
 // (and display), a=p put/display, a=q query, a=d delete, and a=f/a/a/c animation.
@@ -710,6 +720,29 @@ void KittyParser::_ProcessCommand(const Control& command, const std::string_view
                 code = L"EINVAL:unsupported transmission medium";
                 break;
             }
+            if (medium != L'd' && !_localMediaAllowed())
+            {
+                // t=f, t=t, and t=s do not carry the image: they carry the NAME of a
+                // local resource, chosen by whatever is writing to the terminal, that we
+                // are then asked to open -- and for t=t, to delete. That is off unless
+                // the host opts in. Refuse all three with the code an unrecognized medium
+                // gets, before the payload is even decoded, so nothing is looked up or
+                // deleted and the refusal reveals nothing about the machine.
+                success = false;
+                code = L"EINVAL:unsupported transmission medium";
+                break;
+            }
+            if (command.virtualPlacement && command.haveParent)
+            {
+                // A virtual (U=1) placement cannot itself be relative. This is a conflict
+                // between two control keys, so it is settled here, before anything is
+                // decoded, read, or registered: deciding it after the image had been stored
+                // would replace or evict registry entries on behalf of a command that then
+                // fails.
+                success = false;
+                code = L"EINVAL:virtual placements cannot be relative";
+                break;
+            }
             if (compression != 0 && compression != L'z')
             {
                 // Only o=z (zlib/DEFLATE) compression is defined by the protocol;
@@ -787,30 +820,24 @@ void KittyParser::_ProcessCommand(const Control& command, const std::string_view
                 static constexpr std::wstring_view temporaryFileMarker{ L"tty-graphics-protocol" };
 
                 std::wstring path;
-                std::ignore = decodeResourceName(bytes, static_cast<size_t>(INT_MAX), path);
+                if (!decodeResourceName(bytes, static_cast<size_t>(INT_MAX), path))
+                {
+                    // The payload never named a file, so nothing was looked up. This says
+                    // only that the request itself was malformed.
+                    success = false;
+                    code = L"EINVAL:invalid image file request";
+                    break;
+                }
                 const auto deleteAfter = (medium == L't') && (action != L'q');
                 std::vector<uint8_t> fileBytes;
-                // An empty path is a malformed request (EINVAL); otherwise the host reports
-                // whether the file was missing (ENOENT), the request was invalid (EINVAL), or
-                // it could not be read (EBADF). Map each to the kitty file error codes.
-                const auto readResult = path.empty()
-                                            ? til::read_file_result::invalid
-                                            : _dispatcher._api.ReadLocalFile(path, command.fileOffset, command.fileSize, deleteAfter, temporaryFileMarker, fileBytes);
-                if (readResult != til::read_file_result::ok)
+                if (_dispatcher._api.ReadLocalFile(path, command.fileOffset, command.fileSize, deleteAfter, temporaryFileMarker, fileBytes) != til::read_file_result::ok)
                 {
+                    // Every failure from here on reports the same code. Separating "no such
+                    // file" from "exists but could not be read" from "rejected before we
+                    // opened it" would answer, one path per sequence, questions about the
+                    // machine that the writer is not entitled to ask.
                     success = false;
-                    switch (readResult)
-                    {
-                    case til::read_file_result::not_found:
-                        code = L"ENOENT:image file not found";
-                        break;
-                    case til::read_file_result::invalid:
-                        code = L"EINVAL:invalid image file request";
-                        break;
-                    default:
-                        code = L"EBADF:could not read file";
-                        break;
-                    }
+                    code = L"EBADF:could not read file";
                     break;
                 }
                 bytes = std::move(fileBytes);
@@ -842,22 +869,13 @@ void KittyParser::_ProcessCommand(const Control& command, const std::string_view
                 }
 
                 std::vector<uint8_t> sharedBytes;
-                const auto readResult = _dispatcher._api.ReadSharedMemory(name, command.fileOffset, readSize, sharedBytes);
-                if (readResult != ReadSharedMemoryResult::ok)
+                if (_dispatcher._api.ReadSharedMemory(name, command.fileOffset, readSize, sharedBytes) != ReadSharedMemoryResult::ok)
                 {
+                    // Collapsed for the same reason as the file media above: whether a named
+                    // mapping exists, and whether it could be opened, are not facts this
+                    // protocol gets to report back to whoever asked.
                     success = false;
-                    switch (readResult)
-                    {
-                    case ReadSharedMemoryResult::not_found:
-                        code = L"ENOENT:shared memory not found";
-                        break;
-                    case ReadSharedMemoryResult::invalid:
-                        code = L"EINVAL:invalid shared memory request";
-                        break;
-                    default:
-                        code = L"EBADF:could not read shared memory";
-                        break;
-                    }
+                    code = L"EBADF:could not read shared memory";
                     break;
                 }
                 bytes = std::move(sharedBytes);
@@ -962,15 +980,9 @@ void KittyParser::_ProcessCommand(const Control& command, const std::string_view
                 }
                 if (command.virtualPlacement)
                 {
-                    if (command.haveParent)
-                    {
-                        // A virtual (U=1) placement cannot itself be relative.
-                        success = false;
-                        code = L"EINVAL:virtual placements cannot be relative";
-                        break;
-                    }
                     // Virtual (U=1): store the image and its grid geometry; the pixels are
-                    // drawn later by Unicode placeholders, not at the cursor.
+                    // drawn later by Unicode placeholders, not at the cursor. (U=1 with a
+                    // parent was already rejected before anything was registered.)
                     const auto stored = _images.find(assignedId);
                     if (stored != _images.end())
                     {

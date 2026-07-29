@@ -22,6 +22,11 @@ C_DEFINES               = $(C_DEFINES)
 
 # Code in the OneCore depot automatically excludes default Win32 libraries.
 
+# KittyParser.cpp inflates the Kitty graphics o=z (zlib) payload with inflatelib
+# (microsoft/inflatelib), which the MSBuild flavor acquires through vcpkg. This build
+# has no vcpkg, so it needs the depot's copy of inflatelib on INCLUDES and TARGETLIBS;
+# the path for that is owned by the enlistment, not by this file.
+
 # -------------------------------------
 # Sources, Headers, and Libraries
 # -------------------------------------
@@ -33,6 +38,7 @@ SOURCES= \
     ..\adaptDispatch.cpp \
     ..\FontBuffer.cpp \
     ..\InteractDispatch.cpp \
+    ..\KittyParser.cpp \
     ..\MacroBuffer.cpp \
     ..\PageManager.cpp \
     ..\SixelParser.cpp \
