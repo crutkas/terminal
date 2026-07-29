@@ -260,7 +260,7 @@ namespace Microsoft::Console::Render::Atlas
         ATLAS_ATTR_COLD void _drawGridlines(const RenderingPayload& p, u16 y);
         void _drawImages(const RenderingPayload& p, const ShapedRow& row, u16 y, ImagePlacement::RenderPosition position);
         void _drawImage(const RenderingPayload& p, const ImagePlacement& placement, const i32r& clip);
-        void _uploadImage(const RenderingPayload& p, const ImageFrameInfo::Surface& surface);
+        [[nodiscard]] bool _uploadImage(const RenderingPayload& p, const ImageFrameInfo::Surface& surface);
         void _pruneImageCache(const RenderingPayload& p);
         void _drawCursorBackground(const RenderingPayload& p);
         ATLAS_ATTR_COLD void _drawCursorForeground();

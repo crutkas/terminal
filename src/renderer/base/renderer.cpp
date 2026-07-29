@@ -559,7 +559,10 @@ try
         .surfaces = _imageSurfaces,
         .viewportOrigin = _viewport.Origin(),
     });
-    RETURN_IF_FAILED(imageFrameResult);
+    // A failure to prepare images must not blank the frame's text. Treat it like a
+    // fallback to no direct-image support and keep painting; a genuinely lost
+    // device is detected and recovered later in Present(), not here.
+    LOG_IF_FAILED(imageFrameResult);
 
     // 1. Paint Background
     RETURN_IF_FAILED(_PaintBackground(pEngine));

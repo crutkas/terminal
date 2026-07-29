@@ -14,6 +14,7 @@ Author(s):
 
 #pragma once
 
+#include <algorithm>
 #include <d2d1.h>
 
 #include "CursorOptions.h"
@@ -47,11 +48,44 @@ namespace Microsoft::Console::Render
             Image::PixelStorage pixels;
             til::size size;
             uint64_t revision = 0;
+
+            // A snapshot is only renderable when its pixels actually describe its
+            // declared size. A malformed snapshot - missing image or pixels, a
+            // nonpositive or over-large dimension, or a pixel count that disagrees
+            // with the size - is skipped by every backend so that one bad image can
+            // neither abort the frame nor discard the backend. Genuine device
+            // failures are surfaced separately by the graphics API calls themselves,
+            // so this deliberately says nothing about them.
+            [[nodiscard]] bool IsRenderable() const noexcept
+            {
+                if (!image || !pixels)
+                {
+                    return false;
+                }
+                if (size.width <= 0 || size.height <= 0 ||
+                    size.width > Image::MaximumDimension || size.height > Image::MaximumDimension)
+                {
+                    return false;
+                }
+                return pixels->size() == static_cast<size_t>(size.width) * size.height;
+            }
         };
 
         std::span<const ImagePlacement> placements;
         std::span<const Surface> surfaces;
         til::point viewportOrigin;
+
+        // An image cache entry keyed by `image` is stale once that image no longer
+        // appears among this frame's `surfaces` (it scrolled or was erased out of
+        // the viewport). Backends evict just that one entry - none of them may
+        // reset an unrelated cache (e.g. the glyph atlas) merely because an image
+        // came or went; that is reserved for genuine allocation exhaustion.
+        [[nodiscard]] static bool ImageCacheEntryIsStale(const Image* const image, const std::span<const Surface> surfaces) noexcept
+        {
+            return std::ranges::none_of(surfaces, [&](const Surface& surface) noexcept {
+                return surface.image.get() == image;
+            });
+        }
     };
 
     enum class GridLines

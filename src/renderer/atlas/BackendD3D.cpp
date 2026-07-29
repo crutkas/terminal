@@ -1903,43 +1903,42 @@ void BackendD3D::_drawGridlines(const RenderingPayload& p, u16 y)
 
 void BackendD3D::_pruneImageCache(const RenderingPayload& p)
 {
-    const auto hasStaleEntry = std::any_of(_imageCache.begin(), _imageCache.end(), [&](const auto& entry) {
-        return std::ranges::none_of(p.imageSurfaces, [&](const auto& surface) {
-            return surface.image.get() == entry.first;
-        });
-    });
-    const auto hasResizedEntry = std::ranges::any_of(p.imageSurfaces, [&](const auto& surface) {
-        const auto cached = _imageCache.find(surface.image.get());
-        if (cached == _imageCache.end())
-        {
-            return false;
-        }
-        const auto size = surface.size;
-        return cached->second.size.x != size.width || cached->second.size.y != size.height;
-    });
-    if (hasStaleEntry || hasResizedEntry)
+    // An image leaving the viewport is no reason to throw away the glyph atlas: the
+    // text cache is expensive to rebuild and has nothing to do with images. Match
+    // BackendD2D and simply drop the stale entries individually. Their atlas
+    // rectangles are only reclaimed the next time an allocation genuinely runs out
+    // of room in _drawGlyphAtlasAllocate(), which is the one case that still resets
+    // the atlas. A resized image is handled in _uploadImage(), not here.
+    for (auto it = _imageCache.begin(); it != _imageCache.end();)
     {
-        u32 minWidth = 0;
-        u32 minHeight = 0;
-        for (const auto& surface : p.imageSurfaces)
-        {
-            const auto size = surface.size;
-            minWidth = std::max(minWidth, gsl::narrow_cast<u32>(size.width));
-            minHeight = std::max(minHeight, gsl::narrow_cast<u32>(size.height));
-        }
-        _resetGlyphAtlas(p, minWidth, minHeight);
+        it = ImageFrameInfo::ImageCacheEntryIsStale(it->first, p.imageSurfaces) ? _imageCache.erase(it) : std::next(it);
     }
 }
 
-void BackendD3D::_uploadImage(const RenderingPayload& p, const ImageFrameInfo::Surface& surface)
+[[nodiscard]] bool BackendD3D::_uploadImage(const RenderingPayload& p, const ImageFrameInfo::Surface& surface)
 {
     const auto& image = surface.image;
-    THROW_HR_IF(E_UNEXPECTED, !image || !surface.pixels);
+    // A malformed snapshot is skipped rather than thrown: one bad image must not
+    // abort the frame or discard the backend. This is a data condition (not a code
+    // bug), so it is handled quietly. Device failures below still throw (via
+    // THROW_IF_FAILED) so that genuine device-lost is recovered as usual.
+    if (!surface.IsRenderable())
+    {
+        return false;
+    }
     auto found = _imageCache.find(image.get());
+    const auto size = surface.size;
+    // A resized surface cannot reuse its fixed-size atlas rectangle, so drop the
+    // stale entry and let it be re-allocated below at the new size. This mirrors
+    // how BackendD2D recreates its bitmap on a size change, and keeps
+    // _pruneImageCache free of any atlas-affecting logic.
+    if (found != _imageCache.end() && (found->second.size.x != size.width || found->second.size.y != size.height))
+    {
+        _imageCache.erase(found);
+        found = _imageCache.end();
+    }
     if (found == _imageCache.end())
     {
-        const auto size = surface.size;
-        THROW_HR_IF(E_UNEXPECTED, size.width > Image::MaximumDimension || size.height > Image::MaximumDimension);
         stbrp_rect rect{
             .w = gsl::narrow_cast<stbrp_coord>(size.width),
             .h = gsl::narrow_cast<stbrp_coord>(size.height),
@@ -1961,13 +1960,11 @@ void BackendD3D::_uploadImage(const RenderingPayload& p, const ImageFrameInfo::S
     auto& cached = found->second;
     if (cached.revision == surface.revision)
     {
-        return;
+        return true;
     }
 
     _d2dBeginDrawing();
-    const auto size = surface.size;
     const auto pixels = std::span{ *surface.pixels };
-    THROW_HR_IF(E_UNEXPECTED, pixels.size() != static_cast<size_t>(size.width) * size.height);
     const D2D1_SIZE_U bitmapSize{
         gsl::narrow_cast<UINT32>(size.width),
         gsl::narrow_cast<UINT32>(size.height),
@@ -1993,6 +1990,7 @@ void BackendD3D::_uploadImage(const RenderingPayload& p, const ImageFrameInfo::S
     _d2dRenderTarget->DrawBitmap(bitmap.get(), &destination, 1, D2D1_BITMAP_INTERPOLATION_MODE_NEAREST_NEIGHBOR);
     _d2dRenderTarget->SetPrimitiveBlend(D2D1_PRIMITIVE_BLEND_SOURCE_OVER);
     cached.revision = surface.revision;
+    return true;
 }
 
 void BackendD3D::_drawImage(const RenderingPayload& p, const ImagePlacement& placement, const i32r& clip)
@@ -2001,8 +1999,18 @@ void BackendD3D::_drawImage(const RenderingPayload& p, const ImagePlacement& pla
     const auto snapshot = std::ranges::find(p.imageSurfaces, image.get(), [](const auto& surface) {
         return surface.image.get();
     });
-    THROW_HR_IF(E_UNEXPECTED, snapshot == p.imageSurfaces.end());
-    _uploadImage(p, *snapshot);
+    // A placement with no matching snapshot, or one whose snapshot fails to upload,
+    // is skipped so the rest of the row (text and other images) still draws. Only
+    // genuine device failures propagate out of _uploadImage() for recovery.
+    if (snapshot == p.imageSurfaces.end())
+    {
+        assert(false);
+        return;
+    }
+    if (!_uploadImage(p, *snapshot))
+    {
+        return;
+    }
     const auto& cached = _imageCache.at(image.get());
 
     const auto cellWidth = static_cast<int64_t>(p.s->font->cellSize.x);

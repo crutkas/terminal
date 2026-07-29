@@ -741,7 +741,10 @@ try
 
     for (const auto& surface : info.surfaces)
     {
-        RETURN_IF_FAILED(_PrepareImageSurface(surface));
+        // A malformed or un-preparable snapshot is skipped so the rest of the
+        // frame's images still prepare. _PaintDirectImage tolerates a missing cache
+        // entry, so one bad image neither aborts the frame nor suppresses text.
+        LOG_IF_FAILED(_PrepareImageSurface(surface));
     }
 
     for (auto it = _imageSurfaces.begin(); it != _imageSurfaces.end();)
@@ -765,9 +768,14 @@ CATCH_RETURN();
 [[nodiscard]] HRESULT GdiEngine::_PrepareImageSurface(const ImageFrameInfo::Surface& surface) noexcept
 try
 {
+    // A malformed snapshot is skipped without raising an error: one bad image must
+    // not abort preparation of the others. Genuine GDI failures below are real
+    // errors that the caller logs and skips.
+    if (!surface.IsRenderable())
+    {
+        return S_FALSE;
+    }
     const auto& image = surface.image;
-    RETURN_HR_IF(E_INVALIDARG, !image);
-    RETURN_HR_IF(E_INVALIDARG, !surface.pixels);
     auto& cached = _imageSurfaces.try_emplace(image.get()).first->second;
     cached.image = image;
 
@@ -802,7 +810,6 @@ try
     if (cached.revision != surface.revision)
     {
         const auto pixels = std::span{ *surface.pixels };
-        RETURN_HR_IF(E_INVALIDARG, pixels.size() != static_cast<size_t>(size.width) * size.height);
         memcpy(cached.bits, pixels.data(), pixels.size_bytes());
         cached.allOpaque = true;
         cached.allTransparent = true;
@@ -821,7 +828,13 @@ CATCH_RETURN();
 try
 {
     const auto found = _imageSurfaces.find(placement.SurfacePointer().get());
-    RETURN_HR_IF(HRESULT_FROM_WIN32(ERROR_INVALID_STATE), found == _imageSurfaces.end());
+    // A placement whose surface was skipped during preparation (a malformed
+    // snapshot or a GDI failure) simply has nothing to draw. Skip it quietly so the
+    // rest of the row still paints, rather than failing the whole row's image pass.
+    if (found == _imageSurfaces.end())
+    {
+        return S_FALSE;
+    }
     const auto& cached = found->second;
     RETURN_HR_IF(S_OK, cached.allTransparent);
 
@@ -948,15 +961,21 @@ try
         if (position == ImagePlacement::RenderPosition::BehindBackground)
         {
             RETURN_HR_IF(S_OK, defaultBackgroundMask.empty());
+            // The mask has one entry per visible screen column, so a placement that
+            // extends past the right edge (its bounds are clamped only to the buffer,
+            // not to the mask) must not index past it. Clamp the scan the same way
+            // _MarkDirectImageUnderlay clamps against _underlayColumns.
+            const auto maskRight = _imageViewportOrigin.x + gsl::narrow_cast<til::CoordType>(defaultBackgroundMask.size());
+            const auto scanRight = std::min(right, maskRight);
             auto run = left;
-            while (run < right)
+            while (run < scanRight)
             {
-                while (run < right && til::at(defaultBackgroundMask, gsl::narrow_cast<size_t>(run - _imageViewportOrigin.x)) == 0)
+                while (run < scanRight && til::at(defaultBackgroundMask, gsl::narrow_cast<size_t>(run - _imageViewportOrigin.x)) == 0)
                 {
                     ++run;
                 }
                 const auto runBegin = run;
-                while (run < right && til::at(defaultBackgroundMask, gsl::narrow_cast<size_t>(run - _imageViewportOrigin.x)) != 0)
+                while (run < scanRight && til::at(defaultBackgroundMask, gsl::narrow_cast<size_t>(run - _imageViewportOrigin.x)) != 0)
                 {
                     ++run;
                 }
@@ -968,7 +987,9 @@ try
                         (run - _imageViewportOrigin.x) * cellSize.width,
                         bottomPx,
                     };
-                    RETURN_IF_FAILED(_PaintDirectImage(placement, clip));
+                    // Skip only the affected image on failure; other images and the
+                    // row's text still paint.
+                    LOG_IF_FAILED(_PaintDirectImage(placement, clip));
                 }
             }
         }
@@ -980,7 +1001,9 @@ try
                 (right - _imageViewportOrigin.x) * cellSize.width,
                 bottomPx,
             };
-            RETURN_IF_FAILED(_PaintDirectImage(placement, clip));
+            // Skip only the affected image on failure; other images and the row's
+            // text still paint.
+            LOG_IF_FAILED(_PaintDirectImage(placement, clip));
         }
     }
     return S_OK;

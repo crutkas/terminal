@@ -818,10 +818,7 @@ void BackendD2D::_pruneImageCache(const RenderingPayload& p)
 {
     for (auto it = _imageCache.begin(); it != _imageCache.end();)
     {
-        const auto active = std::ranges::any_of(p.imageSurfaces, [&](const auto& surface) {
-            return surface.image.get() == it->first;
-        });
-        it = active ? std::next(it) : _imageCache.erase(it);
+        it = ImageFrameInfo::ImageCacheEntryIsStale(it->first, p.imageSurfaces) ? _imageCache.erase(it) : std::next(it);
     }
 }
 
@@ -895,7 +892,19 @@ void BackendD2D::_drawImage(const RenderingPayload& p, const ImagePlacement& pla
     const auto snapshot = std::ranges::find(p.imageSurfaces, image.get(), [](const auto& surface) {
         return surface.image.get();
     });
-    THROW_HR_IF(E_UNEXPECTED, snapshot == p.imageSurfaces.end() || !snapshot->pixels);
+    // A placement with no matching snapshot is an internal inconsistency; a
+    // malformed snapshot is a data condition. Either way, skip just this image so
+    // the row's text and other images still draw. The device calls below still
+    // throw (via THROW_IF_FAILED) so genuine device-lost is recovered as usual.
+    if (snapshot == p.imageSurfaces.end())
+    {
+        assert(false);
+        return;
+    }
+    if (!snapshot->IsRenderable())
+    {
+        return;
+    }
     auto& cached = _imageCache[image.get()];
     cached.image = image;
     const auto size = snapshot->size;
@@ -917,7 +926,6 @@ void BackendD2D::_drawImage(const RenderingPayload& p, const ImagePlacement& pla
     if (cached.revision != snapshot->revision)
     {
         const auto pixels = std::span{ *snapshot->pixels };
-        THROW_HR_IF(E_UNEXPECTED, pixels.size() != static_cast<size_t>(size.width) * size.height);
         THROW_IF_FAILED(cached.bitmap->CopyFromMemory(nullptr, pixels.data(), gsl::narrow_cast<UINT32>(size.width * sizeof(RGBQUAD))));
         cached.revision = snapshot->revision;
     }
