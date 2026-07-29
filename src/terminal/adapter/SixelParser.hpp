@@ -117,11 +117,18 @@ namespace Microsoft::Console::VirtualTerminal
         void _decreaseFilledBackgroundHeight(const int decreasedHeight) noexcept;
         void _writeToImageBuffer(const int sixelValue, const int repeatCount);
         void _eraseImageBufferRows(const int rowCount, const til::CoordType startRow = 0) noexcept;
-        void _maybeFlushImageBuffer(const bool endOfSequence = false);
+        void _maybeFlushImageBuffer(const bool endOfSequence = false, const bool force = false);
+        ImagePlacement::Key _allocateImageKey() noexcept;
+
+        struct ActiveTile
+        {
+            til::rect area;
+            ImagePlacement::Key key;
+            Image::Pointer surface;
+        };
 
         std::vector<IndexedPixel> _imageBuffer;
-        Image::Pointer _imageSurface;
-        ImagePlacement::Key _imageKey;
+        std::vector<ActiveTile> _activeTiles;
         til::point _imageOriginCell;
         til::point _imageCursor;
         til::CoordType _imageWidth = 0;
@@ -129,5 +136,9 @@ namespace Microsoft::Console::VirtualTerminal
         size_t _imageLineCount = 0;
         size_t _lastFlushLine = 0;
         std::chrono::steady_clock::time_point _lastFlushTime;
+
+#ifdef UNIT_TESTING
+        friend class AdapterTest;
+#endif
     };
 }

@@ -25,8 +25,10 @@ class ImageTests
     TEST_METHOD(CopyClipsAndTranslates);
     TEST_METHOD(SurfaceUpdateReachesEveryFragment);
     TEST_METHOD(SurfaceResizeIsTransactionalAndPreservesPixels);
+    TEST_METHOD(ProtocolBatchValidationIsAtomic);
     TEST_METHOD(ProtocolIdentityPreventsCrossProtocolMutation);
     TEST_METHOD(TextBufferOwnsImagesOutsideRows);
+    TEST_METHOD(TextBufferResetRowErasesOnlyThatImageRow);
     TEST_METHOD(TextBufferWritesEraseOnlyOverwrittenImageCells);
     TEST_METHOD(CircularAndRegionalScrollUseLogicalRows);
     TEST_METHOD(RectangularCopyAndErasePreserveSampling);
@@ -302,6 +304,78 @@ void ImageTests::SurfaceResizeIsTransactionalAndPreservesPixels()
     VERIFY_ARE_EQUAL(collectionRevision, sharedSurface->Revision());
 }
 
+void ImageTests::ProtocolBatchValidationIsAtomic()
+{
+    constexpr ImagePlacement::Key firstKey{ 0, 1, ImagePlacement::Key::Protocol::Sixel };
+    constexpr ImagePlacement::Key secondKey{ 0, 2, ImagePlacement::Key::Protocol::Sixel };
+    constexpr ImagePlacement::Key kittyKey{ 1, 1, ImagePlacement::Key::Protocol::Kitty };
+    ImageCollection images;
+    images.Add(MakePlacement(firstKey, { 0, 0, 2, 1 }));
+    images.Add(MakePlacement(secondKey, { 0, 1, 2, 2 }));
+    images.Add(MakePlacement(kittyKey, { 0, 0, 2, 2 }));
+
+    const auto firstSurface = images.All()[0].SurfacePointer();
+    const auto secondSurface = images.All()[1].SurfacePointer();
+    const auto firstRevision = firstSurface->Revision();
+    const auto secondRevision = secondSurface->Revision();
+    const auto firstStorage = firstSurface->Storage();
+    const auto secondStorage = secondSurface->Storage();
+    const auto validPixels = std::make_shared<const std::vector<RGBQUAD>>(firstSurface->Pixels().size(), RGBQUAD{ 1, 2, 3, 255 });
+    const auto invalidPixels = std::make_shared<const std::vector<RGBQUAD>>(1, RGBQUAD{ 4, 5, 6, 255 });
+    const std::array areas{
+        til::rect{ 0, 0, 2, 1 },
+        til::rect{ 0, 1, 2, 2 },
+    };
+    const auto makeReplacement = [](const ImagePlacement::Key key, const Image::Pointer& surface, const til::rect area) {
+        return ImagePlacement{
+            key,
+            surface,
+            area,
+            0,
+            {},
+            {
+                .cellSize = CellSize,
+                .targetWidth = gsl::narrow_cast<uint64_t>(surface->PixelSize().width),
+                .targetHeight = gsl::narrow_cast<uint64_t>(surface->PixelSize().height),
+            },
+        };
+    };
+    const std::array invalidReplacements{
+        ImageCollection::ProtocolReplacement{ makeReplacement(firstKey, firstSurface, areas[0]), validPixels },
+        ImageCollection::ProtocolReplacement{ makeReplacement(secondKey, secondSurface, areas[1]), invalidPixels },
+    };
+
+    VERIFY_THROWS_SPECIFIC(images.ReplaceProtocolAreas(ImagePlacement::Key::Protocol::Sixel, areas, invalidReplacements),
+                           wil::ResultException,
+                           [](wil::ResultException& e) { return e.GetErrorCode() == E_INVALIDARG; });
+
+    VERIFY_ARE_EQUAL(size_t{ 3 }, images.Size());
+    VERIFY_ARE_EQUAL(firstRevision, firstSurface->Revision());
+    VERIFY_ARE_EQUAL(secondRevision, secondSurface->Revision());
+    VERIFY_ARE_EQUAL(firstStorage.get(), firstSurface->Storage().get());
+    VERIFY_ARE_EQUAL(secondStorage.get(), secondSurface->Storage().get());
+    VERIFY_IS_TRUE(std::ranges::any_of(images.All(), [&](const auto& placement) {
+        return placement.Identity() == kittyKey;
+    }));
+
+    const auto secondValidPixels = std::make_shared<const std::vector<RGBQUAD>>(secondSurface->Pixels().size(), RGBQUAD{ 7, 8, 9, 255 });
+    const std::array validReplacements{
+        ImageCollection::ProtocolReplacement{ makeReplacement(firstKey, firstSurface, areas[0]), validPixels },
+        ImageCollection::ProtocolReplacement{ makeReplacement(secondKey, secondSurface, areas[1]), secondValidPixels },
+    };
+    images.ReplaceProtocolAreas(ImagePlacement::Key::Protocol::Sixel, areas, validReplacements);
+
+    VERIFY_ARE_NOT_EQUAL(firstRevision, firstSurface->Revision());
+    VERIFY_ARE_NOT_EQUAL(secondRevision, secondSurface->Revision());
+    VERIFY_ARE_EQUAL(1, static_cast<int>(firstSurface->Pixels().front().rgbBlue));
+    VERIFY_ARE_EQUAL(7, static_cast<int>(secondSurface->Pixels().front().rgbBlue));
+    VERIFY_ARE_EQUAL(size_t{ 3 }, images.Size());
+    VERIFY_IS_TRUE(std::ranges::any_of(images.All(), [&](const auto& placement) {
+                       return placement.Identity() == kittyKey;
+                   }),
+                   L"a successful Sixel batch must not erase an overlapping Kitty placement");
+}
+
 void ImageTests::ProtocolIdentityPreventsCrossProtocolMutation()
 {
     constexpr ImagePlacement::Key kittyKey{ 7, 9, ImagePlacement::Key::Protocol::Kitty };
@@ -336,6 +410,20 @@ void ImageTests::TextBufferOwnsImagesOutsideRows()
     buffer.GetMutableRowByOffset(0).Reset(TextAttribute{});
 
     VERIFY_ARE_EQUAL(size_t{ 1 }, buffer.GetImages().Size());
+}
+
+void ImageTests::TextBufferResetRowErasesOnlyThatImageRow()
+{
+    DummyRenderer renderer;
+    TextBuffer buffer{ til::size{ 8, 4 }, TextAttribute{}, 0, false, &renderer };
+    buffer.GetMutableImages().Add(MakePlacement({ 1, 1 }, { 0, 0, 4, 3 }));
+
+    buffer.ResetRow(1, TextAttribute{});
+
+    VERIFY_ARE_EQUAL(size_t{ 2 }, buffer.GetImages().Size());
+    VERIFY_ARE_EQUAL(size_t{ 1 }, buffer.GetImages().IntersectingRows(0, 1).size());
+    VERIFY_IS_TRUE(buffer.GetImages().IntersectingRows(1, 2).empty());
+    VERIFY_ARE_EQUAL(size_t{ 1 }, buffer.GetImages().IntersectingRows(2, 3).size());
 }
 
 void ImageTests::TextBufferWritesEraseOnlyOverwrittenImageCells()

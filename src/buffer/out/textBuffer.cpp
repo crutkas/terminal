@@ -1056,6 +1056,12 @@ void TextBuffer::Reset() noexcept
     _initialAttributes = _currentAttributes;
 }
 
+void TextBuffer::ResetRow(const til::CoordType row, const TextAttribute& attributes)
+{
+    _images.EraseArea({ 0, row, _width, row + 1 });
+    GetMutableRowByOffset(row).Reset(attributes);
+}
+
 // Arguments:
 // - newFirstRow: The current y-position of the viewport. We'll clear up until here.
 // - rowsToKeep: the number of rows to keep in the buffer.

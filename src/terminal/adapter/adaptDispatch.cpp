@@ -16,7 +16,6 @@
 
 #include <mutex>
 
-
 using namespace Microsoft::Console::Types;
 using namespace Microsoft::Console::Render;
 using namespace Microsoft::Console::VirtualTerminal;
@@ -2586,7 +2585,7 @@ bool AdaptDispatch::_DoLineFeed(const Page& page, const bool withReturn, const b
         else
         {
             const auto eraseAttributes = _GetEraseAttributes(page);
-            textBuffer.GetMutableRowByOffset(newPosition.y).Reset(eraseAttributes);
+            textBuffer.ResetRow(newPosition.y, eraseAttributes);
         }
     }
     else

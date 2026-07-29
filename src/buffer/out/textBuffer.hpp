@@ -158,6 +158,7 @@ public:
     til::point BufferToScreenPosition(const til::point position) const;
 
     void Reset() noexcept;
+    void ResetRow(til::CoordType row, const TextAttribute& attributes);
     void ClearScrollback(const til::CoordType start, const til::CoordType height);
 
     void ResizeTraditional(const til::size newSize);

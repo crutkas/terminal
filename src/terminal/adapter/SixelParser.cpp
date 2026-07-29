@@ -422,6 +422,13 @@ void SixelParser::_updateRasterAttributes(const VTParameters& rasterAttributes)
 
 void SixelParser::_scrollTextBuffer(Page& page, const int scrollAmount)
 {
+    if (scrollAmount > 0)
+    {
+        // Scrolling can split or copy placements. Freeze their surfaces so a
+        // later parser revision cannot mutate a preserved fragment in place.
+        _activeTiles.clear();
+    }
+
     // We scroll the text buffer by moving the cursor to the bottom of the
     // margin area and executing an appropriate number of line feeds.
     if (_textCursor.y != _textMargins.bottom - 1)
@@ -502,7 +509,7 @@ void SixelParser::_releaseImageState(const bool restoreCursorVisibility) noexcep
         CATCH_LOG()
     }
     _textCursorWasVisible = false;
-    _imageSurface.reset();
+    _activeTiles.clear();
     std::vector<IndexedPixel>{}.swap(_imageBuffer);
 }
 
@@ -682,12 +689,7 @@ void SixelParser::_updateTextColors()
 void SixelParser::_initImageBuffer()
 {
     _imageBuffer.clear();
-    _imageSurface.reset();
-    _imageKey = { 0, _dispatcher._nextSixelLayerId++, ImagePlacement::Key::Protocol::Sixel };
-    if (_dispatcher._nextSixelLayerId == 0)
-    {
-        _dispatcher._nextSixelLayerId = 1;
-    }
+    _activeTiles.clear();
     _imageOriginCell = _textCursor;
     _imageCursor = {};
     _imageWidth = 0;
@@ -707,10 +709,25 @@ void SixelParser::_initImageBuffer()
     }
 }
 
+ImagePlacement::Key SixelParser::_allocateImageKey() noexcept
+{
+    const auto key = ImagePlacement::Key{ 0, _dispatcher._nextSixelLayerId++, ImagePlacement::Key::Protocol::Sixel };
+    if (_dispatcher._nextSixelLayerId == 0)
+    {
+        _dispatcher._nextSixelLayerId = 1;
+    }
+    return key;
+}
+
 void SixelParser::_resizeImageBuffer(const til::CoordType requiredHeight)
 {
     THROW_HR_IF(E_INVALIDARG, requiredHeight <= 0 || _imageCursor.y < 0 || _imageMaxWidth <= 0);
-    const auto height = static_cast<uint64_t>(_imageCursor.y) + static_cast<uint64_t>(requiredHeight);
+    auto height = static_cast<uint64_t>(_imageCursor.y) + static_cast<uint64_t>(requiredHeight);
+    if (height > Image::MaximumDimension && !_displayMode)
+    {
+        _maybeFlushImageBuffer(false, true);
+        height = static_cast<uint64_t>(_imageCursor.y) + static_cast<uint64_t>(requiredHeight);
+    }
     THROW_HR_IF(E_NOTIMPL, height > Image::MaximumDimension);
     const auto width = gsl::narrow<size_t>(_imageMaxWidth);
     THROW_HR_IF(E_INVALIDARG, height > SIZE_MAX / width);
@@ -893,6 +910,8 @@ void SixelParser::_eraseImageBufferRows(const int rowCount, const til::CoordType
         return;
     }
 
+    _activeTiles.clear();
+
     const auto width = gsl::narrow_cast<size_t>(_imageMaxWidth);
     const auto height = _imageBuffer.size() / width;
     const auto pixelCount = gsl::narrow_cast<size_t>(rowCount) * gsl::narrow_cast<size_t>(_cellSize.height);
@@ -913,7 +932,7 @@ void SixelParser::_eraseImageBufferRows(const int rowCount, const til::CoordType
     }
 }
 
-void SixelParser::_maybeFlushImageBuffer(const bool endOfSequence)
+void SixelParser::_maybeFlushImageBuffer(const bool endOfSequence, const bool force)
 {
     // Regardless of whether we flush the image or not, we always calculate how
     // much we need to scroll in advance. This algorithm is a bit odd. If there
@@ -923,7 +942,7 @@ void SixelParser::_maybeFlushImageBuffer(const bool endOfSequence)
     // common, since it only occurs for pixel aspect ratios of 4:1 or more. Also
     // note that we never scroll more than the margin height, since that would
     // result in the top of the segment being pushed offscreen.
-    if (_segmentHeight > _availablePixelHeight && !_displayMode) [[unlikely]]
+    if (!force && _segmentHeight > _availablePixelHeight && !_displayMode) [[unlikely]]
     {
         const auto marginPixelHeight = pixelExtent(_textMargins.height(), _cellSize.height);
         while (_availablePixelHeight < marginPixelHeight && _segmentHeight >= _availablePixelHeight)
@@ -936,7 +955,10 @@ void SixelParser::_maybeFlushImageBuffer(const bool endOfSequence)
     // Once we've calculated how much scrolling was necessary for the existing
     // segment height, we don't need to track that any longer. The next segment
     // will start with the active sixel height.
-    _segmentHeight = _sixelHeight;
+    if (!force)
+    {
+        _segmentHeight = _sixelHeight;
+    }
 
     // This method is called after every newline (DECGNL), but we don't want to
     // render partial output for high speed image sequences like video, so we
@@ -947,7 +969,7 @@ void SixelParser::_maybeFlushImageBuffer(const bool endOfSequence)
     const auto currentTime = steady_clock::now();
     const auto timeSinceLastFlush = duration_cast<milliseconds>(currentTime - _lastFlushTime);
     const auto linesSinceLastFlush = _imageLineCount - _lastFlushLine;
-    if (endOfSequence || timeSinceLastFlush > 500ms || (linesSinceLastFlush <= 1 && _stateMachine.IsProcessingLastCharacter()))
+    if (force || endOfSequence || timeSinceLastFlush > 500ms || (linesSinceLastFlush <= 1 && _stateMachine.IsProcessingLastCharacter()))
     {
         _lastFlushTime = currentTime;
         _lastFlushLine = _imageLineCount;
@@ -966,93 +988,260 @@ void SixelParser::_maybeFlushImageBuffer(const bool endOfSequence)
         if (_imageWidth > 0)
         {
             const auto imageHeight = gsl::narrow<til::CoordType>(_imageBuffer.size() / gsl::narrow<size_t>(_imageMaxWidth));
-            THROW_HR_IF(E_NOTIMPL, _imageWidth > Image::MaximumDimension || imageHeight > Image::MaximumDimension);
+            auto& images = page.Buffer().GetMutableImages();
+            auto dirtyTop = page.Bottom();
+            auto dirtyBottom = page.Top();
+            const auto placementBottom = _displayMode ? page.Bottom() : page.BufferHeight();
+            const auto cellsPerTile = std::max(Image::MaximumDimension / _cellSize.width, 1);
+            const auto imagePixelLeft = static_cast<int64_t>(_imageOriginCell.x) * _cellSize.width;
+            const auto currentImages = images.All();
+            std::vector<ImagePlacement> existingPlacements{ currentImages.begin(), currentImages.end() };
+            std::stable_sort(existingPlacements.begin(), existingPlacements.end(), [](const auto& lhs, const auto& rhs) {
+                const auto lhsKey = lhs.Identity();
+                const auto rhsKey = rhs.Identity();
+                return std::tuple{ lhs.ZIndex(), lhsKey.protocol, lhsKey.imageId, lhsKey.layerId } <
+                       std::tuple{ rhs.ZIndex(), rhsKey.protocol, rhsKey.imageId, rhsKey.layerId };
+            });
+            std::vector<til::rect> replacementAreas;
+            std::vector<ImageCollection::ProtocolReplacement> replacements;
+            auto nextActiveTiles = _activeTiles;
 
-            const auto surfaceSize = til::size{ _imageWidth, imageHeight };
-            const auto pixelCount = gsl::narrow<size_t>(_imageWidth) * gsl::narrow<size_t>(imageHeight);
-            auto pixels = std::make_shared<std::vector<RGBQUAD>>(pixelCount);
-            for (auto y = 0; y < imageHeight; ++y)
+            for (auto imageRow = 0; imageRow < imageHeight; imageRow += _cellSize.height)
             {
-                const auto sourceRow = gsl::narrow<size_t>(y) * gsl::narrow<size_t>(_imageMaxWidth);
-                const auto targetRow = gsl::narrow<size_t>(y) * gsl::narrow<size_t>(_imageWidth);
-                for (auto x = 0; x < _imageWidth; ++x)
+                const auto cellRow = _imageOriginCell.y + imageRow / _cellSize.height;
+                if (cellRow < 0 || cellRow >= placementBottom)
                 {
-                    const auto indexedPixel = til::at(_imageBuffer, sourceRow + gsl::narrow<size_t>(x));
-                    if (!indexedPixel.transparent)
+                    continue;
+                }
+
+                auto opaqueLeft = _imageWidth;
+                auto opaqueRight = til::CoordType{ 0 };
+                const auto sourceRowEnd = std::min(imageRow + _cellSize.height, imageHeight);
+                for (auto sourceY = imageRow; sourceY < sourceRowEnd; ++sourceY)
+                {
+                    const auto sourceOffset = gsl::narrow<size_t>(sourceY) * gsl::narrow<size_t>(_imageMaxWidth);
+                    for (auto sourceX = 0; sourceX < _imageWidth; ++sourceX)
                     {
-                        til::at(*pixels, targetRow + gsl::narrow<size_t>(x)) = _makeRGBQUAD(_colorFromIndex(indexedPixel.colorIndex));
+                        if (!til::at(_imageBuffer, sourceOffset + gsl::narrow<size_t>(sourceX)).transparent)
+                        {
+                            opaqueLeft = std::min(opaqueLeft, sourceX);
+                            opaqueRight = std::max(opaqueRight, sourceX + 1);
+                        }
+                    }
+                }
+                if (opaqueLeft >= opaqueRight)
+                {
+                    continue;
+                }
+
+                const auto globalOpaqueLeft = imagePixelLeft + opaqueLeft;
+                const auto globalOpaqueRight = imagePixelLeft + opaqueRight;
+                const auto firstOpaqueCell = gsl::narrow<til::CoordType>(globalOpaqueLeft / _cellSize.width);
+                const auto lastOpaqueCell = gsl::narrow<til::CoordType>((globalOpaqueRight - 1) / _cellSize.width);
+                auto tileLeft = firstOpaqueCell / cellsPerTile * cellsPerTile;
+
+                while (tileLeft <= lastOpaqueCell)
+                {
+                    const auto tileRight = std::min(tileLeft + cellsPerTile, page.Width());
+                    THROW_HR_IF(E_INVALIDARG, tileRight <= tileLeft);
+                    const auto tileArea = til::rect{ tileLeft, cellRow, tileRight, cellRow + 1 };
+                    const auto surfaceSize = til::size{ tileArea.width() * _cellSize.width, _cellSize.height };
+                    const auto pixelCount = gsl::narrow<size_t>(surfaceSize.width) * gsl::narrow<size_t>(surfaceSize.height);
+                    auto mutablePixels = std::make_shared<std::vector<RGBQUAD>>(pixelCount);
+
+                    // Flatten existing Sixel content in renderer order before
+                    // overlaying this update. Transparent new pixels therefore
+                    // preserve prior visible Sixel pixels without retaining an
+                    // unbounded stack of backing surfaces.
+                    for (const auto& existing : existingPlacements)
+                    {
+                        if (existing.Identity().protocol != ImagePlacement::Key::Protocol::Sixel)
+                        {
+                            continue;
+                        }
+                        const auto fragment = existing.Crop(tileArea);
+                        if (!fragment)
+                        {
+                            continue;
+                        }
+
+                        const auto sourceRect = fragment->SourceInPixels();
+                        const auto& geometry = fragment->Geometry();
+                        const auto originalBounds = fragment->OriginalCellBounds();
+                        const auto targetLeft = static_cast<double>(originalBounds.left) +
+                                                static_cast<double>(geometry.offset.x) / geometry.cellSize.width;
+                        const auto targetTop = static_cast<double>(originalBounds.top) +
+                                               static_cast<double>(geometry.offset.y) / geometry.cellSize.height;
+                        const auto targetRight = targetLeft + static_cast<double>(geometry.targetWidth) / geometry.cellSize.width;
+                        const auto targetBottom = targetTop + static_cast<double>(geometry.targetHeight) / geometry.cellSize.height;
+                        const auto sourcePixels = fragment->Surface().Pixels();
+                        const auto sourceSize = fragment->Surface().PixelSize();
+                        const auto fragmentBounds = fragment->CellBounds();
+
+                        for (auto targetY = 0; targetY < surfaceSize.height; ++targetY)
+                        {
+                            const auto cellY = cellRow + targetY / _cellSize.height;
+                            const auto sampleY = static_cast<double>(cellRow) +
+                                                 (static_cast<double>(targetY) + 0.5) / _cellSize.height;
+                            if (cellY < fragmentBounds.top || cellY >= fragmentBounds.bottom ||
+                                sampleY < targetTop || sampleY >= targetBottom)
+                            {
+                                continue;
+                            }
+                            const auto sourceY = sourceRect.top + std::clamp(
+                                                                      static_cast<til::CoordType>((sampleY - targetTop) * sourceRect.height() / (targetBottom - targetTop)),
+                                                                      til::CoordType{ 0 },
+                                                                      sourceRect.height() - 1);
+                            const auto sourceRow = gsl::narrow<size_t>(sourceY) * gsl::narrow<size_t>(sourceSize.width);
+                            const auto targetRow = gsl::narrow<size_t>(targetY) * gsl::narrow<size_t>(surfaceSize.width);
+                            for (auto targetX = 0; targetX < surfaceSize.width; ++targetX)
+                            {
+                                const auto cellX = tileLeft + targetX / _cellSize.width;
+                                const auto sampleX = static_cast<double>(tileLeft) +
+                                                     (static_cast<double>(targetX) + 0.5) / _cellSize.width;
+                                if (cellX < fragmentBounds.left || cellX >= fragmentBounds.right ||
+                                    sampleX < targetLeft || sampleX >= targetRight)
+                                {
+                                    continue;
+                                }
+                                const auto sourceX = sourceRect.left + std::clamp(
+                                                                           static_cast<til::CoordType>((sampleX - targetLeft) * sourceRect.width() / (targetRight - targetLeft)),
+                                                                           til::CoordType{ 0 },
+                                                                           sourceRect.width() - 1);
+                                const auto sourcePixel = til::at(sourcePixels, sourceRow + gsl::narrow<size_t>(sourceX));
+                                if (sourcePixel.rgbReserved != 0)
+                                {
+                                    til::at(*mutablePixels, targetRow + gsl::narrow<size_t>(targetX)) = sourcePixel;
+                                }
+                            }
+                        }
+                    }
+
+                    const auto tilePixelLeft = static_cast<int64_t>(tileLeft) * _cellSize.width;
+                    const auto tilePixelRight = static_cast<int64_t>(tileRight) * _cellSize.width;
+                    const auto sourceXBegin = gsl::narrow<til::CoordType>(std::max<int64_t>(0, tilePixelLeft - imagePixelLeft));
+                    const auto sourceXEnd = gsl::narrow<til::CoordType>(std::min<int64_t>(_imageWidth, tilePixelRight - imagePixelLeft));
+                    for (auto sourceY = imageRow; sourceY < sourceRowEnd; ++sourceY)
+                    {
+                        const auto sourceRow = gsl::narrow<size_t>(sourceY) * gsl::narrow<size_t>(_imageMaxWidth);
+                        const auto targetY = sourceY - imageRow;
+                        const auto targetRow = gsl::narrow<size_t>(targetY) * gsl::narrow<size_t>(surfaceSize.width);
+                        for (auto sourceX = sourceXBegin; sourceX < sourceXEnd; ++sourceX)
+                        {
+                            const auto indexedPixel = til::at(_imageBuffer, sourceRow + gsl::narrow<size_t>(sourceX));
+                            if (!indexedPixel.transparent)
+                            {
+                                const auto globalPixelX = imagePixelLeft + sourceX;
+                                const auto targetX = gsl::narrow<size_t>(globalPixelX - tilePixelLeft);
+                                til::at(*mutablePixels, targetRow + targetX) = _makeRGBQUAD(_colorFromIndex(indexedPixel.colorIndex));
+                            }
+                        }
+                    }
+
+                    auto pixelLeft = surfaceSize.width;
+                    auto pixelRight = til::CoordType{ 0 };
+                    for (auto y = 0; y < surfaceSize.height; ++y)
+                    {
+                        const auto rowOffset = gsl::narrow<size_t>(y) * gsl::narrow<size_t>(surfaceSize.width);
+                        for (auto x = 0; x < surfaceSize.width; ++x)
+                        {
+                            if (til::at(*mutablePixels, rowOffset + gsl::narrow<size_t>(x)).rgbReserved != 0)
+                            {
+                                pixelLeft = std::min(pixelLeft, x);
+                                pixelRight = std::max(pixelRight, x + 1);
+                            }
+                        }
+                    }
+
+                    replacementAreas.emplace_back(tileArea);
+                    if (pixelLeft < pixelRight)
+                    {
+                        const Image::PixelStorage storage = mutablePixels;
+                        auto active = std::ranges::find(nextActiveTiles, tileArea, &ActiveTile::area);
+                        auto reuseSurface = active != nextActiveTiles.end() && active->surface->PixelSize() == surfaceSize;
+                        if (reuseSurface)
+                        {
+                            for (const auto& candidate : existingPlacements)
+                            {
+                                if (candidate.Identity() == active->key &&
+                                    ((candidate.CellBounds() & tileArea) != candidate.CellBounds() ||
+                                     candidate.SurfacePointer().get() != active->surface.get()))
+                                {
+                                    reuseSurface = false;
+                                    break;
+                                }
+                            }
+                        }
+
+                        const auto key = reuseSurface ? active->key : _allocateImageKey();
+                        const auto surface = reuseSurface ? active->surface : std::make_shared<Image>(surfaceSize, storage);
+                        if (!reuseSurface)
+                        {
+                            const auto state = ActiveTile{ tileArea, key, surface };
+                            if (active == nextActiveTiles.end())
+                            {
+                                nextActiveTiles.emplace_back(state);
+                            }
+                            else
+                            {
+                                *active = state;
+                            }
+                        }
+
+                        const auto visibleBounds = til::rect{
+                            tileLeft + pixelLeft / _cellSize.width,
+                            cellRow,
+                            tileLeft + (pixelRight + _cellSize.width - 1) / _cellSize.width,
+                            cellRow + 1
+                        };
+                        const auto geometry = ImagePlacement::PixelGeometry{
+                            .cellSize = _cellSize,
+                            .targetWidth = gsl::narrow<uint32_t>(surfaceSize.width),
+                            .targetHeight = gsl::narrow<uint32_t>(surfaceSize.height),
+                        };
+                        auto placement = ImagePlacement{ key, surface, tileArea, 0, {}, geometry };
+                        auto fragment = placement.Crop(visibleBounds);
+                        THROW_HR_IF(E_UNEXPECTED, !fragment);
+                        replacements.emplace_back(ImageCollection::ProtocolReplacement{
+                            std::move(*fragment),
+                            reuseSurface ? storage : Image::PixelStorage{} });
+                    }
+
+                    dirtyTop = std::min(dirtyTop, tileArea.top);
+                    dirtyBottom = std::max(dirtyBottom, tileArea.bottom);
+                    tileLeft += cellsPerTile;
+                }
+            }
+
+            if (!replacementAreas.empty())
+            {
+                images.ReplaceProtocolAreas(
+                    ImagePlacement::Key::Protocol::Sixel,
+                    replacementAreas,
+                    replacements);
+                _activeTiles = std::move(nextActiveTiles);
+
+                if (dirtyTop < dirtyBottom)
+                {
+                    const auto visibleTop = std::max(dirtyTop, page.Top());
+                    const auto visibleBottom = std::min(dirtyBottom, page.Bottom());
+                    if (visibleTop < visibleBottom)
+                    {
+                        const auto dirtyView = Viewport::FromExclusive({ 0, visibleTop, page.Width(), visibleBottom });
+                        page.Buffer().TriggerRedraw(dirtyView);
                     }
                 }
             }
 
-            const Image::PixelStorage storage = pixels;
-            const auto stagedSurface = std::make_shared<Image>(surfaceSize, storage);
-            auto& images = page.Buffer().GetMutableImages();
-            auto dirtyTop = page.Bottom();
-            auto dirtyBottom = page.Top();
-            for (const auto& placement : images.All())
+            // Committed tiles now own scrollback pixels. Rows above the page can
+            // be dropped from the parser staging buffer exactly as they were in
+            // the former row-owned implementation.
+            if (!_displayMode && _imageOriginCell.y < page.Top())
             {
-                if (placement.Identity() == _imageKey)
-                {
-                    dirtyTop = std::min(dirtyTop, placement.CellBounds().top);
-                    dirtyBottom = std::max(dirtyBottom, placement.CellBounds().bottom);
-                }
+                const auto rowsToDelete = page.Top() - _imageOriginCell.y;
+                _eraseImageBufferRows(rowsToDelete);
+                _imageOriginCell.y += rowsToDelete;
             }
-
-            const auto cellWidth = (_imageWidth + _cellSize.width - 1) / _cellSize.width;
-            const auto cellHeight = (imageHeight + _cellSize.height - 1) / _cellSize.height;
-            const auto originalBounds = til::rect{
-                _imageOriginCell.x,
-                _imageOriginCell.y,
-                _imageOriginCell.x + cellWidth,
-                _imageOriginCell.y + cellHeight
-            };
-            const auto geometry = ImagePlacement::PixelGeometry{
-                .cellSize = _cellSize,
-                .targetWidth = gsl::narrow<uint32_t>(_imageWidth),
-                .targetHeight = gsl::narrow<uint32_t>(imageHeight),
-            };
-            const auto placement = ImagePlacement{
-                _imageKey,
-                stagedSurface,
-                originalBounds,
-                0,
-                {},
-                geometry
-            };
-            const auto placementBottom = _displayMode ? page.Bottom() : page.BufferHeight();
-            const auto bufferBounds = til::rect{ 0, 0, page.Width(), placementBottom };
-            if (auto fragment = placement.Crop(bufferBounds))
-            {
-                const auto fragmentBounds = fragment->CellBounds();
-                if (_imageSurface)
-                {
-                    images.AddOrReplace(std::move(*fragment), _imageSurface, surfaceSize, storage);
-                }
-                else
-                {
-                    images.AddOrReplace(std::move(*fragment));
-                    _imageSurface = stagedSurface;
-                }
-                dirtyTop = std::min(dirtyTop, fragmentBounds.top);
-                dirtyBottom = std::max(dirtyBottom, fragmentBounds.bottom);
-            }
-            else
-            {
-                images.Erase(_imageKey);
-            }
-
-            if (dirtyTop < dirtyBottom)
-            {
-                const auto visibleTop = std::max(dirtyTop, page.Top());
-                const auto visibleBottom = std::min(dirtyBottom, page.Bottom());
-                if (visibleTop < visibleBottom)
-                {
-                    const auto dirtyView = Viewport::FromExclusive({ 0, visibleTop, page.Width(), visibleBottom });
-                    page.Buffer().TriggerRedraw(dirtyView);
-                }
-            }
-
         }
 
         // On lower conformance levels, we also update the text colors.

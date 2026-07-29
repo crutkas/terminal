@@ -9,6 +9,7 @@
 
 #include "adaptDispatch.hpp"
 #include "KittyParser.hpp"
+#include "SixelParser.hpp"
 #include "../../../buffer/out/Image.hpp"
 
 using namespace WEX::Common;
@@ -152,8 +153,8 @@ public:
                 continue;
             }
             const auto sourceY = sourceRect.top + std::min<int64_t>(
-                                                       sourceRect.height() - 1,
-                                                       targetY * sourceRect.height() / gsl::narrow_cast<int64_t>(geometry.targetHeight));
+                                                      sourceRect.height() - 1,
+                                                      targetY * sourceRect.height() / gsl::narrow_cast<int64_t>(geometry.targetHeight));
 
             for (auto column = columnBegin; column < columnEnd; ++column)
             {
@@ -4863,7 +4864,7 @@ public:
     TEST_METHOD(SixelUsesSharedSurfaceWithProtocolIdentity)
     {
         _testGetSet->PrepData();
-        _stateMachine->ProcessString(L"\x1bPq#0;2;100;0;0~\x1b\\");
+        _stateMachine->ProcessString(L"\x1bP0;1q#0;2;100;0;0~\x1b\\");
 
         const auto& images = _testGetSet->_textBuffer->GetImages().All();
         VERIFY_ARE_EQUAL(size_t{ 1 }, images.size());
@@ -4871,6 +4872,41 @@ public:
         VERIFY_ARE_EQUAL(uint32_t{ 0 }, images.front().Identity().imageId);
         VERIFY_IS_NOT_NULL(images.front().SurfacePointer().get());
         VERIFY_IS_TRUE(SliceContainsColor(DirectImageSlice(*_testGetSet->_textBuffer, images.front().CellBounds().top), 255, 0, 0));
+    }
+
+    TEST_METHOD(SixelRepeatedFramesCompactSharedTiles)
+    {
+        _testGetSet->PrepData();
+        auto& buffer = *_testGetSet->_textBuffer;
+        _stateMachine->ProcessString(L"\x1b[?80h");
+        _stateMachine->ProcessString(L"\x1bP0;1q#0;2;100;0;0~~~\x1b\\");
+
+        for (auto frame = 0; frame < 64; ++frame)
+        {
+            const auto color = frame % 2 == 0 ? L"#0;2;0;0;100" : L"#0;2;0;100;0";
+            _stateMachine->ProcessString(std::wstring{ L"\x1bP0;1q" } + color + L"~??\x1b\\");
+            VERIFY_ARE_EQUAL(size_t{ 1 }, buffer.GetImages().Size(), L"one row tile must replace prior Sixel frames in place");
+        }
+
+        const auto placements = buffer.GetImages().All();
+        VERIFY_ARE_EQUAL(size_t{ 1 }, placements.size());
+        std::vector<const Image*> surfaces;
+        size_t pixelCount = 0;
+        for (const auto& placement : placements)
+        {
+            surfaces.emplace_back(placement.SurfacePointer().get());
+            pixelCount += placement.Surface().Pixels().size();
+        }
+        std::ranges::sort(surfaces);
+        const auto uniqueEnd = std::ranges::unique(surfaces).begin();
+        VERIFY_ARE_EQUAL(ptrdiff_t{ 1 }, std::distance(surfaces.begin(), uniqueEnd));
+        VERIFY_IS_TRUE(pixelCount <= static_cast<size_t>(buffer.GetSize().Width()) * 10 * 20,
+                       L"repeated frames must retain only one row-sized backing tile");
+
+        const auto slice = DirectImageSlice(buffer, placements.front().CellBounds().top);
+        VERIFY_IS_NOT_NULL(slice);
+        VERIFY_IS_TRUE(SlicePixelIs(slice, 0, 0, 0, 255, 0), L"the latest opaque pixel must replace the prior frame");
+        VERIFY_IS_TRUE(SlicePixelIs(slice, 2, 0, 255, 0, 0), L"transparent pixels must preserve visible prior Sixel content");
     }
 
     // Raster attributes (") are parsed; a zero x-aspect (the division-by-zero guard)
@@ -5342,8 +5378,7 @@ public:
         VERIFY_ARE_EQUAL(static_cast<size_t>(1), static_cast<size_t>(std::count_if(_kitty()._anonymousPlacements.begin(), _kitty()._anonymousPlacements.end(), [](const auto& placement) {
                              return placement.isVirtual;
                          })));
-        VERIFY_ARE_EQUAL(static_cast<size_t>(1), _kitty()._virtualIds.count({ 1u, 0u }),
-                         L"an anonymous physical put must not replace the image's anonymous virtual prototype");
+        VERIFY_ARE_EQUAL(static_cast<size_t>(1), _kitty()._virtualIds.count({ 1u, 0u }), L"an anonymous physical put must not replace the image's anonymous virtual prototype");
     }
 
     // Lowercase delete-all keeps reusable image data; uppercase also frees it.
@@ -5909,17 +5944,7 @@ public:
     {
         // 130 compressed bytes -> 20000 bytes of the repeating pattern DE AD BE EF.
         const std::vector<uint8_t> big{
-            0x78, 0x9c, 0xed, 0xd2, 0x31, 0x11, 0x00, 0x00, 0x08, 0x03, 0x31, 0xff,
-            0x62, 0xb0, 0x80, 0x94, 0x5a, 0xa8, 0x05, 0x64, 0xb0, 0x64, 0x78, 0x03,
-            0x7f, 0xc9, 0x6c, 0x23, 0x0f, 0x18, 0x60, 0x80, 0x01, 0x06, 0x18, 0x60,
-            0x80, 0x01, 0x06, 0x18, 0x60, 0x80, 0x01, 0x06, 0x18, 0x60, 0x80, 0x01,
-            0x06, 0x18, 0x60, 0x80, 0x01, 0x06, 0x18, 0x60, 0x80, 0x01, 0x06, 0x18,
-            0x60, 0x80, 0x01, 0x06, 0x18, 0x60, 0x80, 0x01, 0x06, 0x18, 0x60, 0x80,
-            0x01, 0x06, 0x18, 0x60, 0x80, 0x01, 0x06, 0x18, 0x60, 0x80, 0x01, 0x06,
-            0x18, 0x60, 0x80, 0x01, 0x06, 0x18, 0x60, 0x80, 0x01, 0x06, 0x18, 0x60,
-            0x80, 0x01, 0x06, 0x18, 0x60, 0x80, 0x01, 0x06, 0x18, 0x60, 0x80, 0x01,
-            0x06, 0x18, 0x60, 0x80, 0x01, 0x06, 0x18, 0x60, 0x80, 0x01, 0x06, 0x18,
-            0x60, 0x80, 0x81, 0x7e, 0x3f, 0x38, 0x2e, 0xbd, 0xe1, 0x63
+            0x78, 0x9c, 0xed, 0xd2, 0x31, 0x11, 0x00, 0x00, 0x08, 0x03, 0x31, 0xff, 0x62, 0xb0, 0x80, 0x94, 0x5a, 0xa8, 0x05, 0x64, 0xb0, 0x64, 0x78, 0x03, 0x7f, 0xc9, 0x6c, 0x23, 0x0f, 0x18, 0x60, 0x80, 0x01, 0x06, 0x18, 0x60, 0x80, 0x01, 0x06, 0x18, 0x60, 0x80, 0x01, 0x06, 0x18, 0x60, 0x80, 0x01, 0x06, 0x18, 0x60, 0x80, 0x01, 0x06, 0x18, 0x60, 0x80, 0x01, 0x06, 0x18, 0x60, 0x80, 0x01, 0x06, 0x18, 0x60, 0x80, 0x01, 0x06, 0x18, 0x60, 0x80, 0x01, 0x06, 0x18, 0x60, 0x80, 0x01, 0x06, 0x18, 0x60, 0x80, 0x01, 0x06, 0x18, 0x60, 0x80, 0x01, 0x06, 0x18, 0x60, 0x80, 0x01, 0x06, 0x18, 0x60, 0x80, 0x01, 0x06, 0x18, 0x60, 0x80, 0x01, 0x06, 0x18, 0x60, 0x80, 0x01, 0x06, 0x18, 0x60, 0x80, 0x01, 0x06, 0x18, 0x60, 0x80, 0x01, 0x06, 0x18, 0x60, 0x80, 0x81, 0x7e, 0x3f, 0x38, 0x2e, 0xbd, 0xe1, 0x63
         };
         constexpr size_t expectedSize = 20000;
         static constexpr uint8_t pattern[]{ 0xDE, 0xAD, 0xBE, 0xEF };
@@ -6544,10 +6569,10 @@ public:
     {
         _testGetSet->PrepData();
         _stateMachine->ProcessString(L"\x1b_Ga=t,i=1,f=24,s=2,v=2,m=1;/wAA\x1b\\"); // orphaned (no m=0)
-        _stateMachine->ProcessString(L"\x1b_Ga=T,i=2,f=24,s=1,v=1;AP8A\x1b\\");      // fresh transfer
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=2,f=24,s=1,v=1;AP8A\x1b\\"); // fresh transfer
         _testGetSet->_response.clear();
         _stateMachine->ProcessString(L"\x1b_Ga=p,i=2;\x1b\\");
-        _testGetSet->ValidateInputEvent(L"\x1b_Gi=2;OK\x1b\\");          // id 2 registered cleanly
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=2;OK\x1b\\"); // id 2 registered cleanly
         _stateMachine->ProcessString(L"\x1b_Ga=p,i=1;\x1b\\");
         _testGetSet->ValidateInputEvent(L"\x1b_Gi=1;ENOENT:image not found\x1b\\"); // id 1 discarded
     }
@@ -8040,8 +8065,10 @@ public:
         _stateMachine->ProcessString(L"\x1b_Ga=t,i=2,f=24,s=1,v=1;/wAA\x1b\\"); // store only
         _stateMachine->ProcessString(L"\x1b_Ga=p,i=2,c=3,r=2;\x1b\\"); // put scaled
         VERIFY_ARE_EQUAL(2, CountImageRows(*_testGetSet->_textBuffer));
-        til::CoordType r=-1; const auto s=FindFirstImageSlice(*_testGetSet->_textBuffer,r);
-        VERIFY_IS_NOT_NULL(s); VERIFY_ARE_EQUAL(30, s->PixelWidth());
+        til::CoordType r = -1;
+        const auto s = FindFirstImageSlice(*_testGetSet->_textBuffer, r);
+        VERIFY_IS_NOT_NULL(s);
+        VERIFY_ARE_EQUAL(30, s->PixelWidth());
     }
 
     // Ownership tag covers the full scaled width so delete-by-number erases it all.
@@ -9406,7 +9433,7 @@ public:
     {
         _testGetSet->PrepData();
         auto& buffer = *_testGetSet->_textBuffer;
-        _stateMachine->ProcessString(L"\x1bPq#0;2;100;0;0~\x1b\\");
+        _stateMachine->ProcessString(L"\x1bP0;1q#0;2;100;0;0~\x1b\\");
         til::CoordType sixelRow = -1;
         const auto* sixelSlice = FindFirstImageSlice(buffer, sixelRow);
         VERIFY_IS_NOT_NULL(sixelSlice);
@@ -9415,6 +9442,7 @@ public:
             return placement.Identity().protocol == ImagePlacement::Key::Protocol::Sixel;
         });
         VERIFY_IS_TRUE(sixelPlacement != buffer.GetImages().All().end());
+        const auto sixelKey = sixelPlacement->Identity();
         const auto sixelSurface = sixelPlacement->SurfacePointer();
         VERIFY_IS_TRUE(std::ranges::any_of(sixelSurface->Pixels(), [](const RGBQUAD pixel) { return pixel.rgbRed == 255; }));
         buffer.GetCursor().SetPosition(origin);
@@ -9436,9 +9464,9 @@ public:
         const auto pixel = SlicePixelAt(slice, origin.x + 1 - slice->ColumnOffset(), 0);
         VERIFY_IS_TRUE(pixel.rgbRed == 255 && pixel.rgbGreen == 0, L"deleting moved Kitty pixels must not erase co-moved Sixel pixels");
         VERIFY_ARE_EQUAL(0u, slice->ColumnOwner(origin.x + 1));
-        VERIFY_ARE_EQUAL(sixelSurface.get(), std::ranges::find_if(buffer.GetImages().All(), [](const ImagePlacement& placement) {
-            return placement.Identity().protocol == ImagePlacement::Key::Protocol::Sixel;
-        })->SurfacePointer().get());
+        const auto preservedSixel = std::ranges::find(buffer.GetImages().All(), sixelKey, &ImagePlacement::Identity);
+        VERIFY_IS_TRUE(preservedSixel != buffer.GetImages().All().end());
+        VERIFY_ARE_EQUAL(sixelSurface.get(), preservedSixel->SurfacePointer().get());
     }
 
     TEST_METHOD(KittyGraphicsOmittedZIndexDefaultsAboveText)
@@ -9972,7 +10000,7 @@ public:
         VERIFY_IS_TRUE(foundBoth, L"layers from both rows must survive when widening joins wrapped rows");
     }
 
-    TEST_METHOD(SixelIncrementalFlushReusesAndGrowsSurface)
+    TEST_METHOD(SixelIncrementalFlushReusesTileRevision)
     {
         _testGetSet->PrepData();
         auto& buffer = *_testGetSet->_textBuffer;
@@ -9987,16 +10015,21 @@ public:
 
         _stateMachine->ProcessString(L"#1;2;0;0;100~\x1b\\");
 
-        VERIFY_ARE_EQUAL(size_t{ 1 }, buffer.GetImages().Size());
-        const auto& placement = buffer.GetImages().All().front();
-        VERIFY_ARE_EQUAL(firstKey, placement.Identity());
-        VERIFY_ARE_EQUAL(surface.get(), placement.SurfacePointer().get());
+        VERIFY_ARE_EQUAL(size_t{ 2 }, buffer.GetImages().Size());
+        const auto placements = buffer.GetImages().All();
+        const auto placement = std::ranges::find(placements, firstKey, &ImagePlacement::Identity);
+        VERIFY_IS_TRUE(placement != placements.end());
+        VERIFY_ARE_EQUAL(surface.get(), placement->SurfacePointer().get());
         VERIFY_ARE_NOT_EQUAL(firstRevision, surface->Revision(), L"one streamed flush must commit a new complete-surface revision");
-        VERIFY_IS_TRUE(surface->PixelSize().height > firstSize.height);
+        VERIFY_ARE_EQUAL(firstSize, surface->PixelSize(), L"fixed row tiles refresh without growing one GPU surface");
         VERIFY_IS_TRUE(std::ranges::any_of(surface->Pixels(), [](const RGBQUAD pixel) { return pixel.rgbRed == 255; }),
-                       L"growing the surface must preserve the first flushed band");
+                       L"refreshing the tile must preserve the first flushed band");
         VERIFY_IS_TRUE(std::ranges::any_of(surface->Pixels(), [](const RGBQUAD pixel) { return pixel.rgbBlue == 255; }),
-                       L"the second flushed band must appear in the same surface");
+                       L"the intersecting portion of the second band must appear in the same surface");
+        VERIFY_IS_TRUE(std::ranges::all_of(placements, [](const auto& candidate) {
+            return candidate.Surface().Pixels().size() <=
+                   static_cast<size_t>(Image::MaximumDimension) * Image::MaximumDimension;
+        }));
     }
 
     TEST_METHOD(SixelPannedFlushRetainsScrollback)
@@ -10012,11 +10045,14 @@ public:
         ++_testGetSet->_viewport.bottom;
         _stateMachine->ProcessString(L"#1;2;0;0;100~\x1b\\");
 
-        VERIFY_ARE_EQUAL(size_t{ 1 }, buffer.GetImages().Size());
-        const auto& placement = buffer.GetImages().All().front();
-        VERIFY_ARE_EQUAL(firstTop, placement.CellBounds().top, L"viewport panning must not discard the flushed band in scrollback");
-        VERIFY_IS_TRUE(std::ranges::any_of(placement.Surface().Pixels(), [](const RGBQUAD pixel) { return pixel.rgbRed == 255; }));
-        VERIFY_IS_TRUE(std::ranges::any_of(placement.Surface().Pixels(), [](const RGBQUAD pixel) { return pixel.rgbBlue == 255; }));
+        const auto placements = buffer.GetImages().All();
+        VERIFY_ARE_EQUAL(size_t{ 2 }, placements.size());
+        const auto firstTile = std::ranges::find_if(placements, [&](const auto& placement) {
+            return placement.CellBounds().top == firstTop;
+        });
+        VERIFY_IS_TRUE(firstTile != placements.end(), L"viewport panning must not discard the flushed band in scrollback");
+        VERIFY_IS_TRUE(std::ranges::any_of(firstTile->Surface().Pixels(), [](const RGBQUAD pixel) { return pixel.rgbRed == 255; }));
+        VERIFY_IS_TRUE(std::ranges::any_of(firstTile->Surface().Pixels(), [](const RGBQUAD pixel) { return pixel.rgbBlue == 255; }));
     }
 
     TEST_METHOD(SixelDisplayModeClipsPartialBandAtPageBottom)
@@ -10034,9 +10070,14 @@ public:
         sequence.append(L"\x1b\\");
         _stateMachine->ProcessString(sequence);
 
-        VERIFY_ARE_EQUAL(size_t{ 1 }, buffer.GetImages().Size());
-        const auto& placement = buffer.GetImages().All().front();
-        VERIFY_ARE_EQUAL(pageBottom, placement.CellBounds().bottom, L"DECSDM must clip a partial final band to the page");
+        VERIFY_IS_FALSE(buffer.GetImages().Empty());
+        VERIFY_IS_TRUE(std::ranges::all_of(buffer.GetImages().All(), [&](const auto& placement) {
+            return placement.CellBounds().bottom <= pageBottom;
+        }));
+        VERIFY_IS_TRUE(std::ranges::any_of(buffer.GetImages().All(), [&](const auto& placement) {
+                           return placement.CellBounds().bottom == pageBottom;
+                       }),
+                       L"DECSDM must clip a partial final band to the page");
 
         ++_testGetSet->_viewport.top;
         ++_testGetSet->_viewport.bottom;
@@ -10044,40 +10085,92 @@ public:
                        L"clipped display-mode overflow must not appear after viewport panning");
     }
 
-    TEST_METHOD(SixelOversizeAbortRestoresCursorAndPreservesPlacement)
+    TEST_METHOD(SixelScrollingStreamBeyondMaximumSurfaceHeightUsesTiles)
     {
         _testGetSet->PrepData();
-        _testGetSet->_textBuffer = std::make_unique<TextBuffer>(til::size{ 2, 500 }, TextAttribute{}, 0, false, &_testGetSet->_renderer);
-        _testGetSet->_viewport = { 0, 0, 1, 499 };
+        _testGetSet->_textBuffer = std::make_unique<TextBuffer>(til::size{ 4, 600 }, TextAttribute{}, 0, false, &_testGetSet->_renderer);
+        _testGetSet->_viewport = { 0, 0, 4, 10 };
         auto& buffer = *_testGetSet->_textBuffer;
         buffer.GetCursor().SetPosition({ 0, 0 });
-        _stateMachine->ProcessString(L"\x1bP0;1q#0;2;100;0;0~\x1b\\");
-        const auto existingKey = buffer.GetImages().All().front().Identity();
-        const auto existingSurface = buffer.GetImages().All().front().SurfacePointer();
+        _stateMachine->ProcessString(L"\x1b[?80l");
 
         auto& cursor = buffer.GetCursor();
         cursor.SetIsVisible(true);
         auto handler = _pDispatch->DefineSixelImage(0, DispatchTypes::SixelBackground::Transparent, {});
         VERIFY_IS_TRUE(static_cast<bool>(handler));
 
-        auto accepted = true;
-        for (auto line = 0; accepted && line < 700; ++line)
-        {
-            accepted = handler(L'~');
-            if (accepted)
+        const auto send = [&](const std::wstring_view text) {
+            for (const auto ch : text)
             {
-                accepted = handler(L'-');
+                VERIFY_IS_TRUE(handler(ch), L"the scrolling stream must not abort");
             }
-        }
-
-        VERIFY_IS_FALSE(accepted, L"a surface exceeding the 8192px axis guarantee must be rejected");
-        VERIFY_IS_TRUE(cursor.IsVisible(), L"an aborted Sixel sequence must restore the cursor visibility");
-        const auto existing = std::ranges::find(buffer.GetImages().All(), existingKey, &ImagePlacement::Identity);
-        VERIFY_IS_TRUE(existing != buffer.GetImages().All().end());
-        if (existing != buffer.GetImages().All().end())
+        };
+        send(L"#0;2;100;0;0");
+        constexpr auto bandCount = 700;
+        static_assert(bandCount * 12 > Image::MaximumDimension);
+        for (auto line = 0; line < bandCount; ++line)
         {
-            VERIFY_ARE_EQUAL(existingSurface.get(), existing->SurfacePointer().get(), L"an oversized replacement must leave prior output intact");
+            send(L"~-");
         }
+        send(L"#1;2;0;0;100~");
+        _pDispatch->_sixelParser->_maybeFlushImageBuffer(false, true);
+
+        VERIFY_IS_FALSE(cursor.IsVisible(), L"the in-flight stream must still own cursor visibility");
+        VERIFY_IS_NOT_NULL(_pDispatch->_sixelParser.get());
+        VERIFY_IS_TRUE(_pDispatch->_sixelParser->_imageBuffer.size() <=
+                           static_cast<size_t>(Image::MaximumDimension) * _pDispatch->_sixelParser->_imageMaxWidth,
+                       L"a forced intermediate flush must keep parser staging bounded");
+        VERIFY_IS_FALSE(buffer.GetImages().Empty());
+        std::vector<const Image*> surfaces;
+        for (const auto& placement : buffer.GetImages().All())
+        {
+            const auto size = placement.Surface().PixelSize();
+            VERIFY_IS_TRUE(size.width <= Image::MaximumDimension);
+            VERIFY_IS_TRUE(size.height <= Image::MaximumDimension);
+            surfaces.emplace_back(placement.SurfacePointer().get());
+        }
+        std::ranges::sort(surfaces);
+        const auto uniqueSurfaceCount = std::distance(surfaces.begin(), std::ranges::unique(surfaces).begin());
+        VERIFY_IS_TRUE(uniqueSurfaceCount <= buffer.GetSize().Height(), L"surface count must be bounded by retained buffer rows");
+        VERIFY_IS_TRUE(BufferContainsColor(buffer, 255, 0, 0), L"retained scrolled bands must remain visible");
+        VERIFY_IS_TRUE(BufferContainsColor(buffer, 0, 0, 255), L"the final band beyond 8192px must be decoded");
+
+        VERIFY_IS_TRUE(handler(L'\x1b'));
+        VERIFY_IS_TRUE(cursor.IsVisible(), L"a completed long Sixel sequence must restore cursor visibility");
+    }
+
+    TEST_METHOD(ViewportPanResetErasesOnlyNewImageRow)
+    {
+        _testGetSet->PrepData();
+        auto& buffer = *_testGetSet->_textBuffer;
+        const auto page = _pDispatch->_pages.ActivePage();
+        const auto bottomRow = page.Bottom() - 1;
+        buffer.GetCursor().SetPosition({ 0, bottomRow });
+
+        const auto makePlacement = [&](const ImagePlacement::Key key, const til::rect bounds) {
+            const auto pixelSize = til::size{ bounds.width(), bounds.height() };
+            const auto pixelCount = gsl::narrow<size_t>(pixelSize.width) * gsl::narrow<size_t>(pixelSize.height);
+            return ImagePlacement{
+                key,
+                std::make_shared<Image>(pixelSize, std::vector<RGBQUAD>(pixelCount, RGBQUAD{ 0, 0, 255, 255 })),
+                bounds,
+                0,
+            };
+        };
+        buffer.GetMutableImages().Add(makePlacement(
+            { 0, 1, ImagePlacement::Key::Protocol::Sixel },
+            { 0, bottomRow, 2, bottomRow + 3 }));
+        buffer.GetMutableImages().Add(makePlacement(
+            { 1, 1, ImagePlacement::Key::Protocol::Kitty },
+            { 4, bottomRow, 6, bottomRow + 3 }));
+
+        VERIFY_IS_TRUE(_pDispatch->_DoLineFeed(page, false, false));
+
+        VERIFY_ARE_EQUAL(size_t{ 4 }, buffer.GetImages().Size());
+        VERIFY_ARE_EQUAL(size_t{ 2 }, buffer.GetImages().IntersectingRows(bottomRow, bottomRow + 1).size());
+        VERIFY_IS_TRUE(buffer.GetImages().IntersectingRows(bottomRow + 1, bottomRow + 2).empty(),
+                       L"the newly exposed row must not retain Sixel or Kitty fragments");
+        VERIFY_ARE_EQUAL(size_t{ 2 }, buffer.GetImages().IntersectingRows(bottomRow + 2, bottomRow + 3).size(), L"fragments below the reset row must survive");
     }
 
     TEST_METHOD(SixelFinalizationReleasesParserSurface)
@@ -10096,7 +10189,7 @@ public:
     {
         _testGetSet->PrepData();
         auto& buffer = *_testGetSet->_textBuffer;
-        _stateMachine->ProcessString(L"\x1bPq#0;2;100;0;0~\x1b\\");
+        _stateMachine->ProcessString(L"\x1bP0;1q#0;2;100;0;0~\x1b\\");
         const auto firstKey = buffer.GetImages().All().front().Identity();
         const auto firstSurface = buffer.GetImages().All().front().SurfacePointer();
         _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,f=24,s=1,v=1,C=1;AP8A\x1b\\");
@@ -10109,7 +10202,7 @@ public:
         VERIFY_ARE_EQUAL(firstSurface.get(), images.front().SurfacePointer().get());
 
         buffer.GetCursor().SetPosition({ 10, 25 });
-        _stateMachine->ProcessString(L"\x1bPq#0;2;0;0;100~\x1b\\");
+        _stateMachine->ProcessString(L"\x1bP0;1q#0;2;0;0;100~\x1b\\");
         images = buffer.GetImages().All();
         VERIFY_ARE_EQUAL(size_t{ 2 }, images.size());
         const auto second = std::ranges::find_if(images, [&](const auto& placement) {

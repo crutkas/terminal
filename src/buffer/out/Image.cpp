@@ -135,6 +135,11 @@ void Image::UpdatePixels(const til::size pixelSize, PixelStorage pixels)
 
     // All validation and allocation happens before changing either field, so a
     // rejected resize leaves every placement with its prior valid surface.
+    _updatePixels(pixelSize, std::move(pixels));
+}
+
+void Image::_updatePixels(const til::size pixelSize, PixelStorage pixels) noexcept
+{
     _pixelSize = pixelSize;
     _pixels = std::move(pixels);
     _revision = nextRevision();
@@ -165,8 +170,7 @@ ImagePlacement::ImagePlacement(const Key key,
     const til::rect imageBounds{ 0, 0, imageSize.width, imageSize.height };
     THROW_HR_IF(E_INVALIDARG, _sourceInPixels.empty() || (_sourceInPixels & imageBounds) != _sourceInPixels);
     THROW_HR_IF(E_INVALIDARG, _geometry.cellSize.width <= 0 || _geometry.cellSize.height <= 0);
-    THROW_HR_IF(E_INVALIDARG, _geometry.offset.x < 0 || _geometry.offset.x >= _geometry.cellSize.width ||
-                                     _geometry.offset.y < 0 || _geometry.offset.y >= _geometry.cellSize.height);
+    THROW_HR_IF(E_INVALIDARG, _geometry.offset.x < 0 || _geometry.offset.x >= _geometry.cellSize.width || _geometry.offset.y < 0 || _geometry.offset.y >= _geometry.cellSize.height);
     if (_geometry.targetWidth == 0)
     {
         _geometry.targetWidth = gsl::narrow_cast<uint64_t>(_sourceInPixels.width());
@@ -186,12 +190,7 @@ ImagePlacement ImagePlacement::FromFragment(const Key key,
                                             const til::rect sourceInPixels,
                                             const PixelGeometry geometry)
 {
-    THROW_HR_IF(E_INVALIDARG, originalCellBounds.right <= originalCellBounds.left ||
-                                      originalCellBounds.bottom <= originalCellBounds.top ||
-                                      cellBounds.left < originalCellBounds.left ||
-                                      cellBounds.top < originalCellBounds.top ||
-                                      cellBounds.right > originalCellBounds.right ||
-                                      cellBounds.bottom > originalCellBounds.bottom);
+    THROW_HR_IF(E_INVALIDARG, originalCellBounds.right <= originalCellBounds.left || originalCellBounds.bottom <= originalCellBounds.top || cellBounds.left < originalCellBounds.left || cellBounds.top < originalCellBounds.top || cellBounds.right > originalCellBounds.right || cellBounds.bottom > originalCellBounds.bottom);
     auto placement = ImagePlacement{ key, std::move(image), cellBounds, zIndex, sourceInPixels, geometry };
     placement._originalCellBounds = originalCellBounds;
     return placement;
@@ -494,6 +493,54 @@ void ImageCollection::AddOrReplaceArea(ImagePlacement image)
         }
     }
     remaining.emplace_back(std::move(image));
+    _replace(std::move(remaining));
+}
+
+void ImageCollection::ReplaceProtocolAreas(const ImagePlacement::Key::Protocol protocol,
+                                           const std::span<const til::rect> areas,
+                                           const std::span<const ProtocolReplacement> replacements)
+{
+    for (const auto& replacement : replacements)
+    {
+        THROW_HR_IF(E_INVALIDARG, replacement.placement.Identity().protocol != protocol);
+        if (replacement.pixels)
+        {
+            const auto size = replacement.placement.Surface().PixelSize();
+            const auto pixelCount = checkedPixelCount(size);
+            THROW_HR_IF(E_INVALIDARG, replacement.pixels->size() != pixelCount);
+        }
+    }
+
+    const auto current = All();
+    std::vector<ImagePlacement> remaining;
+    remaining.reserve(current.size() + replacements.size());
+    for (const auto& candidate : current)
+    {
+        if (candidate.Identity().protocol != protocol)
+        {
+            remaining.emplace_back(candidate);
+            continue;
+        }
+
+        const std::array candidateArray{ candidate };
+        auto fragments = _eraseAreas(candidateArray, areas);
+        std::move(fragments.begin(), fragments.end(), std::back_inserter(remaining));
+    }
+    for (const auto& replacement : replacements)
+    {
+        remaining.emplace_back(replacement.placement);
+    }
+
+    // Every allocation and validation has completed. These updates and the
+    // final vector swap are nonthrowing, so the batch cannot partially commit.
+    for (const auto& replacement : replacements)
+    {
+        if (replacement.pixels)
+        {
+            const auto& surface = replacement.placement.SurfacePointer();
+            surface->_updatePixels(surface->PixelSize(), replacement.pixels);
+        }
+    }
     _replace(std::move(remaining));
 }
 

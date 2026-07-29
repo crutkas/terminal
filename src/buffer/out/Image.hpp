@@ -34,6 +34,10 @@ public:
     void UpdatePixels(til::size pixelSize, PixelStorage pixels);
 
 private:
+    friend class ImageCollection;
+
+    void _updatePixels(til::size pixelSize, PixelStorage pixels) noexcept;
+
     til::size _pixelSize;
     PixelStorage _pixels;
     uint64_t _revision = 0;
@@ -129,6 +133,14 @@ private:
 class ImageCollection final
 {
 public:
+    struct ProtocolReplacement
+    {
+        ImagePlacement placement;
+        // When set, the placement reuses an existing surface and this storage
+        // is committed only after the entire batch has been validated.
+        Image::PixelStorage pixels;
+    };
+
     class LogicalPlacement final
     {
     public:
@@ -166,6 +178,9 @@ public:
     void AddOrReplace(ImagePlacement image);
     void AddOrReplace(ImagePlacement image, const Image::Pointer& surface, til::size pixelSize, Image::PixelStorage pixels);
     void AddOrReplaceArea(ImagePlacement image);
+    void ReplaceProtocolAreas(ImagePlacement::Key::Protocol protocol,
+                              std::span<const til::rect> areas,
+                              std::span<const ProtocolReplacement> replacements);
     void Clear() noexcept;
     size_t EraseProtocol(ImagePlacement::Key::Protocol protocol) noexcept;
     bool Erase(ImagePlacement::Key key);
