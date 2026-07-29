@@ -50,8 +50,9 @@ namespace
         std::vector<bool> columnsContainGreen;
         std::vector<uint8_t> defaultBackgroundMask;
         std::vector<COLORREF> cellBackgrounds;
-        // Position of this paint within the frame, so a test can compare the order of
-        // image and cursor painting without depending on any one backend.
+        // Order in which the renderer submitted this paint within the frame. This records
+        // IRenderEngine call order only - what a backend does with those calls internally is
+        // its own business.
         size_t paintStep = 0;
     };
 
@@ -414,7 +415,7 @@ namespace
     constexpr std::wstring_view OrdinaryCombiningText{ L"A\x0301" };
     // A 4x1 red image drawn across four columns, between the background and the text.
     constexpr std::wstring_view PlaceRedKittyImageBehindText{ L"\x1b_Ga=T,f=24,s=4,v=1,c=4,r=1,z=-1,q=2;/wAA/wAA/wAA/wAA\x1b\\" };
-    // The same, in green, at the default z (>= 0) so it is drawn on top of the text.
+    // The same, in green, at the default z (>= 0), which classifies its placement AboveText.
     constexpr std::wstring_view PlaceGreenKittyImageAboveText{ L"\x1b_Ga=T,f=24,s=4,v=1,c=4,r=1,q=2;AP8AAP8AAP8AAP8A\x1b\\" };
 
     std::optional<til::point> FindKittyPlaceholder(const TextBuffer& buffer)
@@ -510,7 +511,7 @@ namespace TerminalCoreUnitTests
         TEST_METHOD(KittyAnimationSurvivesFontAndRendererRefresh);
         TEST_METHOD(KittyPlaceholderRendersInRealTerminal);
         TEST_METHOD(KittyImageRowCarriesEachCellsBackgroundColor);
-        TEST_METHOD(CursorPaintsAfterAboveTextImages);
+        TEST_METHOD(RendererSubmitsCursorAfterImages);
         TEST_METHOD(KittyPlaceholderSuppressesGlyphOnPaintAndRepaint);
         TEST_METHOD(KittyPlaceholderLeavesUnrecognizedTextUntouched);
         TEST_METHOD(KittyPlaceholderSuppressesGlyphAfterResize);
@@ -1815,15 +1816,16 @@ void TerminalApiTest::KittyImageRowCarriesEachCellsBackgroundColor()
     VERIFY_ARE_NOT_EQUAL(RGB(4, 5, 6), painted->cellBackgrounds.at(2), L"a default cell must not inherit the colored one");
 }
 
-// A kitty image with z >= 0 is drawn on top of the text, and the cursor can be standing on
-// exactly such a cell. The base renderer paints in a fixed order - background, text (with the
-// row's image content bracketed around it), selection, then the cursor - so the cursor lands on
-// top of an above-text image on every backend. Each backend decides how it draws an image, but
-// none of them gets to reorder this, which is why the assertion is made here against the shared
-// Renderer rather than in a backend's own tests. Whether a z >= 0 image *should* cover the
-// cursor is a protocol question; this only pins down what the renderer does today, so a change
-// to it has to be deliberate.
-void TerminalApiTest::CursorPaintsAfterAboveTextImages()
+// Renderer::PaintFrame hands work to the engine in a fixed order: background, then the text
+// rows with each row's image content bracketed around them, then selection, then the cursor.
+// This asserts that submission order, and nothing more. It is a real contract - a backend can
+// only composite the cursor against a row's images if it has been given both by the time it
+// draws - but it is not a statement about pixels: a backend is free to batch the calls into
+// passes of its own and composite them in another order, and BackendD3D does exactly that,
+// emitting the cursor background before the text and images and the cursor foreground in a
+// later pass. What a z >= 0 image should look like where it meets the cursor is a product
+// question, and proving what it does look like needs a backend-level test, not this one.
+void TerminalApiTest::RendererSubmitsCursorAfterImages()
 {
     KittyRenderFixture fixture{ { 8, 3 }, 0 };
     auto& stateMachine = *fixture.terminal._stateMachine;
@@ -1832,27 +1834,27 @@ void TerminalApiTest::CursorPaintsAfterAboveTextImages()
     fixture.renderer.AllowCursorVisibility(Microsoft::Console::Render::InhibitionSource::Host, true);
 
     stateMachine.ProcessString(L"\x1b[1;1H");
-    stateMachine.ProcessString(PlaceRedKittyImageBehindText); // z=-1, under the text
+    stateMachine.ProcessString(PlaceRedKittyImageBehindText); // z=-1, classified BehindText
     stateMachine.ProcessString(L"\x1b[2;1H");
-    stateMachine.ProcessString(PlaceGreenKittyImageAboveText); // default z, over the text
+    stateMachine.ProcessString(PlaceGreenKittyImageAboveText); // default z, classified AboveText
     stateMachine.ProcessString(L"\x1b[2;1H"); // park the cursor on the above-text image
 
-    VERIFY_IS_TRUE(fixture.terminal._mainBuffer->GetCursor().IsVisible(), L"the cursor has to be painted for this to mean anything");
+    VERIFY_IS_TRUE(fixture.terminal._mainBuffer->GetCursor().IsVisible(), L"the cursor has to be submitted for this to mean anything");
 
     fixture.StartPainting();
     const auto frame = fixture.engine.Snapshot();
 
     const auto behind = std::ranges::find(frame.images, ImagePlacement::RenderPosition::BehindText, &PaintedImage::position);
     const auto above = std::ranges::find(frame.images, ImagePlacement::RenderPosition::AboveText, &PaintedImage::position);
-    VERIFY_IS_TRUE(behind != frame.images.end(), L"the z<0 image is painted behind the text");
-    VERIFY_IS_TRUE(above != frame.images.end(), L"the z>=0 image is painted above the text");
+    VERIFY_IS_TRUE(behind != frame.images.end(), L"the z<0 image reaches the engine as BehindText");
+    VERIFY_IS_TRUE(above != frame.images.end(), L"the z>=0 image reaches the engine as AboveText");
     VERIFY_IS_TRUE(above->containsGreen, L"the above-text image is the green one");
 
-    VERIFY_ARE_EQUAL(size_t{ 1 }, frame.cursors.size(), L"the cursor is painted exactly once per frame");
-    VERIFY_ARE_EQUAL((til::point{ 0, 1 }), frame.cursors.front().position, L"the cursor stands on the above-text image");
+    VERIFY_ARE_EQUAL(size_t{ 1 }, frame.cursors.size(), L"the cursor is submitted exactly once per frame");
+    VERIFY_ARE_EQUAL((til::point{ 0, 1 }), frame.cursors.front().position, L"the cursor is submitted for the cell the above-text image covers");
     for (const auto& image : frame.images)
     {
-        VERIFY_IS_TRUE(image.paintStep < frame.cursors.front().paintStep, L"every image, above-text included, is painted before the cursor");
+        VERIFY_IS_TRUE(image.paintStep < frame.cursors.front().paintStep, L"every image, above-text included, is submitted before the cursor");
     }
 }
 
