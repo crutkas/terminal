@@ -1999,12 +1999,11 @@ void BackendD3D::_drawImage(const RenderingPayload& p, const ImagePlacement& pla
     const auto snapshot = std::ranges::find(p.imageSurfaces, image.get(), [](const auto& surface) {
         return surface.image.get();
     });
-    // A placement with no matching snapshot, or one whose snapshot fails to upload,
-    // is skipped so the rest of the row (text and other images) still draws. Only
-    // genuine device failures propagate out of _uploadImage() for recovery.
+    // A shaped row can briefly outlive its frame snapshot after an image is erased.
+    // Skip that stale placement or malformed upload, while genuine device failures
+    // still propagate out of _uploadImage() for recovery.
     if (snapshot == p.imageSurfaces.end())
     {
-        assert(false);
         return;
     }
     if (!_uploadImage(p, *snapshot))

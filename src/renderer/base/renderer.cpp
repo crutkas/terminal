@@ -447,6 +447,21 @@ DWORD Renderer::_timerToMillis(TimerRepr t) noexcept
         }
 
         LOG_HR_IF(hr, hr != E_PENDING);
+        if (attempt < maxRetriesForRenderEngine)
+        {
+            // EndPaint finalizes an attempted frame and consumes each engine's dirty
+            // state. Re-invalidate under the console lock, which also serializes normal
+            // dirty-state updates, so the replacement frame repaints everything the
+            // failed attempt may have cleared or partially updated.
+            _pData->LockConsole();
+            auto unlock = wil::scope_exit([&]() {
+                _pData->UnlockConsole();
+            });
+            for (const auto pEngine : _engines)
+            {
+                LOG_IF_FAILED(pEngine->InvalidateAll());
+            }
+        }
     }
 
     if (FAILED(hr))
@@ -559,10 +574,9 @@ try
         .surfaces = _imageSurfaces,
         .viewportOrigin = _viewport.Origin(),
     });
-    // A failure to prepare images must not blank the frame's text. Treat it like a
-    // fallback to no direct-image support and keep painting; a genuinely lost
-    // device is detected and recovered later in Present(), not here.
-    LOG_IF_FAILED(imageFrameResult);
+    // S_FALSE is the supported text-only fallback. Actual preparation failures must
+    // propagate so the renderer can retry or recover the graphics device.
+    RETURN_IF_FAILED(imageFrameResult);
 
     // 1. Paint Background
     RETURN_IF_FAILED(_PaintBackground(pEngine));

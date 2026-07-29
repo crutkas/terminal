@@ -92,6 +92,8 @@ namespace
 
         HRESULT EndPaint() noexcept override
         {
+            const auto guard = _lock.lock_exclusive();
+            _dirtyArea = {};
             return S_OK;
         }
 
@@ -137,6 +139,8 @@ namespace
 
         HRESULT InvalidateAll() noexcept override
         {
+            const auto guard = _lock.lock_exclusive();
+            _dirtyArea = { 0, 0, SHRT_MAX, SHRT_MAX };
             return S_OK;
         }
 
@@ -167,6 +171,9 @@ namespace
         try
         {
             const auto guard = _lock.lock_exclusive();
+            ++_imageFramePreparationCalls;
+            const auto result = std::exchange(_nextImageFrameResult, S_OK);
+            RETURN_IF_FAILED(result);
             _framePlacements.assign(info.placements.begin(), info.placements.end());
             _frameSurfaces.assign(info.surfaces.begin(), info.surfaces.end());
             _imageViewportOrigin = info.viewportOrigin;
@@ -339,6 +346,18 @@ namespace
             };
         }
 
+        void FailNextImagePreparation(const HRESULT result) noexcept
+        {
+            const auto guard = _lock.lock_exclusive();
+            _nextImageFrameResult = result;
+        }
+
+        size_t ImageFramePreparationCalls() const noexcept
+        {
+            const auto guard = _lock.lock_shared();
+            return _imageFramePreparationCalls;
+        }
+
     protected:
         HRESULT _DoUpdateTitle(const std::wstring_view /*title*/) noexcept override
         {
@@ -356,6 +375,8 @@ namespace
         std::vector<ImagePlacement> _framePlacements;
         std::vector<ImageFrameInfo::Surface> _frameSurfaces;
         til::point _imageViewportOrigin;
+        HRESULT _nextImageFrameResult = S_OK;
+        size_t _imageFramePreparationCalls = 0;
         std::unordered_map<const Image*, uint64_t> _surfaceRevisions;
         size_t _imageFramePreparations = 0;
         size_t _surfaceUploads = 0;
@@ -511,6 +532,7 @@ namespace TerminalCoreUnitTests
         TEST_METHOD(KittyAnimationSurvivesFontAndRendererRefresh);
         TEST_METHOD(KittyPlaceholderRendersInRealTerminal);
         TEST_METHOD(KittyImageRowCarriesEachCellsBackgroundColor);
+        TEST_METHOD(RendererRetriesImagePreparationFailure);
         TEST_METHOD(RendererSubmitsCursorAfterImages);
         TEST_METHOD(KittyPlaceholderSuppressesGlyphOnPaintAndRepaint);
         TEST_METHOD(KittyPlaceholderLeavesUnrecognizedTextUntouched);
@@ -1814,6 +1836,19 @@ void TerminalApiTest::KittyImageRowCarriesEachCellsBackgroundColor()
     VERIFY_ARE_EQUAL(RGB(4, 5, 6), painted->cellBackgrounds.at(1), L"a cell's own background color must survive to the engine");
     VERIFY_ARE_EQUAL(painted->cellBackgrounds.at(2), painted->cellBackgrounds.at(3), L"the default-background cells must agree");
     VERIFY_ARE_NOT_EQUAL(RGB(4, 5, 6), painted->cellBackgrounds.at(2), L"a default cell must not inherit the colored one");
+}
+
+void TerminalApiTest::RendererRetriesImagePreparationFailure()
+{
+    KittyRenderFixture fixture{ { 8, 3 }, 0 };
+    fixture.terminal._stateMachine->ProcessString(L"X");
+    fixture.engine.FailNextImagePreparation(E_OUTOFMEMORY);
+
+    fixture.StartPainting();
+
+    VERIFY_ARE_EQUAL(size_t{ 2 }, fixture.engine.ImageFramePreparationCalls(), L"a failed image preparation must escape the engine frame and trigger the renderer retry path");
+    const auto frame = fixture.engine.Snapshot();
+    VERIFY_IS_TRUE(std::ranges::any_of(frame.clusters, [](const auto& cluster) { return cluster.text.find(L'X') != std::wstring::npos; }), L"the retry must re-invalidate content consumed by the aborted frame");
 }
 
 // Renderer::PaintFrame hands work to the engine in a fixed order: background, then the text

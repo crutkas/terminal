@@ -231,7 +231,11 @@ bool GdiEngine::FontHasWesternScript(HDC hdc)
     const auto pt = _GetInvalidRectPoint();
     const auto sz = _GetInvalidRectSize();
 
-    LOG_HR_IF(E_FAIL, !(BitBlt(_psInvalidData.hdc, pt.x, pt.y, sz.width, sz.height, _hdcMemoryContext, pt.x, pt.y, SRCCOPY)));
+    if (SUCCEEDED(_imageRenderResult) &&
+        !BitBlt(_psInvalidData.hdc, pt.x, pt.y, sz.width, sz.height, _hdcMemoryContext, pt.x, pt.y, SRCCOPY))
+    {
+        _RecordImageError(E_FAIL);
+    }
     WHEN_DBG(_DebugBltAll());
 
     _rcInvalid = {};
@@ -258,10 +262,11 @@ bool GdiEngine::FontHasWesternScript(HDC hdc)
 // Arguments:
 // - <none>
 // Return Value:
-// - S_FALSE since we do nothing.
+// - S_FALSE when no error was latched; otherwise the latched image-rendering failure.
 [[nodiscard]] HRESULT GdiEngine::Present() noexcept
 {
-    return S_FALSE;
+    const auto result = std::exchange(_imageRenderResult, S_OK);
+    return FAILED(result) ? result : S_FALSE;
 }
 
 // Routine Description:
@@ -736,22 +741,32 @@ namespace
 [[nodiscard]] HRESULT GdiEngine::PrepareImageFrame(const ImageFrameInfo info) noexcept
 try
 {
+    _imageRenderResult = S_OK;
     _frameImagePlacements.assign(info.placements.begin(), info.placements.end());
     _imageViewportOrigin = info.viewportOrigin;
 
+    std::vector<const Image*> preparedImages;
+    preparedImages.reserve(info.surfaces.size());
     for (const auto& surface : info.surfaces)
     {
-        // A malformed or un-preparable snapshot is skipped so the rest of the
-        // frame's images still prepare. _PaintDirectImage tolerates a missing cache
-        // entry, so one bad image neither aborts the frame nor suppresses text.
-        LOG_IF_FAILED(_PrepareImageSurface(surface));
+        const auto image = surface.image.get();
+        const auto result = _PrepareImageSurface(surface);
+        if (result == S_OK)
+        {
+            preparedImages.emplace_back(image);
+        }
+        else
+        {
+            // Malformed data returns S_FALSE and skips only this image. A real GDI
+            // failure clears any stale pixels and propagates for renderer recovery.
+            _imageSurfaces.erase(image);
+            RETURN_IF_FAILED(result);
+        }
     }
 
     for (auto it = _imageSurfaces.begin(); it != _imageSurfaces.end();)
     {
-        const auto active = std::any_of(_frameImagePlacements.begin(), _frameImagePlacements.end(), [&](const auto& placement) {
-            return placement.SurfacePointer().get() == it->first;
-        });
+        const auto active = std::ranges::find(preparedImages, it->first) != preparedImages.end();
         if (active)
         {
             ++it;
@@ -828,9 +843,8 @@ CATCH_RETURN();
 try
 {
     const auto found = _imageSurfaces.find(placement.SurfacePointer().get());
-    // A placement whose surface was skipped during preparation (a malformed
-    // snapshot or a GDI failure) simply has nothing to draw. Skip it quietly so the
-    // rest of the row still paints, rather than failing the whole row's image pass.
+    // A placement whose malformed or stale surface was skipped during preparation
+    // simply has nothing to draw. S_FALSE lets the rest of the row continue.
     if (found == _imageSurfaces.end())
     {
         return S_FALSE;
@@ -987,9 +1001,7 @@ try
                         (run - _imageViewportOrigin.x) * cellSize.width,
                         bottomPx,
                     };
-                    // Skip only the affected image on failure; other images and the
-                    // row's text still paint.
-                    LOG_IF_FAILED(_PaintDirectImage(placement, clip));
+                    RETURN_IF_FAILED(_PaintDirectImage(placement, clip));
                 }
             }
         }
@@ -1001,14 +1013,20 @@ try
                 (right - _imageViewportOrigin.x) * cellSize.width,
                 bottomPx,
             };
-            // Skip only the affected image on failure; other images and the row's
-            // text still paint.
-            LOG_IF_FAILED(_PaintDirectImage(placement, clip));
+            RETURN_IF_FAILED(_PaintDirectImage(placement, clip));
         }
     }
     return S_OK;
 }
 CATCH_RETURN();
+
+void GdiEngine::_RecordImageError(const HRESULT result) noexcept
+{
+    if (FAILED(result) && SUCCEEDED(_imageRenderResult))
+    {
+        _imageRenderResult = result;
+    }
+}
 
 // Routine Description:
 // - Hands back a device context holding a top-down 32bpp surface of this size,
@@ -1075,7 +1093,7 @@ try
     const auto rendition = _currentLineRendition;
     LOG_IF_FAILED(ResetLineTransform());
 
-    LOG_IF_FAILED(_PaintDirectImages(ImagePlacement::RenderPosition::BehindBackground, targetRow, defaultBackgroundMask, true));
+    _RecordImageError(_PaintDirectImages(ImagePlacement::RenderPosition::BehindBackground, targetRow, defaultBackgroundMask, true));
     for (const auto& placement : _frameImagePlacements)
     {
         if (placement.Position() == ImagePlacement::RenderPosition::BehindText)
@@ -1092,8 +1110,8 @@ try
     // cell's own background, and the text pass will not paint one for any cell
     // this row's images cover. Lay it down now, in the one window where the plane
     // below the background is already painted and the plane above it is not.
-    LOG_IF_FAILED(_FillImageRowCellBackgrounds(targetRow, defaultBackgroundMask, cellBackgrounds));
-    LOG_IF_FAILED(_PaintDirectImages(ImagePlacement::RenderPosition::BehindText, targetRow, {}, false));
+    _RecordImageError(_FillImageRowCellBackgrounds(targetRow, defaultBackgroundMask, cellBackgrounds));
+    _RecordImageError(_PaintDirectImages(ImagePlacement::RenderPosition::BehindText, targetRow, {}, false));
 
     // Withholding ETO_OPAQUE stops the text filling its background *rectangle*,
     // but a device context also fills the box behind every individual glyph
@@ -1271,7 +1289,7 @@ try
 
     // ...and only then put the above-text content on top of all of it.
     LOG_IF_FAILED(ResetLineTransform());
-    LOG_IF_FAILED(_PaintDirectImages(ImagePlacement::RenderPosition::AboveText, _rowImageTargetRow, {}, false));
+    _RecordImageError(_PaintDirectImages(ImagePlacement::RenderPosition::AboveText, _rowImageTargetRow, {}, false));
     LOG_IF_FAILED(PrepareLineTransform(rendition, _rowImageTargetRow, _rowImageViewportLeft));
 
     return S_OK;

@@ -892,13 +892,11 @@ void BackendD2D::_drawImage(const RenderingPayload& p, const ImagePlacement& pla
     const auto snapshot = std::ranges::find(p.imageSurfaces, image.get(), [](const auto& surface) {
         return surface.image.get();
     });
-    // A placement with no matching snapshot is an internal inconsistency; a
-    // malformed snapshot is a data condition. Either way, skip just this image so
-    // the row's text and other images still draw. The device calls below still
-    // throw (via THROW_IF_FAILED) so genuine device-lost is recovered as usual.
+    // A shaped row can briefly outlive its frame snapshot after an image is erased.
+    // Skip that stale placement, while device calls below still throw so genuine
+    // device-lost failures are recovered as usual.
     if (snapshot == p.imageSurfaces.end())
     {
-        assert(false);
         return;
     }
     if (!snapshot->IsRenderable())

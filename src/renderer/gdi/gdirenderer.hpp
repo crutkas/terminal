@@ -194,6 +194,7 @@ namespace Microsoft::Console::Render
         std::unordered_map<const Image*, CachedImageSurface> _imageSurfaces;
         std::vector<ImagePlacement> _frameImagePlacements;
         til::point _imageViewportOrigin{};
+        HRESULT _imageRenderResult = S_OK;
         // A DIB section to blend image content from. Declared before the device
         // context that selects it so that the context is destroyed first and the
         // bitmap is no longer selected anywhere by the time it goes.
@@ -220,6 +221,7 @@ namespace Microsoft::Console::Render
                                                  std::span<const uint8_t> defaultBackgroundMask,
                                                  bool markUnderlay) noexcept;
         [[nodiscard]] HRESULT _PaintDirectImage(const ImagePlacement& placement, const RECT& clip) noexcept;
+        void _RecordImageError(HRESULT result) noexcept;
         void _MarkDirectImageUnderlay(const ImagePlacement& placement,
                                       til::CoordType targetRow,
                                       std::span<const uint8_t> defaultBackgroundMask) noexcept;
