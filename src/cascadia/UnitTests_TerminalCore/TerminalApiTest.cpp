@@ -1820,11 +1820,12 @@ void TerminalApiTest::KittyImageRowCarriesEachCellsBackgroundColor()
 // rows with each row's image content bracketed around them, then selection, then the cursor.
 // This asserts that submission order, and nothing more. It is a real contract - a backend can
 // only composite the cursor against a row's images if it has been given both by the time it
-// draws - but it is not a statement about pixels: a backend is free to batch the calls into
-// passes of its own and composite them in another order, and BackendD3D does exactly that,
-// emitting the cursor background before the text and images and the cursor foreground in a
-// later pass. What a z >= 0 image should look like where it meets the cursor is a product
-// question, and proving what it does look like needs a backend-level test, not this one.
+// draws - but it is NOT a statement about final pixels, and must not be read as one. A backend
+// is free to batch these calls into passes of its own and composite them in another order, and
+// BackendD3D does exactly that, emitting the cursor background before the text and its
+// above-text images and drawing the cursor foreground in a later pass. So which of a z >= 0
+// image and the cursor ends up on top is left unproven here: it is product-defined, and
+// showing what a given backend actually produces needs a backend-level test, not this one.
 void TerminalApiTest::RendererSubmitsCursorAfterImages()
 {
     KittyRenderFixture fixture{ { 8, 3 }, 0 };
@@ -1852,9 +1853,12 @@ void TerminalApiTest::RendererSubmitsCursorAfterImages()
 
     VERIFY_ARE_EQUAL(size_t{ 1 }, frame.cursors.size(), L"the cursor is submitted exactly once per frame");
     VERIFY_ARE_EQUAL((til::point{ 0, 1 }), frame.cursors.front().position, L"the cursor is submitted for the cell the above-text image covers");
+    // Submission order only. Which of the two ends up on top in the final pixels is not
+    // decided here: a backend may batch these calls into passes of its own, and what it
+    // ought to look like is product-defined.
     for (const auto& image : frame.images)
     {
-        VERIFY_IS_TRUE(image.paintStep < frame.cursors.front().paintStep, L"every image, above-text included, is submitted before the cursor");
+        VERIFY_IS_TRUE(image.paintStep < frame.cursors.front().paintStep, L"every image, above-text included, is submitted before the cursor - this says nothing about which one wins in the final pixels, which stays unproven here and product-defined");
     }
 }
 
