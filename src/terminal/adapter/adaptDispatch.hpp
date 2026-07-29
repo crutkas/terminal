@@ -267,6 +267,7 @@ namespace Microsoft::Console::VirtualTerminal
         void _CursorMovePosition(const Offset rowOffset, const Offset colOffset, const bool clampInMargins);
         void _FillRect(const Page& page, const til::rect& fillRect, const std::wstring_view& fillChar, const TextAttribute& fillAttrs) const;
         void _SelectiveEraseRect(const Page& page, const til::rect& eraseRect);
+        static std::vector<til::rect> _UnprotectedSpans(const Page& page, const til::rect& eraseRect);
         void _ChangeRectAttributes(const Page& page, const til::rect& changeRect, const ChangeOps& changeOps);
         void _ChangeRectOrStreamAttributes(const til::rect& changeArea, const ChangeOps& changeOps);
         til::rect _CalculateRectArea(const Page& page, const VTInt top, const VTInt left, const VTInt bottom, const VTInt right);

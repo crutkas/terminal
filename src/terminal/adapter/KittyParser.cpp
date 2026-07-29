@@ -3662,6 +3662,23 @@ bool KittyParser::_IsPlaceholderDiacriticRun(const std::wstring_view cluster) no
     return true;
 }
 
+// True when a run opens with a kitty rowcolumn diacritic. Such a run carries no U+10EEEE of its
+// own, but its leading marks join - and so re-complete - the placeholder cell the previous write
+// left behind, which is why the writer still has to route it through RenderPlaceholders.
+bool KittyParser::StartsWithPlaceholderDiacritic(const std::wstring_view text) noexcept
+{
+    if (text.empty())
+    {
+        return false;
+    }
+    auto cp = static_cast<char32_t>(text[0]);
+    if (til::is_leading_surrogate(text[0]) && text.size() > 1 && til::is_trailing_surrogate(text[1]))
+    {
+        cp = til::combine_surrogates(text[0], text[1]);
+    }
+    return _PlaceholderDiacriticIndex(cp) >= 0;
+}
+
 // Overlays each U+10EEEE placeholder in one just-written segment with its sub-rect of the
 // (virtual) image named by the cell's foreground (24-bit RGB or a 256-color index = the id).
 // The grid (rows x cols) is the geometry recorded when the image was stored virtually, so it
@@ -3679,14 +3696,6 @@ void KittyParser::RenderPlaceholders(const std::wstring_view segment, const til:
     auto page = _dispatcher._pages.ActivePage();
     auto& buffer = page.Buffer();
     auto& row = buffer.GetMutableRowByOffset(screenRow);
-    const auto colorId = [](const TextColor color) noexcept {
-        if (color.IsRgb())
-        {
-            const auto rgb = color.GetRGB();
-            return (static_cast<uint32_t>(GetRValue(rgb)) << 16) | (static_cast<uint32_t>(GetGValue(rgb)) << 8) | GetBValue(rgb);
-        }
-        return color.IsIndex256() ? static_cast<uint32_t>(color.GetIndex()) : 0u;
-    };
     auto column = startColumn;
     // Track the drawn placeholder cell span so ONE bounded redraw covers the whole segment/row,
     // instead of a TriggerRedraw per cell on the text-output hot path (matches _placeImage).
@@ -3694,136 +3703,37 @@ void KittyParser::RenderPlaceholders(const std::wstring_view segment, const til:
     auto lastDrawnCol = static_cast<til::CoordType>(-1);
     std::vector<ImagePlacement> fragments;
     fragments.reserve(std::min(segment.size(), static_cast<size_t>(page.Width())));
+    const auto recordDraw = [&](const til::CoordType drawnColumn) noexcept {
+        firstDrawnCol = std::min(firstDrawnCol, drawnColumn);
+        lastDrawnCol = std::max(lastDrawnCol, drawnColumn);
+    };
     for (size_t i = 0; i < segment.size();)
     {
         const auto next = buffer.GraphemeNext(segment, i);
-        // A write may be split anywhere, including between a placeholder's two diacritics - the
-        // console write path chunks long runs. The orphaned marks then open the next segment, where
-        // they join the cell the previous segment already wrote, occupying no column of their own.
-        // Step over them without advancing: counting them as a cell shifted every placeholder that
-        // followed one column right, onto a cell carrying no image foreground, so that tile was
-        // silently dropped and the grid rendered with a hole in it.
-        if (i == 0 && _IsPlaceholderDiacriticRun(segment.substr(i, next - i)))
+        const auto cluster = segment.substr(i, next - i);
+        // A write may be split anywhere, including before or between a placeholder's diacritics -
+        // the console write path chunks long runs. The orphaned marks then open the next segment,
+        // where they join the cell the previous segment already wrote, occupying no column of
+        // their own. Counting them as a cell shifted every placeholder that followed one column
+        // right, onto a cell carrying no image foreground, so that tile was silently dropped and
+        // the grid rendered with a hole in it.
+        if (i == 0 && _IsPlaceholderDiacriticRun(cluster))
         {
+            // The joined cell was resolved from whatever part of its cluster had arrived, so a
+            // split ahead of the first mark left it addressing grid (0,0). The row now holds the
+            // finished grapheme, so resolve that cell again from it - at its own column, which
+            // keeps the write column where it is.
+            const auto previous = row.NavigateToPrevious(startColumn);
+            if (previous < startColumn && _renderPlaceholderCell(row, row.GlyphAt(previous), previous, screenRow, fragments))
+            {
+                recordDraw(previous);
+            }
             i = next;
             continue;
         }
-        if (i + 1 < next && segment[i] == PlaceholderCodePointHigh && segment[i + 1] == PlaceholderCodePointLow)
+        if (_renderPlaceholderCell(row, cluster, column, screenRow, fragments))
         {
-            // The first two recognized diacritics in the cluster give row then column; an optional
-            // third gives the most significant byte of a >24-bit image id (composed below).
-            // idHighByte starts at -1 (absent) so a 4th+ diacritic cannot overwrite an explicit 3rd
-            // diacritic of index 0 (the spec ignores extras); absent or 0 leaves a plain 24-bit id.
-            auto rowDiacritic = -1;
-            auto colDiacritic = -1;
-            auto idHighByte = -1;
-            for (auto j = i + 2; j < next; ++j)
-            {
-                // A row/col diacritic may be an astral combining mark (index >= 283 in the
-                // rowcolumn-diacritics table), stored as a UTF-16 surrogate pair; decode it to a
-                // full codepoint before the lookup so large grids address the right row/column.
-                auto cp = static_cast<char32_t>(segment[j]);
-                if (til::is_leading_surrogate(segment[j]) && j + 1 < next && til::is_trailing_surrogate(segment[j + 1]))
-                {
-                    cp = til::combine_surrogates(segment[j], segment[j + 1]);
-                    ++j;
-                }
-                if (const auto idx = _PlaceholderDiacriticIndex(cp); idx >= 0)
-                {
-                    if (rowDiacritic < 0)
-                    {
-                        rowDiacritic = idx;
-                    }
-                    else if (colDiacritic < 0)
-                    {
-                        colDiacritic = idx;
-                    }
-                    else if (idHighByte < 0)
-                    {
-                        idHighByte = idx;
-                    }
-                }
-            }
-            const auto attributes = row.GetAttrByColumn(column);
-            const auto fg = attributes.GetForeground();
-            if ((fg.IsRgb() || fg.IsIndex256()) && idHighByte <= 255)
-            {
-                const auto imageIdLow = colorId(fg);
-
-                // Kitty's omission rules are positional:
-                //  * no diacritics: inherit row, left column + 1, and high byte;
-                //  * row only: inherit column + 1/high byte only when the rows match;
-                //  * row+column: inherit only the high byte when the coordinates are adjacent.
-                // Every inheritance case also requires matching foreground image-id and underline
-                // placement-id color values. At column 0 or after any failed gate, omitted values
-                // remain zero.
-                auto cellRow = rowDiacritic >= 0 ? static_cast<uint32_t>(rowDiacritic) : 0u;
-                auto cellCol = colDiacritic >= 0 ? static_cast<uint32_t>(colDiacritic) : 0u;
-                auto highByte = idHighByte >= 0 ? static_cast<uint8_t>(idHighByte) : uint8_t{ 0 };
-                const auto left = column > 0 ? row.GetImageCellRef(column - 1) : nullptr;
-                const auto leftAttributes = left ? row.GetAttrByColumn(column - 1) : TextAttribute{};
-                const auto attributesMatch = left &&
-                                             colorId(leftAttributes.GetForeground()) == imageIdLow &&
-                                             colorId(leftAttributes.GetUnderlineColor()) == colorId(attributes.GetUnderlineColor());
-                if (rowDiacritic < 0)
-                {
-                    if (attributesMatch)
-                    {
-                        cellRow = left->row;
-                        cellCol = static_cast<uint32_t>(left->column) + 1;
-                        highByte = left->imageIdHighByte;
-                    }
-                }
-                else if (colDiacritic < 0)
-                {
-                    if (attributesMatch && left->row == cellRow)
-                    {
-                        cellCol = static_cast<uint32_t>(left->column) + 1;
-                        highByte = left->imageIdHighByte;
-                    }
-                }
-                else if (idHighByte < 0)
-                {
-                    if (attributesMatch && left->row == cellRow && static_cast<uint32_t>(left->column) + 1 == cellCol)
-                    {
-                        highByte = left->imageIdHighByte;
-                    }
-                }
-
-                // Compose the effective id only after resolving an omitted high byte from the
-                // left cell. A non-zero byte selects a >24-bit image; a missing image/placement
-                // draws nothing but the resolved cell metadata remains available to its right.
-                const auto imageId = highByte > 0 ? (imageIdLow | (static_cast<uint32_t>(highByte) << 24)) : imageIdLow;
-                const auto placementId = colorId(attributes.GetUnderlineColor());
-                const auto placement = _virtualIds.find({ imageId, placementId });
-                const auto imageEntry = _images.find(imageId);
-                const auto layerId = placement != _virtualIds.end() ? placement->second.layerId : 0;
-                auto drawn = false;
-                if (placement != _virtualIds.end() && imageEntry != _images.end())
-                {
-                    const auto& place = placement->second;
-                    drawn = _placeImageCellRef(imageEntry->second, imageId, column, screenRow, cellRow, cellCol, place, fragments);
-                    if (drawn)
-                    {
-                        imageEntry->second.hasRenderedPlacements = true;
-                        firstDrawnCol = std::min(firstDrawnCol, column);
-                        lastDrawnCol = std::max(lastDrawnCol, column);
-                    }
-                }
-                // A layer id is only recorded once that layer has actually received this
-                // cell's pixels. A placeholder outside the placement grid draws nothing, and
-                // claiming a layer it has no pixels in would tell reflow to carry across a
-                // region the layer does not cover. The grid coordinates are recorded either
-                // way, because the cell to the right resolves its own column and image-id
-                // high byte from them.
-                row.SetImageCellRef(column, ImageCellRef{
-                                                           .layerId = drawn ? layerId : 0,
-                                                           .column = cellCol,
-                                                           .row = gsl::narrow_cast<uint16_t>(cellRow),
-                                                           .imageIdHighByte = highByte,
-                                                           .valid = true,
-                                                       });
-            }
+            recordDraw(column);
         }
         // Advance by the glyph's real cell width; guard against a non-advancing step.
         const auto nextColumn = row.NavigateToNext(column);
@@ -3837,6 +3747,139 @@ void KittyParser::RenderPlaceholders(const std::wstring_view segment, const til:
     {
         buffer.TriggerRedraw(Viewport::FromExclusive({ firstDrawnCol, screenRow, std::min<til::CoordType>(lastDrawnCol + 1, page.Width()), screenRow + 1 }));
     }
+}
+
+// Resolves one text cell that stands in for an image cell, from its complete grapheme cluster,
+// and stages the tile it addresses. Anything that is not a placeholder base is left alone.
+// Returns true if a tile was staged, so the caller can extend its redraw span.
+bool KittyParser::_renderPlaceholderCell(ROW& row, const std::wstring_view cluster, const til::CoordType column, const til::CoordType screenRow, std::vector<ImagePlacement>& fragments)
+{
+    if (cluster.size() < 2 || cluster[0] != PlaceholderCodePointHigh || cluster[1] != PlaceholderCodePointLow)
+    {
+        return false;
+    }
+    const auto colorId = [](const TextColor color) noexcept {
+        if (color.IsRgb())
+        {
+            const auto rgb = color.GetRGB();
+            return (static_cast<uint32_t>(GetRValue(rgb)) << 16) | (static_cast<uint32_t>(GetGValue(rgb)) << 8) | GetBValue(rgb);
+        }
+        return color.IsIndex256() ? static_cast<uint32_t>(color.GetIndex()) : 0u;
+    };
+    // The first two recognized diacritics in the cluster give row then column; an optional
+    // third gives the most significant byte of a >24-bit image id (composed below).
+    // idHighByte starts at -1 (absent) so a 4th+ diacritic cannot overwrite an explicit 3rd
+    // diacritic of index 0 (the spec ignores extras); absent or 0 leaves a plain 24-bit id.
+    auto rowDiacritic = -1;
+    auto colDiacritic = -1;
+    auto idHighByte = -1;
+    for (auto j = size_t{ 2 }; j < cluster.size(); ++j)
+    {
+        // A row/col diacritic may be an astral combining mark (index >= 283 in the
+        // rowcolumn-diacritics table), stored as a UTF-16 surrogate pair; decode it to a
+        // full codepoint before the lookup so large grids address the right row/column.
+        auto cp = static_cast<char32_t>(cluster[j]);
+        if (til::is_leading_surrogate(cluster[j]) && j + 1 < cluster.size() && til::is_trailing_surrogate(cluster[j + 1]))
+        {
+            cp = til::combine_surrogates(cluster[j], cluster[j + 1]);
+            ++j;
+        }
+        if (const auto idx = _PlaceholderDiacriticIndex(cp); idx >= 0)
+        {
+            if (rowDiacritic < 0)
+            {
+                rowDiacritic = idx;
+            }
+            else if (colDiacritic < 0)
+            {
+                colDiacritic = idx;
+            }
+            else if (idHighByte < 0)
+            {
+                idHighByte = idx;
+            }
+        }
+    }
+    const auto attributes = row.GetAttrByColumn(column);
+    const auto fg = attributes.GetForeground();
+    if (!(fg.IsRgb() || fg.IsIndex256()) || idHighByte > 255)
+    {
+        return false;
+    }
+    const auto imageIdLow = colorId(fg);
+
+    // Kitty's omission rules are positional:
+    //  * no diacritics: inherit row, left column + 1, and high byte;
+    //  * row only: inherit column + 1/high byte only when the rows match;
+    //  * row+column: inherit only the high byte when the coordinates are adjacent.
+    // Every inheritance case also requires matching foreground image-id and underline
+    // placement-id color values. At column 0 or after any failed gate, omitted values
+    // remain zero.
+    auto cellRow = rowDiacritic >= 0 ? static_cast<uint32_t>(rowDiacritic) : 0u;
+    auto cellCol = colDiacritic >= 0 ? static_cast<uint32_t>(colDiacritic) : 0u;
+    auto highByte = idHighByte >= 0 ? static_cast<uint8_t>(idHighByte) : uint8_t{ 0 };
+    const auto left = column > 0 ? row.GetImageCellRef(column - 1) : nullptr;
+    const auto leftAttributes = left ? row.GetAttrByColumn(column - 1) : TextAttribute{};
+    const auto attributesMatch = left &&
+                                 colorId(leftAttributes.GetForeground()) == imageIdLow &&
+                                 colorId(leftAttributes.GetUnderlineColor()) == colorId(attributes.GetUnderlineColor());
+    if (rowDiacritic < 0)
+    {
+        if (attributesMatch)
+        {
+            cellRow = left->row;
+            cellCol = static_cast<uint32_t>(left->column) + 1;
+            highByte = left->imageIdHighByte;
+        }
+    }
+    else if (colDiacritic < 0)
+    {
+        if (attributesMatch && left->row == cellRow)
+        {
+            cellCol = static_cast<uint32_t>(left->column) + 1;
+            highByte = left->imageIdHighByte;
+        }
+    }
+    else if (idHighByte < 0)
+    {
+        if (attributesMatch && left->row == cellRow && static_cast<uint32_t>(left->column) + 1 == cellCol)
+        {
+            highByte = left->imageIdHighByte;
+        }
+    }
+
+    // Compose the effective id only after resolving an omitted high byte from the
+    // left cell. A non-zero byte selects a >24-bit image; a missing image/placement
+    // draws nothing but the resolved cell metadata remains available to its right.
+    const auto imageId = highByte > 0 ? (imageIdLow | (static_cast<uint32_t>(highByte) << 24)) : imageIdLow;
+    const auto placementId = colorId(attributes.GetUnderlineColor());
+    const auto placement = _virtualIds.find({ imageId, placementId });
+    const auto imageEntry = _images.find(imageId);
+    const auto layerId = placement != _virtualIds.end() ? placement->second.layerId : 0;
+    auto drawn = false;
+    if (placement != _virtualIds.end() && imageEntry != _images.end())
+    {
+        const auto& place = placement->second;
+        drawn = _placeImageCellRef(imageEntry->second, imageId, column, screenRow, cellRow, cellCol, place, fragments);
+        if (drawn)
+        {
+            imageEntry->second.hasRenderedPlacements = true;
+        }
+    }
+    // A layer id is only recorded once that layer has actually received this
+    // cell's pixels. A placeholder outside the placement grid draws nothing, and
+    // claiming a layer it has no pixels in would tell reflow to carry across a
+    // region the layer does not cover. The grid coordinates are recorded either
+    // way, because the cell to the right resolves its own column and image-id
+    // high byte from them.
+    row.SetImageCellRef(column, ImageCellRef{
+                                    .layerId = drawn ? layerId : 0,
+                                    .column = cellCol,
+                                    .row = gsl::narrow_cast<uint16_t>(cellRow),
+                                    .imageIdHighByte = highByte,
+                                    .valid = true,
+                                });
+    return drawn;
 }
 
 

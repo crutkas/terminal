@@ -27,6 +27,8 @@ Abstract:
 class AdapterTest;
 #endif
 
+class ROW;
+
 namespace Microsoft::Console::VirtualTerminal
 {
     class AdaptDispatch;
@@ -50,6 +52,11 @@ namespace Microsoft::Console::VirtualTerminal
 
         // Resolves the placeholder cells in a run of text the writer just placed.
         void RenderPlaceholders(const std::wstring_view segment, const til::CoordType screenRow, const til::CoordType startColumn);
+
+        // True when a run of text opens with kitty rowcolumn diacritics, i.e. it may be the tail
+        // of a placeholder cell whose write was split before its marks. The writer has to notice
+        // such a run even though it carries no U+10EEEE of its own.
+        static bool StartsWithPlaceholderDiacritic(const std::wstring_view text) noexcept;
 
         // Runs every animated image forward to the given time, then reports when it
         // next needs to be called. The host calls this when the deadline it was last
@@ -304,6 +311,9 @@ namespace Microsoft::Console::VirtualTerminal
         std::optional<til::point> _deriveVirtualPlacementAnchor(uint32_t imageId, uint32_t placementId) const;
         // Returns true if a placeholder tile was staged (the caller publishes and redraws once per segment).
         bool _placeImageCellRef(const Image& image, const uint32_t imageId, const til::CoordType column, const til::CoordType row, const uint32_t cellRow, const uint32_t cellCol, const VirtualPlacement& place, std::vector<ImagePlacement>& fragments);
+        // Resolves one placeholder text cell from its complete grapheme cluster and stages the
+        // tile it addresses. Returns true if a tile was staged.
+        bool _renderPlaceholderCell(ROW& row, const std::wstring_view cluster, const til::CoordType column, const til::CoordType screenRow, std::vector<ImagePlacement>& fragments);
         static int _PlaceholderDiacriticIndex(const char32_t ch) noexcept;
         static bool _IsPlaceholderDiacriticRun(const std::wstring_view cluster) noexcept;
 

@@ -4752,6 +4752,107 @@ public:
         VERIFY_ARE_EQUAL(50, newBuffer->GetSize().Width());
     }
 
+    // Marks a half-open column range of a row as DECSCA-protected.
+    static void ProtectColumns(TextBuffer& buffer, const til::CoordType row, const til::CoordType begin, const til::CoordType end)
+    {
+        TextAttribute attributes;
+        attributes.SetProtected(true);
+        buffer.GetMutableRowByOffset(row).ReplaceAttributes(begin, end, attributes);
+    }
+
+    // A selective erase asks for every unprotected cell in a region. Describing that as one
+    // rect per cell hands the image collection and the renderer hundreds of single-cell
+    // requests for what is really a handful of runs, so the unprotected cells are coalesced
+    // into contiguous per-row spans first. A span must never merge across a protected cell,
+    // and must never cross a row - a protected cell in one row says nothing about the cell
+    // below it.
+    TEST_METHOD(SelectiveEraseCoalescesUnprotectedCellsIntoSpans)
+    {
+        _testGetSet->PrepData();
+        auto& buffer = *_testGetSet->_textBuffer;
+        const auto width = buffer.GetSize().Width();
+        VERIFY_IS_TRUE(width >= 60, L"the mixed pattern below needs a reasonably wide buffer");
+
+        // Row 0: two protected fields carve the row into three runs.
+        ProtectColumns(buffer, 0, 10, 20);
+        ProtectColumns(buffer, 0, 40, 45);
+        // Row 1: protected at both ends, so exactly one run survives in the middle.
+        ProtectColumns(buffer, 1, 0, 5);
+        ProtectColumns(buffer, 1, 50, width);
+        // Row 2: fully protected - it contributes no span at all.
+        ProtectColumns(buffer, 2, 0, width);
+        // Row 3 is left entirely unprotected: one span covering the whole erase width.
+
+        const til::rect eraseRect{ 0, 0, width, 4 };
+        const auto spans = AdaptDispatch::_UnprotectedSpans(_pDispatch->_pages.ActivePage(), eraseRect);
+
+        const std::vector<til::rect> expected{
+            { 0, 0, 10, 1 },
+            { 20, 0, 40, 1 },
+            { 45, 0, width, 1 },
+            { 5, 1, 50, 2 },
+            { 0, 3, width, 4 },
+        };
+        VERIFY_ARE_EQUAL(expected.size(), spans.size(), L"one span per contiguous unprotected run, not one per cell");
+        for (size_t i = 0; i < expected.size(); i++)
+        {
+            VERIFY_ARE_EQUAL(expected[i], spans[i]);
+        }
+
+        // Guard the point of the change: the spans describe the same cells the per-cell form
+        // did, in far fewer rects.
+        auto cells = 0;
+        for (const auto span : spans)
+        {
+            cells += span.width();
+        }
+        VERIFY_ARE_EQUAL(10 + 20 + (width - 45) + 45 + width, cells, L"every unprotected cell is still covered");
+        VERIFY_IS_TRUE(spans.size() < static_cast<size_t>(cells), L"the spans are a genuine reduction over one rect per cell");
+    }
+
+    // The coalescing must not change what a selective erase does to the image underneath: an
+    // image spanning a mixed protected/unprotected run keeps exactly the protected cells, and
+    // is left as one fragment per protected run.
+    TEST_METHOD(SelectiveEraseKeepsProtectedImageCells)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        auto& buffer = *_testGetSet->_textBuffer;
+        const auto origin = buffer.GetCursor().GetPosition();
+        VERIFY_ARE_EQUAL(0, origin.x, L"the placement below is measured from column 0");
+
+        // A 40px-wide fully red image; with a 1x1 cell it covers exactly 40 columns of the
+        // cursor row, one source pixel per cell, so every cropped fragment is well defined.
+        std::wstring redRow = L"\x1b_Ga=T,i=1,f=24,s=40,v=1;";
+        for (auto i = 0; i < 40; i++)
+        {
+            redRow += L"/wAA"; // one red pixel per 4 base64 characters, no padding
+        }
+        redRow += L"\x1b\\";
+        _stateMachine->ProcessString(redRow);
+        {
+            const auto drawn = buffer.GetImages().IntersectingRows(origin.y, origin.y + 1);
+            VERIFY_ARE_EQUAL(static_cast<size_t>(1), drawn.size());
+            VERIFY_ARE_EQUAL(til::rect(0, origin.y, 40, origin.y + 1), drawn[0]->CellBounds(), L"the placement covers the columns the erase pattern below assumes");
+        }
+
+        ProtectColumns(buffer, origin.y, 10, 20);
+        ProtectColumns(buffer, origin.y, 30, 35);
+
+        _pDispatch->SelectiveEraseInDisplay(DispatchTypes::EraseType::All);
+
+        const auto placements = buffer.GetImages().IntersectingRows(origin.y, origin.y + 1);
+        VERIFY_ARE_EQUAL(static_cast<size_t>(2), placements.size(), L"one surviving fragment per protected run");
+        VERIFY_ARE_EQUAL(til::rect(10, origin.y, 20, origin.y + 1), placements[0]->CellBounds());
+        VERIFY_ARE_EQUAL(til::rect(30, origin.y, 35, origin.y + 1), placements[1]->CellBounds());
+
+        const auto* slice = DirectImageSlice(buffer, origin.y);
+        VERIFY_IS_NOT_NULL(slice);
+        VERIFY_IS_TRUE(SlicePixelIs(slice, 0, 0, 255, 0, 0), L"column 10, the first protected cell, keeps its pixel");
+        VERIFY_IS_TRUE(SlicePixelIs(slice, 20, 0, 255, 0, 0), L"column 30, the second protected run, keeps its pixels");
+        VERIFY_IS_FALSE(SlicePixelIs(slice, 10, 0, 255, 0, 0), L"column 20, in the middle unprotected span, was erased");
+    }
+
     // A tall sixel spans multiple buffer rows (cf. alignment fix #17724). Uses a
     // transparent background so the height reflects the drawn content rather than
     // the (vertically-filling) opaque background.
@@ -6763,6 +6864,55 @@ public:
         VERIFY_ARE_EQUAL(static_cast<size_t>(1), _kitty()._images.count(92), L"A normal chunked transfer must still work.");
     }
 
+    // The parser can be reset out from under an in-progress chunked transfer: conhost calls
+    // StateMachine::ResetState() to "jiggle the handle" whenever an application clears
+    // ENABLE_VIRTUAL_TERMINAL_PROCESSING (src/host/getset.cpp). ResetState is noexcept and only
+    // returns the parser to Ground - it does not reach into the transfer state any more than it
+    // does for a DCS handler - so this pins down what that leaves behind. The pending payload is
+    // retained, but it is never finalized on its own: the next command that is not a bare
+    // continuation discards it, exactly as an orphaned transfer is discarded today.
+    TEST_METHOD(KittyGraphicsParserResetLeavesChunkSelfClearing)
+    {
+        _testGetSet->PrepData();
+        // A 2x1 f=24 image needs 6 bytes; this first chunk carries the 3 red ones.
+        _stateMachine->ProcessString(L"\x1b_Ga=t,i=1,f=24,s=2,v=1,m=1;/wAA\x1b\\");
+        VERIFY_IS_TRUE(_kitty()._chunkActive, L"the first chunk leaves a transfer in progress");
+
+        _stateMachine->ResetState();
+        VERIFY_IS_TRUE(_kitty()._chunkActive, L"a parser reset does not reach the transfer state");
+
+        // A fresh self-describing transfer is not assembled from the retained bytes.
+        _testGetSet->_response.clear();
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=2,f=24,s=1,v=1;AP8A\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=2;OK\x1b\\");
+        VERIFY_IS_FALSE(_kitty()._chunkActive, L"the fresh command discards the retained transfer");
+        VERIFY_ARE_EQUAL(static_cast<size_t>(0), _kitty()._images.count(1), L"the interrupted transfer never finalized");
+
+        // Nothing can revive it afterwards: a bare m=0 is now a fresh (and incomplete) command.
+        _testGetSet->_response.clear();
+        _stateMachine->ProcessString(L"\x1b_Gm=0;/wAA\x1b\\");
+        VERIFY_ARE_EQUAL(static_cast<size_t>(0), _kitty()._images.count(1), L"a later continuation cannot revive the pre-reset transfer");
+    }
+
+    // The transfer that follows the reset is usually a chunked one too, since that is what a
+    // large image looks like. Its own first chunk is self-describing, so the bytes retained
+    // across the reset are dropped rather than prepended to it.
+    TEST_METHOD(KittyGraphicsParserResetDoesNotCorruptTheNextChunkedTransfer)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1b_Ga=t,i=1,f=24,s=2,v=1,m=1;/wAA\x1b\\"); // 3 red bytes pending
+        _stateMachine->ResetState();
+
+        // A new chunked transfer of a single green pixel, split mid-base64.
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=2,f=24,s=1,v=1,m=1;AP8\x1b\\");
+        _testGetSet->_response.clear();
+        _stateMachine->ProcessString(L"\x1b_Gm=0;A\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=2;OK\x1b\\");
+        VERIFY_ARE_EQUAL(static_cast<size_t>(1), _kitty()._images.count(2), L"the new chunked transfer assembles");
+        VERIFY_IS_TRUE(BufferContainsColor(*_testGetSet->_textBuffer, 0, 255, 0), L"it draws its own green pixel");
+        VERIFY_IS_FALSE(BufferContainsColor(*_testGetSet->_textBuffer, 255, 0, 0), L"no byte of the interrupted transfer leaks into it");
+    }
+
     // Delete-by-id must erase the image's on-screen PIXELS, not just drop the registry entry --
     // a delete that left the drawn cells behind would ghost the image after it was "deleted".
     // This holds for a scaled placement too: its larger on-screen footprint must go entirely.
@@ -7850,6 +8000,67 @@ public:
         _stateMachine->ProcessString(L"\x0305" + Placeholder() + L"\x0305" + L"\x030D"); // orphan, then row 0 col 1
         VERIFY_IS_TRUE(BufferContainsColor(*_testGetSet->_textBuffer, 255, 0, 0), L"col 0 = red");
         VERIFY_IS_TRUE(BufferContainsColor(*_testGetSet->_textBuffer, 0, 255, 0), L"col 1 = green; a split between diacritics must not drop the cell");
+    }
+
+    // Re-storing a virtual placement must not erase the resolved metadata attached to existing
+    // placeholder text. Old failure: resetting placement-global counters made the adjacent
+    // no-diacritic cell repeat col 0 instead of inheriting col 1 from the left cell.
+    // The split can also fall between the placeholder base and its FIRST diacritic, so a whole
+    // write consists of nothing but the row/column marks. They join the cell the previous write
+    // placed, which was resolved from the base alone and therefore addressed grid (0,0). The
+    // completed cell has to be resolved again from the row's finished grapheme, or the tile the
+    // application asked for is never drawn.
+    TEST_METHOD(KittyPlaceholderSplitBeforeDiacriticsResolvesCell)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        const auto origin = _testGetSet->_textBuffer->GetCursor().GetPosition();
+        // 2x2 image: TL red, TR green, BL blue, BR white.
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,f=24,s=2,v=2,c=2,r=2;/wAAAP8AAAD/////\x1b\\");
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m");
+        _stateMachine->ProcessString(Placeholder()); // base only: resolves to (0,0)
+        _stateMachine->ProcessString(L"\x030D" L"\x030D"); // row 1, col 1 arrive on their own
+
+        const auto* slice = DirectImageSlice(*_testGetSet->_textBuffer, origin.y);
+        VERIFY_IS_TRUE(SlicePixelIs(slice, 0, 0, 255, 255, 255), L"the completed cell is grid (1,1) = white, not the (0,0) red the base alone selected");
+        VERIFY_ARE_EQUAL(origin.x + 1, _testGetSet->_textBuffer->GetCursor().GetPosition().x, L"diacritics that join the previous cell consume no column");
+    }
+
+    // The re-resolved cell also has to keep feeding the inheritance chain, and must not shift
+    // anything: the marks occupy no column, so the next placeholder lands one cell to the right
+    // and continues from the column the re-resolved cell actually holds.
+    TEST_METHOD(KittyPlaceholderSplitBeforeDiacriticsKeepsColumns)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        const auto origin = _testGetSet->_textBuffer->GetCursor().GetPosition();
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,f=24,s=3,v=1,c=3,r=1;/wAAAP8AAAD/\x1b\\"); // red|green|blue
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m");
+        _stateMachine->ProcessString(Placeholder()); // base only
+        _stateMachine->ProcessString(L"\x0305" L"\x030D"); // row 0, col 1
+        _stateMachine->ProcessString(Placeholder()); // inherits col 2 from the re-resolved cell
+
+        const auto* slice = DirectImageSlice(*_testGetSet->_textBuffer, origin.y);
+        VERIFY_IS_TRUE(SlicePixelIs(slice, 0, 0, 0, 255, 0), L"the re-resolved cell is grid col 1 (green)");
+        VERIFY_IS_TRUE(SlicePixelIs(slice, 1, 0, 0, 0, 255), L"the next cell inherits col 2 (blue) from it, with no column drift");
+    }
+
+    // A leading combining mark that is a kitty diacritic but joins ordinary text must be left
+    // alone: there is no placeholder to resolve, and the text after it still starts at the
+    // write's own column.
+    TEST_METHOD(KittyPlaceholderDiacriticOnPlainTextIsInert)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        auto& buffer = *_testGetSet->_textBuffer;
+        const auto origin = buffer.GetCursor().GetPosition();
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,f=24,s=2,v=1,c=2,r=1;/wAAAP8A\x1b\\");
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m");
+        _stateMachine->ProcessString(L"A");
+        _stateMachine->ProcessString(L"\x0305" L"B"); // combining overline joins the A, then a B
+
+        VERIFY_IS_NULL(DirectImageSlice(buffer, origin.y), L"a diacritic over ordinary text draws no image");
+        VERIFY_ARE_EQUAL(L"B", buffer.GetRowByOffset(origin.y).GlyphAt(origin.x + 1), L"the text after the mark keeps its column");
     }
 
     // Re-storing a virtual placement must not erase the resolved metadata attached to existing

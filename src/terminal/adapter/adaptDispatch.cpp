@@ -136,7 +136,12 @@ void AdaptDispatch::_WriteToBuffer(const std::wstring_view string)
     // Kitty Unicode placeholders (cells holding U+10EEEE) overlay a sub-rect of a virtually
     // placed image. They're rendered per written segment inside the loop below, after each
     // segment's wrap resolves, so a wrapped or scrolled run lands every cell on its real row.
-    const auto hasKittyPlaceholders = _kittyParser && string.find(KittyParser::PlaceholderCodePointHigh) != std::wstring_view::npos;
+    // A write may also begin with nothing but a placeholder's row/column diacritics, when the
+    // split fell before them: they carry no U+10EEEE, but they complete - and so re-resolve -
+    // the cell the previous write placed.
+    const auto hasKittyPlaceholders = _kittyParser &&
+                                      (string.find(KittyParser::PlaceholderCodePointHigh) != std::wstring_view::npos ||
+                                       KittyParser::StartsWithPlaceholderDiacritic(string));
 
     auto [topMargin, bottomMargin] = _GetVerticalMargins(page, true);
     const auto [leftMargin, rightMargin] = _GetHorizontalMargins(page.Width());
@@ -199,7 +204,8 @@ void AdaptDispatch::_WriteToBuffer(const std::wstring_view string)
         if (hasKittyPlaceholders && textPositionAfter > textPositionBefore)
         {
             const std::wstring_view segment{ textPositionBefore, static_cast<size_t>(textPositionAfter - textPositionBefore) };
-            if (segment.find(KittyParser::PlaceholderCodePointHigh) != std::wstring_view::npos)
+            if (segment.find(KittyParser::PlaceholderCodePointHigh) != std::wstring_view::npos ||
+                KittyParser::StartsWithPlaceholderDiacritic(segment))
             {
                 _kittyParser->RenderPlaceholders(segment, cursorPosition.y, state.columnBegin);
             }
@@ -874,6 +880,47 @@ void AdaptDispatch::EraseInLine(const DispatchTypes::EraseType eraseType)
 }
 
 // Routine Description:
+// - Collects the unprotected cells of an area as contiguous per-row spans.
+// - Selective erases are almost always a handful of long runs interrupted by a few protected
+//   fields, so emitting one rect per cell hands the image collection and the renderer hundreds
+//   of single-cell requests where a few spans say the same thing. A span never crosses a row,
+//   because a protected cell in one row must not erase the cell below it.
+// Arguments:
+// - page - Target page to be inspected.
+// - eraseRect - Area of the page that will be affected.
+// Return Value:
+// - the unprotected spans, in row order, left to right
+std::vector<til::rect> AdaptDispatch::_UnprotectedSpans(const Page& page, const til::rect& eraseRect)
+{
+    std::vector<til::rect> spans;
+    for (auto row = eraseRect.top; row < eraseRect.bottom; row++)
+    {
+        const auto& rowBuffer = page.Buffer().GetRowByOffset(row);
+        auto spanBegin = eraseRect.left;
+        auto inSpan = false;
+        for (auto col = eraseRect.left; col < eraseRect.right; col++)
+        {
+            const auto unprotected = !rowBuffer.GetAttrByColumn(col).IsProtected();
+            if (unprotected && !inSpan)
+            {
+                spanBegin = col;
+                inSpan = true;
+            }
+            else if (!unprotected && inSpan)
+            {
+                spans.emplace_back(spanBegin, row, col, row + 1);
+                inSpan = false;
+            }
+        }
+        if (inSpan)
+        {
+            spans.emplace_back(spanBegin, row, eraseRect.right, row + 1);
+        }
+    }
+    return spans;
+}
+
+// Routine Description:
 // - Selectively erases unprotected cells in an area of the buffer.
 // Arguments:
 // - page - Target page to be erased.
@@ -884,25 +931,16 @@ void AdaptDispatch::_SelectiveEraseRect(const Page& page, const til::rect& erase
 {
     if (eraseRect)
     {
-        std::vector<til::rect> areas;
-        for (auto row = eraseRect.top; row < eraseRect.bottom; row++)
-        {
-            const auto& rowBuffer = page.Buffer().GetRowByOffset(row);
-            for (auto col = eraseRect.left; col < eraseRect.right; col++)
-            {
-                if (!rowBuffer.GetAttrByColumn(col).IsProtected())
-                {
-                    areas.emplace_back(col, row, col + 1, row + 1);
-                }
-            }
-        }
-
+        const auto areas = _UnprotectedSpans(page, eraseRect);
         page.Buffer().GetMutableImages().EraseAreas(areas);
         for (const auto area : areas)
         {
             auto& rowBuffer = page.Buffer().GetMutableRowByOffset(area.top);
-            rowBuffer.ClearCell(area.left);
-            page.Buffer().TriggerRedraw(Viewport::FromDimensions(area.origin(), { 1, 1 }));
+            for (auto col = area.left; col < area.right; col++)
+            {
+                rowBuffer.ClearCell(col);
+            }
+            page.Buffer().TriggerRedraw(Viewport::FromExclusive(area));
         }
     }
 }
