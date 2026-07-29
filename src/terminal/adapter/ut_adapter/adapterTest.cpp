@@ -4842,9 +4842,24 @@ public:
         _pDispatch->SelectiveEraseInDisplay(DispatchTypes::EraseType::All);
 
         const auto placements = buffer.GetImages().IntersectingRows(origin.y, origin.y + 1);
+        // The surviving fragments are asserted as a set: nothing in the erase contract fixes
+        // the order the collection stores them in, and coalescing the areas handed to
+        // EraseAreas is free to change it.
         VERIFY_ARE_EQUAL(static_cast<size_t>(2), placements.size(), L"one surviving fragment per protected run");
-        VERIFY_ARE_EQUAL(til::rect(10, origin.y, 20, origin.y + 1), placements[0]->CellBounds());
-        VERIFY_ARE_EQUAL(til::rect(30, origin.y, 35, origin.y + 1), placements[1]->CellBounds());
+        std::vector<til::rect> survivors;
+        for (const auto& placement : placements)
+        {
+            survivors.emplace_back(placement->CellBounds());
+        }
+        std::sort(survivors.begin(), survivors.end(), [](const auto lhs, const auto rhs) { return lhs.left < rhs.left; });
+        const std::vector<til::rect> expected{
+            { 10, origin.y, 20, origin.y + 1 },
+            { 30, origin.y, 35, origin.y + 1 },
+        };
+        for (size_t i = 0; i < expected.size() && i < survivors.size(); i++)
+        {
+            VERIFY_ARE_EQUAL(expected[i], survivors[i], L"the fragments cover exactly the protected runs");
+        }
 
         const auto* slice = DirectImageSlice(buffer, origin.y);
         VERIFY_IS_NOT_NULL(slice);
