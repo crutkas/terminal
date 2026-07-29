@@ -3882,7 +3882,6 @@ bool KittyParser::_renderPlaceholderCell(ROW& row, const std::wstring_view clust
     return drawn;
 }
 
-
 // Erases every direct Kitty placement of an image.
 void KittyParser::_eraseImagePlacements(const uint32_t imageId)
 {

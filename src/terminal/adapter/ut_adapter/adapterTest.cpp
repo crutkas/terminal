@@ -8034,7 +8034,8 @@ public:
         _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,f=24,s=2,v=2,c=2,r=2;/wAAAP8AAAD/////\x1b\\");
         _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m");
         _stateMachine->ProcessString(Placeholder()); // base only: resolves to (0,0)
-        _stateMachine->ProcessString(L"\x030D" L"\x030D"); // row 1, col 1 arrive on their own
+        _stateMachine->ProcessString(L"\x030D"
+                                     L"\x030D"); // row 1, col 1 arrive on their own
 
         const auto* slice = DirectImageSlice(*_testGetSet->_textBuffer, origin.y);
         VERIFY_IS_TRUE(SlicePixelIs(slice, 0, 0, 255, 255, 255), L"the completed cell is grid (1,1) = white, not the (0,0) red the base alone selected");
@@ -8052,7 +8053,8 @@ public:
         _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,f=24,s=3,v=1,c=3,r=1;/wAAAP8AAAD/\x1b\\"); // red|green|blue
         _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m");
         _stateMachine->ProcessString(Placeholder()); // base only
-        _stateMachine->ProcessString(L"\x0305" L"\x030D"); // row 0, col 1
+        _stateMachine->ProcessString(L"\x0305"
+                                     L"\x030D"); // row 0, col 1
         _stateMachine->ProcessString(Placeholder()); // inherits col 2 from the re-resolved cell
 
         const auto* slice = DirectImageSlice(*_testGetSet->_textBuffer, origin.y);
@@ -8072,7 +8074,8 @@ public:
         _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,f=24,s=2,v=1,c=2,r=1;/wAAAP8A\x1b\\");
         _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m");
         _stateMachine->ProcessString(L"A");
-        _stateMachine->ProcessString(L"\x0305" L"B"); // combining overline joins the A, then a B
+        _stateMachine->ProcessString(L"\x0305"
+                                     L"B"); // combining overline joins the A, then a B
 
         VERIFY_IS_NULL(DirectImageSlice(buffer, origin.y), L"a diacritic over ordinary text draws no image");
         VERIFY_ARE_EQUAL(L"B", buffer.GetRowByOffset(origin.y).GlyphAt(origin.x + 1), L"the text after the mark keeps its column");

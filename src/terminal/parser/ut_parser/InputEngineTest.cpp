@@ -1070,7 +1070,8 @@ void InputEngineTest::ApcResponseReachesTheApplication()
     // The 8-bit form (APC = 0x9F, ST = 0x9C) is what _ReturnApcResponse emits once the terminal
     // has been put into SendC1 mode, so it has to survive the same path. It is only parsed as a
     // control when the parser has been told to accept C1 codes.
-    const std::wstring c1Ack = L"\x9f" L"Gi=1;OK\x9c";
+    const std::wstring c1Ack = L"\x9f"
+                               L"Gi=1;OK\x9c";
     VERIFY_ARE_EQUAL(c1Ack, RunInputSequences({ c1Ack }, true), L"an 8-bit APC response must reach the application unchanged");
 
     // Two responses back to back must not run together or drop the second one.
