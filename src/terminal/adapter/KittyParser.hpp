@@ -299,8 +299,8 @@ namespace Microsoft::Console::VirtualTerminal
         std::optional<til::point> _resolvePlacementAnchor(const uint32_t parentImageId, const uint32_t parentPlacementId, const std::pair<uint32_t, uint32_t> origin, std::wstring_view& code) const;
         std::optional<til::point> _derivePlacementAnchor(const Placement& placement) const;
         std::optional<til::point> _deriveVirtualPlacementAnchor(uint32_t imageId, uint32_t placementId) const;
-        // Returns true if a placeholder tile was drawn (the caller batches one redraw per segment).
-        bool _placeImageCellRef(const Image& image, const uint32_t imageId, const til::CoordType column, const til::CoordType row, const uint32_t cellRow, const uint32_t cellCol, const VirtualPlacement& place);
+        // Returns true if a placeholder tile was staged (the caller publishes and redraws once per segment).
+        bool _placeImageCellRef(const Image& image, const uint32_t imageId, const til::CoordType column, const til::CoordType row, const uint32_t cellRow, const uint32_t cellCol, const VirtualPlacement& place, std::vector<ImagePlacement>& fragments);
         static int _PlaceholderDiacriticIndex(const char32_t ch) noexcept;
         static bool _IsPlaceholderDiacriticRun(const std::wstring_view cluster) noexcept;
 

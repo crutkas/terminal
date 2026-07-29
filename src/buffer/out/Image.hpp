@@ -5,6 +5,7 @@
 
 #include "til.h"
 
+#include <compare>
 #include <memory>
 #include <optional>
 #include <span>
@@ -62,6 +63,7 @@ public:
         Protocol protocol = Protocol::Kitty;
 
         constexpr bool operator==(const Key&) const noexcept = default;
+        constexpr auto operator<=>(const Key&) const noexcept = default;
     };
 
     enum class RenderPosition : uint8_t
@@ -178,6 +180,7 @@ public:
     void AddOrReplace(ImagePlacement image);
     void AddOrReplace(ImagePlacement image, const Image::Pointer& surface, til::size pixelSize, Image::PixelStorage pixels);
     void AddOrReplaceArea(ImagePlacement image);
+    void AddOrReplaceAreas(std::vector<ImagePlacement> images);
     void ReplaceProtocolAreas(ImagePlacement::Key::Protocol protocol,
                               std::span<const til::rect> areas,
                               std::span<const ProtocolReplacement> replacements);
@@ -202,6 +205,7 @@ public:
     size_t Size() const noexcept;
     bool Empty() const noexcept;
     uint64_t RowEpoch() const noexcept;
+    uint64_t Revision() const noexcept;
 
 private:
     struct RowIndex;
@@ -217,6 +221,7 @@ private:
     std::vector<ImagePlacement> _images;
     uint64_t _rowEpoch = 0;
     uint64_t _lastPurgeEpoch = 0;
+    uint64_t _revision = 0;
     til::CoordType _bufferHeight = til::CoordTypeMax;
     mutable std::vector<ImagePlacement> _logicalImages;
     mutable std::unique_ptr<RowIndex> _rowIndex;

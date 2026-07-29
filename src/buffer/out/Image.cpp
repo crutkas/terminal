@@ -5,6 +5,8 @@
 
 #include "Image.hpp"
 
+#include <map>
+
 namespace
 {
     std::atomic<uint64_t> s_revision{ 1 };
@@ -56,6 +58,57 @@ namespace
         const auto rhsBounds = rhs->CellBounds();
         return std::tie(lhsBounds.top, lhsBounds.left, lhsBounds.bottom, lhsBounds.right) <
                std::tie(rhsBounds.top, rhsBounds.left, rhsBounds.bottom, rhsBounds.right);
+    }
+
+    void coalesceAreas(std::vector<til::rect>& areas)
+    {
+        std::erase_if(areas, [](const auto area) {
+            return area.empty();
+        });
+        std::sort(areas.begin(), areas.end(), [](const auto lhs, const auto rhs) {
+            return std::tie(lhs.top, lhs.bottom, lhs.left, lhs.right) <
+                   std::tie(rhs.top, rhs.bottom, rhs.left, rhs.right);
+        });
+
+        std::vector<til::rect> merged;
+        merged.reserve(areas.size());
+        for (const auto area : areas)
+        {
+            if (!merged.empty())
+            {
+                auto& previous = merged.back();
+                if (previous.top == area.top &&
+                    previous.bottom == area.bottom &&
+                    area.left <= previous.right)
+                {
+                    previous.right = std::max(previous.right, area.right);
+                    continue;
+                }
+            }
+            merged.emplace_back(area);
+        }
+
+        std::sort(merged.begin(), merged.end(), [](const auto lhs, const auto rhs) {
+            return std::tie(lhs.left, lhs.right, lhs.top, lhs.bottom) <
+                   std::tie(rhs.left, rhs.right, rhs.top, rhs.bottom);
+        });
+        areas.clear();
+        areas.reserve(merged.size());
+        for (const auto area : merged)
+        {
+            if (!areas.empty())
+            {
+                auto& previous = areas.back();
+                if (previous.left == area.left &&
+                    previous.right == area.right &&
+                    area.top <= previous.bottom)
+                {
+                    previous.bottom = std::max(previous.bottom, area.bottom);
+                    continue;
+                }
+            }
+            areas.emplace_back(area);
+        }
     }
 }
 
@@ -369,6 +422,7 @@ ImageCollection ImageCollection::Snapshot() const
     snapshot._images = _images;
     snapshot._rowEpoch = _rowEpoch;
     snapshot._lastPurgeEpoch = _lastPurgeEpoch;
+    snapshot._revision = _revision;
     snapshot._bufferHeight = _bufferHeight;
     return snapshot;
 }
@@ -496,6 +550,43 @@ void ImageCollection::AddOrReplaceArea(ImagePlacement image)
     _replace(std::move(remaining));
 }
 
+void ImageCollection::AddOrReplaceAreas(std::vector<ImagePlacement> images)
+{
+    if (images.empty())
+    {
+        return;
+    }
+
+    std::map<ImagePlacement::Key, std::vector<til::rect>> areasByKey;
+    for (const auto& image : images)
+    {
+        areasByKey[image.Identity()].emplace_back(image.CellBounds());
+    }
+    for (auto& entry : areasByKey)
+    {
+        coalesceAreas(entry.second);
+    }
+
+    const auto current = All();
+    std::vector<ImagePlacement> remaining;
+    remaining.reserve(current.size() + images.size());
+    for (const auto& candidate : current)
+    {
+        const auto areas = areasByKey.find(candidate.Identity());
+        if (areas == areasByKey.end())
+        {
+            remaining.emplace_back(candidate);
+            continue;
+        }
+
+        const std::array candidateArray{ candidate };
+        auto fragments = _eraseAreas(candidateArray, areas->second);
+        std::move(fragments.begin(), fragments.end(), std::back_inserter(remaining));
+    }
+    std::move(images.begin(), images.end(), std::back_inserter(remaining));
+    _replace(std::move(remaining));
+}
+
 void ImageCollection::ReplaceProtocolAreas(const ImagePlacement::Key::Protocol protocol,
                                            const std::span<const til::rect> areas,
                                            const std::span<const ProtocolReplacement> replacements)
@@ -607,10 +698,30 @@ void ImageCollection::EraseAreas(const std::span<const til::rect> areas)
         return;
     }
 
+    std::vector<til::rect> coalescedAreas;
+    auto effectiveAreas = areas;
+    if (areas.size() == 1)
+    {
+        if (areas.front().empty())
+        {
+            return;
+        }
+    }
+    else
+    {
+        coalescedAreas.assign(areas.begin(), areas.end());
+        coalesceAreas(coalescedAreas);
+        if (coalescedAreas.empty())
+        {
+            return;
+        }
+        effectiveAreas = coalescedAreas;
+    }
+
     const auto current = All();
     const auto intersects = std::any_of(current.begin(), current.end(), [&](const auto& image) {
-        return std::any_of(areas.begin(), areas.end(), [&](const auto area) {
-            return !area.empty() && !(image.CellBounds() & area).empty();
+        return std::any_of(effectiveAreas.begin(), effectiveAreas.end(), [&](const auto area) {
+            return !(image.CellBounds() & area).empty();
         });
     });
     if (!intersects)
@@ -618,7 +729,7 @@ void ImageCollection::EraseAreas(const std::span<const til::rect> areas)
         return;
     }
 
-    _replace(_eraseAreas(current, areas));
+    _replace(_eraseAreas(current, effectiveAreas));
 }
 
 void ImageCollection::CopyArea(const til::rect source, const til::point target, ImageCollection& destination) const
@@ -806,6 +917,11 @@ uint64_t ImageCollection::RowEpoch() const noexcept
     return _rowEpoch;
 }
 
+uint64_t ImageCollection::Revision() const noexcept
+{
+    return _revision;
+}
+
 std::optional<til::CoordType> ImageCollection::_logicalRowOffset(const ImagePlacement& image) const noexcept
 {
     if (image._rowEpoch > _rowEpoch)
@@ -832,7 +948,9 @@ std::optional<til::CoordType> ImageCollection::_logicalRowOffset(const ImagePlac
 
 void ImageCollection::_markLogicalImagesDirty() noexcept
 {
+    _logicalImages.clear();
     _logicalImagesDirty = true;
+    ++_revision;
 }
 
 void ImageCollection::_markIndexDirty() noexcept

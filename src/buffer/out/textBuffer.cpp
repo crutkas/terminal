@@ -575,9 +575,10 @@ til::point TextBuffer::NavigateCursor(til::point position, til::CoordType distan
 void TextBuffer::Replace(til::CoordType row, const TextAttribute& attributes, RowWriteState& state)
 {
     auto& r = GetMutableRowByOffset(row);
+    const auto imageColumnBegin = r.AdjustToGlyphStart(state.columnBegin);
     r.ReplaceText(state);
     r.ReplaceAttributes(state.columnBegin, state.columnEnd, attributes);
-    _images.EraseArea({ state.columnBegin, row, state.columnEnd, row + 1 });
+    _images.EraseArea({ imageColumnBegin, row, state.columnEndDirty, row + 1 });
     TriggerRedraw(Viewport::FromExclusive({ state.columnBeginDirty, row, state.columnEndDirty, row + 1 }));
 }
 
@@ -588,6 +589,7 @@ void TextBuffer::Insert(til::CoordType row, const TextAttribute& attributes, Row
 
     scratch.CopyFrom(r);
 
+    const auto imageColumnBegin = r.AdjustToGlyphStart(state.columnBegin);
     r.ReplaceText(state);
     r.ReplaceAttributes(state.columnBegin, state.columnEnd, attributes);
 
@@ -597,6 +599,7 @@ void TextBuffer::Insert(til::CoordType row, const TextAttribute& attributes, Row
         .columnBegin = state.columnEnd,
         .columnLimit = state.columnLimit,
     };
+    const auto restoreImageColumnBegin = r.AdjustToGlyphStart(restoreState.columnBegin);
     r.ReplaceText(restoreState);
 
     // Restore trailing attributes as well.
@@ -612,10 +615,29 @@ void TextBuffer::Insert(til::CoordType row, const TextAttribute& attributes, Row
             { restoreState.columnBegin, row },
             _images);
     }
-    // Image content at the insert position needs to be erased.
-    _images.EraseArea({ state.columnBegin, row, restoreState.columnBegin, row + 1 });
+    // Image content in dirty cells not repopulated from the shifted source needs to be erased.
+    const std::array eraseAreas{
+        til::rect{
+            std::min(imageColumnBegin, restoreImageColumnBegin),
+            row,
+            restoreState.columnBegin,
+            row + 1,
+        },
+        til::rect{
+            restoreState.columnEnd,
+            row,
+            std::max(state.columnEndDirty, restoreState.columnEndDirty),
+            row + 1,
+        },
+    };
+    _images.EraseAreas(eraseAreas);
 
-    TriggerRedraw(Viewport::FromExclusive({ state.columnBeginDirty, row, restoreState.columnEndDirty, row + 1 }));
+    TriggerRedraw(Viewport::FromExclusive({
+        std::min(state.columnBeginDirty, restoreState.columnBeginDirty),
+        row,
+        std::max(state.columnEndDirty, restoreState.columnEndDirty),
+        row + 1,
+    }));
 }
 
 // Fills an area of the buffer with a given fill character(s) and attributes.
@@ -625,8 +647,6 @@ void TextBuffer::FillRect(const til::rect& rect, const std::wstring_view& fill, 
     {
         return;
     }
-
-    _images.EraseArea(rect);
 
     auto& scratchpad = GetScratchpadRow(attributes);
 
@@ -665,12 +685,20 @@ void TextBuffer::FillRect(const til::rect& rect, const std::wstring_view& fill, 
             .sourceColumnBegin = rect.left,
         };
 
+        std::vector<til::rect> dirtyAreas;
+        dirtyAreas.reserve(rect.height());
         for (auto y = rect.top; y < rect.bottom; ++y)
         {
             auto& r = GetMutableRowByOffset(y);
+            const auto imageColumnBegin = r.AdjustToGlyphStart(rect.left);
             r.CopyTextFrom(state);
             r.ReplaceAttributes(rect.left, rect.right, attributes);
-            TriggerRedraw(Viewport::FromExclusive({ state.columnBeginDirty, y, state.columnEndDirty, y + 1 }));
+            dirtyAreas.emplace_back(imageColumnBegin, y, state.columnEndDirty, y + 1);
+        }
+        _images.EraseAreas(dirtyAreas);
+        for (const auto area : dirtyAreas)
+        {
+            TriggerRedraw(Viewport::FromExclusive(area));
         }
     }
 }
@@ -749,11 +777,12 @@ OutputCellIterator TextBuffer::WriteLine(const OutputCellIterator givenIt,
 
     //  Get the row and write the cells
     auto& row = GetMutableRowByOffset(target.y);
-    const auto newIt = row.WriteCells(givenIt, target.x, wrap, limitRight);
+    auto columnBeginDirty = target.x;
+    auto columnEndDirty = target.x;
+    const auto newIt = row.WriteCells(givenIt, target.x, wrap, limitRight, &columnBeginDirty, &columnEndDirty);
 
     // Take the cell distance written and notify that it needs to be repainted.
-    const auto written = newIt.GetCellDistance(givenIt);
-    const auto paint = Viewport::FromDimensions(target, { written, 1 });
+    const auto paint = Viewport::FromExclusive({ columnBeginDirty, target.y, columnEndDirty, target.y + 1 });
     _images.EraseArea(paint.ToExclusive());
     TriggerRedraw(paint);
 
@@ -3111,16 +3140,16 @@ void TextBuffer::Reflow(TextBuffer& oldBuffer, TextBuffer& newBuffer, const View
     placeholderKeys.reserve(imageCellMoves.size());
     for (const auto& move : imageCellMoves)
     {
-        placeholderKeys.push_back({ move.imageId, move.layerId });
+        placeholderKeys.push_back({ move.imageId, move.layerId, ImagePlacement::Key::Protocol::Kitty });
     }
-    std::sort(placeholderKeys.begin(), placeholderKeys.end(), [](const auto lhs, const auto rhs) {
-        return std::tie(lhs.imageId, lhs.layerId) < std::tie(rhs.imageId, rhs.layerId);
-    });
+    const auto keyLess = [](const auto lhs, const auto rhs) {
+        return std::tie(lhs.protocol, lhs.imageId, lhs.layerId) <
+               std::tie(rhs.protocol, rhs.imageId, rhs.layerId);
+    };
+    std::sort(placeholderKeys.begin(), placeholderKeys.end(), keyLess);
     placeholderKeys.erase(std::unique(placeholderKeys.begin(), placeholderKeys.end()), placeholderKeys.end());
     const auto isPlaceholder = [&](const ImagePlacement::Key key) {
-        return std::binary_search(placeholderKeys.begin(), placeholderKeys.end(), key, [](const auto lhs, const auto rhs) {
-            return std::tie(lhs.imageId, lhs.layerId) < std::tie(rhs.imageId, rhs.layerId);
-        });
+        return std::binary_search(placeholderKeys.begin(), placeholderKeys.end(), key, keyLess);
     };
 
     ImageCollection reflowedImages;
@@ -3174,7 +3203,7 @@ void TextBuffer::Reflow(TextBuffer& oldBuffer, TextBuffer& newBuffer, const View
         for (const auto placement : oldBuffer._images.IntersectingRows(move.source.y, move.source.y + 1))
         {
             const auto bounds = placement->CellBounds();
-            if (placement->Identity() != ImagePlacement::Key{ move.imageId, move.layerId } ||
+            if (placement->Identity() != ImagePlacement::Key{ move.imageId, move.layerId, ImagePlacement::Key::Protocol::Kitty } ||
                 move.source.x < bounds.left || move.source.x >= bounds.right)
             {
                 continue;

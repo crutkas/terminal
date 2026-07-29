@@ -7168,6 +7168,64 @@ public:
         VERIFY_IS_FALSE(BufferContainsColor(*_testGetSet->_textBuffer, 0, 255, 0), L"stored cols=2 must keep the right tile (green) out of grid col 0");
     }
 
+    TEST_METHOD(KittyPlaceholderLargeGridPublishesOneBatch)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        auto& buffer = *_testGetSet->_textBuffer;
+        const auto origin = buffer.GetCursor().GetPosition();
+        constexpr auto columns = 16;
+        constexpr auto rows = 8;
+        VERIFY_IS_TRUE(origin.x + columns <= buffer.GetSize().Width());
+        VERIFY_IS_TRUE(origin.y + rows <= buffer.GetSize().Height());
+
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,f=24,s=1,v=1,c=16,r=8;/wAA\x1b\\");
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m");
+        constexpr std::array rowDiacritics{ L'\x0305', L'\x030d', L'\x030e', L'\x0310', L'\x0312', L'\x033d', L'\x033e', L'\x033f' };
+
+        const auto revision = buffer.GetImages().Revision();
+        for (auto row = 0; row < rows; ++row)
+        {
+            buffer.GetCursor().SetPosition({ origin.x, origin.y + row });
+            auto placeholders = Placeholder() + rowDiacritics[row] + rowDiacritics[0];
+            for (auto column = 1; column < columns; ++column)
+            {
+                placeholders += Placeholder();
+            }
+            _stateMachine->ProcessString(placeholders);
+        }
+
+        VERIFY_ARE_EQUAL(revision + rows, buffer.GetImages().Revision(), L"commit growth is bounded by row segments, not placeholder cells");
+        VERIFY_ARE_EQUAL(size_t{ columns * rows }, buffer.GetImages().Size(), L"placement growth is bounded to one fragment per visible grid cell");
+        const til::rect expectedOriginal{ origin.x, origin.y, origin.x + columns, origin.y + rows };
+        std::vector<bool> covered(columns * rows);
+        const ::Image* surface = nullptr;
+        for (const auto& placement : buffer.GetImages().All())
+        {
+            VERIFY_ARE_EQUAL(ImagePlacement::Key::Protocol::Kitty, placement.Identity().protocol);
+            VERIFY_ARE_EQUAL(expectedOriginal, placement.OriginalCellBounds());
+            VERIFY_ARE_EQUAL(uint64_t{ columns }, placement.Geometry().targetWidth);
+            VERIFY_ARE_EQUAL(uint64_t{ rows }, placement.Geometry().targetHeight);
+            VERIFY_ARE_EQUAL(1, placement.CellBounds().width());
+            VERIFY_ARE_EQUAL(1, placement.CellBounds().height());
+            const auto column = placement.CellBounds().left - origin.x;
+            const auto row = placement.CellBounds().top - origin.y;
+            VERIFY_IS_TRUE(column >= 0 && column < columns);
+            VERIFY_IS_TRUE(row >= 0 && row < rows);
+            covered[row * columns + column] = true;
+            if (!surface)
+            {
+                surface = &placement.Surface();
+            }
+            else
+            {
+                VERIFY_ARE_EQUAL(surface, &placement.Surface());
+            }
+        }
+        VERIFY_IS_TRUE(std::ranges::all_of(covered, std::identity{}));
+        VERIFY_IS_TRUE(BufferContainsColor(buffer, 255, 0, 0), L"the batched grid still renders its image pixels");
+    }
+
     // An explicit COLUMN diacritic (the 2nd recognized diacritic) selects the grid column
     // independently of the row: a 2px red|green image in a 2-col grid addressed (row 0, col 1)
     // shows ONLY green; the left tile (red) must be absent.

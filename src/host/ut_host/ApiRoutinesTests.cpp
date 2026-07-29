@@ -820,4 +820,60 @@ class ApiRoutinesTests
 
         ValidateComplexScreen(si, background, fill, scrollRect, Viewport::FromInclusive(scroll), destination, clipViewport);
     }
+
+    TEST_METHOD(ApiScrollConsoleScreenBufferWPreservesImageCellRefs)
+    {
+        auto& gci = ServiceLocator::LocateGlobals().getConsoleInformation();
+        auto& si = gci.GetActiveOutputBuffer();
+        auto& buffer = si.GetTextBuffer();
+        buffer.ResizeTraditional({ 5, 5 });
+
+        const ImageCellRef first{
+            .layerId = 11,
+            .column = 3,
+            .row = 4,
+            .imageIdHighByte = 5,
+            .valid = true,
+        };
+        const ImageCellRef second{
+            .layerId = 22,
+            .column = 6,
+            .row = 7,
+            .imageIdHighByte = 8,
+            .valid = true,
+        };
+        buffer.GetMutableRowByOffset(1).SetImageCellRef(1, first);
+        buffer.GetMutableRowByOffset(1).SetImageCellRef(2, second);
+
+        gci.LockConsole();
+        auto unlock = wil::scope_exit([&] { gci.UnlockConsole(); });
+        VERIFY_SUCCEEDED(_pApiRoutines->ScrollConsoleScreenBufferWImpl(
+            si,
+            { 1, 1, 2, 1 },
+            { 2, 1 },
+            std::nullopt,
+            L' ',
+            0));
+
+        const auto copiedFirst = buffer.GetRowByOffset(1).GetImageCellRef(2);
+        const auto copiedSecond = buffer.GetRowByOffset(1).GetImageCellRef(3);
+        VERIFY_IS_NOT_NULL(copiedFirst);
+        VERIFY_IS_NOT_NULL(copiedSecond);
+        if (copiedFirst)
+        {
+            VERIFY_ARE_EQUAL(first.layerId, copiedFirst->layerId);
+            VERIFY_ARE_EQUAL(first.column, copiedFirst->column);
+            VERIFY_ARE_EQUAL(first.row, copiedFirst->row);
+            VERIFY_ARE_EQUAL(first.imageIdHighByte, copiedFirst->imageIdHighByte);
+            VERIFY_ARE_EQUAL(first.valid, copiedFirst->valid);
+        }
+        if (copiedSecond)
+        {
+            VERIFY_ARE_EQUAL(second.layerId, copiedSecond->layerId);
+            VERIFY_ARE_EQUAL(second.column, copiedSecond->column);
+            VERIFY_ARE_EQUAL(second.row, copiedSecond->row);
+            VERIFY_ARE_EQUAL(second.imageIdHighByte, copiedSecond->imageIdHighByte);
+            VERIFY_ARE_EQUAL(second.valid, copiedSecond->valid);
+        }
+    }
 };

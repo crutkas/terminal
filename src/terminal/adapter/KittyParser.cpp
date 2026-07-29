@@ -2432,7 +2432,7 @@ til::size KittyParser::_placeImage(const Image& image, const bool moveCursor, co
             surface = std::make_shared<::Image>(til::size{ imageWidth, imageHeight }, *frameStorage);
         }
 
-        const ImagePlacement::Key key{ imageId, layerId };
+        const ImagePlacement::Key key{ imageId, layerId, ImagePlacement::Key::Protocol::Kitty };
         buffer.GetMutableImages().AddOrReplace(ImagePlacement{
             key,
             surface,
@@ -3334,7 +3334,7 @@ std::optional<til::point> KittyParser::_derivePlacementAnchor(const Placement& p
     auto found = false;
     for (const auto& image : buffer.GetImages().All())
     {
-        if (image.Identity() != ImagePlacement::Key{ placement.imageId, placement.layerId })
+        if (image.Identity() != ImagePlacement::Key{ placement.imageId, placement.layerId, ImagePlacement::Key::Protocol::Kitty })
         {
             continue;
         }
@@ -3365,7 +3365,7 @@ std::optional<til::point> KittyParser::_deriveVirtualPlacementAnchor(const uint3
     auto found = false;
     for (const auto& image : buffer.GetImages().All())
     {
-        if (image.Identity() != ImagePlacement::Key{ imageId, layerId })
+        if (image.Identity() != ImagePlacement::Key{ imageId, layerId, ImagePlacement::Key::Protocol::Kitty })
         {
             continue;
         }
@@ -3557,7 +3557,7 @@ int KittyParser::_PlaceholderDiacriticIndex(const char32_t ch) noexcept
 
 // Registers one visible cell fragment of a Unicode placeholder. The renderer samples
 // the complete scaled placement, so adjacent fragments share one source surface.
-bool KittyParser::_placeImageCellRef(const Image& image, const uint32_t imageId, const til::CoordType column, const til::CoordType row, const uint32_t cellRow, const uint32_t cellCol, const VirtualPlacement& place)
+bool KittyParser::_placeImageCellRef(const Image& image, const uint32_t imageId, const til::CoordType column, const til::CoordType row, const uint32_t cellRow, const uint32_t cellCol, const VirtualPlacement& place, std::vector<ImagePlacement>& fragments)
 {
     const auto frameStorage = _frameStorage(image, image.presentedFrame);
     if (!frameStorage || !*frameStorage || (*frameStorage)->empty() || image.width == 0 || image.height == 0)
@@ -3565,7 +3565,6 @@ bool KittyParser::_placeImageCellRef(const Image& image, const uint32_t imageId,
         return false;
     }
     auto page = _dispatcher._pages.ActivePage();
-    auto& buffer = page.Buffer();
     if (column < 0 || column >= page.Width() || row < 0 || row >= page.Bottom())
     {
         return false;
@@ -3608,7 +3607,7 @@ bool KittyParser::_placeImageCellRef(const Image& image, const uint32_t imageId,
         gsl::narrow<til::CoordType>(static_cast<int64_t>(originalTop) + gridRows),
     };
     auto fragment = ImagePlacement::FromFragment(
-        { imageId, place.layerId },
+        { imageId, place.layerId, ImagePlacement::Key::Protocol::Kitty },
         surface,
         { column, row, column + 1, row + 1 },
         originalBounds,
@@ -3618,9 +3617,8 @@ bool KittyParser::_placeImageCellRef(const Image& image, const uint32_t imageId,
             .cellSize = clampedCellSize,
             .targetWidth = gsl::narrow_cast<uint64_t>(targetW),
             .targetHeight = gsl::narrow_cast<uint64_t>(targetH),
-        }
-    );
-    buffer.GetMutableImages().AddOrReplaceArea(std::move(fragment));
+        });
+    fragments.emplace_back(std::move(fragment));
     if (newSurface)
     {
         image.surface = std::move(surface);
@@ -3682,6 +3680,8 @@ void KittyParser::RenderPlaceholders(const std::wstring_view segment, const til:
     // instead of a TriggerRedraw per cell on the text-output hot path (matches _placeImage).
     auto firstDrawnCol = page.Width();
     auto lastDrawnCol = static_cast<til::CoordType>(-1);
+    std::vector<ImagePlacement> fragments;
+    fragments.reserve(std::min(segment.size(), static_cast<size_t>(page.Width())));
     for (size_t i = 0; i < segment.size();)
     {
         const auto next = buffer.GraphemeNext(segment, i);
@@ -3790,7 +3790,7 @@ void KittyParser::RenderPlaceholders(const std::wstring_view segment, const til:
                 if (placement != _virtualIds.end() && imageEntry != _images.end())
                 {
                     const auto& place = placement->second;
-                    drawn = _placeImageCellRef(imageEntry->second, imageId, column, screenRow, cellRow, cellCol, place);
+                    drawn = _placeImageCellRef(imageEntry->second, imageId, column, screenRow, cellRow, cellCol, place, fragments);
                     if (drawn)
                     {
                         imageEntry->second.hasRenderedPlacements = true;
@@ -3818,6 +3818,7 @@ void KittyParser::RenderPlaceholders(const std::wstring_view segment, const til:
         column = nextColumn > column ? nextColumn : column + 1;
         i = next;
     }
+    buffer.GetMutableImages().AddOrReplaceAreas(std::move(fragments));
     // One bounded redraw for every placeholder tile drawn in this segment (avoids a per-cell
     // TriggerRedraw on the text hot path; mirrors _placeImage's single-redraw model).
     if (lastDrawnCol >= firstDrawnCol)
@@ -3876,7 +3877,7 @@ void KittyParser::_erasePlacementCells(const Placement& placement)
         auto& buffer = page.Buffer();
         auto firstRow = page.Bottom();
         auto lastRow = 0;
-        const ImagePlacement::Key key{ placement.imageId, placement.layerId };
+        const ImagePlacement::Key key{ placement.imageId, placement.layerId, ImagePlacement::Key::Protocol::Kitty };
         for (const auto& image : buffer.GetImages().All())
         {
             if (image.Identity() == key)

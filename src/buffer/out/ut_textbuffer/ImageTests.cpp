@@ -22,20 +22,25 @@ class ImageTests
     TEST_METHOD(EraseSplitsWithoutCopyingTheSurface);
     TEST_METHOD(AddOrReplaceCollapsesFragments);
     TEST_METHOD(AddOrReplacePreservesScrolledPlacements);
+    TEST_METHOD(BatchedAreaReplacementCommitsOnceAndPreservesGeometry);
     TEST_METHOD(CopyClipsAndTranslates);
     TEST_METHOD(SurfaceUpdateReachesEveryFragment);
     TEST_METHOD(SurfaceResizeIsTransactionalAndPreservesPixels);
     TEST_METHOD(ProtocolBatchValidationIsAtomic);
     TEST_METHOD(ProtocolIdentityPreventsCrossProtocolMutation);
+    TEST_METHOD(LogicalCacheReleasesSurfacesOnInvalidation);
     TEST_METHOD(TextBufferOwnsImagesOutsideRows);
     TEST_METHOD(TextBufferResetRowErasesOnlyThatImageRow);
     TEST_METHOD(TextBufferWritesEraseOnlyOverwrittenImageCells);
+    TEST_METHOD(TextBufferWritesEraseWholeBisectedWideGlyph);
+    TEST_METHOD(FillRectCoalescesImageErasure);
     TEST_METHOD(CircularAndRegionalScrollUseLogicalRows);
     TEST_METHOD(RectangularCopyAndErasePreserveSampling);
     TEST_METHOD(CrossBufferBlankCopyErasesPlacement);
     TEST_METHOD(TraditionalResizeClipsAndRetainsImages);
     TEST_METHOD(ResizeRetainsMixedCellSizesWithoutRowStorage);
     TEST_METHOD(ReflowAppliesDirectPlacementPolicy);
+    TEST_METHOD(ReflowDistinguishesPlaceholderProtocol);
 
     static constexpr til::size CellSize{ 2, 3 };
 
@@ -192,6 +197,44 @@ void ImageTests::AddOrReplacePreservesScrolledPlacements()
         const til::rect expected{ 0, 1, 2, 3 };
         VERIFY_ARE_EQUAL(expected, existing->CellBounds(), L"replacing another identity must not undo logical row scrolling");
     }
+}
+
+void ImageTests::BatchedAreaReplacementCommitsOnceAndPreservesGeometry()
+{
+    constexpr ImagePlacement::Key key{ 1, 9, ImagePlacement::Key::Protocol::Kitty };
+    ImageCollection images;
+    images.Add(MakePlacement(key, { 0, 2, 6, 4 }));
+    images.AdvanceRows(1, 10);
+
+    const auto logical = images.All();
+    VERIFY_ARE_EQUAL(size_t{ 1 }, logical.size());
+    const auto surface = logical[0].SurfacePointer();
+    const auto originalBounds = logical[0].OriginalCellBounds();
+    std::vector<ImagePlacement> replacements;
+    replacements.emplace_back(*logical[0].Crop({ 1, 1, 2, 2 }));
+    replacements.emplace_back(*logical[0].Crop({ 4, 2, 5, 3 }));
+    const auto revision = images.Revision();
+
+    images.AddOrReplaceAreas(std::move(replacements));
+
+    VERIFY_ARE_EQUAL(revision + 1, images.Revision());
+    VERIFY_ARE_EQUAL(uint64_t{ 1 }, images.RowEpoch());
+    const auto result = images.All();
+    VERIFY_IS_TRUE(result.size() >= 2);
+    const til::rect firstReplacement{ 1, 1, 2, 2 };
+    const til::rect secondReplacement{ 4, 2, 5, 3 };
+    VERIFY_ARE_EQUAL(firstReplacement, result[result.size() - 2].CellBounds());
+    VERIFY_ARE_EQUAL(secondReplacement, result[result.size() - 1].CellBounds());
+
+    size_t coveredArea = 0;
+    for (const auto& placement : result)
+    {
+        VERIFY_ARE_EQUAL(key, placement.Identity());
+        VERIFY_ARE_EQUAL(originalBounds, placement.OriginalCellBounds());
+        VERIFY_ARE_EQUAL(surface.get(), placement.SurfacePointer().get());
+        coveredArea += static_cast<size_t>(placement.CellBounds().width()) * placement.CellBounds().height();
+    }
+    VERIFY_ARE_EQUAL(size_t{ 12 }, coveredArea);
 }
 
 void ImageTests::CopyClipsAndTranslates()
@@ -401,6 +444,38 @@ void ImageTests::ProtocolIdentityPreventsCrossProtocolMutation()
     VERIFY_ARE_EQUAL(sixelKey, images.All()[0].Identity());
 }
 
+void ImageTests::LogicalCacheReleasesSurfacesOnInvalidation()
+{
+    ImageCollection images;
+    auto clearPlacement = MakePlacement({ 1, 1 }, { 0, 0, 2, 1 });
+    auto clearSurface = clearPlacement.SurfacePointer();
+    const std::weak_ptr<Image> clearWeak = clearSurface;
+    images.Add(std::move(clearPlacement));
+    images.All();
+    images.PrepareRowIndex();
+    clearSurface.reset();
+
+    images.Clear();
+
+    VERIFY_IS_TRUE(clearWeak.expired(), L"Clear must not leave a cached logical placement retaining the surface");
+    VERIFY_IS_TRUE(images.IntersectingRows(0, 1).empty());
+
+    auto erasedPlacement = MakePlacement({ 2, 2 }, { 0, 0, 2, 1 });
+    auto erasedSurface = erasedPlacement.SurfacePointer();
+    const std::weak_ptr<Image> erasedWeak = erasedSurface;
+    images.Add(std::move(erasedPlacement));
+    images.Add(MakePlacement({ 3, 3 }, { 0, 2, 2, 3 }));
+    images.All();
+    images.PrepareRowIndex();
+    erasedSurface.reset();
+
+    VERIFY_IS_TRUE(images.Erase({ 2, 2 }));
+
+    VERIFY_IS_TRUE(erasedWeak.expired(), L"a non-Clear mutation must release stale cached logical placements immediately");
+    VERIFY_IS_TRUE(images.IntersectingRows(0, 1).empty());
+    VERIFY_ARE_EQUAL(size_t{ 1 }, images.IntersectingRows(2, 3).size(), L"row indexing must rebuild around the surviving placement");
+}
+
 void ImageTests::TextBufferOwnsImagesOutsideRows()
 {
     DummyRenderer renderer;
@@ -455,6 +530,56 @@ void ImageTests::TextBufferWritesEraseOnlyOverwrittenImageCells()
     for (const auto& fragment : buffer.GetImages().All())
     {
         VERIFY_ARE_EQUAL(surface.get(), fragment.SurfacePointer().get());
+    }
+}
+
+void ImageTests::TextBufferWritesEraseWholeBisectedWideGlyph()
+{
+    DummyRenderer renderer;
+    const auto verifyWrite = [&](const auto& write) {
+        TextBuffer buffer{ til::size{ 8, 2 }, TextAttribute{}, 0, false, &renderer };
+        buffer.GetMutableRowByOffset(0).ReplaceCharacters(1, 2, L"\x4e00");
+        buffer.GetMutableImages().Add(MakePlacement({ 1, 1 }, { 0, 0, 4, 1 }));
+
+        write(buffer);
+
+        VERIFY_IS_TRUE(PlacementCoversCell(buffer, 1, { 0, 0 }));
+        VERIFY_IS_FALSE(PlacementCoversCell(buffer, 1, { 1, 0 }), L"overwriting the trailing half dirties the leading half");
+        VERIFY_IS_FALSE(PlacementCoversCell(buffer, 1, { 2, 0 }), L"the targeted trailing half is erased");
+        VERIFY_IS_TRUE(PlacementCoversCell(buffer, 1, { 3, 0 }));
+    };
+
+    verifyWrite([](TextBuffer& buffer) {
+        const std::wstring text{ L"x" };
+        buffer.WriteLine(OutputCellIterator{ std::wstring_view{ text } }, { 2, 0 });
+    });
+    verifyWrite([](TextBuffer& buffer) {
+        RowWriteState state{ .text = L"x", .columnBegin = 2 };
+        buffer.Replace(0, TextAttribute{}, state);
+    });
+    verifyWrite([](TextBuffer& buffer) {
+        RowWriteState state{ .text = L"x", .columnBegin = 2 };
+        buffer.Insert(0, TextAttribute{}, state);
+    });
+    verifyWrite([](TextBuffer& buffer) {
+        buffer.FillRect({ 2, 0, 3, 1 }, L"x", TextAttribute{});
+    });
+}
+
+void ImageTests::FillRectCoalescesImageErasure()
+{
+    DummyRenderer renderer;
+    TextBuffer buffer{ til::size{ 8, 4 }, TextAttribute{}, 0, false, &renderer };
+    buffer.GetMutableImages().Add(MakePlacement({ 1, 1 }, { 0, 0, 5, 4 }));
+
+    buffer.FillRect({ 2, 0, 3, 4 }, L"x", TextAttribute{});
+
+    VERIFY_ARE_EQUAL(size_t{ 2 }, buffer.GetImages().Size(), L"adjacent row dirties must erase one rectangle, not fragment once per row");
+    for (auto row = 0; row < 4; ++row)
+    {
+        VERIFY_IS_TRUE(PlacementCoversCell(buffer, 1, { 1, row }));
+        VERIFY_IS_FALSE(PlacementCoversCell(buffer, 1, { 2, row }));
+        VERIFY_IS_TRUE(PlacementCoversCell(buffer, 1, { 3, row }));
     }
 }
 
@@ -667,4 +792,43 @@ void ImageTests::ReflowAppliesDirectPlacementPolicy()
     VERIFY_IS_TRUE(PlacementCoversCell(reflowed, 1, { 2, 2 }));
     VERIFY_IS_TRUE(PlacementCoversCell(reflowed, 1, { 0, 3 }));
     VERIFY_IS_TRUE(PlacementCoversCell(reflowed, 2, { 0, 6 }));
+}
+
+void ImageTests::ReflowDistinguishesPlaceholderProtocol()
+{
+    DummyRenderer renderer;
+    TextBuffer buffer{ til::size{ 4, 2 }, TextAttribute{}, 0, false, &renderer };
+    RowWriteState text{ .text = L"AB" };
+    buffer.Replace(0, TextAttribute{}, text);
+    const ImageCellRef metadata{
+        .layerId = 9,
+        .valid = true,
+    };
+    buffer.GetMutableRowByOffset(0).SetImageCellRef(0, metadata);
+
+    constexpr ImagePlacement::Key kittyKey{ 0, 9, ImagePlacement::Key::Protocol::Kitty };
+    constexpr ImagePlacement::Key sixelKey{ 0, 9, ImagePlacement::Key::Protocol::Sixel };
+    const auto kittySurface = MakeSurface({ 0, 0, 1, 1 });
+    const auto sixelSurface = MakeSurface({ 1, 0, 2, 1 });
+    buffer.GetMutableImages().Add(ImagePlacement{ kittyKey, kittySurface, { 0, 0, 1, 1 }, 0 });
+    buffer.GetMutableImages().Add(ImagePlacement{ sixelKey, sixelSurface, { 1, 0, 2, 1 }, 0 });
+    buffer.GetCursor().SetPosition({ 1, 0 });
+
+    TextBuffer reflowed{ til::size{ 2, 4 }, TextAttribute{}, 0, false, &renderer };
+    TextBuffer::Reflow(buffer, reflowed);
+
+    VERIFY_ARE_EQUAL(size_t{ 2 }, reflowed.GetImages().Size());
+    const auto result = reflowed.GetImages().All();
+    const auto kitty = std::ranges::find(result, kittyKey, &ImagePlacement::Identity);
+    const auto sixel = std::ranges::find(result, sixelKey, &ImagePlacement::Identity);
+    VERIFY_IS_TRUE(kitty != result.end());
+    VERIFY_IS_TRUE(sixel != result.end(), L"a Sixel with the same numeric ids is not a Kitty placeholder fragment");
+    if (kitty != result.end())
+    {
+        VERIFY_ARE_EQUAL(kittySurface.get(), kitty->SurfacePointer().get());
+    }
+    if (sixel != result.end())
+    {
+        VERIFY_ARE_EQUAL(sixelSurface.get(), sixel->SurfacePointer().get());
+    }
 }
