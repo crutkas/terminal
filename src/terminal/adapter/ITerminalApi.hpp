@@ -22,6 +22,7 @@ Author(s):
 
 #include <deque>
 #include <memory>
+#include <span>
 
 namespace Microsoft::Console::VirtualTerminal
 {
@@ -94,5 +95,14 @@ namespace Microsoft::Console::VirtualTerminal
         virtual void SearchMissingCommand(const std::wstring_view command) = 0;
 
         virtual void ShowNotification(const std::wstring_view title, const std::wstring_view body) = 0;
+
+        // Decodes an encoded image (e.g. PNG) into premultiplied BGRA pixels. Not every
+        // host has an image decoder; one that does not returns false and its caller goes
+        // without the image.
+        virtual bool DecodeImageToBgra(const std::span<const uint8_t> data, std::vector<RGBQUAD>& pixels, til::size& size) noexcept = 0;
+
+        // The pixel size of a text cell, for anything that has to lay pixels out against
+        // the grid.
+        virtual til::size GetCellSize() const noexcept = 0;
     };
 }

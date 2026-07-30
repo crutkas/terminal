@@ -8,6 +8,7 @@
 #include "../../../renderer/inc/DummyRenderer.hpp"
 
 #include "adaptDispatch.hpp"
+#include "KittyParser.hpp"
 #include "SixelParser.hpp"
 #include "../../../buffer/out/Image.hpp"
 
@@ -377,6 +378,27 @@ public:
         Log::Comment(L"ShowNotification MOCK called...");
     }
 
+    bool DecodeImageToBgra(const std::span<const uint8_t> data, std::vector<RGBQUAD>& pixels, til::size& size) noexcept override
+    {
+        Log::Comment(L"DecodeImageToBgra MOCK called...");
+        _decodeImageCallCount++;
+        if (!_decodeImageSucceeds || data.empty())
+        {
+            return false;
+        }
+        // Return a fixed 2x2 opaque blue image so tests can verify the PNG path.
+        size = { 2, 2 };
+        // When asked, return an inconsistent pixel count (3 != 2*2) to exercise the
+        // adapter's host-contract guard.
+        pixels.assign(_decodeImageMismatched ? 3 : 4, RGBQUAD{ 255, 0, 0, 255 });
+        return true;
+    }
+
+    til::size GetCellSize() const noexcept override
+    {
+        return _cellSize;
+    }
+
     void PrepData()
     {
         PrepData(CursorDirection::UP); // if called like this, the cursor direction doesn't matter.
@@ -536,6 +558,14 @@ public:
 
     bool _returnResponseResult = false;
 
+    bool _decodeImageSucceeds = true;
+    bool _decodeImageMismatched = false;
+    int _decodeImageCallCount = 0;
+    til::size _cellSize{ 10, 20 };
+    int _readLocalFileCallCount = 0;
+    bool _lastKittyFileDeleteAfter = false;
+    int _readSharedMemoryCallCount = 0;
+
     til::enumset<Mode> _systemMode{ Mode::AutoWrap };
 
     bool _setWindowTitleResult = false;
@@ -549,6 +579,96 @@ public:
 private:
     HANDLE _hCon;
 };
+
+namespace
+{
+    // A Kitty graphics command paired with the exact acknowledgement it must produce.
+    // Whole families of these share one shape -- send the command, expect the ack -- so each
+    // family rides a single index-driven TEST_METHOD (see ArrayIndexTaefAdapterSource) instead
+    // of one near-identical method apiece.
+    struct KittyGraphicsCase
+    {
+        std::wstring_view name;
+        const wchar_t* input;
+        const wchar_t* expected;
+    };
+
+    // Malformed commands each report one specific error acknowledgement.
+    constexpr KittyGraphicsCase kittyErrorCases[] = {
+        { L"put unknown id", L"\x1b_Ga=p,i=50;\x1b\\", L"\x1b_Gi=50;ENOENT:image not found\x1b\\" },
+        { L"i and I together", L"\x1b_Ga=t,i=2,I=3;\x1b\\", L"\x1b_Gi=2;EINVAL:i and I are mutually exclusive\x1b\\" },
+        { L"unknown action", L"\x1b_Ga=z,i=4;\x1b\\", L"\x1b_Gi=4;EINVAL:unknown action\x1b\\" },
+        { L"payload size mismatch", L"\x1b_Ga=t,i=3,f=24,s=2,v=2;AQIDBA==\x1b\\", L"\x1b_Gi=3;EINVAL:payload size mismatch\x1b\\" },
+        { L"bad base64 length", L"\x1b_Ga=t,i=4,f=32,s=1,v=1;AAA\x1b\\", L"\x1b_Gi=4;EINVAL:bad payload\x1b\\" },
+        { L"invalid base64 char", L"\x1b_Ga=t,i=7,f=100;A@==\x1b\\", L"\x1b_Gi=7;EINVAL:bad payload\x1b\\" },
+        { L"non-ascii payload", L"\x1b_Ga=t,i=8,f=100;\u00FF\u00FF\u00FF\u00FF\x1b\\", L"\x1b_Gi=8;EINVAL:bad payload\x1b\\" },
+        { L"query invalid payload", L"\x1b_Ga=q,i=5,f=100;AAA\x1b\\", L"\x1b_Gi=5;EINVAL:bad payload\x1b\\" },
+        { L"unsupported format", L"\x1b_Ga=t,i=6,f=99;\x1b\\", L"\x1b_Gi=6;EINVAL:unsupported format\x1b\\" },
+        { L"unsupported compression", L"\x1b_Ga=t,i=7,o=x;\x1b\\", L"\x1b_Gi=7;EINVAL:unsupported compression\x1b\\" },
+        { L"overflow dimensions", L"\x1b_Ga=t,i=14,f=32,s=2147483648,v=2147483648;AQIDBA==\x1b\\", L"\x1b_Gi=14;EFBIG:image dimensions exceed renderer limit\x1b\\" },
+        { L"renderer dimension limit", L"\x1b_Ga=t,i=15,f=32,s=8193,v=1;AQIDBA==\x1b\\", L"\x1b_Gi=15;EFBIG:image dimensions exceed renderer limit\x1b\\" },
+        { L"semicolon in payload", L"\x1b_Ga=t,i=1,f=100;AAAA;BBBB\x1b\\", L"\x1b_Gi=1;EINVAL:bad payload\x1b\\" },
+        { L"missing dimensions", L"\x1b_Ga=t,i=1,f=24;AAAA\x1b\\", L"\x1b_Gi=1;EINVAL:missing dimensions\x1b\\" },
+        { L"unsupported medium", L"\x1b_Ga=t,i=1,f=24,s=1,v=1,t=x;AAAA\x1b\\", L"\x1b_Gi=1;EINVAL:unsupported transmission medium\x1b\\" },
+        { L"malformed o=z stream", L"\x1b_Ga=T,i=1,f=100,o=z;iVBORw0K\x1b\\", L"\x1b_Gi=1;EINVAL:invalid compressed data\x1b\\" },
+        { L"unsupported delete target", L"\x1b_Ga=d,d=b,i=5;\x1b\\", L"\x1b_Gi=5;EINVAL:unsupported delete target\x1b\\" },
+        { L"delete by id needs i", L"\x1b_Ga=d,d=i;\x1b\\", L"\x1b_G;EINVAL:delete by id requires i\x1b\\" },
+        { L"q=1 does not suppress error", L"\x1b_Ga=p,i=77,q=1;\x1b\\", L"\x1b_Gi=77;ENOENT:image not found\x1b\\" },
+    };
+
+    // Well-formed (or gracefully tolerated) requests each echo the expected OK acknowledgement.
+    constexpr KittyGraphicsCase kittyAcceptedCases[] = {
+        { L"explicit id echoed", L"\x1b_Gi=1,a=t,f=24,s=1,v=1;AAAA\x1b\\", L"\x1b_Gi=1;OK\x1b\\" },
+        { L"large id echoed", L"\x1b_Ga=t,i=42,f=24,s=1,v=1;AAAA\x1b\\", L"\x1b_Gi=42;OK\x1b\\" },
+        { L"number assigns id", L"\x1b_GI=7,a=t,f=24,s=1,v=1;AAAA\x1b\\", L"\x1b_Gi=1,I=7;OK\x1b\\" },
+        { L"query validates ok", L"\x1b_Ga=q,i=99,f=24,s=1,v=1;AAAA\x1b\\", L"\x1b_Gi=99;OK\x1b\\" },
+        { L"rgb payload size matches", L"\x1b_Ga=t,i=2,f=24,s=2,v=2;AAAAAAAAAAAAAAAA\x1b\\", L"\x1b_Gi=2;OK\x1b\\" },
+        { L"rgba payload size matches", L"\x1b_Ga=t,i=1,f=32,s=1,v=1;AQIDBA==\x1b\\", L"\x1b_Gi=1;OK\x1b\\" },
+        { L"multi-char keys ignored", L"\x1b_Ga=t,ab=5,zz,i=1,f=24,s=1,v=1;AAAA\x1b\\", L"\x1b_Gi=1;OK\x1b\\" },
+        { L"PNG f=100 skips raw size check", L"\x1b_Ga=t,i=5,f=100,s=1,v=1;AQIDBA==\x1b\\", L"\x1b_Gi=5;OK\x1b\\" },
+        { L"overflow id clamped to uint32 max", L"\x1b_Ga=t,i=99999999999999999999,f=24,s=1,v=1;AAAA\x1b\\", L"\x1b_Gi=4294967295;OK\x1b\\" },
+        { L"single-pad base64 accepted", L"\x1b_Ga=t,i=12,f=32,s=2,v=1;AAAAAAAAAAA=\x1b\\", L"\x1b_Gi=12;OK\x1b\\" },
+    };
+
+    // Malformed zlib (RFC 1950) streams that _inflateZlib must reject. Each row is the raw
+    // resource bytes; the shared shape -- feed the bytes, expect false -- rides one
+    // index-driven TEST_METHOD instead of one method apiece.
+    struct KittyInflateRejectCase
+    {
+        std::wstring_view name;
+        std::vector<uint8_t> bytes;
+    };
+
+    const std::vector<KittyInflateRejectCase> kittyInflateRejectCases = {
+        { L"raw deflate, no zlib wrapper", { 0x63, 0x64, 0x62, 0x66, 0x61, 0x65, 0x63, 0xe7, 0xe0, 0xe4, 0xe2, 0xe6, 0x01, 0x00 } },
+        // c12 with the low byte of the trailing Adler-32 flipped (0x4f ^ 0xff == 0xb0).
+        { L"corrupt adler-32 trailer", { 0x78, 0xda, 0x63, 0x64, 0x62, 0x66, 0x61, 0x65, 0x63, 0xe7, 0xe0, 0xe4, 0xe2, 0xe6, 0x01, 0x00, 0x01, 0x78, 0x00, 0xb0 } },
+        { L"header too short", { 0x78, 0xda, 0x00 } },
+        // CMF=0x78, FLG=0x00 -> (0x7800 % 31) != 0 -> FCHECK fails.
+        { L"bad FCHECK header", { 0x78, 0x00, 0x01, 0x00, 0x00, 0x00 } },
+        // c12 with an extra 0x00 spliced in before the 4-byte checksum.
+        { L"trailing garbage before adler", { 0x78, 0xda, 0x63, 0x64, 0x62, 0x66, 0x61, 0x65, 0x63, 0xe7, 0xe0, 0xe4, 0xe2, 0xe6, 0x01, 0x00, 0x00, 0x01, 0x78, 0x00, 0x4f } },
+        { L"inflates to zero bytes", { 0x78, 0x9c, 0x03, 0x00, 0x00, 0x00, 0x00, 0x01 } },
+        { L"six-byte empty deflate body", { 0x78, 0x9c, 0x00, 0x00, 0x00, 0x01 } },
+        { L"FDICT preset-dictionary header", { 0x78, 0xbb, 0x04, 0x09, 0x01, 0xa5, 0x63, 0x64, 0x62, 0x06, 0x00, 0x00, 0x0d, 0x00, 0x07 } },
+        { L"truncated deflate stream", { 0x78, 0xda, 0x63, 0x64, 0x62, 0x66, 0x61, 0x65, 0x63, 0xe7, 0xe0, 0xe4, 0xe2, 0xe6, 0x01, 0x01, 0x78, 0x00, 0x4f } },
+    };
+}
+
+extern "C" HRESULT __declspec(dllexport) __cdecl KittyGraphicsErrorDataSource(IDataSource** ppDataSource, void*)
+{
+    return Microsoft::WRL::MakeAndInitialize<ArrayIndexTaefAdapterSource>(ppDataSource, std::size(kittyErrorCases));
+}
+
+extern "C" HRESULT __declspec(dllexport) __cdecl KittyGraphicsAcceptedDataSource(IDataSource** ppDataSource, void*)
+{
+    return Microsoft::WRL::MakeAndInitialize<ArrayIndexTaefAdapterSource>(ppDataSource, std::size(kittyAcceptedCases));
+}
+
+extern "C" HRESULT __declspec(dllexport) __cdecl KittyInflateRejectDataSource(IDataSource** ppDataSource, void*)
+{
+    return Microsoft::WRL::MakeAndInitialize<ArrayIndexTaefAdapterSource>(ppDataSource, kittyInflateRejectCases.size());
+}
 
 class AdapterTest
 {
@@ -5108,9 +5228,676 @@ public:
         VERIFY_IS_TRUE(surface.expired(), L"completed output must be owned by placements, not retained by the parser");
     }
 
+    TEST_METHOD(KittyGraphicsAnonymousTransmitIsSilent)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1b_Ga=t,f=24,s=1,v=1;AAAA\x1b\\");
+        VERIFY_IS_TRUE(_testGetSet->_response.empty(), L"An anonymous transmit should not produce a response.");
+    }
+
+    TEST_METHOD(KittyGraphicsQuietModeSuppressesAck)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1b_Gi=1,a=t,q=1,f=24,s=1,v=1;AAAA\x1b\\");
+        VERIFY_IS_TRUE(_testGetSet->_response.empty(), L"q=1 should suppress the success acknowledgement.");
+    }
+
+    TEST_METHOD(KittyGraphicsProtocolErrors)
+    {
+        BEGIN_TEST_METHOD_PROPERTIES()
+            TEST_METHOD_PROPERTY(L"DataSource", L"Export:KittyGraphicsErrorDataSource")
+        END_TEST_METHOD_PROPERTIES()
+
+        size_t i{};
+        TestData::TryGetValue(L"index", i);
+        const auto& tc = kittyErrorCases[i];
+        Log::Comment(NoThrowString().Format(L"[%zu] %.*s", i, static_cast<int>(tc.name.size()), tc.name.data()));
+
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(tc.input);
+        _testGetSet->ValidateInputEvent(tc.expected);
+    }
+
+    TEST_METHOD(KittyGraphicsAccepted)
+    {
+        BEGIN_TEST_METHOD_PROPERTIES()
+            TEST_METHOD_PROPERTY(L"DataSource", L"Export:KittyGraphicsAcceptedDataSource")
+        END_TEST_METHOD_PROPERTIES()
+
+        size_t i{};
+        TestData::TryGetValue(L"index", i);
+        const auto& tc = kittyAcceptedCases[i];
+        Log::Comment(NoThrowString().Format(L"[%zu] %.*s", i, static_cast<int>(tc.name.size()), tc.name.data()));
+
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(tc.input);
+        _testGetSet->ValidateInputEvent(tc.expected);
+    }
+
+    TEST_METHOD(KittyGraphicsDeleteByIdPreservesOthers)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1b_Ga=t,i=8,f=24,s=1,v=1;AAAA\x1b\\");
+        _stateMachine->ProcessString(L"\x1b_Ga=t,i=9,f=24,s=1,v=1;AAAA\x1b\\");
+        _stateMachine->ProcessString(L"\x1b_Ga=d,d=I,i=8;\x1b\\");
+        _testGetSet->_response.clear();
+        _stateMachine->ProcessString(L"\x1b_Ga=p,i=8;\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=8;ENOENT:image not found\x1b\\");
+        _stateMachine->ProcessString(L"\x1b_Ga=p,i=9;\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=9;OK\x1b\\");
+    }
+
+    TEST_METHOD(KittyGraphicsDeleteLowercaseKeepsImageData)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,f=24,s=1,v=1,C=1;/wAA\x1b\\"); // display red
+        VERIFY_IS_TRUE(BufferContainsColor(*_testGetSet->_textBuffer, 255, 0, 0));
+        VERIFY_ARE_EQUAL(size_t{ 1 }, _testGetSet->_textBuffer->GetImages().Size());
+        VERIFY_ARE_EQUAL(sizeof(RGBQUAD), _kitty()._totalPixelBytes);
+        _stateMachine->ProcessString(L"\x1b_Ga=d,d=i,i=1;\x1b\\"); // lowercase: keep the image data
+        VERIFY_IS_FALSE(BufferContainsColor(*_testGetSet->_textBuffer, 255, 0, 0), L"lowercase delete still erases on-screen pixels");
+        VERIFY_IS_TRUE(_testGetSet->_textBuffer->GetImages().Empty());
+        VERIFY_ARE_EQUAL(sizeof(RGBQUAD), _kitty()._totalPixelBytes);
+        _testGetSet->_response.clear();
+        _stateMachine->ProcessString(L"\x1b_Ga=p,i=1;\x1b\\"); // image data survived -> OK, not ENOENT
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=1;OK\x1b\\");
+        VERIFY_ARE_EQUAL(size_t{ 1 }, _testGetSet->_textBuffer->GetImages().Size());
+        VERIFY_ARE_EQUAL(sizeof(RGBQUAD), _kitty()._totalPixelBytes);
+    }
+
+    TEST_METHOD(KittyGraphicsDeleteAllHonorsCase)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1b_Ga=t,i=8,f=24,s=1,v=1;AAAA\x1b\\");
+        _stateMachine->ProcessString(L"\x1b_Ga=t,i=9,f=24,s=1,v=1;AAAA\x1b\\");
+        _stateMachine->ProcessString(L"\x1b_Ga=d,d=a;\x1b\\");
+        VERIFY_ARE_EQUAL(static_cast<size_t>(1), _kitty()._images.count(8));
+        VERIFY_ARE_EQUAL(static_cast<size_t>(1), _kitty()._images.count(9));
+
+        _stateMachine->ProcessString(L"\x1b_Ga=p,i=8,C=1;\x1b\\");
+        _stateMachine->ProcessString(L"\x1b_Ga=p,i=9,C=1;\x1b\\");
+        _stateMachine->ProcessString(L"\x1b_Ga=d,d=A;\x1b\\");
+        VERIFY_ARE_EQUAL(static_cast<size_t>(0), _kitty()._images.count(8));
+        VERIFY_ARE_EQUAL(static_cast<size_t>(0), _kitty()._images.count(9));
+    }
+
+    TEST_METHOD(KittyGraphicsQuietTwoSuppressesErrors)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1b_Ga=p,i=77,q=2;\x1b\\");
+        VERIFY_IS_TRUE(_testGetSet->_response.empty(), L"q=2 should suppress error responses.");
+    }
+
+    TEST_METHOD(KittyGraphicsChunkedTransmitAssembles)
+    {
+        _testGetSet->PrepData();
+        // First chunk carries the control + half the base64; it must not respond.
+        _stateMachine->ProcessString(L"\x1b_Ga=t,i=6,f=24,s=2,v=2,m=1;AAAAAAAA\x1b\\");
+        VERIFY_IS_TRUE(_testGetSet->_response.empty(), L"An intermediate chunk should not respond.");
+        // Final chunk (m=0) completes 12 bytes == 2*2*3 and is acknowledged.
+        _stateMachine->ProcessString(L"\x1b_Gm=0;AAAAAAAA\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=6;OK\x1b\\");
+    }
+
+    TEST_METHOD(KittyGraphicsHardResetClearsChunk)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1b_Ga=t,i=9,f=100,m=1;AAAA\x1b\\");
+        _pDispatch->HardReset(true);
+        _testGetSet->_response.clear();
+        // After RIS the pending transfer is gone, so this is a fresh single command.
+        _stateMachine->ProcessString(L"\x1b_Ga=t,i=10,f=100;AAAA\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=10;OK\x1b\\");
+    }
+
+    TEST_METHOD(KittyGraphicsTransmitAndDisplayRendersPixels)
+    {
+        _testGetSet->PrepData();
+        // "/wAA/w==" decodes to RGBA {255,0,0,255} (opaque red).
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,f=32,s=1,v=1;/wAA/w==\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=1;OK\x1b\\");
+        const auto& buffer = *_testGetSet->_textBuffer;
+        til::CoordType imageRow = -1;
+        const auto slice = FindFirstImageSlice(buffer, imageRow);
+        VERIFY_IS_NOT_NULL(slice, L"a=T should place an image slice in the buffer.");
+        VERIFY_IS_TRUE(SliceContainsColor(slice, 255, 0, 0), L"The placed image should contain the red pixel.");
+        VERIFY_ARE_EQUAL(1, CountImageRows(buffer));
+    }
+
+    TEST_METHOD(KittyGraphicsPutDisplaysStoredImage)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1b_Ga=t,i=2,f=32,s=1,v=1;/wAA/w==\x1b\\");
+        VERIFY_ARE_EQUAL(0, CountImageRows(*_testGetSet->_textBuffer)); // a=t must not display
+        _stateMachine->ProcessString(L"\x1b_Ga=p,i=2;\x1b\\");
+        const auto& buffer = *_testGetSet->_textBuffer;
+        til::CoordType imageRow = -1;
+        const auto slice = FindFirstImageSlice(buffer, imageRow);
+        VERIFY_IS_NOT_NULL(slice, L"a=p should display the stored image.");
+        VERIFY_IS_TRUE(SliceContainsColor(slice, 255, 0, 0));
+    }
+
+    TEST_METHOD(KittyGraphicsRgbImageDisplays)
+    {
+        _testGetSet->PrepData();
+        // "/wAA" decodes to RGB {255,0,0}.
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=3,f=24,s=1,v=1;/wAA\x1b\\");
+        const auto& buffer = *_testGetSet->_textBuffer;
+        til::CoordType imageRow = -1;
+        const auto slice = FindFirstImageSlice(buffer, imageRow);
+        VERIFY_IS_NOT_NULL(slice);
+        VERIFY_IS_TRUE(SliceContainsColor(slice, 255, 0, 0));
+    }
+
+    TEST_METHOD(KittyGraphicsRgbaChannelOrderExact)
+    {
+        _testGetSet->PrepData();
+        // "ChQe/w==" decodes to RGBA {10,20,30,255}.
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,f=32,s=1,v=1;ChQe/w==\x1b\\");
+        const auto& buffer = *_testGetSet->_textBuffer;
+        til::CoordType imageRow = -1;
+        const auto slice = FindFirstImageSlice(buffer, imageRow);
+        VERIFY_IS_NOT_NULL(slice);
+        const auto px = slice->Pixels(ImageSlice::RenderPosition::AboveText)[0];
+        VERIFY_ARE_EQUAL(10, static_cast<int>(px.rgbRed));
+        VERIFY_ARE_EQUAL(20, static_cast<int>(px.rgbGreen));
+        VERIFY_ARE_EQUAL(30, static_cast<int>(px.rgbBlue));
+        VERIFY_ARE_EQUAL(255, static_cast<int>(px.rgbReserved));
+    }
+
+    TEST_METHOD(KittyGraphicsPremultipliedAlpha)
+    {
+        _testGetSet->PrepData();
+        // "/wAAgA==" decodes to RGBA {255,0,0,128}.
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,f=32,s=1,v=1;/wAAgA==\x1b\\");
+        const auto& buffer = *_testGetSet->_textBuffer;
+        til::CoordType imageRow = -1;
+        const auto slice = FindFirstImageSlice(buffer, imageRow);
+        VERIFY_IS_NOT_NULL(slice);
+        const auto px = slice->Pixels(ImageSlice::RenderPosition::AboveText)[0];
+        VERIFY_ARE_EQUAL(128, static_cast<int>(px.rgbRed));
+        VERIFY_ARE_EQUAL(0, static_cast<int>(px.rgbGreen));
+        VERIFY_ARE_EQUAL(0, static_cast<int>(px.rgbBlue));
+        VERIFY_ARE_EQUAL(128, static_cast<int>(px.rgbReserved));
+    }
+
+    TEST_METHOD(KittyGraphicsRetransmitReplacesPixels)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1b_Ga=t,i=1,f=32,s=1,v=1;/wAA/w==\x1b\\"); // red
+        _stateMachine->ProcessString(L"\x1b_Ga=t,i=1,f=32,s=1,v=1;AP8A/w==\x1b\\"); // green
+        _stateMachine->ProcessString(L"\x1b_Ga=p,i=1;\x1b\\");
+        const auto& buffer = *_testGetSet->_textBuffer;
+        til::CoordType imageRow = -1;
+        const auto slice = FindFirstImageSlice(buffer, imageRow);
+        VERIFY_IS_NOT_NULL(slice);
+        VERIFY_IS_TRUE(SliceContainsColor(slice, 0, 255, 0));
+        VERIFY_IS_FALSE(SliceContainsColor(slice, 255, 0, 0));
+    }
+
+    TEST_METHOD(KittyGraphicsPngTransmitAndDisplay)
+    {
+        _testGetSet->PrepData();
+        // The mock host decodes any non-empty data to a 2x2 opaque blue image.
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,f=100;iVBORw0K\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=1;OK\x1b\\");
+        const auto& buffer = *_testGetSet->_textBuffer;
+        til::CoordType imageRow = -1;
+        const auto slice = FindFirstImageSlice(buffer, imageRow);
+        VERIFY_IS_NOT_NULL(slice, L"a PNG a=T should render the host-decoded image.");
+        VERIFY_IS_TRUE(SliceContainsColor(slice, 0, 0, 255)); // blue
+        VERIFY_ARE_EQUAL(1, CountImageRows(buffer)); // 2px tall => 1 row
+    }
+
+    TEST_METHOD(KittyGraphicsPngDecodeFailureIsError)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_decodeImageSucceeds = false;
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,f=100;iVBORw0K\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=1;EBADPNG:could not decode image\x1b\\");
+        VERIFY_ARE_EQUAL(0, CountImageRows(*_testGetSet->_textBuffer));
+        // The failed image must not be registered (no phantom entry).
+        _stateMachine->ProcessString(L"\x1b_Ga=p,i=1;\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=1;ENOENT:image not found\x1b\\");
+    }
+
+    TEST_METHOD(KittyGraphicsPngIgnoresClientSizeUsesHostDims)
+    {
+        _testGetSet->PrepData();
+        // Client claims 25x40 (would be 3 columns, 2 rows); host decodes 2x2
+        // (1 column, 1 row). The render must reflect the host's 2x2.
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,f=100,s=25,v=40;iVBORw0K\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=1;OK\x1b\\");
+        const auto& buffer = *_testGetSet->_textBuffer;
+        til::CoordType imageRow = -1;
+        const auto slice = FindFirstImageSlice(buffer, imageRow);
+        VERIFY_IS_NOT_NULL(slice);
+        VERIFY_ARE_EQUAL(10, slice->PixelWidth()); // 1 cell (host 2px), not 30 (client 25px)
+        VERIFY_ARE_EQUAL(1, CountImageRows(buffer)); // host 2px => 1 row, not client 40px => 2
+    }
+
+    TEST_METHOD(KittyGraphicsPngInconsistentDecodeRejected)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_decodeImageMismatched = true; // returns 3 pixels for a 2x2 size
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,f=100;iVBORw0K\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=1;EBADPNG:could not decode image\x1b\\");
+        VERIFY_ARE_EQUAL(0, CountImageRows(*_testGetSet->_textBuffer));
+    }
+
+    TEST_METHOD(KittyGraphicsPngQueryDoesNotDecode)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1b_Ga=q,i=1,f=100;iVBORw0K\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=1;OK\x1b\\");
+        VERIFY_ARE_EQUAL(0, _testGetSet->_decodeImageCallCount);
+    }
+
+    TEST_METHOD(KittyGraphicsUsesHostCellSize)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 5, 10 };
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,f=32,s=1,v=1;/wAA/w==\x1b\\");
+        til::CoordType imageRow = -1;
+        const auto slice = FindFirstImageSlice(*_testGetSet->_textBuffer, imageRow);
+        VERIFY_IS_NOT_NULL(slice);
+        VERIFY_ARE_EQUAL((til::size{ 5, 10 }), slice->CellSize()); // host cell, not {10,20}
+        VERIFY_ARE_EQUAL(5, slice->PixelWidth()); // 1 cell * 5px
+    }
+
+    TEST_METHOD(KittyGraphicsPutByNumberDisplays)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1b_Ga=t,I=7,f=32,s=1,v=1;/wAA/w==\x1b\\");
+        _stateMachine->ProcessString(L"\x1b_Ga=p,I=7;\x1b\\");
+        const auto& buffer = *_testGetSet->_textBuffer;
+        til::CoordType imageRow = -1;
+        const auto slice = FindFirstImageSlice(buffer, imageRow);
+        VERIFY_IS_NOT_NULL(slice);
+        VERIFY_IS_TRUE(SliceContainsColor(slice, 255, 0, 0));
+    }
+
+    TEST_METHOD(KittyGraphicsTransmitByNumberNewIdEachTime)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1b_Ga=t,I=7,f=24,s=1,v=1;AAAA\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=1,I=7;OK\x1b\\");
+        _stateMachine->ProcessString(L"\x1b_Ga=t,I=7,f=24,s=1,v=1;AAAA\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=2,I=7;OK\x1b\\");
+    }
+
+    TEST_METHOD(KittyGraphicsDeleteByNumber)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1b_Ga=t,I=7,f=24,s=1,v=1;AAAA\x1b\\");
+        _stateMachine->ProcessString(L"\x1b_Ga=t,I=8,f=24,s=1,v=1;AAAA\x1b\\");
+        _stateMachine->ProcessString(L"\x1b_Ga=d,d=N,I=7;\x1b\\");
+        _testGetSet->_response.clear();
+        _stateMachine->ProcessString(L"\x1b_Ga=p,I=7;\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_GI=7;ENOENT:image not found\x1b\\");
+        _stateMachine->ProcessString(L"\x1b_Ga=p,I=8;\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_GI=8;OK\x1b\\");
+    }
+
+    TEST_METHOD(KittyGraphicsHardResetClearsRegistry)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1b_Ga=t,i=5,f=24,s=1,v=1;AAAA\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=5;OK\x1b\\");
+        _pDispatch->HardReset(true);
+        _testGetSet->_response.clear();
+        _stateMachine->ProcessString(L"\x1b_Ga=p,i=5;\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=5;ENOENT:image not found\x1b\\");
+    }
+
+    TEST_METHOD(KittyGraphicsZlibTransmitDecodes)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1b_Ga=t,i=13,f=24,s=2,v=2,o=z;eNpjZGJmYWVj5+Dk4uYBAAF4AE8=\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=13;OK\x1b\\");
+
+        // Round-trip proof: the stored image must hold the EXACT inflated pixels, not merely
+        // a correctly-sized buffer. The payload inflates to [1..12] = four f=24 pixels
+        // (1,2,3)(4,5,6)(7,8,9)(10,11,12); f=24 sets reserved (alpha) to 255.
+        const auto it = _kitty()._images.find(13);
+        VERIFY_IS_TRUE(it != _kitty()._images.end(), L"the o=z transmit must store an image under id 13.");
+        VERIFY_ARE_EQUAL(2u, it->second.width);
+        VERIFY_ARE_EQUAL(2u, it->second.height);
+        VERIFY_ARE_EQUAL(static_cast<size_t>(4), it->second.pixels->size());
+        const BYTE expected[4][3]{ { 1, 2, 3 }, { 4, 5, 6 }, { 7, 8, 9 }, { 10, 11, 12 } };
+        for (size_t i = 0; i < 4; ++i)
+        {
+            VERIFY_ARE_EQUAL(static_cast<int>(expected[i][0]), static_cast<int>((*it->second.pixels)[i].rgbRed));
+            VERIFY_ARE_EQUAL(static_cast<int>(expected[i][1]), static_cast<int>((*it->second.pixels)[i].rgbGreen));
+            VERIFY_ARE_EQUAL(static_cast<int>(expected[i][2]), static_cast<int>((*it->second.pixels)[i].rgbBlue));
+            VERIFY_ARE_EQUAL(255, static_cast<int>((*it->second.pixels)[i].rgbReserved));
+        }
+    }
+
+    TEST_METHOD(KittyInflateZlibRoundTripsCompressed)
+    {
+        // zlib.deflateSync(Buffer.alloc(64, 0xAB)) -- inflates to 64 bytes of 0xAB.
+        const std::vector<uint8_t> cAB{ 0x78, 0xda, 0x5b, 0xbd, 0x9a, 0x32, 0x00, 0x00, 0x6d, 0xeb, 0x2a, 0xc1 };
+        std::vector<uint8_t> out;
+        VERIFY_IS_TRUE(KittyParser::_inflateZlib(cAB, out, 32 * 1024 * 1024));
+        VERIFY_ARE_EQUAL(64u, out.size());
+        for (const auto b : out)
+        {
+            VERIFY_ARE_EQUAL(0xABu, static_cast<unsigned>(b));
+        }
+
+        // zlib.deflateSync([1..12]) -- inflates back to the 1..12 ramp.
+        const std::vector<uint8_t> c12{ 0x78, 0xda, 0x63, 0x64, 0x62, 0x66, 0x61, 0x65, 0x63, 0xe7, 0xe0, 0xe4, 0xe2, 0xe6, 0x01, 0x00, 0x01, 0x78, 0x00, 0x4f };
+        const std::vector<uint8_t> ramp{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12 };
+        out.clear();
+        VERIFY_IS_TRUE(KittyParser::_inflateZlib(c12, out, 32 * 1024 * 1024));
+        VERIFY_ARE_EQUAL(ramp.size(), out.size());
+        VERIFY_IS_TRUE(std::equal(out.begin(), out.end(), ramp.begin()));
+    }
+
+    TEST_METHOD(KittyInflateZlibEnforcesCap)
+    {
+        const std::vector<uint8_t> cAB{ 0x78, 0xda, 0x5b, 0xbd, 0x9a, 0x32, 0x00, 0x00, 0x6d, 0xeb, 0x2a, 0xc1 };
+        std::vector<uint8_t> out;
+        VERIFY_IS_FALSE(KittyParser::_inflateZlib(cAB, out, 32)); // 64 > 32 -> reject
+        VERIFY_IS_TRUE(out.empty());
+        VERIFY_IS_TRUE(KittyParser::_inflateZlib(cAB, out, 64)); // 64 <= 64 -> accept
+        VERIFY_ARE_EQUAL(64u, out.size());
+    }
+
+    TEST_METHOD(KittyInflateZlibRejectsMalformed)
+    {
+        BEGIN_TEST_METHOD_PROPERTIES()
+            TEST_METHOD_PROPERTY(L"DataSource", L"Export:KittyInflateRejectDataSource")
+        END_TEST_METHOD_PROPERTIES()
+
+        size_t i{};
+        TestData::TryGetValue(L"index", i);
+        const auto& tc = kittyInflateRejectCases[i];
+        Log::Comment(NoThrowString().Format(L"[%zu] %.*s", i, static_cast<int>(tc.name.size()), tc.name.data()));
+
+        std::vector<uint8_t> out;
+        VERIFY_IS_FALSE(KittyParser::_inflateZlib(tc.bytes, out, 32 * 1024 * 1024));
+    }
+
+    TEST_METHOD(KittyGraphicsZlibChunkedTransmitDecodes)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1b_Ga=t,i=15,f=24,s=2,v=2,o=z,m=1;eNpjZGJm\x1b\\");
+        VERIFY_IS_TRUE(_testGetSet->_response.empty(), L"An intermediate chunk should not respond.");
+        _stateMachine->ProcessString(L"\x1b_Gm=0;YWVj5+Dk4uYBAAF4AE8=\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=15;OK\x1b\\");
+    }
+
+    TEST_METHOD(KittyGraphicsZlibPngTransmitDecodes)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=14,f=100,o=z;eJzrDPBz5+UCAAb9AYY=\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=14;OK\x1b\\");
+        VERIFY_IS_TRUE(_testGetSet->_decodeImageCallCount > 0, L"o=z + f=100 must reach the host PNG decoder.");
+    }
+
+    TEST_METHOD(KittyGraphicsZlibWrongInflatedSizeIsEinval)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1b_Ga=t,i=21,f=24,s=3,v=2,o=z;eNpjZGJmYWVj5+Dk4uYBAAF4AE8=\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=21;EINVAL:payload size mismatch\x1b\\");
+        VERIFY_ARE_EQUAL(static_cast<size_t>(0), _kitty()._images.count(21), L"a size-mismatched o=z payload must not store an image.");
+    }
+
+    TEST_METHOD(KittyGraphicsZlibF32TransmitDecodes)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1b_Ga=t,i=22,f=32,s=4,v=4,o=z;eNpbvZoyAABt6yrB\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=22;OK\x1b\\");
+        const auto it = _kitty()._images.find(22);
+        VERIFY_IS_TRUE(it != _kitty()._images.end(), L"the o=z f=32 transmit must store an image under id 22.");
+        VERIFY_ARE_EQUAL(4u, it->second.width);
+        VERIFY_ARE_EQUAL(4u, it->second.height);
+        VERIFY_ARE_EQUAL(static_cast<size_t>(16), it->second.pixels->size());
+        for (const auto& p : *it->second.pixels)
+        {
+            VERIFY_ARE_EQUAL(114, static_cast<int>(p.rgbRed));
+            VERIFY_ARE_EQUAL(114, static_cast<int>(p.rgbGreen));
+            VERIFY_ARE_EQUAL(114, static_cast<int>(p.rgbBlue));
+            VERIFY_ARE_EQUAL(0xAB, static_cast<int>(p.rgbReserved));
+        }
+    }
+
+    TEST_METHOD(KittyGraphicsRegistryEvictsOldest)
+    {
+        _testGetSet->PrepData();
+        for (auto i = 1; i <= 4097; ++i)
+        {
+            _stateMachine->ProcessString(L"\x1b_Ga=t,i=" + std::to_wstring(i) + L",f=24,s=1,v=1;AAAA\x1b\\");
+        }
+        _testGetSet->_response.clear();
+        _stateMachine->ProcessString(L"\x1b_Ga=p,i=1;\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=1;ENOENT:image not found\x1b\\");
+        _stateMachine->ProcessString(L"\x1b_Ga=p,i=4097;\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=4097;OK\x1b\\");
+    }
+
+    TEST_METHOD(KittyGraphicsRetransmitMovesToBackOfEviction)
+    {
+        _testGetSet->PrepData();
+        for (auto i = 1; i <= 4096; ++i)
+        {
+            _stateMachine->ProcessString(L"\x1b_Ga=t,i=" + std::to_wstring(i) + L",f=24,s=1,v=1;AAAA\x1b\\");
+        }
+        _stateMachine->ProcessString(L"\x1b_Ga=t,i=1,f=24,s=1,v=1;AAAA\x1b\\"); // re-transmit -> moves id 1 to back
+        _stateMachine->ProcessString(L"\x1b_Ga=t,i=4097,f=24,s=1,v=1;AAAA\x1b\\"); // over cap -> evicts the new front (id 2)
+        _testGetSet->_response.clear();
+        _stateMachine->ProcessString(L"\x1b_Ga=p,i=1;\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=1;OK\x1b\\"); // survived
+        _stateMachine->ProcessString(L"\x1b_Ga=p,i=2;\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=2;ENOENT:image not found\x1b\\"); // evicted
+    }
+
+    TEST_METHOD(KittyGraphicsLocalMediaAreOffByDefault)
+    {
+        const std::pair<std::wstring_view, std::wstring_view> cases[]{
+            { L"\x1b_Ga=t,i=30,f=24,s=1,v=1,t=f;L3RtcC94\x1b\\", L"\x1b_Gi=30;EINVAL:unsupported transmission medium\x1b\\" },
+            { L"\x1b_Ga=t,i=31,f=24,s=1,v=1,t=t;L3RtcC94\x1b\\", L"\x1b_Gi=31;EINVAL:unsupported transmission medium\x1b\\" },
+            { L"\x1b_Ga=t,i=32,f=24,s=1,v=1,t=s;TG9jYWxca2l0dHktc2htLXRlc3Q=\x1b\\", L"\x1b_Gi=32;EINVAL:unsupported transmission medium\x1b\\" },
+            { L"\x1b_Ga=T,i=33,f=24,s=1,v=1,t=f;L3RtcC94\x1b\\", L"\x1b_Gi=33;EINVAL:unsupported transmission medium\x1b\\" },
+            { L"\x1b_Ga=q,i=34,f=24,s=1,v=1,t=t;L3RtcC94\x1b\\", L"\x1b_Gi=34;EINVAL:unsupported transmission medium\x1b\\" },
+            // The refusal is indistinguishable from a medium the protocol has never heard of.
+            { L"\x1b_Ga=t,i=35,f=24,s=1,v=1,t=x;AAAA\x1b\\", L"\x1b_Gi=35;EINVAL:unsupported transmission medium\x1b\\" },
+        };
+
+        for (const auto& [sequence, expected] : cases)
+        {
+            _testGetSet->PrepData();
+            _stateMachine->ProcessString(sequence);
+            _testGetSet->ValidateInputEvent(expected.data());
+            VERIFY_ARE_EQUAL(0, _testGetSet->_readLocalFileCallCount, L"a gated medium must never reach the host file read.");
+            VERIFY_ARE_EQUAL(0, _testGetSet->_readSharedMemoryCallCount, L"a gated medium must never reach the host shared memory read.");
+            VERIFY_IS_FALSE(_testGetSet->_lastKittyFileDeleteAfter, L"a gated t=t must never ask for a deletion.");
+            VERIFY_IS_TRUE(_kitty()._images.empty(), L"a gated medium must not register an image.");
+        }
+    }
+
+    TEST_METHOD(KittyGraphicsInlineMediaUnaffectedByLocalMediaGate)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=36,f=24,s=1,v=1,t=d;/wAA\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=36;OK\x1b\\");
+        VERIFY_ARE_EQUAL(static_cast<size_t>(1), _kitty()._images.count(36));
+
+        // An omitted t= is t=d, and the inline error codes are untouched by the gate.
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1b_Ga=t,i=37,f=24,s=2,v=2;/wAA\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=37;EINVAL:payload size mismatch\x1b\\");
+    }
+
+    TEST_METHOD(KittyGraphicsByteAccounting)
+    {
+        _testGetSet->PrepData();
+        VERIFY_ARE_EQUAL(static_cast<size_t>(0), _kitty()._totalPixelBytes);
+        // 2x2 RGBA = 4 px stored as 4 RGBQUAD = 16 bytes.
+        _stateMachine->ProcessString(L"\x1b_Ga=t,i=1,f=32,s=2,v=2;AAAAAAAAAAAAAAAAAAAAAA==\x1b\\");
+        VERIFY_ARE_EQUAL(static_cast<size_t>(16), _kitty()._totalPixelBytes);
+        _stateMachine->ProcessString(L"\x1b_Ga=t,i=1,f=32,s=2,v=2;AAAAAAAAAAAAAAAAAAAAAA==\x1b\\"); // replace
+        VERIFY_ARE_EQUAL(static_cast<size_t>(16), _kitty()._totalPixelBytes);
+        _stateMachine->ProcessString(L"\x1b_Ga=d,d=I,i=1;\x1b\\"); // delete frees bytes
+        VERIFY_ARE_EQUAL(static_cast<size_t>(0), _kitty()._totalPixelBytes);
+    }
+
+    TEST_METHOD(KittyGraphicsNewTransferResetsOrphanedChunk)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1b_Ga=t,i=1,f=24,s=2,v=2,m=1;/wAA\x1b\\"); // orphaned (no m=0)
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=2,f=24,s=1,v=1;AP8A\x1b\\"); // fresh transfer
+        _testGetSet->_response.clear();
+        _stateMachine->ProcessString(L"\x1b_Ga=p,i=2;\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=2;OK\x1b\\"); // id 2 registered cleanly
+        _stateMachine->ProcessString(L"\x1b_Ga=p,i=1;\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=1;ENOENT:image not found\x1b\\"); // id 1 discarded
+    }
+
+    TEST_METHOD(KittyGraphicsChunkedContinuationQuietDoesNotDropTransfer)
+    {
+        _testGetSet->PrepData();
+        // Three chunks of "AAAA" (3 bytes each) assemble 9 bytes == 3*1*3 for f=24.
+        _stateMachine->ProcessString(L"\x1b_Ga=t,i=42,f=24,s=3,v=1,m=1;AAAA\x1b\\"); // first chunk
+        VERIFY_IS_TRUE(_testGetSet->_response.empty(), L"An intermediate chunk must not respond.");
+        _stateMachine->ProcessString(L"\x1b_Gm=1;AAAA\x1b\\"); // middle continuation chunk
+        VERIFY_IS_TRUE(_testGetSet->_response.empty(), L"An intermediate chunk must not respond.");
+        // Final continuation chunk carries q=2: the transfer must complete (not drop),
+        // storing the image, and q=2 must suppress the acknowledgement.
+        _stateMachine->ProcessString(L"\x1b_Gm=0,q=2;AAAA\x1b\\");
+        VERIFY_IS_TRUE(_testGetSet->_response.empty(), L"q=2 on the final chunk must suppress the ack.");
+        VERIFY_ARE_EQUAL(static_cast<size_t>(1), _kitty()._images.count(42), L"The chunked image must be stored, not dropped.");
+    }
+
+    TEST_METHOD(KittyGraphicsCanAbortClearsChunkState)
+    {
+        _testGetSet->PrepData();
+        // First chunk completes normally (ESC), leaving a transfer in progress with
+        // exactly 3 pending bytes ("AAAA") that would satisfy s=1,v=1,f=24.
+        _stateMachine->ProcessString(L"\x1b_Ga=t,i=90,f=24,s=1,v=1,m=1;AAAA\x1b\\");
+        VERIFY_IS_TRUE(_testGetSet->_response.empty(), L"An intermediate chunk must not respond.");
+        VERIFY_IS_TRUE(_kitty()._chunkActive, L"The first chunk should leave a transfer active.");
+
+        // A continuation chunk is aborted mid-APC by a CAN; its payload must be
+        // dropped AND the pending transfer discarded.
+        _stateMachine->ProcessString(L"\x1b_Gm=1;BBBB\x18");
+        VERIFY_IS_TRUE(_testGetSet->_response.empty(), L"CAN must abort without an acknowledgement.");
+        VERIFY_IS_FALSE(_kitty()._chunkActive, L"CAN must clear the pending chunk state.");
+
+        // A later bare "m=0" must NOT finalize the aborted transfer. Because the chunk
+        // state was cleared it is treated as a fresh (and here, incomplete) command, so
+        // no stale image id 90 is ever stored.
+        _stateMachine->ProcessString(L"\x1b_Gm=0;\x1b\\");
+        VERIFY_ARE_EQUAL(static_cast<size_t>(0), _kitty()._images.count(90), L"The aborted transfer must not have been finalized.");
+
+        // A normal (unaborted) chunked transfer must still assemble and store.
+        _stateMachine->ProcessString(L"\x1b_Ga=t,i=92,f=24,s=2,v=1,m=1;AAAA\x1b\\");
+        _stateMachine->ProcessString(L"\x1b_Gm=0;AAAA\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=92;OK\x1b\\");
+        VERIFY_ARE_EQUAL(static_cast<size_t>(1), _kitty()._images.count(92), L"A normal chunked transfer must still work.");
+    }
+
+    TEST_METHOD(KittyGraphicsBufferSwitchDiscardsAnInProgressChunkedTransfer)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+
+        _stateMachine->ProcessString(L"\x1b_Ga=t,i=9,f=24,s=1,v=1,m=1;/w\x1b\\");
+        VERIFY_IS_TRUE(_kitty()._chunkActive, L"sanity: a transfer is in progress");
+
+        _stateMachine->ProcessString(L"\x1b[?1049h");
+        VERIFY_IS_FALSE(_kitty()._chunkActive, L"entering the alt buffer discards it");
+
+        // The continuation that would have completed it must now do nothing at all.
+        _stateMachine->ProcessString(L"\x1b_Gm=0;AAA=\x1b\\");
+        VERIFY_IS_FALSE(_kitty()._images.contains(9u), L"the orphaned continuation must not produce an image");
+
+        _stateMachine->ProcessString(L"\x1b_Ga=t,i=9,f=24,s=1,v=1,m=1;/w\x1b\\");
+        VERIFY_IS_TRUE(_kitty()._chunkActive);
+        _stateMachine->ProcessString(L"\x1b[?1049l");
+        VERIFY_IS_FALSE(_kitty()._chunkActive, L"leaving the alt buffer discards it too");
+    }
+
+    TEST_METHOD(KittyGraphicsOverlongControlBlockIsRefusedNotTruncated)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+
+        // Pad so the bound falls in the MIDDLE of the image id: truncation would keep
+        // "i=12" and store a different image entirely. This is the dangerous shape -- the
+        // result is not malformed, it is a different perfectly valid command.
+        constexpr size_t bound = 1024;
+        std::wstring prefix = L"a=t,f=24,s=1,v=1";
+        while (prefix.size() + 4 <= bound - 5)
+        {
+            prefix += L",q=0";
+        }
+        while (prefix.size() < bound - 5)
+        {
+            prefix += L"0";
+        }
+        const auto control = prefix + L",i=1234";
+        VERIFY_ARE_EQUAL(std::wstring_view{ L",i=12" }, std::wstring_view{ control }.substr(bound - 5, 5), L"sanity: truncation would keep i=12");
+        VERIFY_IS_GREATER_THAN(control.size(), bound, L"sanity: the id straddles the bound");
+        _stateMachine->ProcessString(L"\x1b_G" + control + L";/wAA\x1b\\");
+
+        VERIFY_IS_TRUE(_kitty()._images.empty(), L"nothing may be stored from a control block we could not read");
+        VERIFY_IS_FALSE(_kitty()._images.contains(12u), L"and certainly not under the truncated id");
+
+        // Also the simpler shape, where the bound falls before the id entirely and
+        // truncation would leave a valid id-less transmit that gets an auto-assigned id.
+        std::wstring past = L"a=t,f=24,s=1,v=1";
+        while (past.size() < 1100)
+        {
+            past += L",q=0";
+        }
+        past += L",i=1234";
+        _stateMachine->ProcessString(L"\x1b_G" + past + L";/wAA\x1b\\");
+        VERIFY_IS_TRUE(_kitty()._images.empty(), L"nor may an over-long block store an auto-assigned image");
+
+        // And the same command within the bound still works, so the guard has not simply
+        // disabled long-but-legal control blocks.
+        std::wstring shorter = L"a=t,f=24,s=1,v=1";
+        while (shorter.size() < 900)
+        {
+            shorter += L",q=0";
+        }
+        shorter += L",i=1234";
+        _stateMachine->ProcessString(L"\x1b_G" + shorter + L";/wAA\x1b\\");
+        VERIFY_IS_TRUE(_kitty()._images.contains(1234u), L"a long but in-bounds control block still parses");
+    }
+
+    TEST_METHOD(NonKittyApcIgnored)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1b_Zhello\x1b\\");
+        VERIFY_IS_TRUE(_testGetSet->_response.empty(), L"A non-Kitty APC should produce no response.");
+    }
+
+    TEST_METHOD(SosPmStringsStillIgnored)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1bXsos data\x1b\\");
+        _stateMachine->ProcessString(L"\x1b^pm data\x1b\\");
+        VERIFY_IS_TRUE(_testGetSet->_response.empty(), L"SOS/PM strings should be ignored.");
+    }
+
 private:
     TerminalInput _terminalInput;
     std::unique_ptr<TestGetSet> _testGetSet;
+    // The parser is created on the first APC G sequence. A test that inspects its
+    // state before sending one sees the same empty registry either way.
+    KittyParser& _kitty()
+    {
+        if (!_pDispatch->_kittyParser)
+        {
+            _pDispatch->_kittyParser = std::make_unique<KittyParser>(*_pDispatch);
+        }
+        return *_pDispatch->_kittyParser;
+    }
+
     AdaptDispatch* _pDispatch; // non-ownership pointer
     std::unique_ptr<StateMachine> _stateMachine;
 };
