@@ -90,6 +90,14 @@ class ImageTests
     }
 };
 
+template<typename T>
+concept HasRowImageStorage = requires(T& row) {
+    row.GetImageSlice();
+    row.GetMutableImageSlice();
+};
+
+static_assert(!HasRowImageStorage<ROW>);
+
 void ImageTests::RowQueryIsHalfOpenAndZOrdered()
 {
     ImageCollection images;

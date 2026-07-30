@@ -55,9 +55,6 @@ namespace Microsoft::Console::Render
                                                    const COLORREF underlineColor,
                                                    const size_t cchLine,
                                                    const til::point coordTarget) noexcept override;
-        [[nodiscard]] HRESULT PaintImageSlice(const ImageSlice& imageSlice,
-                                              const til::CoordType targetRow,
-                                              const til::CoordType viewportLeft) noexcept override;
         [[nodiscard]] HRESULT PrepareImageFrame(ImageFrameInfo info) noexcept override;
         [[nodiscard]] HRESULT BeginRowImages(til::CoordType targetRow,
                                              til::CoordType viewportLeft,
@@ -183,7 +180,6 @@ namespace Microsoft::Console::Render
         std::pmr::vector<std::pmr::wstring> _polyStrings;
         std::pmr::vector<std::pmr::vector<int>> _polyWidths;
 
-        std::vector<DWORD> _imageMask;
         struct CachedImageSurface
         {
             Image::Pointer image;
@@ -199,11 +195,24 @@ namespace Microsoft::Console::Render
         std::vector<ImagePlacement> _frameImagePlacements;
         til::point _imageViewportOrigin{};
         HRESULT _imageRenderResult = S_OK;
+        // A DIB section to blend image content from. Declared before the device
+        // context that selects it so that the context is destroyed first and the
+        // bitmap is no longer selected anywhere by the time it goes.
+        wil::unique_hbitmap _hbitmapImageSource;
+        wil::unique_hdc _hdcImageSource;
+        til::size _szImageSource;
+        RGBQUAD* _imageSourceBits = nullptr;
         til::CoordType _rowImageTargetRow = 0;
         til::CoordType _rowImageViewportLeft = 0;
+        // One flag per screen column of the current row's slice, set where
+        // image content will end up visibly below the text. Text over those
+        // columns must not fill its own background or it would paint the
+        // image out. Screen columns, so the line rendition is already applied.
         std::vector<uint8_t> _underlayColumns;
         til::CoordType _underlayColumnOffset = 0;
         int _underlayScale = 0;
+        // The background mode to put back once this row's text has been drawn,
+        // or 0 if we never changed it. See BeginRowImages.
         int _restoreBkMode = 0;
 
         [[nodiscard]] HRESULT _PrepareImageSurface(const ImageFrameInfo::Surface& surface) noexcept;
@@ -216,6 +225,7 @@ namespace Microsoft::Console::Render
         void _MarkDirectImageUnderlay(const ImagePlacement& placement,
                                       til::CoordType targetRow,
                                       std::span<const uint8_t> defaultBackgroundMask) noexcept;
+        [[nodiscard]] HRESULT _PrepareImageSourceSurface(til::size size, _Outptr_result_maybenull_ RGBQUAD** bits) noexcept;
         bool _UnderlayCoversColumn(til::CoordType column) const noexcept;
         bool _UnderlayCoversBufferCell(til::CoordType bufferColumn) const noexcept;
         bool _UnderlayCoversAnyOf(til::CoordType columnBegin, til::CoordType columnEnd) const noexcept;

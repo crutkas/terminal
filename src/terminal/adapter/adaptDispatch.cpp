@@ -582,8 +582,6 @@ void AdaptDispatch::_ScrollRectVertically(const Page& page, const til::rect& scr
                 srcView.WalkInBounds(srcPos, walkDirection);
             } while (dstView.WalkInBounds(dstPos, walkDirection));
             sourceImages.CopyArea(srcView.ToExclusive(), dstOrigin, textBuffer.GetMutableImages());
-            // Copy any image content in the affected area.
-            ImageSlice::CopyBlock(textBuffer, srcView.ToExclusive(), textBuffer, dstView.ToExclusive());
         }
     }
 
@@ -636,8 +634,6 @@ void AdaptDispatch::_ScrollRectHorizontally(const Page& page, const til::rect& s
             textBuffer.WriteLine(OutputCellIterator({ &current, 1 }), targetPos);
         } while (target.WalkInBounds(targetPos, walkDirection));
         sourceImages.CopyArea(source.ToExclusive(), { left + actualDelta, top }, textBuffer.GetMutableImages());
-        // Copy any image content in the affected area.
-        ImageSlice::CopyBlock(textBuffer, source.ToExclusive(), textBuffer, target.ToExclusive());
     }
 
     // Columns revealed by the scroll are filled with standard erase attributes.
@@ -881,7 +877,6 @@ void AdaptDispatch::_SelectiveEraseRect(const Page& page, const til::rect& erase
             for (auto col = area.left; col < area.right; col++)
             {
                 rowBuffer.ClearCell(col);
-                ImageSlice::EraseCells(rowBuffer, col, col + 1);
             }
             page.Buffer().TriggerRedraw(Viewport::FromExclusive(area));
         }
@@ -1225,8 +1220,6 @@ void AdaptDispatch::CopyRectangularArea(const VTInt top, const VTInt left, const
             }
         } while (dstView.WalkInBounds(dstPos, walkDirection));
         sourceImages.CopyArea(srcView.ToExclusive(), dstRect.origin(), dst.Buffer().GetMutableImages());
-        // Copy any image content in the affected area.
-        ImageSlice::CopyBlock(src.Buffer(), srcView.ToExclusive(), dst.Buffer(), dstView.ToExclusive());
     }
 }
 

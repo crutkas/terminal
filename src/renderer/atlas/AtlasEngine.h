@@ -44,7 +44,6 @@ namespace Microsoft::Console::Render::Atlas
         [[nodiscard]] HRESULT PaintBackground() noexcept override;
         [[nodiscard]] HRESULT PaintBufferLine(std::span<const Cluster> clusters, til::point coord, bool fTrimLeft) noexcept override;
         [[nodiscard]] HRESULT PaintBufferGridLines(const GridLineSet lines, const COLORREF gridlineColor, const COLORREF underlineColor, const size_t cchLine, const til::point coordTarget) noexcept override;
-        [[nodiscard]] HRESULT PaintImageSlice(const ImageSlice& imageSlice, til::CoordType targetRow, til::CoordType viewportLeft) noexcept override;
         [[nodiscard]] HRESULT BeginRowImages(til::CoordType targetRow, til::CoordType viewportLeft, std::span<const uint8_t> defaultBackgroundMask, std::span<const COLORREF> cellBackgrounds) noexcept override;
         [[nodiscard]] HRESULT EndRowImages() noexcept override;
         [[nodiscard]] HRESULT PaintSelection(const til::rect& rect) noexcept override;

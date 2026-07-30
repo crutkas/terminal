@@ -8,11 +8,149 @@
 #include "../../../renderer/inc/DummyRenderer.hpp"
 
 #include "adaptDispatch.hpp"
-#include "../../../buffer/out/ImageSlice.hpp"
+#include "SixelParser.hpp"
+#include "../../../buffer/out/Image.hpp"
 
 using namespace WEX::Common;
 using namespace WEX::Logging;
 using namespace WEX::TestExecution;
+
+// Test-only compositor for inspecting shared rectangular placements. Production
+// code intentionally has no row-owned image representation.
+class TestImageRow final
+{
+public:
+    using RenderPosition = ImagePlacement::RenderPosition;
+    static constexpr size_t RenderPositionCount = 3;
+
+    TestImageRow(const til::size cellSize, const til::CoordType columnOffset, const til::CoordType columnCount) :
+        _cellSize{ cellSize },
+        _columnOffset{ columnOffset },
+        _pixelWidth{ columnCount * cellSize.width }
+    {
+        const auto pixelCount = gsl::narrow<size_t>(_pixelWidth) * gsl::narrow<size_t>(_cellSize.height);
+        for (auto& plane : _planes)
+        {
+            plane.resize(pixelCount);
+        }
+    }
+
+    til::size CellSize() const noexcept
+    {
+        return _cellSize;
+    }
+
+    til::CoordType ColumnOffset() const noexcept
+    {
+        return _columnOffset;
+    }
+
+    til::CoordType PixelWidth() const noexcept
+    {
+        return _pixelWidth;
+    }
+
+    std::span<const RGBQUAD> Pixels(const RenderPosition position) const noexcept
+    {
+        return _planes.at(static_cast<size_t>(position));
+    }
+
+    std::span<const RGBQUAD> Pixels() const noexcept
+    {
+        return Pixels(RenderPosition::AboveText);
+    }
+
+    bool Rasterize(const ImagePlacement& placement,
+                   const til::CoordType row,
+                   til::CoordType columnBegin,
+                   til::CoordType columnEnd)
+    {
+        const auto bounds = placement.CellBounds();
+        if (row < bounds.top || row >= bounds.bottom)
+        {
+            return false;
+        }
+
+        columnBegin = std::max({ columnBegin, bounds.left, _columnOffset });
+        columnEnd = std::min({ columnEnd, bounds.right, _columnOffset + _pixelWidth / _cellSize.width });
+        if (columnBegin >= columnEnd)
+        {
+            return false;
+        }
+
+        const auto position = placement.Position();
+        const auto positionIndex = static_cast<size_t>(position);
+
+        auto& destination = _planes.at(positionIndex);
+        const auto geometry = placement.Geometry();
+        const auto originalBounds = placement.OriginalCellBounds();
+        const auto sourceRect = placement.SourceInPixels();
+        const auto surfaceSize = placement.Surface().PixelSize();
+        const auto sourcePixels = placement.Surface().Pixels();
+
+        for (auto outputY = 0; outputY < _cellSize.height; ++outputY)
+        {
+            const auto placementY = (static_cast<int64_t>(row) - originalBounds.top) * geometry.cellSize.height +
+                                    static_cast<int64_t>(outputY) * geometry.cellSize.height / _cellSize.height;
+            const auto targetY = placementY - geometry.offset.y;
+            if (targetY < 0 || static_cast<uint64_t>(targetY) >= geometry.targetHeight)
+            {
+                continue;
+            }
+            const auto sourceY = sourceRect.top + std::min<int64_t>(
+                                                      sourceRect.height() - 1,
+                                                      targetY * sourceRect.height() / gsl::narrow_cast<int64_t>(geometry.targetHeight));
+
+            for (auto column = columnBegin; column < columnEnd; ++column)
+            {
+                for (auto outputX = 0; outputX < _cellSize.width; ++outputX)
+                {
+                    const auto placementX = (static_cast<int64_t>(column) - originalBounds.left) * geometry.cellSize.width +
+                                            static_cast<int64_t>(outputX) * geometry.cellSize.width / _cellSize.width;
+                    const auto targetX = placementX - geometry.offset.x;
+                    if (targetX < 0 || static_cast<uint64_t>(targetX) >= geometry.targetWidth)
+                    {
+                        continue;
+                    }
+                    const auto sourceX = sourceRect.left + std::min<int64_t>(
+                                                               sourceRect.width() - 1,
+                                                               targetX * sourceRect.width() / gsl::narrow_cast<int64_t>(geometry.targetWidth));
+                    const auto sourceIndex = gsl::narrow<size_t>(sourceY) * gsl::narrow<size_t>(surfaceSize.width) +
+                                             gsl::narrow<size_t>(sourceX);
+                    const auto destinationIndex = gsl::narrow<size_t>(outputY) * gsl::narrow<size_t>(_pixelWidth) +
+                                                  gsl::narrow<size_t>(column - _columnOffset) * gsl::narrow<size_t>(_cellSize.width) +
+                                                  gsl::narrow<size_t>(outputX);
+                    if (sourceIndex < sourcePixels.size() && destinationIndex < destination.size())
+                    {
+                        const auto source = til::at(sourcePixels, sourceIndex);
+                        if (source.rgbReserved == 0xff)
+                        {
+                            til::at(destination, destinationIndex) = source;
+                        }
+                        else if (source.rgbReserved != 0)
+                        {
+                            auto& target = til::at(destination, destinationIndex);
+                            const auto inverseAlpha = 255 - source.rgbReserved;
+                            target.rgbBlue = gsl::narrow_cast<BYTE>(source.rgbBlue + (target.rgbBlue * inverseAlpha + 127) / 255);
+                            target.rgbGreen = gsl::narrow_cast<BYTE>(source.rgbGreen + (target.rgbGreen * inverseAlpha + 127) / 255);
+                            target.rgbRed = gsl::narrow_cast<BYTE>(source.rgbRed + (target.rgbRed * inverseAlpha + 127) / 255);
+                            target.rgbReserved = gsl::narrow_cast<BYTE>(source.rgbReserved + (target.rgbReserved * inverseAlpha + 127) / 255);
+                        }
+                    }
+                }
+            }
+        }
+        return true;
+    }
+
+private:
+    til::size _cellSize;
+    til::CoordType _columnOffset = 0;
+    til::CoordType _pixelWidth = 0;
+    std::array<std::vector<RGBQUAD>, RenderPositionCount> _planes;
+};
+
+using ImageSlice = TestImageRow;
 
 namespace Microsoft
 {
@@ -4032,7 +4170,7 @@ public:
         _testGetSet->ValidateInputEvent(L"\x1b]4;0;rgb:0c0c/0c0c/0c0c\x1b\\");
     }
 
-    // Scans the whole buffer for the first row that carries an image slice.
+    // Scans the whole buffer for the first row covered by a shared placement.
     // Sixel images are written at the cursor position, so the exact row depends
     // on cursor/viewport state; scanning keeps these tests position-independent.
     static const ImageSlice* FindFirstImageSlice(const TextBuffer& buffer, til::CoordType& outRow)
@@ -4040,7 +4178,7 @@ public:
         const auto height = buffer.GetSize().Height();
         for (til::CoordType y = 0; y < height; y++)
         {
-            if (const auto slice = buffer.GetRowByOffset(y).GetImageSlice())
+            if (const auto slice = DirectImageSlice(buffer, y))
             {
                 outRow = y;
                 return slice;
@@ -4056,11 +4194,16 @@ public:
         {
             return false;
         }
-        for (const auto& px : slice->Pixels())
+        // "Anywhere in this slice" spans every plane: content behind the text is
+        // no less present than content above it.
+        for (size_t plane = 0; plane < ImageSlice::RenderPositionCount; ++plane)
         {
-            if (px.rgbRed == r && px.rgbGreen == g && px.rgbBlue == b)
+            for (const auto& px : slice->Pixels(static_cast<ImageSlice::RenderPosition>(plane)))
             {
-                return true;
+                if (px.rgbRed == r && px.rgbGreen == g && px.rgbBlue == b)
+                {
+                    return true;
+                }
             }
         }
         return false;
@@ -4071,7 +4214,7 @@ public:
         const auto height = buffer.GetSize().Height();
         for (til::CoordType y = 0; y < height; y++)
         {
-            if (SliceContainsColor(buffer.GetRowByOffset(y).GetImageSlice(), r, g, b))
+            if (SliceContainsColor(DirectImageSlice(buffer, y), r, g, b))
             {
                 return true;
             }
@@ -4085,7 +4228,7 @@ public:
         const auto height = buffer.GetSize().Height();
         for (til::CoordType y = 0; y < height; y++)
         {
-            if (buffer.GetRowByOffset(y).GetImageSlice())
+            if (!buffer.GetImages().IntersectingRows(y, y + 1).empty())
             {
                 count++;
             }
@@ -4093,12 +4236,67 @@ public:
         return count;
     }
 
+    static void VerifyNoDirectImageLayers(const TextBuffer& buffer, const til::CoordType row)
+    {
+        for (const auto placement : buffer.GetImages().IntersectingRows(row, row + 1))
+        {
+            VERIFY_IS_FALSE(placement->Surface().Pixels().empty(), L"all image pixels must be owned by shared surfaces");
+        }
+    }
+
+    static void VerifyNoDirectImageLayers(const TextBuffer& buffer)
+    {
+        for (til::CoordType row = 0; row < buffer.GetSize().Height(); ++row)
+        {
+            VerifyNoDirectImageLayers(buffer, row);
+        }
+    }
+
+    // Adapter tests inspect the collection through a test-only rectangular
+    // compositor that never becomes part of TextBuffer.
+    static const ImageSlice* DirectImageSlice(const TextBuffer& buffer, const til::CoordType row)
+    {
+        VerifyNoDirectImageLayers(buffer, row);
+
+        const auto placements = buffer.GetImages().IntersectingRows(row, row + 1);
+        if (placements.empty())
+        {
+            return nullptr;
+        }
+
+        static thread_local std::vector<std::unique_ptr<ImageSlice>> slices;
+        if (slices.size() == 64)
+        {
+            slices.erase(slices.begin());
+        }
+        auto left = buffer.GetSize().Width();
+        auto right = til::CoordType{ 0 };
+        for (const auto placement : placements)
+        {
+            left = std::min(left, placement->CellBounds().left);
+            right = std::max(right, placement->CellBounds().right);
+        }
+        auto slice = std::make_unique<ImageSlice>(placements.front()->Geometry().cellSize, left, right - left);
+        const auto width = buffer.GetSize().Width();
+        for (const auto& placement : placements)
+        {
+            const auto fragment = placement.Crop(placement->CellBounds());
+            VERIFY_IS_TRUE(fragment && slice->Rasterize(*fragment, row, 0, width));
+        }
+
+        const auto result = slice.get();
+        slices.emplace_back(std::move(slice));
+        return result;
+    }
+
     // Returns the pixel at (px, py) within an image slice's own pixel buffer (px is
     // relative to the slice's left edge). Used for exact positional color checks
     // rather than the "is this color anywhere in the slice" SliceContainsColor scan.
     static RGBQUAD SlicePixelAt(const ImageSlice* slice, til::CoordType px, til::CoordType py)
     {
-        const auto pixels = slice->Pixels();
+        // A placement with no explicit z sits above the text, so that is the
+        // plane an unqualified positional check means.
+        const auto pixels = slice->Pixels(ImageSlice::RenderPosition::AboveText);
         const auto idx = static_cast<size_t>(py) * slice->PixelWidth() + px;
         return idx < pixels.size() ? pixels[idx] : RGBQUAD{};
     }
@@ -4120,6 +4318,18 @@ public:
             }
         }
         return count;
+    }
+
+    // True if the slice pixel at (px, py) is exactly (r, g, b). Lets a test assert WHICH
+    // grid tile landed in WHICH cell, not just that a color appears somewhere in the row.
+    static bool SlicePixelIs(const ImageSlice* slice, til::CoordType px, til::CoordType py, BYTE r, BYTE g, BYTE b)
+    {
+        if (!slice)
+        {
+            return false;
+        }
+        const auto p = SlicePixelAt(slice, px, py);
+        return p.rgbRed == r && p.rgbGreen == g && p.rgbBlue == b;
     }
 
     // Baseline smoke test: the simplest valid sixel (one color, one full column) must produce a
@@ -4499,6 +4709,241 @@ public:
         const auto& buffer = *_testGetSet->_textBuffer;
         VERIFY_IS_TRUE(BufferContainsColor(buffer, 255, 0, 0), L"Bare #0 must select the red register.");
         VERIFY_IS_TRUE(BufferContainsColor(buffer, 0, 0, 255), L"Bare #1 must select the blue register.");
+    }
+
+    TEST_METHOD(SixelUsesSharedSurfaceWithProtocolIdentity)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1bP0;1q#0;2;100;0;0~\x1b\\");
+
+        const auto& images = _testGetSet->_textBuffer->GetImages().All();
+        VERIFY_ARE_EQUAL(size_t{ 1 }, images.size());
+        VERIFY_ARE_EQUAL(ImagePlacement::Key::Protocol::Sixel, images.front().Identity().protocol);
+        VERIFY_ARE_EQUAL(uint32_t{ 0 }, images.front().Identity().imageId);
+        VERIFY_IS_NOT_NULL(images.front().SurfacePointer().get());
+        VERIFY_IS_TRUE(SliceContainsColor(DirectImageSlice(*_testGetSet->_textBuffer, images.front().CellBounds().top), 255, 0, 0));
+    }
+
+    TEST_METHOD(SixelRepeatedFramesCompactSharedTiles)
+    {
+        _testGetSet->PrepData();
+        auto& buffer = *_testGetSet->_textBuffer;
+        _stateMachine->ProcessString(L"\x1b[?80h");
+        _stateMachine->ProcessString(L"\x1bP0;1q#0;2;100;0;0~~~\x1b\\");
+
+        for (auto frame = 0; frame < 64; ++frame)
+        {
+            const auto color = frame % 2 == 0 ? L"#0;2;0;0;100" : L"#0;2;0;100;0";
+            _stateMachine->ProcessString(std::wstring{ L"\x1bP0;1q" } + color + L"~??\x1b\\");
+            VERIFY_ARE_EQUAL(size_t{ 1 }, buffer.GetImages().Size(), L"one row tile must replace prior Sixel frames in place");
+        }
+
+        const auto placements = buffer.GetImages().All();
+        VERIFY_ARE_EQUAL(size_t{ 1 }, placements.size());
+        std::vector<const Image*> surfaces;
+        size_t pixelCount = 0;
+        for (const auto& placement : placements)
+        {
+            surfaces.emplace_back(placement.SurfacePointer().get());
+            pixelCount += placement.Surface().Pixels().size();
+        }
+        std::ranges::sort(surfaces);
+        const auto uniqueEnd = std::ranges::unique(surfaces).begin();
+        VERIFY_ARE_EQUAL(ptrdiff_t{ 1 }, std::distance(surfaces.begin(), uniqueEnd));
+        VERIFY_IS_TRUE(pixelCount <= static_cast<size_t>(buffer.GetSize().Width()) * 10 * 20,
+                       L"repeated frames must retain only one row-sized backing tile");
+
+        const auto slice = DirectImageSlice(buffer, placements.front().CellBounds().top);
+        VERIFY_IS_NOT_NULL(slice);
+        VERIFY_IS_TRUE(SlicePixelIs(slice, 0, 0, 0, 255, 0), L"the latest opaque pixel must replace the prior frame");
+        VERIFY_IS_TRUE(SlicePixelIs(slice, 2, 0, 255, 0, 0), L"transparent pixels must preserve visible prior Sixel content");
+    }
+
+    TEST_METHOD(SixelIncrementalFlushReusesTileRevision)
+    {
+        _testGetSet->PrepData();
+        auto& buffer = *_testGetSet->_textBuffer;
+
+        _stateMachine->ProcessString(L"\x1bP0;1q#0;2;100;0;0~-");
+        VERIFY_ARE_EQUAL(size_t{ 1 }, buffer.GetImages().Size());
+        const auto firstKey = buffer.GetImages().All().front().Identity();
+        const auto surface = buffer.GetImages().All().front().SurfacePointer();
+        const auto firstRevision = surface->Revision();
+        const auto firstSize = surface->PixelSize();
+        VERIFY_IS_TRUE(std::ranges::any_of(surface->Pixels(), [](const RGBQUAD pixel) { return pixel.rgbRed == 255; }));
+
+        _stateMachine->ProcessString(L"#1;2;0;0;100~\x1b\\");
+
+        VERIFY_ARE_EQUAL(size_t{ 2 }, buffer.GetImages().Size());
+        const auto placements = buffer.GetImages().All();
+        const auto placement = std::ranges::find(placements, firstKey, &ImagePlacement::Identity);
+        VERIFY_IS_TRUE(placement != placements.end());
+        VERIFY_ARE_EQUAL(surface.get(), placement->SurfacePointer().get());
+        VERIFY_ARE_NOT_EQUAL(firstRevision, surface->Revision(), L"one streamed flush must commit a new complete-surface revision");
+        VERIFY_ARE_EQUAL(firstSize, surface->PixelSize(), L"fixed row tiles refresh without growing one GPU surface");
+        VERIFY_IS_TRUE(std::ranges::any_of(surface->Pixels(), [](const RGBQUAD pixel) { return pixel.rgbRed == 255; }),
+                       L"refreshing the tile must preserve the first flushed band");
+        VERIFY_IS_TRUE(std::ranges::any_of(surface->Pixels(), [](const RGBQUAD pixel) { return pixel.rgbBlue == 255; }),
+                       L"the intersecting portion of the second band must appear in the same surface");
+        VERIFY_IS_TRUE(std::ranges::all_of(placements, [](const auto& candidate) {
+            return candidate.Surface().Pixels().size() <=
+                   static_cast<size_t>(Image::MaximumDimension) * Image::MaximumDimension;
+        }));
+    }
+
+    TEST_METHOD(SixelPannedFlushRetainsScrollback)
+    {
+        _testGetSet->PrepData();
+        auto& buffer = *_testGetSet->_textBuffer;
+
+        _stateMachine->ProcessString(L"\x1bP0;1q#0;2;100;0;0~-");
+        VERIFY_ARE_EQUAL(size_t{ 1 }, buffer.GetImages().Size());
+        const auto firstTop = buffer.GetImages().All().front().CellBounds().top;
+
+        ++_testGetSet->_viewport.top;
+        ++_testGetSet->_viewport.bottom;
+        _stateMachine->ProcessString(L"#1;2;0;0;100~\x1b\\");
+
+        const auto placements = buffer.GetImages().All();
+        VERIFY_ARE_EQUAL(size_t{ 2 }, placements.size());
+        const auto firstTile = std::ranges::find_if(placements, [&](const auto& placement) {
+            return placement.CellBounds().top == firstTop;
+        });
+        VERIFY_IS_TRUE(firstTile != placements.end(), L"viewport panning must not discard the flushed band in scrollback");
+        VERIFY_IS_TRUE(std::ranges::any_of(firstTile->Surface().Pixels(), [](const RGBQUAD pixel) { return pixel.rgbRed == 255; }));
+        VERIFY_IS_TRUE(std::ranges::any_of(firstTile->Surface().Pixels(), [](const RGBQUAD pixel) { return pixel.rgbBlue == 255; }));
+    }
+
+    TEST_METHOD(SixelDisplayModeClipsPartialBandAtPageBottom)
+    {
+        _testGetSet->PrepData();
+        auto& buffer = *_testGetSet->_textBuffer;
+        const auto pageBottom = _testGetSet->_viewport.bottom;
+        _stateMachine->ProcessString(L"\x1b[?80h");
+
+        std::wstring sequence{ L"\x1bPq#0;2;100;0;0~" };
+        for (auto band = 1; band < 97; ++band)
+        {
+            sequence.append(L"-~");
+        }
+        sequence.append(L"\x1b\\");
+        _stateMachine->ProcessString(sequence);
+
+        VERIFY_IS_FALSE(buffer.GetImages().Empty());
+        VERIFY_IS_TRUE(std::ranges::all_of(buffer.GetImages().All(), [&](const auto& placement) {
+            return placement.CellBounds().bottom <= pageBottom;
+        }));
+        VERIFY_IS_TRUE(std::ranges::any_of(buffer.GetImages().All(), [&](const auto& placement) {
+                           return placement.CellBounds().bottom == pageBottom;
+                       }),
+                       L"DECSDM must clip a partial final band to the page");
+
+        ++_testGetSet->_viewport.top;
+        ++_testGetSet->_viewport.bottom;
+        VERIFY_IS_TRUE(buffer.GetImages().IntersectingRows(pageBottom, pageBottom + 1).empty(),
+                       L"clipped display-mode overflow must not appear after viewport panning");
+    }
+
+    TEST_METHOD(SixelScrollingStreamBeyondMaximumSurfaceHeightUsesTiles)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_textBuffer = std::make_unique<TextBuffer>(til::size{ 4, 600 }, TextAttribute{}, 0, false, &_testGetSet->_renderer);
+        _testGetSet->_viewport = { 0, 0, 4, 10 };
+        auto& buffer = *_testGetSet->_textBuffer;
+        buffer.GetCursor().SetPosition({ 0, 0 });
+        _stateMachine->ProcessString(L"\x1b[?80l");
+
+        auto& cursor = buffer.GetCursor();
+        cursor.SetIsVisible(true);
+        auto handler = _pDispatch->DefineSixelImage(0, DispatchTypes::SixelBackground::Transparent, {});
+        VERIFY_IS_TRUE(static_cast<bool>(handler));
+
+        const auto send = [&](const std::wstring_view text) {
+            for (const auto ch : text)
+            {
+                VERIFY_IS_TRUE(handler(ch), L"the scrolling stream must not abort");
+            }
+        };
+        send(L"#0;2;100;0;0");
+        constexpr auto bandCount = 700;
+        static_assert(bandCount * 12 > Image::MaximumDimension);
+        for (auto line = 0; line < bandCount; ++line)
+        {
+            send(L"~-");
+        }
+        send(L"#1;2;0;0;100~");
+        _pDispatch->_sixelParser->_maybeFlushImageBuffer(false, true);
+
+        VERIFY_IS_FALSE(cursor.IsVisible(), L"the in-flight stream must still own cursor visibility");
+        VERIFY_IS_NOT_NULL(_pDispatch->_sixelParser.get());
+        VERIFY_IS_TRUE(_pDispatch->_sixelParser->_imageBuffer.size() <=
+                           static_cast<size_t>(Image::MaximumDimension) * _pDispatch->_sixelParser->_imageMaxWidth,
+                       L"a forced intermediate flush must keep parser staging bounded");
+        VERIFY_IS_FALSE(buffer.GetImages().Empty());
+        std::vector<const Image*> surfaces;
+        for (const auto& placement : buffer.GetImages().All())
+        {
+            const auto size = placement.Surface().PixelSize();
+            VERIFY_IS_TRUE(size.width <= Image::MaximumDimension);
+            VERIFY_IS_TRUE(size.height <= Image::MaximumDimension);
+            surfaces.emplace_back(placement.SurfacePointer().get());
+        }
+        std::ranges::sort(surfaces);
+        const auto uniqueSurfaceCount = std::distance(surfaces.begin(), std::ranges::unique(surfaces).begin());
+        VERIFY_IS_TRUE(uniqueSurfaceCount <= buffer.GetSize().Height(), L"surface count must be bounded by retained buffer rows");
+        VERIFY_IS_TRUE(BufferContainsColor(buffer, 255, 0, 0), L"retained scrolled bands must remain visible");
+        VERIFY_IS_TRUE(BufferContainsColor(buffer, 0, 0, 255), L"the final band beyond 8192px must be decoded");
+
+        VERIFY_IS_TRUE(handler(L'\x1b'));
+        VERIFY_IS_TRUE(cursor.IsVisible(), L"a completed long Sixel sequence must restore cursor visibility");
+    }
+
+    TEST_METHOD(SixelNewlineOnlyScrollingStreamPrunesStaging)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_textBuffer = std::make_unique<TextBuffer>(til::size{ 4, 600 }, TextAttribute{}, 0, false, &_testGetSet->_renderer);
+        _testGetSet->_viewport = { 0, 0, 4, 10 };
+        auto& buffer = *_testGetSet->_textBuffer;
+        auto& cursor = buffer.GetCursor();
+        cursor.SetPosition({ 0, 0 });
+        cursor.SetIsVisible(true);
+        _stateMachine->ProcessString(L"\x1b[?80l");
+
+        auto handler = _pDispatch->DefineSixelImage(0, DispatchTypes::SixelBackground::Transparent, {});
+        VERIFY_IS_TRUE(static_cast<bool>(handler));
+
+        constexpr auto bandCount = 700;
+        static_assert(bandCount * 12 > Image::MaximumDimension);
+        for (auto line = 0; line < bandCount; ++line)
+        {
+            VERIFY_IS_TRUE(handler(L'-'), L"a newline-only scrolling stream must not abort");
+        }
+
+        const auto& parser = *_pDispatch->_sixelParser;
+        VERIFY_ARE_EQUAL(til::CoordType{ 0 }, parser._imageWidth);
+        VERIFY_IS_TRUE(buffer.GetImages().Empty(), L"newlines without sixel values must not publish placements");
+        VERIFY_IS_TRUE(parser._imageBuffer.size() <=
+                           static_cast<size_t>(Image::MaximumDimension) * parser._imageMaxWidth,
+                       L"scrolled-off newline-only staging rows must be pruned");
+        VERIFY_IS_TRUE(parser._textMargins.top > 0, L"the long stream must scroll the viewport");
+        VERIFY_IS_TRUE(parser._imageOriginCell.y > 0, L"staging origin must advance when scrolled rows are pruned");
+        VERIFY_IS_TRUE(parser._imageOriginCell.y <= parser._textMargins.top);
+
+        VERIFY_IS_TRUE(handler(L'\x1b'));
+        VERIFY_IS_TRUE(cursor.IsVisible(), L"a completed newline-only sequence must restore cursor visibility");
+        VERIFY_ARE_EQUAL(_testGetSet->_viewport.bottom, cursor.GetPosition().y, L"the cursor must remain aligned with the next sixel row after scrolling");
+    }
+
+    TEST_METHOD(SixelFinalizationReleasesParserSurface)
+    {
+        _testGetSet->PrepData();
+        auto& buffer = *_testGetSet->_textBuffer;
+        _stateMachine->ProcessString(L"\x1bPq#0;2;100;0;0~\x1b\\");
+
+        std::weak_ptr<Image> surface = buffer.GetImages().All().front().SurfacePointer();
+        buffer.GetMutableImages().Clear();
+        VERIFY_IS_TRUE(buffer.GetImages().All().empty());
+        VERIFY_IS_TRUE(surface.expired(), L"completed output must be owned by placements, not retained by the parser");
     }
 
 private:

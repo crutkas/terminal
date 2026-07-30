@@ -266,9 +266,6 @@ static FillConsoleResult FillConsoleImpl(SCREEN_INFORMATION& screenInfo, FillCon
         const auto done = screenBuffer.Write(it, startingCoordinate, false);
         result.lengthRead = done.GetInputDistance(it);
         result.cellsModified = done.GetCellDistance(it);
-
-        // If we've overwritten image content, it needs to be erased.
-        ImageSlice::EraseCells(screenBuffer.GetTextBuffer(), startingCoordinate, result.cellsModified);
     }
 
     // These attribute APIs historically erase image content even though they don't replace text.

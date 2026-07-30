@@ -259,14 +259,6 @@ try
 {
     _flushBufferLine();
 
-    for (const auto r : _p.rows)
-    {
-        if (r->bitmap.revision != 0 && !r->bitmap.active)
-        {
-            r->bitmap = {};
-        }
-    }
-
     // PaintCursor() is only called when the cursor is visible, but we need to invalidate the cursor area
     // even if it isn't. Otherwise, a transition from a visible to an invisible cursor wouldn't be rendered.
     if (const auto r = _api.invalidatedCursorArea; r.non_empty())
@@ -555,12 +547,10 @@ try
 }
 CATCH_RETURN()
 
-// Atlas defers drawing until Present, so this snapshots the direct placements
-// that intersect the row. The legacy ImageSlice snapshot remains independent.
-[[nodiscard]] HRESULT AtlasEngine::BeginRowImages(const til::CoordType targetRow,
-                                                  const til::CoordType /*viewportLeft*/,
-                                                  const std::span<const uint8_t> defaultBackgroundMask,
-                                                  const std::span<const COLORREF> /*cellBackgrounds*/) noexcept
+// cellBackgrounds is unused here: this engine draws the whole row's backgrounds in
+// its own pass before any of the image quads it appends below, so content between
+// the background and the text already composites over the right color.
+[[nodiscard]] HRESULT AtlasEngine::BeginRowImages(const til::CoordType targetRow, const til::CoordType /*viewportLeft*/, const std::span<const uint8_t> defaultBackgroundMask, const std::span<const COLORREF> /*cellBackgrounds*/) noexcept
 try
 {
     const auto y = clamp<til::CoordType>(targetRow, 0, _p.s->viewportCellCount.y - 1);
@@ -586,52 +576,10 @@ CATCH_RETURN()
 
 [[nodiscard]] HRESULT AtlasEngine::EndRowImages() noexcept
 {
+    // Nothing to do: this backend defers all drawing, so the row's snapshots are
+    // placed relative to its text when the frame is actually drawn.
     return S_OK;
 }
-
-[[nodiscard]] HRESULT AtlasEngine::PaintImageSlice(const ImageSlice& imageSlice, const til::CoordType targetRow, const til::CoordType viewportLeft) noexcept
-try
-{
-    const auto y = clamp<til::CoordType>(targetRow, 0, _p.s->viewportCellCount.y - 1);
-    const auto row = _p.rows[y];
-    const auto revision = imageSlice.Revision();
-    const auto srcWidth = std::max(0, imageSlice.PixelWidth());
-    const auto srcCellSize = imageSlice.CellSize();
-    auto& b = row->bitmap;
-
-    // If this row's ImageSlice has changed we need to update our snapshot.
-    // Theoretically another _p.rows[y]->bitmap may have this particular revision already,
-    // but that can only happen if we're scrolling _and_ the entire viewport was invalidated.
-    if (b.revision != revision)
-    {
-        const auto srcHeight = std::max(0, srcCellSize.height);
-        const auto pixels = imageSlice.Pixels();
-        const auto expectedSize = gsl::narrow_cast<size_t>(srcWidth) * gsl::narrow_cast<size_t>(srcHeight);
-
-        // Sanity check.
-        if (pixels.size() != expectedSize)
-        {
-            assert(false);
-            return S_OK;
-        }
-
-        if (b.source.size() != pixels.size())
-        {
-            b.source = Buffer<u32, 32>{ pixels.size() };
-        }
-
-        memcpy(b.source.data(), pixels.data(), pixels.size_bytes());
-        b.revision = revision;
-        b.sourceSize.x = srcWidth;
-        b.sourceSize.y = srcHeight;
-    }
-
-    b.targetOffset = (imageSlice.ColumnOffset() - viewportLeft);
-    b.targetWidth = srcWidth / srcCellSize.width;
-    b.active = true;
-    return S_OK;
-}
-CATCH_RETURN()
 
 [[nodiscard]] HRESULT AtlasEngine::PaintSelection(const til::rect& rect) noexcept
 {
