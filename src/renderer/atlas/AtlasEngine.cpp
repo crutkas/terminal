@@ -545,6 +545,50 @@ try
 }
 CATCH_RETURN()
 
+[[nodiscard]] HRESULT AtlasEngine::PrepareImageFrame(const ImageFrameInfo info) noexcept
+try
+{
+    _api.imagePlacements.assign(info.placements.begin(), info.placements.end());
+    _p.imageSurfaces.assign(info.surfaces.begin(), info.surfaces.end());
+    _api.imageViewportOrigin = info.viewportOrigin;
+    return S_OK;
+}
+CATCH_RETURN()
+
+// Atlas defers drawing until Present, so this snapshots the direct placements
+// that intersect the row. The legacy ImageSlice snapshot remains independent.
+[[nodiscard]] HRESULT AtlasEngine::BeginRowImages(const til::CoordType targetRow,
+                                                  const til::CoordType /*viewportLeft*/,
+                                                  const std::span<const uint8_t> defaultBackgroundMask,
+                                                  const std::span<const COLORREF> /*cellBackgrounds*/) noexcept
+try
+{
+    const auto y = clamp<til::CoordType>(targetRow, 0, _p.s->viewportCellCount.y - 1);
+    const auto row = _p.rows[y];
+    row->images.clear();
+    row->imageDefaultBackground.assign(defaultBackgroundMask.begin(), defaultBackgroundMask.end());
+    const auto bufferRow = targetRow + _api.imageViewportOrigin.y;
+    for (const auto& placement : _api.imagePlacements)
+    {
+        const auto bounds = placement.CellBounds();
+        if (bufferRow >= bounds.top && bufferRow < bounds.bottom)
+        {
+            if (auto fragment = placement.Crop({ bounds.left, bufferRow, bounds.right, bufferRow + 1 }))
+            {
+                row->images.emplace_back(std::move(*fragment));
+            }
+        }
+    }
+
+    return S_OK;
+}
+CATCH_RETURN()
+
+[[nodiscard]] HRESULT AtlasEngine::EndRowImages() noexcept
+{
+    return S_OK;
+}
+
 [[nodiscard]] HRESULT AtlasEngine::PaintImageSlice(const ImageSlice& imageSlice, const til::CoordType targetRow, const til::CoordType viewportLeft) noexcept
 try
 {

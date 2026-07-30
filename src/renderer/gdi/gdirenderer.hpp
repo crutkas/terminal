@@ -16,6 +16,7 @@ Author(s):
 
 #include "../inc/RenderEngineBase.hpp"
 #include "../inc/FontResource.hpp"
+#include <unordered_map>
 
 namespace Microsoft::Console::Render
 {
@@ -57,6 +58,12 @@ namespace Microsoft::Console::Render
         [[nodiscard]] HRESULT PaintImageSlice(const ImageSlice& imageSlice,
                                               const til::CoordType targetRow,
                                               const til::CoordType viewportLeft) noexcept override;
+        [[nodiscard]] HRESULT PrepareImageFrame(ImageFrameInfo info) noexcept override;
+        [[nodiscard]] HRESULT BeginRowImages(til::CoordType targetRow,
+                                             til::CoordType viewportLeft,
+                                             std::span<const uint8_t> defaultBackgroundMask,
+                                             std::span<const COLORREF> cellBackgrounds) noexcept override;
+        [[nodiscard]] HRESULT EndRowImages() noexcept override;
         [[nodiscard]] HRESULT PaintSelection(const til::rect& rect) noexcept override;
 
         [[nodiscard]] HRESULT PaintCursor(const CursorOptions& options) noexcept override;
@@ -177,6 +184,45 @@ namespace Microsoft::Console::Render
         std::pmr::vector<std::pmr::vector<int>> _polyWidths;
 
         std::vector<DWORD> _imageMask;
+        struct CachedImageSurface
+        {
+            Image::Pointer image;
+            uint64_t revision = 0;
+            til::size size{};
+            wil::unique_hbitmap bitmap;
+            wil::unique_hdc context;
+            RGBQUAD* bits = nullptr;
+            bool allOpaque = false;
+            bool allTransparent = true;
+        };
+        std::unordered_map<const Image*, CachedImageSurface> _imageSurfaces;
+        std::vector<ImagePlacement> _frameImagePlacements;
+        til::point _imageViewportOrigin{};
+        HRESULT _imageRenderResult = S_OK;
+        til::CoordType _rowImageTargetRow = 0;
+        til::CoordType _rowImageViewportLeft = 0;
+        std::vector<uint8_t> _underlayColumns;
+        til::CoordType _underlayColumnOffset = 0;
+        int _underlayScale = 0;
+        int _restoreBkMode = 0;
+
+        [[nodiscard]] HRESULT _PrepareImageSurface(const ImageFrameInfo::Surface& surface) noexcept;
+        [[nodiscard]] HRESULT _PaintDirectImages(ImagePlacement::RenderPosition position,
+                                                 til::CoordType targetRow,
+                                                 std::span<const uint8_t> defaultBackgroundMask,
+                                                 bool markUnderlay) noexcept;
+        [[nodiscard]] HRESULT _PaintDirectImage(const ImagePlacement& placement, const RECT& clip) noexcept;
+        void _RecordImageError(HRESULT result) noexcept;
+        void _MarkDirectImageUnderlay(const ImagePlacement& placement,
+                                      til::CoordType targetRow,
+                                      std::span<const uint8_t> defaultBackgroundMask) noexcept;
+        bool _UnderlayCoversColumn(til::CoordType column) const noexcept;
+        bool _UnderlayCoversBufferCell(til::CoordType bufferColumn) const noexcept;
+        bool _UnderlayCoversAnyOf(til::CoordType columnBegin, til::CoordType columnEnd) const noexcept;
+        [[nodiscard]] HRESULT _FillUncoveredRunBackground(const RECT& runRect, til::CoordType fontWidth) noexcept;
+        [[nodiscard]] HRESULT _FillImageRowCellBackgrounds(til::CoordType targetRow,
+                                                           std::span<const uint8_t> defaultBackgroundMask,
+                                                           std::span<const COLORREF> cellBackgrounds) noexcept;
 
         [[nodiscard]] HRESULT _InvalidCombine(const til::rect* const prc) noexcept;
         [[nodiscard]] HRESULT _InvalidOffset(const til::point* const ppt) noexcept;

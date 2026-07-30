@@ -20,5 +20,7 @@ public:
     DummyRenderer(Microsoft::Console::Render::IRenderData* pData = nullptr) :
         Microsoft::Console::Render::Renderer(_renderSettings, pData) {}
 
+    using Microsoft::Console::Render::Renderer::PaintFrame;
+
     Microsoft::Console::Render::RenderSettings _renderSettings;
 };
