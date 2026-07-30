@@ -425,7 +425,7 @@ void ROW::ClearCell(const til::CoordType column)
 // - limitRight - right inclusive column ID for the last write in this row. (optional, will just write to the end of row if nullopt)
 // Return Value:
 // - iterator to first cell that was not written to this row.
-OutputCellIterator ROW::WriteCells(OutputCellIterator it, const til::CoordType columnBegin, const std::optional<bool> wrap, std::optional<til::CoordType> limitRight)
+OutputCellIterator ROW::WriteCells(OutputCellIterator it, const til::CoordType columnBegin, const std::optional<bool> wrap, std::optional<til::CoordType> limitRight, til::CoordType* const columnBeginDirty, til::CoordType* const columnEndDirty)
 {
     THROW_HR_IF(E_INVALIDARG, columnBegin >= size());
     THROW_HR_IF(E_INVALIDARG, limitRight.value_or(0) >= size());
@@ -437,9 +437,23 @@ OutputCellIterator ROW::WriteCells(OutputCellIterator it, const til::CoordType c
     uint16_t colorUses = 0;
     auto colorStarts = gsl::narrow_cast<uint16_t>(columnBegin);
     auto currentIndex = colorStarts;
+    auto dirtyBegin = gsl::narrow_cast<til::CoordType>(currentIndex);
+    auto dirtyEnd = dirtyBegin;
+    const auto recordDirty = [&](const til::CoordType begin, const til::CoordType end) {
+        dirtyBegin = std::min<til::CoordType>(dirtyBegin, begin);
+        dirtyEnd = std::max<til::CoordType>(dirtyEnd, end);
+    };
+    const auto replaceCharacters = [&](const til::CoordType begin, const til::CoordType width, const std::wstring_view chars) {
+        til::CoordType beginDirty = begin;
+        til::CoordType endDirty = begin;
+        ReplaceCharacters(begin, width, chars, &beginDirty, &endDirty);
+        recordDirty(beginDirty, endDirty);
+    };
 
     while (it && currentIndex <= finalColumnInRow)
     {
+        recordDirty(currentIndex, currentIndex + 1);
+
         // Fill the color if the behavior isn't set to keeping the current color.
         if (it->TextAttrBehavior() != TextAttributeBehavior::Current)
         {
@@ -476,12 +490,12 @@ OutputCellIterator ROW::WriteCells(OutputCellIterator it, const til::CoordType c
                     // The wide char doesn't fit. Pad with whitespace.
                     // Don't increment the iterator. Instead we'll return from this function and the
                     // caller can call WriteCells() again on the next row with the same iterator position.
-                    ClearCell(currentIndex);
+                    replaceCharacters(currentIndex, 1, L" ");
                     SetDoubleBytePadded(true);
                 }
                 else
                 {
-                    ReplaceCharacters(currentIndex, 2, chars);
+                    replaceCharacters(currentIndex, 2, chars);
                     ++it;
                 }
                 break;
@@ -490,7 +504,7 @@ OutputCellIterator ROW::WriteCells(OutputCellIterator it, const til::CoordType c
                 {
                     // The wide char doesn't fit. Pad with whitespace.
                     // Ignore the character. There's no correct alternative way to handle this situation.
-                    ClearCell(currentIndex);
+                    replaceCharacters(currentIndex, 1, L" ");
                 }
                 else if (it.Position() == 0)
                 {
@@ -500,12 +514,12 @@ OutputCellIterator ROW::WriteCells(OutputCellIterator it, const til::CoordType c
                     // throwing away the trailing half of all `CHAR_INFO`s (during text rendering, as well as during
                     // `ReadConsoleOutputW`), so to make this code behave the same and prevent surprises, we need to
                     // make sure to only look at the trailer if it's the first `CHAR_INFO` the user is trying to write.
-                    ReplaceCharacters(currentIndex - 1, 2, chars);
+                    replaceCharacters(currentIndex - 1, 2, chars);
                 }
                 ++it;
                 break;
             default:
-                ReplaceCharacters(currentIndex, 1, chars);
+                replaceCharacters(currentIndex, 1, chars);
                 ++it;
                 break;
             }
@@ -534,6 +548,14 @@ OutputCellIterator ROW::WriteCells(OutputCellIterator it, const til::CoordType c
     if (colorUses)
     {
         _attr.replace(colorStarts, currentIndex, currentColor);
+    }
+    if (columnBeginDirty)
+    {
+        *columnBeginDirty = dirtyBegin;
+    }
+    if (columnEndDirty)
+    {
+        *columnEndDirty = dirtyEnd;
     }
 
     return it;
@@ -569,17 +591,33 @@ void ROW::ReplaceAttributes(const til::CoordType beginIndex, const til::CoordTyp
     return colBeg < colLimit && !chars.empty();
 }
 
-void ROW::ReplaceCharacters(til::CoordType columnBegin, til::CoordType width, const std::wstring_view& chars)
+void ROW::ReplaceCharacters(til::CoordType columnBegin, til::CoordType width, const std::wstring_view& chars, til::CoordType* const columnBeginDirty, til::CoordType* const columnEndDirty)
 try
 {
     assert(width >= 1 && width <= 2);
     WriteHelper h{ *this, columnBegin, _columnCount, chars };
     if (!h.IsValid())
     {
+        if (columnBeginDirty)
+        {
+            *columnBeginDirty = h.colBeg;
+        }
+        if (columnEndDirty)
+        {
+            *columnEndDirty = h.colBeg;
+        }
         return;
     }
     h.ReplaceCharacters(width);
     h.Finish();
+    if (columnBeginDirty)
+    {
+        *columnBeginDirty = h.colBegDirty;
+    }
+    if (columnEndDirty)
+    {
+        *columnEndDirty = h.colEndDirty;
+    }
 }
 catch (...)
 {

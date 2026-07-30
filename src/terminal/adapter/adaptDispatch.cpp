@@ -571,6 +571,7 @@ void AdaptDispatch::_ScrollRectVertically(const Page& page, const til::rect& scr
             const auto dstOrigin = til::point{ scrollRect.left, top + actualDelta };
             const auto srcView = Viewport::FromDimensions(srcOrigin, { width, height });
             const auto dstView = Viewport::FromDimensions(dstOrigin, { width, height });
+            const auto sourceImages = textBuffer.GetImages().Snapshot();
             const auto walkDirection = Viewport::DetermineWalkDirection(srcView, dstView);
             auto srcPos = srcView.GetWalkOrigin(walkDirection);
             auto dstPos = dstView.GetWalkOrigin(walkDirection);
@@ -580,6 +581,7 @@ void AdaptDispatch::_ScrollRectVertically(const Page& page, const til::rect& scr
                 textBuffer.WriteLine(OutputCellIterator({ &current, 1 }), dstPos);
                 srcView.WalkInBounds(srcPos, walkDirection);
             } while (dstView.WalkInBounds(dstPos, walkDirection));
+            sourceImages.CopyArea(srcView.ToExclusive(), dstOrigin, textBuffer.GetMutableImages());
             // Copy any image content in the affected area.
             ImageSlice::CopyBlock(textBuffer, srcView.ToExclusive(), textBuffer, dstView.ToExclusive());
         }
@@ -618,6 +620,7 @@ void AdaptDispatch::_ScrollRectHorizontally(const Page& page, const til::rect& s
 
         const auto source = Viewport::FromDimensions({ left, top }, { width, height });
         const auto target = Viewport::Offset(source, { actualDelta, 0 });
+        const auto sourceImages = textBuffer.GetImages().Snapshot();
         const auto walkDirection = Viewport::DetermineWalkDirection(source, target);
         auto sourcePos = source.GetWalkOrigin(walkDirection);
         auto targetPos = target.GetWalkOrigin(walkDirection);
@@ -632,6 +635,7 @@ void AdaptDispatch::_ScrollRectHorizontally(const Page& page, const til::rect& s
             next = OutputCell(*textBuffer.GetCellDataAt(sourcePos));
             textBuffer.WriteLine(OutputCellIterator({ &current, 1 }), targetPos);
         } while (target.WalkInBounds(targetPos, walkDirection));
+        sourceImages.CopyArea(source.ToExclusive(), { left + actualDelta, top }, textBuffer.GetMutableImages());
         // Copy any image content in the affected area.
         ImageSlice::CopyBlock(textBuffer, source.ToExclusive(), textBuffer, target.ToExclusive());
     }
@@ -818,6 +822,47 @@ void AdaptDispatch::EraseInLine(const DispatchTypes::EraseType eraseType)
 }
 
 // Routine Description:
+// - Collects the unprotected cells of an area as contiguous per-row spans.
+// - Selective erases are almost always a handful of long runs interrupted by a few protected
+//   fields, so emitting one rect per cell hands the image collection and the renderer hundreds
+//   of single-cell requests where a few spans say the same thing. A span never crosses a row,
+//   because a protected cell in one row must not erase the cell below it.
+// Arguments:
+// - page - Target page to be inspected.
+// - eraseRect - Area of the page that will be affected.
+// Return Value:
+// - the unprotected spans, in row order, left to right
+std::vector<til::rect> AdaptDispatch::_UnprotectedSpans(const Page& page, const til::rect& eraseRect)
+{
+    std::vector<til::rect> spans;
+    for (auto row = eraseRect.top; row < eraseRect.bottom; row++)
+    {
+        const auto& rowBuffer = page.Buffer().GetRowByOffset(row);
+        auto spanBegin = eraseRect.left;
+        auto inSpan = false;
+        for (auto col = eraseRect.left; col < eraseRect.right; col++)
+        {
+            const auto unprotected = !rowBuffer.GetAttrByColumn(col).IsProtected();
+            if (unprotected && !inSpan)
+            {
+                spanBegin = col;
+                inSpan = true;
+            }
+            else if (!unprotected && inSpan)
+            {
+                spans.emplace_back(spanBegin, row, col, row + 1);
+                inSpan = false;
+            }
+        }
+        if (inSpan)
+        {
+            spans.emplace_back(spanBegin, row, eraseRect.right, row + 1);
+        }
+    }
+    return spans;
+}
+
+// Routine Description:
 // - Selectively erases unprotected cells in an area of the buffer.
 // Arguments:
 // - page - Target page to be erased.
@@ -828,21 +873,17 @@ void AdaptDispatch::_SelectiveEraseRect(const Page& page, const til::rect& erase
 {
     if (eraseRect)
     {
-        for (auto row = eraseRect.top; row < eraseRect.bottom; row++)
+        const auto areas = _UnprotectedSpans(page, eraseRect);
+        page.Buffer().GetMutableImages().EraseAreas(areas);
+        for (const auto area : areas)
         {
-            auto& rowBuffer = page.Buffer().GetMutableRowByOffset(row);
-            for (auto col = eraseRect.left; col < eraseRect.right; col++)
+            auto& rowBuffer = page.Buffer().GetMutableRowByOffset(area.top);
+            for (auto col = area.left; col < area.right; col++)
             {
-                // Only unprotected cells are affected.
-                if (!rowBuffer.GetAttrByColumn(col).IsProtected())
-                {
-                    // The text is cleared but the attributes are left as is.
-                    rowBuffer.ClearCell(col);
-                    // Any image content also needs to be erased.
-                    ImageSlice::EraseCells(rowBuffer, col, col + 1);
-                    page.Buffer().TriggerRedraw(Viewport::FromDimensions({ col, row }, { 1, 1 }));
-                }
+                rowBuffer.ClearCell(col);
+                ImageSlice::EraseCells(rowBuffer, col, col + 1);
             }
+            page.Buffer().TriggerRedraw(Viewport::FromExclusive(area));
         }
     }
 }
@@ -1162,6 +1203,7 @@ void AdaptDispatch::CopyRectangularArea(const VTInt top, const VTInt left, const
         // it needs to be clipped, so we only care about the destination size.
         const auto srcView = Viewport::FromDimensions(srcRect.origin(), dstRect.size());
         const auto dstView = Viewport::FromDimensions(dstRect.origin(), dstRect.size());
+        const auto sourceImages = src.Buffer().GetImages().Snapshot();
         const auto walkDirection = Viewport::DetermineWalkDirection(srcView, dstView);
         auto srcPos = srcView.GetWalkOrigin(walkDirection);
         auto dstPos = dstView.GetWalkOrigin(walkDirection);
@@ -1182,6 +1224,7 @@ void AdaptDispatch::CopyRectangularArea(const VTInt top, const VTInt left, const
                 dst.Buffer().WriteLine(OutputCellIterator({ &current, 1 }), dstPos);
             }
         } while (dstView.WalkInBounds(dstPos, walkDirection));
+        sourceImages.CopyArea(srcView.ToExclusive(), dstRect.origin(), dst.Buffer().GetMutableImages());
         // Copy any image content in the affected area.
         ImageSlice::CopyBlock(src.Buffer(), srcView.ToExclusive(), dst.Buffer(), dstView.ToExclusive());
     }
@@ -2478,7 +2521,7 @@ bool AdaptDispatch::_DoLineFeed(const Page& page, const bool withReturn, const b
         else
         {
             const auto eraseAttributes = _GetEraseAttributes(page);
-            textBuffer.GetMutableRowByOffset(newPosition.y).Reset(eraseAttributes);
+            textBuffer.ResetRow(newPosition.y, eraseAttributes);
         }
     }
     else
