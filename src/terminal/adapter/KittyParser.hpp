@@ -8,6 +8,7 @@
 #include "../../buffer/out/Image.hpp"
 
 #include <deque>
+#include <map>
 #include <optional>
 #include <unordered_map>
 #include <vector>
@@ -56,13 +57,26 @@ namespace Microsoft::Console::VirtualTerminal
             uint32_t format = 32;
             uint32_t width = 0;
             uint32_t height = 0;
+            uint32_t cols = 0;
+            uint32_t rows = 0;
+            uint32_t srcX = 0;
+            uint32_t srcY = 0;
+            uint32_t srcW = 0;
+            uint32_t srcH = 0;
+            uint32_t cellOffsetX = 0;
+            uint32_t cellOffsetY = 0;
             bool moreChunks = false;
             bool mPresent = false;
             bool haveId = false;
             bool haveNumber = false;
             wchar_t medium = L'd';
+            bool noCursorMovement = false;
             bool hasNonChunkKey = false;
             bool hasNonChunkKeyOtherThanAction = false;
+            uint32_t placementId = 0;
+            int32_t zIndex = 0;
+            bool haveZ = false;
+            bool havePlacementId = false;
         };
 
         struct Image
@@ -71,6 +85,7 @@ namespace Microsoft::Console::VirtualTerminal
             uint32_t width = 0;
             uint32_t height = 0;
             ::Image::PixelStorage pixels;
+            bool hasRenderedPlacements = false;
             mutable ::Image::Pointer surface;
 
             size_t PixelBytes() const noexcept
@@ -81,6 +96,32 @@ namespace Microsoft::Console::VirtualTerminal
 
         using ImageNumberMap = std::unordered_map<uint32_t, std::vector<uint32_t>>;
 
+        struct TargetSize
+        {
+            int64_t width = 0;
+            int64_t height = 0;
+        };
+
+        struct Placement
+        {
+            uint32_t imageId = 0;
+            uint32_t placementId = 0;
+            uint64_t layerId = 0;
+            til::CoordType anchorRow = 0;
+            til::CoordType anchorCol = 0;
+            til::CoordType cols = 0;
+            til::CoordType rows = 0;
+            uint32_t displayCols = 0;
+            uint32_t displayRows = 0;
+            uint32_t srcX = 0;
+            uint32_t srcY = 0;
+            uint32_t srcW = 0;
+            uint32_t srcH = 0;
+            uint32_t cellOffsetX = 0;
+            uint32_t cellOffsetY = 0;
+            int32_t zIndex = 0;
+        };
+
         struct BufferState
         {
             uint32_t nextImageId = 1;
@@ -89,6 +130,8 @@ namespace Microsoft::Console::VirtualTerminal
             std::unordered_map<uint32_t, Image> images;
             ImageNumberMap imageNumbers;
             std::deque<uint32_t> imageOrder;
+            std::map<std::pair<uint32_t, uint32_t>, Placement> placements;
+            std::vector<Placement> anonymousPlacements;
         };
 
         static Control _ParseControl(std::wstring_view control) noexcept;
@@ -97,6 +140,7 @@ namespace Microsoft::Console::VirtualTerminal
         void _ProcessCommand(const Control& command, std::string_view payload, bool payloadValid, bool payloadTooLarge);
         void _clearChunk() noexcept;
         static uint32_t _ParseUint(std::wstring_view value) noexcept;
+        static int32_t _ParseInt(std::wstring_view value) noexcept;
         static bool _DecodeBase64(std::string_view input, std::vector<uint8_t>& output) noexcept;
         static bool _inflateZlib(const std::vector<uint8_t>& input, std::vector<uint8_t>& output, size_t cap) noexcept;
         static std::vector<RGBQUAD> _decodePixels(uint32_t format, const std::vector<uint8_t>& bytes);
@@ -109,20 +153,34 @@ namespace Microsoft::Console::VirtualTerminal
         BufferState _takeBufferState() noexcept;
         void _restoreBufferState(BufferState&& state) noexcept;
         size_t _retainedPixelBytes() const noexcept;
-        til::size _placeImage(const Image& image, bool moveCursor, uint32_t imageId, uint64_t layerId);
+        void _releaseImageSurface(Image& image) noexcept;
+        static TargetSize _targetPixels(int64_t cropW, int64_t cropH, uint32_t cols, uint32_t rows, int64_t cellWidth, int64_t cellHeight) noexcept;
+        til::size _placeImage(const Image& image, bool moveCursor, uint32_t imageId, uint64_t layerId, uint32_t cols = 0, uint32_t rows = 0, uint32_t srcX = 0, uint32_t srcY = 0, uint32_t srcW = 0, uint32_t srcH = 0, uint32_t cellOffsetX = 0, uint32_t cellOffsetY = 0, int32_t zIndex = 0);
+        void _registerPlacement(const Placement& placement);
+        void _erasePlacementCells(const Placement& placement);
+        void _erasePlacementsForImage(uint32_t imageId);
+        bool _imageHasPlacements(uint32_t id) const noexcept;
+        bool _imageHasRenderedPlacements(uint32_t id) const;
+        void _deletePlacement(uint32_t imageId, uint32_t placementId, bool freeData);
         void _eraseImagePlacements(uint32_t imageId);
         void _deleteAllPlacements(bool freeData);
+        void _deleteImagesIntersecting(til::CoordType left, til::CoordType top, til::CoordType right, til::CoordType bottom, bool freeData);
+        void _deleteImagesInIdRange(uint32_t lo, uint32_t hi, bool freeData);
+        void _deletePlacementsByZ(int32_t zIndex, bool freeData, std::optional<til::point> cell = std::nullopt);
 
         static constexpr size_t MaxImages = 4096;
         static constexpr size_t MaxControl = 1024;
         static constexpr size_t MaxPayload = 32 * 1024 * 1024;
         static constexpr size_t MaxTotalBytes = 320 * 1024 * 1024;
+        static constexpr size_t MaxPlacements = MaxImages * 4;
         uint32_t _nextImageId = 1;
         uint64_t _nextLayerId = 1;
         size_t _totalPixelBytes = 0;
         std::unordered_map<uint32_t, Image> _images;
         ImageNumberMap _imageNumbers;
         std::deque<uint32_t> _imageOrder;
+        std::map<std::pair<uint32_t, uint32_t>, Placement> _placements;
+        std::vector<Placement> _anonymousPlacements;
         std::optional<BufferState> _mainBufferState;
 
         bool _chunkActive = false;
