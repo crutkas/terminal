@@ -77,6 +77,22 @@ struct RowCopyTextFromState
     til::CoordType sourceColumnEnd = 0; // OUT
 };
 
+// Resolved coordinates of the image cell this text cell stands in for. Stored with
+// the text cell so omitted diacritics can inherit from the immediate-left cell even
+// after separate writes, scrolling, or reflow.
+struct ImageCellRef
+{
+    // Ordered widest-first so this packs without padding. There is one of these
+    // per column of a row that stands in for image cells, so the difference
+    // between a packed and an unpacked layout is a third of that allocation.
+    uint64_t layerId = 0;
+    uint32_t column = 0;
+    uint16_t row = 0;
+    uint8_t imageIdHighByte = 0;
+    bool valid = false;
+};
+static_assert(sizeof(ImageCellRef) == 16);
+
 // This structure is basically an inverse of ROW::_charOffsets. If you have a pointer
 // into a ROW's text this class can tell you what cell that pointer belongs to.
 struct CharToColumnMapper
@@ -172,6 +188,9 @@ public:
     DbcsAttribute DbcsAttrAt(til::CoordType column) const noexcept;
     std::wstring_view GetText() const noexcept;
     std::wstring_view GetText(til::CoordType columnBegin, til::CoordType columnEnd) const noexcept;
+    const ImageCellRef* GetImageCellRef(til::CoordType column) const noexcept;
+    void SetImageCellRef(til::CoordType column, const ImageCellRef& metadata);
+    void CopyImageCellRefs(const ROW& source, til::CoordType sourceColumnBegin, til::CoordType columnBegin, til::CoordType columnEnd);
     til::CoordType GetLeadingColumnAtCharOffset(ptrdiff_t offset) const noexcept;
     til::CoordType GetTrailingColumnAtCharOffset(ptrdiff_t offset) const noexcept;
     uint16_t GetCharOffset(til::CoordType col) const noexcept;
@@ -263,6 +282,7 @@ private:
     void _init() noexcept;
     void _resizeChars(uint16_t colEndDirty, uint16_t chBegDirty, size_t chEndDirty, uint16_t chEndDirtyOld);
     CharToColumnMapper _createCharToColumnMapper(ptrdiff_t offset) const noexcept;
+    void _clearImageCellRefs(til::CoordType columnBegin, til::CoordType columnEnd) noexcept;
 
     // These fields are a bit "wasteful", but it makes all this a bit more robust against
     // programming errors during initial development (which is when this comment was written).
@@ -317,6 +337,10 @@ private:
     bool _doubleBytePadded = false;
 
     std::optional<ScrollbarData> _promptData = std::nullopt;
+
+    // Allocated lazily; when present it holds exactly _columnCount entries, so
+    // like _charOffsets it carries no size of its own.
+    std::unique_ptr<ImageCellRef[]> _imageCellRefs;
 };
 
 #ifdef UNIT_TESTING

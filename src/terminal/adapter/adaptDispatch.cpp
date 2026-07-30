@@ -19,6 +19,15 @@ using namespace Microsoft::Console::VirtualTerminal;
 
 static constexpr std::wstring_view whitespace{ L" " };
 
+static ImageCellRef getImageCellRef(const TextBuffer& buffer, const til::point position) noexcept
+{
+    if (const auto metadata = buffer.GetRowByOffset(position.y).GetImageCellRef(position.x))
+    {
+        return *metadata;
+    }
+    return {};
+}
+
 struct XtermResourceColorTableEntry
 {
     int ColorTableIndex;
@@ -106,6 +115,15 @@ void AdaptDispatch::_WriteToBuffer(const std::wstring_view string)
     auto cursorPosition = cursor.GetPosition();
     const auto wrapAtEOL = _api.GetSystemMode(ITerminalApi::Mode::AutoWrap);
     const auto& attributes = page.Attributes();
+    // Kitty Unicode placeholders (cells holding U+10EEEE) overlay a sub-rect of a virtually
+    // placed image. They're rendered per written segment inside the loop below, after each
+    // segment's wrap resolves, so a wrapped or scrolled run lands every cell on its real row.
+    // A write may also begin with nothing but a placeholder's row/column diacritics, when the
+    // split fell before them: they carry no U+10EEEE, but they complete - and so re-resolve -
+    // the cell the previous write placed.
+    const auto hasKittyPlaceholders = _kittyParser &&
+                                      (string.find(KittyParser::PlaceholderCodePointHigh) != std::wstring_view::npos ||
+                                       KittyParser::StartsWithPlaceholderDiacritic(string));
 
     auto [topMargin, bottomMargin] = _GetVerticalMargins(page, true);
     const auto [leftMargin, rightMargin] = _GetHorizontalMargins(page.Width());
@@ -161,6 +179,19 @@ void AdaptDispatch::_WriteToBuffer(const std::wstring_view string)
             textBuffer.Replace(cursorPosition.y, attributes, state);
         }
         const auto textPositionAfter = state.text.data();
+
+        // Overlay any placeholders in the segment just written, on its real (post-wrap) row
+        // and from its true start column, so wrapping and bottom-of-buffer scrolls place each
+        // cell correctly rather than replaying the whole run from one pre-wrap origin.
+        if (hasKittyPlaceholders && textPositionAfter > textPositionBefore)
+        {
+            const std::wstring_view segment{ textPositionBefore, static_cast<size_t>(textPositionAfter - textPositionBefore) };
+            if (segment.find(KittyParser::PlaceholderCodePointHigh) != std::wstring_view::npos ||
+                KittyParser::StartsWithPlaceholderDiacritic(segment))
+            {
+                _kittyParser->RenderPlaceholders(segment, cursorPosition.y, state.columnBegin);
+            }
+        }
 
         // If we're past the end of the line, we need to clamp the cursor
         // back into range, and if wrapping is enabled, set the delayed wrap
@@ -579,7 +610,12 @@ void AdaptDispatch::_ScrollRectVertically(const Page& page, const til::rect& scr
             do
             {
                 const auto current = OutputCell(*textBuffer.GetCellDataAt(srcPos));
+                const auto metadata = getImageCellRef(textBuffer, srcPos);
                 textBuffer.WriteLine(OutputCellIterator({ &current, 1 }), dstPos);
+                if (metadata.valid)
+                {
+                    textBuffer.GetMutableRowByOffset(dstPos.y).SetImageCellRef(dstPos.x, metadata);
+                }
                 srcView.WalkInBounds(srcPos, walkDirection);
             } while (dstView.WalkInBounds(dstPos, walkDirection));
             sourceImages.CopyArea(srcView.ToExclusive(), dstOrigin, textBuffer.GetMutableImages());
@@ -627,12 +663,19 @@ void AdaptDispatch::_ScrollRectHorizontally(const Page& page, const til::rect& s
         // to the target, so a two-cell DBCS character can't accidentally delete
         // itself when moving one cell horizontally.
         auto next = OutputCell(*textBuffer.GetCellDataAt(sourcePos));
+        auto nextMetadata = getImageCellRef(textBuffer, sourcePos);
         do
         {
             const auto current = next;
+            const auto currentMetadata = nextMetadata;
             source.WalkInBounds(sourcePos, walkDirection);
             next = OutputCell(*textBuffer.GetCellDataAt(sourcePos));
+            nextMetadata = getImageCellRef(textBuffer, sourcePos);
             textBuffer.WriteLine(OutputCellIterator({ &current, 1 }), targetPos);
+            if (currentMetadata.valid)
+            {
+                textBuffer.GetMutableRowByOffset(targetPos.y).SetImageCellRef(targetPos.x, currentMetadata);
+            }
         } while (target.WalkInBounds(targetPos, walkDirection));
         sourceImages.CopyArea(source.ToExclusive(), { left + actualDelta, top }, textBuffer.GetMutableImages());
     }
@@ -1207,17 +1250,24 @@ void AdaptDispatch::CopyRectangularArea(const VTInt top, const VTInt left, const
         // to the target, so a two-cell DBCS character can't accidentally delete
         // itself when moving one cell horizontally.
         auto next = OutputCell(*src.Buffer().GetCellDataAt(srcPos));
+        auto nextMetadata = getImageCellRef(src.Buffer(), srcPos);
         do
         {
             const auto current = next;
+            const auto currentMetadata = nextMetadata;
             const auto currentSrcPos = srcPos;
             srcView.WalkInBounds(srcPos, walkDirection);
             next = OutputCell(*src.Buffer().GetCellDataAt(srcPos));
+            nextMetadata = getImageCellRef(src.Buffer(), srcPos);
             // If the source position is offscreen (which can occur on double
             // width lines), then we shouldn't copy anything to the destination.
             if (currentSrcPos.x < src.Buffer().GetLineWidth(currentSrcPos.y))
             {
                 dst.Buffer().WriteLine(OutputCellIterator({ &current, 1 }), dstPos);
+                if (currentMetadata.valid)
+                {
+                    dst.Buffer().GetMutableRowByOffset(dstPos.y).SetImageCellRef(dstPos.x, currentMetadata);
+                }
             }
         } while (dstView.WalkInBounds(dstPos, walkDirection));
         sourceImages.CopyArea(srcView.ToExclusive(), dstRect.origin(), dst.Buffer().GetMutableImages());

@@ -7,13 +7,450 @@
 #include "../cascadia/TerminalCore/Terminal.hpp"
 #include "MockTermSettings.h"
 #include "../renderer/inc/DummyRenderer.hpp"
+#include "../renderer/inc/RenderEngineBase.hpp"
 #include "consoletaeftemplates.hpp"
+
+#include <wil/resource.h>
 
 using namespace winrt::Microsoft::Terminal::Core;
 using namespace Microsoft::Terminal::Core;
+using namespace Microsoft::Console::Render;
 
 using namespace WEX::Logging;
 using namespace WEX::TestExecution;
+
+namespace
+{
+    struct PaintedCluster
+    {
+        til::point position;
+        til::CoordType columns;
+        std::wstring text;
+        TextAttribute attribute;
+    };
+
+    struct PaintedImage
+    {
+        til::CoordType targetRow;
+        til::CoordType columnOffset;
+        ImagePlacement::Key key;
+        const Image* surface = nullptr;
+        uint64_t revision = 0;
+        til::size surfaceSize;
+        til::rect bounds;
+        til::rect originalBounds;
+        til::rect source;
+        ImagePlacement::PixelGeometry geometry;
+        int32_t zIndex = 0;
+        ImagePlacement::RenderPosition position = ImagePlacement::RenderPosition::AboveText;
+        bool containsRed = false;
+        bool containsGreen = false;
+        std::vector<uint32_t> columnOwners;
+        std::vector<bool> columnsContainRed;
+        std::vector<bool> columnsContainGreen;
+        std::vector<uint8_t> defaultBackgroundMask;
+        std::vector<COLORREF> cellBackgrounds;
+    };
+
+    struct PaintedFrame
+    {
+        std::vector<PaintedCluster> clusters;
+        std::vector<PaintedImage> images;
+        size_t imageFramePreparations = 0;
+        size_t surfaceUploads = 0;
+        size_t surfaceRefreshes = 0;
+        size_t surfaceEvictions = 0;
+    };
+
+    class KittyRecordingRenderEngine final : public RenderEngineBase
+    {
+    public:
+        HRESULT StartPaint() noexcept override
+        {
+            const auto guard = _lock.lock_exclusive();
+            _clusters.clear();
+            _images.clear();
+            _imageFramePreparations = 0;
+            _surfaceUploads = 0;
+            _surfaceRefreshes = 0;
+            _surfaceEvictions = 0;
+            return S_OK;
+        }
+
+        HRESULT EndPaint() noexcept override
+        {
+            const auto guard = _lock.lock_exclusive();
+            _dirtyArea = {};
+            return S_OK;
+        }
+
+        HRESULT Present() noexcept override
+        try
+        {
+            const auto guard = _lock.lock_exclusive();
+            _presentedClusters = _clusters;
+            _presentedImages = _images;
+            _presentedImageFramePreparations = _imageFramePreparations;
+            _presentedSurfaceUploads = _surfaceUploads;
+            _presentedSurfaceRefreshes = _surfaceRefreshes;
+            _presentedSurfaceEvictions = _surfaceEvictions;
+            return S_OK;
+        }
+        CATCH_RETURN()
+
+        HRESULT ScrollFrame() noexcept override
+        {
+            return S_OK;
+        }
+
+        HRESULT Invalidate(const til::rect* /*region*/) noexcept override
+        {
+            return S_OK;
+        }
+
+        HRESULT InvalidateCursor(const til::rect* /*region*/) noexcept override
+        {
+            return S_OK;
+        }
+
+        HRESULT InvalidateSystem(const til::rect* /*region*/) noexcept override
+        {
+            return S_OK;
+        }
+
+        HRESULT InvalidateScroll(const til::point* /*delta*/) noexcept override
+        {
+            return S_OK;
+        }
+
+        HRESULT InvalidateAll() noexcept override
+        {
+            const auto guard = _lock.lock_exclusive();
+            _dirtyArea = { 0, 0, SHRT_MAX, SHRT_MAX };
+            return S_OK;
+        }
+
+        HRESULT PaintBackground() noexcept override
+        {
+            return S_OK;
+        }
+
+        HRESULT PaintBufferLine(const std::span<const Cluster> clusters, til::point position, bool /*trimLeft*/) noexcept override
+        try
+        {
+            const auto guard = _lock.lock_exclusive();
+            for (const auto& cluster : clusters)
+            {
+                _clusters.emplace_back(position, cluster.GetColumns(), std::wstring{ cluster.GetText() }, _currentAttribute);
+                position.x += cluster.GetColumns();
+            }
+            return S_OK;
+        }
+        CATCH_RETURN()
+
+        HRESULT PaintBufferGridLines(GridLineSet /*lines*/, COLORREF /*gridlineColor*/, COLORREF /*underlineColor*/, size_t /*length*/, til::point /*position*/) noexcept override
+        {
+            return S_OK;
+        }
+
+        HRESULT PrepareImageFrame(const ImageFrameInfo info) noexcept override
+        try
+        {
+            const auto guard = _lock.lock_exclusive();
+            _framePlacements.assign(info.placements.begin(), info.placements.end());
+            _frameSurfaces.assign(info.surfaces.begin(), info.surfaces.end());
+            _imageViewportOrigin = info.viewportOrigin;
+            ++_imageFramePreparations;
+
+            std::vector<const Image*> seen;
+            for (const auto& surface : _frameSurfaces)
+            {
+                const auto key = surface.image.get();
+                seen.push_back(key);
+                const auto cached = _surfaceRevisions.find(key);
+                if (cached == _surfaceRevisions.end())
+                {
+                    _surfaceRevisions.emplace(key, surface.revision);
+                    ++_surfaceUploads;
+                }
+                else if (cached->second != surface.revision)
+                {
+                    cached->second = surface.revision;
+                    ++_surfaceRefreshes;
+                }
+            }
+            for (auto cached = _surfaceRevisions.begin(); cached != _surfaceRevisions.end();)
+            {
+                if (std::find(seen.begin(), seen.end(), cached->first) == seen.end())
+                {
+                    cached = _surfaceRevisions.erase(cached);
+                    ++_surfaceEvictions;
+                }
+                else
+                {
+                    ++cached;
+                }
+            }
+            return S_OK;
+        }
+        CATCH_RETURN()
+
+        HRESULT BeginRowImages(const til::CoordType targetRow,
+                               const til::CoordType /*viewportLeft*/,
+                               const std::span<const uint8_t> defaultBackgroundMask,
+                               const std::span<const COLORREF> cellBackgrounds) noexcept override
+        try
+        {
+            const auto bufferRow = targetRow + _imageViewportOrigin.y;
+            for (const auto& placement : _framePlacements)
+            {
+                const auto bounds = placement.CellBounds();
+                if (bufferRow < bounds.top || bufferRow >= bounds.bottom)
+                {
+                    continue;
+                }
+                const auto surface = std::ranges::find(_frameSurfaces, placement.SurfacePointer().get(), [](const auto& candidate) {
+                    return candidate.image.get();
+                });
+                THROW_HR_IF(E_UNEXPECTED, surface == _frameSurfaces.end() || !surface->pixels);
+
+                PaintedImage image{
+                    .targetRow = targetRow,
+                    .columnOffset = bounds.left - _imageViewportOrigin.x,
+                    .key = placement.Identity(),
+                    .surface = &placement.Surface(),
+                    .revision = surface->revision,
+                    .surfaceSize = surface->size,
+                    .bounds = bounds,
+                    .originalBounds = placement.OriginalCellBounds(),
+                    .source = placement.SourceInPixels(),
+                    .geometry = placement.Geometry(),
+                    .zIndex = placement.ZIndex(),
+                    .position = placement.Position(),
+                };
+                image.defaultBackgroundMask.assign(defaultBackgroundMask.begin(), defaultBackgroundMask.end());
+                image.cellBackgrounds.assign(cellBackgrounds.begin(), cellBackgrounds.end());
+                for (const auto& pixel : *surface->pixels)
+                {
+                    image.containsRed |= pixel.rgbRed == 255 && pixel.rgbGreen == 0 && pixel.rgbBlue == 0;
+                    image.containsGreen |= pixel.rgbRed == 0 && pixel.rgbGreen == 255 && pixel.rgbBlue == 0;
+                }
+                _images.emplace_back(std::move(image));
+            }
+            return S_OK;
+        }
+        CATCH_RETURN()
+
+        HRESULT EndRowImages() noexcept override
+        {
+            return S_OK;
+        }
+
+        HRESULT PaintSelection(const til::rect& /*rect*/) noexcept override
+        {
+            return S_OK;
+        }
+
+        HRESULT PaintCursor(const CursorOptions& options) noexcept override
+        {
+            static_cast<void>(options);
+            return S_OK;
+        }
+
+        HRESULT UpdateDrawingBrushes(const TextAttribute& textAttributes,
+                                     const RenderSettings& /*renderSettings*/,
+                                     gsl::not_null<IRenderData*> /*renderData*/,
+                                     bool /*usingSoftFont*/,
+                                     bool /*isSettingDefaultBrushes*/) noexcept override
+        {
+            const auto guard = _lock.lock_exclusive();
+            _currentAttribute = textAttributes;
+            return S_OK;
+        }
+
+        HRESULT UpdateFont(const FontInfoDesired& /*desired*/, _Out_ FontInfo& /*actual*/) noexcept override
+        {
+            return S_OK;
+        }
+
+        HRESULT UpdateDpi(int /*dpi*/) noexcept override
+        {
+            return S_OK;
+        }
+
+        HRESULT UpdateViewport(const til::inclusive_rect& /*viewport*/) noexcept override
+        {
+            return S_OK;
+        }
+
+        HRESULT GetProposedFont(const FontInfoDesired& /*desired*/, _Out_ FontInfo& /*actual*/, int /*dpi*/) noexcept override
+        {
+            return S_OK;
+        }
+
+        HRESULT GetDirtyArea(std::span<const til::rect>& area) noexcept override
+        {
+            area = { &_dirtyArea, 1 };
+            return S_OK;
+        }
+
+        HRESULT GetFontSize(_Out_ til::size* const fontSize) noexcept override
+        {
+            *fontSize = { 10, 20 };
+            return S_OK;
+        }
+
+        HRESULT IsGlyphWideByFont(std::wstring_view /*glyph*/, _Out_ bool* const isWide) noexcept override
+        {
+            *isWide = false;
+            return S_OK;
+        }
+
+        void WaitUntilCanRender() noexcept override
+        {
+        }
+
+        PaintedFrame Snapshot() const
+        {
+            const auto guard = _lock.lock_shared();
+            return {
+                _presentedClusters,
+                _presentedImages,
+                _presentedImageFramePreparations,
+                _presentedSurfaceUploads,
+                _presentedSurfaceRefreshes,
+                _presentedSurfaceEvictions,
+            };
+        }
+
+    protected:
+        HRESULT _DoUpdateTitle(const std::wstring_view /*title*/) noexcept override
+        {
+            return S_OK;
+        }
+
+    private:
+        mutable wil::srwlock _lock;
+        til::rect _dirtyArea{ 0, 0, SHRT_MAX, SHRT_MAX };
+        TextAttribute _currentAttribute;
+        std::vector<PaintedCluster> _clusters;
+        std::vector<PaintedImage> _images;
+        std::vector<ImagePlacement> _framePlacements;
+        std::vector<ImageFrameInfo::Surface> _frameSurfaces;
+        til::point _imageViewportOrigin;
+        std::unordered_map<const Image*, uint64_t> _surfaceRevisions;
+        size_t _imageFramePreparations = 0;
+        size_t _surfaceUploads = 0;
+        size_t _surfaceRefreshes = 0;
+        size_t _surfaceEvictions = 0;
+        std::vector<PaintedCluster> _presentedClusters;
+        std::vector<PaintedImage> _presentedImages;
+        size_t _presentedImageFramePreparations = 0;
+        size_t _presentedSurfaceUploads = 0;
+        size_t _presentedSurfaceRefreshes = 0;
+        size_t _presentedSurfaceEvictions = 0;
+    };
+
+    class KittyRenderFixture
+    {
+    public:
+        KittyRenderFixture(const til::size viewport, const til::CoordType history) :
+            terminal{ Terminal::TestDummyMarker{} },
+            renderer{ &terminal }
+        {
+            renderer.AddRenderEngine(&engine);
+            terminal.Create(viewport, history, renderer);
+        }
+
+        ~KittyRenderFixture()
+        {
+            renderer.TriggerTeardown();
+        }
+
+        // Painting normally happens on the renderer's own thread, but a test that starts
+        // one is at the mercy of the scheduler: on a machine busy with I/O the thread can
+        // fail to run at all for tens of seconds, and every wait for a frame then expires
+        // for reasons that have nothing to do with what is being tested. Paint on the
+        // calling thread instead. Nothing here needs a frame to arrive on its own -- the
+        // tests write to the buffer, ask for a paint, and look at what the engine was
+        // handed -- so the thread bought nothing but flakiness.
+        void StartPainting()
+        {
+            Repaint();
+        }
+
+        void Repaint()
+        {
+            renderer.TriggerRedrawAll();
+            THROW_IF_FAILED(renderer.PaintFrame());
+        }
+
+        KittyRecordingRenderEngine engine;
+        Terminal terminal;
+        DummyRenderer renderer;
+    };
+
+    constexpr std::wstring_view StoreRedKittyImage{ L"\x1b_Ga=T,U=1,i=1,f=24,s=1,v=1,c=1,r=1,q=2;/wAA\x1b\\" };
+    constexpr std::wstring_view SelectKittyImageAndBackground{ L"\x1b[38;2;0;0;1;48;2;4;5;6m" };
+    constexpr std::wstring_view KittyPlaceholder{ L"\xDBFB\xDEEE\x0305\x0305\x0305" };
+    constexpr std::wstring_view OrdinaryCombiningText{ L"A\x0301" };
+    // A 4x1 red image drawn across four columns, between the background and the text.
+    constexpr std::wstring_view PlaceRedKittyImageBehindText{ L"\x1b_Ga=T,f=24,s=4,v=1,c=4,r=1,z=-1,q=2;/wAA/wAA/wAA/wAA\x1b\\" };
+
+    std::optional<til::point> FindKittyPlaceholder(const TextBuffer& buffer)
+    {
+        for (til::CoordType y = 0; y < buffer.GetSize().Height(); ++y)
+        {
+            const auto& row = buffer.GetRowByOffset(y);
+            for (til::CoordType x = 0; x < buffer.GetSize().Width(); ++x)
+            {
+                if (row.GetImageCellRef(x))
+                {
+                    return til::point{ x, y };
+                }
+            }
+        }
+        return std::nullopt;
+    }
+
+    void VerifyPlaceholderFrame(const PaintedFrame& frame,
+                                const til::point screenPosition,
+                                const TextAttribute& expectedAttribute,
+                                const uint32_t imageId)
+    {
+        const auto leakedPlaceholder = std::ranges::any_of(frame.clusters, [](const auto& cluster) {
+            return cluster.text.find(L'\xDBFB') != std::wstring::npos ||
+                   cluster.text.find(L'\xDEEE') != std::wstring::npos ||
+                   cluster.text.find(L'\x0305') != std::wstring::npos;
+        });
+        VERIFY_IS_FALSE(leakedPlaceholder, L"the KGP placeholder grapheme reached the glyph renderer");
+
+        const auto cluster = std::ranges::find(frame.clusters, screenPosition, &PaintedCluster::position);
+        VERIFY_IS_TRUE(cluster != frame.clusters.end(), L"the placeholder cell was not painted");
+        if (cluster != frame.clusters.end())
+        {
+            VERIFY_ARE_EQUAL(std::wstring{ L" " }, cluster->text, L"the full placeholder grapheme must be replaced by one non-rendering cell");
+            VERIFY_ARE_EQUAL(1, cluster->columns, L"the placeholder must retain its cell occupancy");
+            VERIFY_IS_TRUE(cluster->attribute == expectedAttribute, L"placeholder colors and attributes must survive glyph suppression");
+        }
+
+        auto imageAtPlaceholder = false;
+        for (const auto& image : frame.images)
+        {
+            if (image.targetRow == screenPosition.y &&
+                image.key.imageId == imageId &&
+                screenPosition.x >= image.columnOffset &&
+                screenPosition.x < image.columnOffset + image.bounds.width() &&
+                image.containsRed)
+            {
+                imageAtPlaceholder = true;
+                break;
+            }
+        }
+        VERIFY_IS_TRUE(imageAtPlaceholder, L"the KGP image must remain painted at the placeholder cell");
+    }
+
+}
 
 namespace TerminalCoreUnitTests
 {
@@ -41,6 +478,14 @@ namespace TerminalCoreUnitTests
         TEST_METHOD(SetWorkingDirectory);
 
         TEST_METHOD(GetCellSizeFallsBackWhenFontUnset);
+
+        TEST_METHOD(DirectImageRendererPreservesSharedSurfaceGeometryAndLifetime);
+        TEST_METHOD(KittyPlaceholderRendersInRealTerminal);
+        TEST_METHOD(KittyImageRowCarriesEachCellsBackgroundColor);
+        TEST_METHOD(KittyPlaceholderSuppressesGlyphOnPaintAndRepaint);
+        TEST_METHOD(KittyPlaceholderLeavesUnrecognizedTextUntouched);
+        TEST_METHOD(KittyPlaceholderSuppressesGlyphAfterResize);
+        TEST_METHOD(KittyPlaceholderSuppressesGlyphAfterScroll);
     };
 };
 
@@ -406,4 +851,375 @@ void TerminalApiTest::GetCellSizeFallsBackWhenFontUnset()
     const auto cellSize = term.GetCellSize();
     VERIFY_IS_GREATER_THAN(cellSize.width, 1, L"cell width must not be a degenerate 1px");
     VERIFY_IS_GREATER_THAN(cellSize.height, 1, L"cell height must not be a degenerate 1px");
+}
+
+void TerminalApiTest::DirectImageRendererPreservesSharedSurfaceGeometryAndLifetime()
+{
+    KittyRenderFixture fixture{ { 6, 3 }, 0 };
+    auto& buffer = *fixture.terminal._mainBuffer;
+
+    auto pixels = std::make_shared<std::vector<RGBQUAD>>(8, RGBQUAD{ 0, 0, 128, 128 });
+    pixels->at(1) = RGBQUAD{ 0, 0, 255, 255 };
+    const auto surface = std::make_shared<Image>(til::size{ 4, 2 }, pixels);
+    const ImagePlacement::PixelGeometry croppedGeometry{
+        .cellSize = { 10, 20 },
+        .targetWidth = 40,
+        .targetHeight = 40,
+        .offset = { 2, 3 },
+    };
+    const ImagePlacement::PixelGeometry fullGeometry{
+        .cellSize = { 10, 20 },
+        .targetWidth = 20,
+        .targetHeight = 40,
+    };
+
+    fixture.terminal.LockConsole();
+    auto unlock = wil::scope_exit([&fixture]() {
+        fixture.terminal.UnlockConsole();
+    });
+    auto& images = buffer.GetMutableImages();
+    images.AddOrReplace(ImagePlacement{
+        { 9, 100 },
+        surface,
+        { 0, 1, 2, 3 },
+        ImagePlacement::BackgroundZThreshold - 1,
+        { 1, 0, 3, 2 },
+        croppedGeometry,
+    });
+    images.AddOrReplace(ImagePlacement{
+        { 9, 101 },
+        surface,
+        { 2, 0, 4, 2 },
+        -2,
+        { 0, 0, 4, 2 },
+        fullGeometry,
+    });
+    images.AddOrReplaceArea(ImagePlacement::FromFragment(
+        { 9, 102 },
+        surface,
+        { 4, 0, 5, 1 },
+        { 4, 0, 6, 2 },
+        5,
+        { 0, 0, 4, 2 },
+        fullGeometry));
+    images.AddOrReplaceArea(ImagePlacement::FromFragment(
+        { 9, 102 },
+        surface,
+        { 5, 1, 6, 2 },
+        { 4, 0, 6, 2 },
+        5,
+        { 0, 0, 4, 2 },
+        fullGeometry));
+    unlock.reset();
+
+    fixture.StartPainting();
+    auto frame = fixture.engine.Snapshot();
+    VERIFY_ARE_EQUAL(size_t{ 1 }, frame.imageFramePreparations, L"placements must be queried once per engine frame");
+    VERIFY_ARE_EQUAL(size_t{ 1 }, frame.surfaceUploads, L"all placements and fragments must share one complete upload");
+    VERIFY_ARE_EQUAL(size_t{ 0 }, frame.surfaceRefreshes);
+    VERIFY_ARE_EQUAL(static_cast<BYTE>(128), surface->Pixels().front().rgbReserved, L"surface alpha must remain intact");
+    VERIFY_IS_TRUE(std::ranges::all_of(frame.images, [&](const auto& image) {
+        return image.surface == surface.get();
+    }));
+
+    const auto cropped = std::ranges::find_if(frame.images, [](const auto& image) {
+        return image.key.layerId == 100;
+    });
+    VERIFY_IS_TRUE(cropped != frame.images.end());
+    if (cropped != frame.images.end())
+    {
+        VERIFY_ARE_EQUAL((til::rect{ 1, 0, 3, 2 }), cropped->source);
+        VERIFY_ARE_EQUAL(uint64_t{ 40 }, cropped->geometry.targetWidth);
+        VERIFY_ARE_EQUAL(uint64_t{ 40 }, cropped->geometry.targetHeight);
+        VERIFY_ARE_EQUAL((til::point{ 2, 3 }), cropped->geometry.offset);
+        VERIFY_ARE_EQUAL(static_cast<int>(ImagePlacement::RenderPosition::BehindBackground), static_cast<int>(cropped->position));
+    }
+
+    const auto fragmentCount = std::ranges::count_if(frame.images, [](const auto& image) {
+        return image.key.layerId == 102;
+    });
+    VERIFY_ARE_EQUAL(ptrdiff_t{ 2 }, fragmentCount, L"disjoint fragments must reuse one placement surface");
+    std::vector<int32_t> rowOneZ;
+    for (const auto& image : frame.images)
+    {
+        if (image.targetRow == 1)
+        {
+            rowOneZ.push_back(image.zIndex);
+        }
+    }
+    VERIFY_IS_TRUE(std::ranges::is_sorted(rowOneZ), L"the renderer must preserve stable z composition across all three phases");
+
+    fixture.terminal.LockConsole();
+    auto unlockAfterScroll = wil::scope_exit([&fixture]() {
+        fixture.terminal.UnlockConsole();
+    });
+    buffer.GetMutableImages().AdvanceRows(1, buffer.GetSize().Height());
+    unlockAfterScroll.reset();
+    fixture.Repaint();
+    frame = fixture.engine.Snapshot();
+    VERIFY_ARE_EQUAL(size_t{ 0 }, frame.surfaceUploads, L"epoch scrolling must reuse the cached surface");
+    const auto scrolledFragment = std::ranges::find_if(frame.images, [](const auto& image) {
+        return image.key.layerId == 102;
+    });
+    VERIFY_IS_TRUE(scrolledFragment != frame.images.end());
+    if (scrolledFragment != frame.images.end())
+    {
+        VERIFY_ARE_EQUAL(0, scrolledFragment->bounds.top);
+        VERIFY_ARE_EQUAL(-1, scrolledFragment->originalBounds.top, L"logical bounds must follow the monotonic row epoch");
+    }
+
+    auto changedPixels = std::make_shared<std::vector<RGBQUAD>>(15);
+    changedPixels->front() = RGBQUAD{ 0, 255, 0, 192 };
+    fixture.terminal.LockConsole();
+    auto unlockAfterRevision = wil::scope_exit([&fixture]() {
+        fixture.terminal.UnlockConsole();
+    });
+    surface->UpdatePixels({ 5, 3 }, std::move(changedPixels));
+    unlockAfterRevision.reset();
+    fixture.Repaint();
+    frame = fixture.engine.Snapshot();
+    VERIFY_ARE_EQUAL(size_t{ 0 }, frame.surfaceUploads);
+    VERIFY_ARE_EQUAL(size_t{ 1 }, frame.surfaceRefreshes, L"a new revision must refresh the existing cached surface");
+    VERIFY_IS_TRUE(std::ranges::all_of(frame.images, [](const auto& image) {
+        return image.surfaceSize == til::size{ 5, 3 };
+    }), L"renderer frames must retain dimensions with their immutable pixel snapshot");
+
+    fixture.terminal.LockConsole();
+    auto unlockAfterDelete = wil::scope_exit([&fixture]() {
+        fixture.terminal.UnlockConsole();
+    });
+    buffer.GetMutableImages().Clear();
+    unlockAfterDelete.reset();
+    fixture.Repaint();
+    frame = fixture.engine.Snapshot();
+    VERIFY_IS_TRUE(frame.images.empty());
+    VERIFY_ARE_EQUAL(size_t{ 1 }, frame.surfaceEvictions, L"deletion must release the backend cache entry");
+}
+
+void TerminalApiTest::KittyPlaceholderRendersInRealTerminal()
+{
+    Terminal term{ Terminal::TestDummyMarker{} };
+    DummyRenderer renderer{ &term };
+    term.Create({ 100, 100 }, 0, renderer);
+
+    auto& tbi = *(term._mainBuffer);
+    auto& sm = *(term._stateMachine);
+
+    // Virtually store a 1x1 red image as id 1 (U=1 => no cursor draw).
+    sm.ProcessString(L"\x1b_Ga=T,i=1,U=1,f=24,s=1,v=1;/wAA\x1b\\");
+    // Foreground = image id 1 (RGB 0,0,1), then print one U+10EEEE placeholder cell.
+    sm.ProcessString(L"\x1b[38;2;0;0;1m");
+    sm.ProcessString(std::wstring{ L'\xDBFB', L'\xDEEE' });
+
+    const auto placements = tbi.GetImages().All();
+    VERIFY_ARE_EQUAL(size_t{ 1 }, placements.size(), L"the placeholder must register one direct-renderer fragment");
+    if (!placements.empty())
+    {
+        const auto& pixel = placements.front().Surface().Pixels().front();
+        VERIFY_ARE_EQUAL(static_cast<BYTE>(255), pixel.rgbRed);
+        VERIFY_ARE_EQUAL(static_cast<BYTE>(0), pixel.rgbGreen);
+        VERIFY_ARE_EQUAL(static_cast<BYTE>(0), pixel.rgbBlue);
+        VERIFY_ARE_EQUAL((til::rect{ 0, 0, 1, 1 }), placements.front().CellBounds());
+    }
+}
+
+// An engine that withholds the text pass's background fill from the cells an image
+// covers has to paint those backgrounds itself, or the image composites over the
+// default background instead of the cell's own. That means the row's per-column
+// background colors have to reach the engine, not just which of them are default.
+void TerminalApiTest::KittyImageRowCarriesEachCellsBackgroundColor()
+{
+    KittyRenderFixture fixture{ { 8, 3 }, 0 };
+    auto& stateMachine = *fixture.terminal._stateMachine;
+
+    // Two cells with an explicit background, then two that keep the default one.
+    stateMachine.ProcessString(L"\x1b[48;2;4;5;6m  \x1b[0m  ");
+    stateMachine.ProcessString(L"\x1b[1;1H");
+    stateMachine.ProcessString(PlaceRedKittyImageBehindText);
+
+    fixture.StartPainting();
+    const auto frame = fixture.engine.Snapshot();
+
+    const auto painted = std::ranges::find(frame.images, til::CoordType{ 0 }, &PaintedImage::targetRow);
+    VERIFY_IS_TRUE(painted != frame.images.end(), L"the image row was never handed to the engine");
+
+    const std::vector<uint8_t> expectedMask{ 0, 0, 1, 1, 1, 1, 1, 1 };
+    VERIFY_ARE_EQUAL(expectedMask, painted->defaultBackgroundMask, L"only the two cells with an explicit background are non-default");
+
+    VERIFY_ARE_EQUAL(size_t{ 8 }, painted->cellBackgrounds.size(), L"the engine needs one color per visible column");
+    VERIFY_ARE_EQUAL(RGB(4, 5, 6), painted->cellBackgrounds.at(0), L"a cell's own background color must survive to the engine");
+    VERIFY_ARE_EQUAL(RGB(4, 5, 6), painted->cellBackgrounds.at(1), L"a cell's own background color must survive to the engine");
+    VERIFY_ARE_EQUAL(painted->cellBackgrounds.at(2), painted->cellBackgrounds.at(3), L"the default-background cells must agree");
+    VERIFY_ARE_NOT_EQUAL(RGB(4, 5, 6), painted->cellBackgrounds.at(2), L"a default cell must not inherit the colored one");
+}
+
+void TerminalApiTest::KittyPlaceholderSuppressesGlyphOnPaintAndRepaint()
+{
+    KittyRenderFixture fixture{ { 8, 3 }, 0 };
+    auto& buffer = *fixture.terminal._mainBuffer;
+    auto& stateMachine = *fixture.terminal._stateMachine;
+
+    stateMachine.ProcessString(StoreRedKittyImage);
+    stateMachine.ProcessString(L"XY");
+    stateMachine.ProcessString(SelectKittyImageAndBackground);
+    stateMachine.ProcessString(KittyPlaceholder);
+
+    const til::point placeholderPosition{ 2, 0 };
+    VERIFY_ARE_EQUAL((til::point{ 3, 0 }), buffer.GetCursor().GetPosition(), L"the placeholder must advance the cursor by one cell");
+    VERIFY_ARE_EQUAL(std::wstring{ KittyPlaceholder }, std::wstring{ buffer.GetRowByOffset(0).GlyphAt(2) }, L"glyph suppression must not alter stored text");
+    const auto placeholderAttribute = buffer.GetRowByOffset(0).GetAttrByColumn(2);
+
+    stateMachine.ProcessString(L"\x1b[0m\x1b[2;1H");
+    stateMachine.ProcessString(OrdinaryCombiningText);
+
+    fixture.StartPainting();
+    auto frame = fixture.engine.Snapshot();
+    VerifyPlaceholderFrame(frame, placeholderPosition, placeholderAttribute, 1);
+
+    const auto ordinary = std::ranges::find(frame.clusters, til::point{ 0, 1 }, &PaintedCluster::position);
+    VERIFY_IS_TRUE(ordinary != frame.clusters.end(), L"the ordinary combining sequence was not painted");
+    if (ordinary != frame.clusters.end())
+    {
+        VERIFY_ARE_EQUAL(std::wstring{ OrdinaryCombiningText }, ordinary->text, L"ordinary Unicode combining sequences must remain unchanged");
+    }
+
+    fixture.Repaint();
+    VerifyPlaceholderFrame(fixture.engine.Snapshot(), placeholderPosition, placeholderAttribute, 1);
+}
+
+void TerminalApiTest::KittyPlaceholderLeavesUnrecognizedTextUntouched()
+{
+    KittyRenderFixture fixture{ { 6, 2 }, 0 };
+    auto& buffer = *fixture.terminal._mainBuffer;
+    fixture.terminal._stateMachine->ProcessString(KittyPlaceholder);
+
+    VERIFY_IS_NULL(buffer.GetRowByOffset(0).GetImageCellRef(0), L"no stored virtual placement should leave the private-use text unrecognized");
+    fixture.StartPainting();
+
+    const auto frame = fixture.engine.Snapshot();
+    const auto cluster = std::ranges::find(frame.clusters, til::point{ 0, 0 }, &PaintedCluster::position);
+    VERIFY_IS_TRUE(cluster != frame.clusters.end(), L"the unrecognized private-use text was not painted");
+    if (cluster != frame.clusters.end())
+    {
+        VERIFY_ARE_EQUAL(std::wstring{ KittyPlaceholder }, cluster->text, L"unrecognized private-use text must reach the glyph renderer unchanged");
+        VERIFY_ARE_EQUAL(1, cluster->columns);
+    }
+}
+
+void TerminalApiTest::KittyPlaceholderSuppressesGlyphAfterResize()
+{
+    KittyRenderFixture fixture{ { 12, 4 }, 0 };
+    auto& initialBuffer = *fixture.terminal._mainBuffer;
+    auto& stateMachine = *fixture.terminal._stateMachine;
+
+    stateMachine.ProcessString(StoreRedKittyImage);
+    stateMachine.ProcessString(L"0123456789");
+    stateMachine.ProcessString(SelectKittyImageAndBackground);
+    stateMachine.ProcessString(KittyPlaceholder);
+
+    const til::point oldPosition{ 10, 0 };
+    VERIFY_IS_NOT_NULL(initialBuffer.GetRowByOffset(oldPosition.y).GetImageCellRef(oldPosition.x));
+    const auto sixelSurface = std::make_shared<Image>(
+        til::size{ 1, 1 },
+        std::vector<RGBQUAD>{ RGBQUAD{ 255, 0, 0, 255 } });
+    initialBuffer.GetMutableImages().Add(ImagePlacement{
+        { 0, 1, ImagePlacement::Key::Protocol::Sixel },
+        sixelSurface,
+        { 0, 0, 1, 1 },
+        0,
+        {},
+        {
+            .cellSize = { 1, 1 },
+            .targetWidth = 1,
+            .targetHeight = 1,
+        },
+    });
+    fixture.StartPainting();
+
+    fixture.terminal.LockConsole();
+    auto unlockAfterResize = wil::scope_exit([&fixture]() {
+        fixture.terminal.UnlockConsole();
+    });
+    VERIFY_SUCCEEDED(fixture.terminal.UserResize({ 6, 4 }));
+    unlockAfterResize.reset();
+    fixture.Repaint();
+
+    const auto& resizedBuffer = *fixture.terminal._mainBuffer;
+    const auto movedPosition = FindKittyPlaceholder(resizedBuffer);
+    VERIFY_IS_TRUE(movedPosition.has_value(), L"the placeholder metadata was lost during reflow");
+    if (movedPosition)
+    {
+        VERIFY_ARE_EQUAL((til::point{ 4, 1 }), *movedPosition, L"the placeholder must reflow with its text cell");
+        VERIFY_ARE_NOT_EQUAL(oldPosition, *movedPosition, L"the placeholder did not move during reflow");
+        VERIFY_ARE_EQUAL(std::wstring{ KittyPlaceholder }, std::wstring{ resizedBuffer.GetRowByOffset(movedPosition->y).GlyphAt(movedPosition->x) });
+
+        const auto screenPosition = *movedPosition - til::point{ 0, fixture.terminal.GetViewport().Top() };
+        const auto attribute = resizedBuffer.GetRowByOffset(movedPosition->y).GetAttrByColumn(movedPosition->x);
+        VerifyPlaceholderFrame(fixture.engine.Snapshot(), screenPosition, attribute, 1);
+    }
+    const auto resizedImages = resizedBuffer.GetImages().All();
+    const auto resizedSixel = std::ranges::find_if(resizedImages, [](const ImagePlacement& placement) {
+        return placement.Identity().protocol == ImagePlacement::Key::Protocol::Sixel;
+    });
+    VERIFY_IS_TRUE(resizedSixel != resizedImages.end(), L"relocating Kitty pixels must not drop the Sixel placement");
+    VERIFY_ARE_EQUAL(sixelSurface.get(), resizedSixel->SurfacePointer().get());
+    VERIFY_ARE_EQUAL(static_cast<BYTE>(255), resizedSixel->Surface().Pixels().front().rgbBlue);
+
+    fixture.terminal.LockConsole();
+    auto unlockAfterWiden = wil::scope_exit([&fixture]() {
+        fixture.terminal.UnlockConsole();
+    });
+    VERIFY_SUCCEEDED(fixture.terminal.UserResize({ 12, 4 }));
+    unlockAfterWiden.reset();
+    fixture.Repaint();
+
+    const auto& widenedBuffer = *fixture.terminal._mainBuffer;
+    const auto widenedPosition = FindKittyPlaceholder(widenedBuffer);
+    VERIFY_IS_TRUE(widenedPosition.has_value(), L"the placeholder metadata was lost while joining wrapped rows");
+    if (widenedPosition)
+    {
+        VERIFY_ARE_EQUAL(oldPosition, *widenedPosition, L"widening must join the placeholder back into its original logical row");
+        const auto attribute = widenedBuffer.GetRowByOffset(widenedPosition->y).GetAttrByColumn(widenedPosition->x);
+        VerifyPlaceholderFrame(fixture.engine.Snapshot(), *widenedPosition, attribute, 1);
+    }
+    const auto widenedImages = widenedBuffer.GetImages().All();
+    const auto widenedSixel = std::ranges::find_if(widenedImages, [](const ImagePlacement& placement) {
+        return placement.Identity().protocol == ImagePlacement::Key::Protocol::Sixel;
+    });
+    VERIFY_IS_TRUE(widenedSixel != widenedImages.end(), L"joining wrapped rows must preserve the Sixel placement");
+    VERIFY_ARE_EQUAL(sixelSurface.get(), widenedSixel->SurfacePointer().get());
+}
+
+void TerminalApiTest::KittyPlaceholderSuppressesGlyphAfterScroll()
+{
+    KittyRenderFixture fixture{ { 6, 3 }, 0 };
+    auto& buffer = *fixture.terminal._mainBuffer;
+    auto& stateMachine = *fixture.terminal._stateMachine;
+
+    stateMachine.ProcessString(StoreRedKittyImage);
+    stateMachine.ProcessString(L"\x1b[2;2H");
+    stateMachine.ProcessString(SelectKittyImageAndBackground);
+    stateMachine.ProcessString(KittyPlaceholder);
+
+    const til::point oldPosition{ 1, 1 };
+    fixture.StartPainting();
+    fixture.terminal.LockConsole();
+    auto unlockAfterScroll = wil::scope_exit([&fixture]() {
+        fixture.terminal.UnlockConsole();
+    });
+    stateMachine.ProcessString(L"\x1b[3;1H\n");
+    unlockAfterScroll.reset();
+    fixture.Repaint();
+
+    const auto movedPosition = FindKittyPlaceholder(buffer);
+    VERIFY_IS_TRUE(movedPosition.has_value(), L"the placeholder metadata was lost during scrolling");
+    if (movedPosition)
+    {
+        VERIFY_ARE_EQUAL((til::point{ 1, 0 }), *movedPosition, L"the placeholder must move with the scrolled row");
+        VERIFY_ARE_NOT_EQUAL(oldPosition, *movedPosition);
+        VERIFY_ARE_EQUAL(std::wstring{ KittyPlaceholder }, std::wstring{ buffer.GetRowByOffset(movedPosition->y).GlyphAt(movedPosition->x) });
+
+        const auto attribute = buffer.GetRowByOffset(movedPosition->y).GetAttrByColumn(movedPosition->x);
+        VerifyPlaceholderFrame(fixture.engine.Snapshot(), *movedPosition, attribute, 1);
+    }
 }

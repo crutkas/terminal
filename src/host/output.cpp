@@ -105,13 +105,27 @@ static void _CopyRectangle(SCREEN_INFORMATION& screenInfo,
         // Note that we read two cells from the source before we start writing
         // to the target, so a two-cell DBCS character can't accidentally delete
         // itself when moving one cell horizontally.
+        const auto getImageCellRef = [&](const til::point position) noexcept {
+            if (const auto metadata = textBuffer.GetRowByOffset(position.y).GetImageCellRef(position.x))
+            {
+                return *metadata;
+            }
+            return ImageCellRef{};
+        };
         auto next = OutputCell(*screenInfo.GetCellDataAt(sourcePos));
+        auto nextMetadata = getImageCellRef(sourcePos);
         do
         {
             const auto current = next;
+            const auto currentMetadata = nextMetadata;
             source.WalkInBounds(sourcePos, walkDirection);
             next = OutputCell(*screenInfo.GetCellDataAt(sourcePos));
+            nextMetadata = getImageCellRef(sourcePos);
             textBuffer.WriteLine(OutputCellIterator({ &current, 1 }), targetPos);
+            if (currentMetadata.valid)
+            {
+                textBuffer.GetMutableRowByOffset(targetPos.y).SetImageCellRef(targetPos.x, currentMetadata);
+            }
         } while (target.WalkInBounds(targetPos, walkDirection));
 
         sourceImages.CopyArea(source.ToExclusive(), targetOrigin, textBuffer.GetMutableImages());

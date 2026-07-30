@@ -5,6 +5,7 @@
 
 #include "KittyParser.hpp"
 #include "adaptDispatch.hpp"
+#include <til/unicode.h>
 #include "../../types/inc/Viewport.hpp"
 #include "../parser/ascii.hpp"
 
@@ -219,6 +220,9 @@ KittyParser::Control KittyParser::_ParseControl(const std::wstring_view control)
                 c.zIndex = _ParseInt(value);
                 c.haveZ = true;
                 break;
+            case L'U':
+                c.virtualPlacement = _ParseUint(value) != 0;
+                break;
             case L'm':
                 c.moreChunks = _ParseUint(value) != 0;
                 c.mPresent = true;
@@ -350,11 +354,26 @@ void KittyParser::_ProcessCommand(const Control& command, const std::string_view
                 priorPlacement = existing->second;
             }
         }
-        const auto priorAnchor = priorPlacement ? _derivePlacementAnchor(*priorPlacement) : std::nullopt;
+        const auto priorAnchor = priorPlacement ?
+                                     (priorPlacement->isVirtual ?
+                                          _deriveVirtualPlacementAnchor(targetImageId, placementId) :
+                                          _derivePlacementAnchor(*priorPlacement)) :
+                                     std::nullopt;
         const auto removePriorPlacement = [&]() {
             if (priorPlacement)
             {
                 _erasePlacementCells(*priorPlacement);
+                if (priorPlacement->isVirtual)
+                {
+                    _virtualIds.erase({ targetImageId, placementId });
+                }
+                if (placementId == 0)
+                {
+                    _virtualIds.erase({ targetImageId, 0u });
+                    std::erase_if(_anonymousPlacements, [&](const auto& placement) {
+                        return placement.layerId == priorPlacement->layerId;
+                    });
+                }
             }
         };
         const auto registerPlacement = [&](const Placement& placement) {
@@ -365,7 +384,12 @@ void KittyParser::_ProcessCommand(const Control& command, const std::string_view
             }
             while (_anonymousPlacements.size() >= MaxPlacements)
             {
-                _erasePlacementCells(_anonymousPlacements.front());
+                const auto& victim = _anonymousPlacements.front();
+                _erasePlacementCells(victim);
+                if (victim.isVirtual)
+                {
+                    _virtualIds.erase({ victim.imageId, 0u });
+                }
                 _anonymousPlacements.erase(_anonymousPlacements.begin());
             }
             _anonymousPlacements.push_back(placement);
@@ -445,6 +469,7 @@ void KittyParser::_ProcessCommand(const Control& command, const std::string_view
             placement.offsetV = command.offsetV;
             placement.zIndex = command.zIndex;
             placement.hasParent = true;
+            placement.isVirtual = false;
             registerPlacement(placement);
             if (placementId != 0 && movesChildren &&
                 !_movePlacementChildren({ targetImageId, placementId }, childAnchor, true, code))
@@ -517,6 +542,7 @@ void KittyParser::_ProcessCommand(const Control& command, const std::string_view
         placement.cellOffsetY = command.cellOffsetY;
         placement.zIndex = command.zIndex;
         placement.hasParent = false;
+        placement.isVirtual = false;
         registerPlacement(placement);
         if (placementId != 0 && movesChildren &&
             !_movePlacementChildren({ targetImageId, placementId }, cursorPos, true, code))
@@ -527,6 +553,81 @@ void KittyParser::_ProcessCommand(const Control& command, const std::string_view
             return;
         }
         removePriorPlacement();
+    };
+    const auto storeKittyVirtualPlacement = [&](const uint32_t targetImageId, const Image& image) {
+        const auto placementId = command.havePlacementId ? command.placementId : 0u;
+        auto layerId = _nextLayerId++;
+        if (layerId == 0)
+        {
+            layerId = _nextLayerId++;
+        }
+
+        auto priorPlacement = std::optional<Placement>{};
+        if (placementId != 0)
+        {
+            const auto existing = _placements.find({ targetImageId, placementId });
+            if (existing != _placements.end())
+            {
+                priorPlacement = existing->second;
+            }
+        }
+        else
+        {
+            const auto existing = std::find_if(_anonymousPlacements.begin(), _anonymousPlacements.end(), [&](const auto& placement) {
+                return placement.isVirtual && placement.imageId == targetImageId;
+            });
+            if (existing != _anonymousPlacements.end())
+            {
+                priorPlacement = *existing;
+            }
+        }
+
+        _storeVirtualPlacement(targetImageId, placementId, image, command.cols, command.rows, command.srcX, command.srcY, command.srcW, command.srcH, command.zIndex, layerId);
+
+        if (priorPlacement)
+        {
+            _erasePlacementCells(*priorPlacement);
+            if (placementId != 0)
+            {
+                _placements.erase({ targetImageId, placementId });
+            }
+            else
+            {
+                std::erase_if(_anonymousPlacements, [&](const auto& placement) {
+                    return placement.layerId == priorPlacement->layerId;
+                });
+            }
+        }
+
+        const auto virtualPlacement = _virtualIds.find({ targetImageId, placementId });
+        if (virtualPlacement == _virtualIds.end())
+        {
+            return;
+        }
+        Placement placement;
+        placement.imageId = targetImageId;
+        placement.placementId = placementId;
+        placement.layerId = layerId;
+        placement.zIndex = command.zIndex;
+        placement.isVirtual = true;
+        if (placementId != 0)
+        {
+            _registerPlacement(placement);
+        }
+        else
+        {
+            while (_anonymousPlacements.size() >= MaxPlacements)
+            {
+                const auto& victim = _anonymousPlacements.front();
+                _erasePlacementCells(victim);
+                if (victim.isVirtual)
+                {
+                    _virtualIds.erase({ victim.imageId, 0u });
+                }
+                _anonymousPlacements.erase(_anonymousPlacements.begin());
+            }
+            _anonymousPlacements.push_back(placement);
+        }
     };
 
     if (haveId && haveNumber)
@@ -556,6 +657,17 @@ void KittyParser::_ProcessCommand(const Control& command, const std::string_view
                 static_cast<void>(_localMediaAllowed());
                 success = false;
                 code = L"EINVAL:unsupported transmission medium";
+                break;
+            }
+            if (command.virtualPlacement && command.haveParent)
+            {
+                // A virtual (U=1) placement cannot itself be relative. This is a conflict
+                // between two control keys, so it is settled here, before anything is
+                // decoded, read, or registered: deciding it after the image had been stored
+                // would replace or evict registry entries on behalf of a command that then
+                // fails.
+                success = false;
+                code = L"EINVAL:virtual placements cannot be relative";
                 break;
             }
             if (compression != 0 && compression != L'z')
@@ -656,7 +768,21 @@ void KittyParser::_ProcessCommand(const Control& command, const std::string_view
                     code = L"ENOSPC:image storage limit exceeded";
                     break;
                 }
-                if (action == L'T')
+                if (command.virtualPlacement)
+                {
+                    const auto stored = _images.find(assignedId);
+                    if (stored != _images.end())
+                    {
+                        storeKittyVirtualPlacement(assignedId, stored->second);
+                    }
+                }
+                else
+                {
+                    std::erase_if(_virtualIds, [&](const auto& entry) {
+                        return entry.first.first == assignedId;
+                    });
+                }
+                if (action == L'T' && !command.virtualPlacement)
                 {
                     const auto stored = _images.find(assignedId);
                     if (stored != _images.end())
@@ -699,8 +825,26 @@ void KittyParser::_ProcessCommand(const Control& command, const std::string_view
                 success = false;
                 code = L"ENOENT:image not found";
             }
+            else if (command.virtualPlacement)
+            {
+                if (command.haveParent)
+                {
+                    // A virtual (U=1) placement cannot itself be relative.
+                    success = false;
+                    code = L"EINVAL:virtual placements cannot be relative";
+                }
+                else
+                {
+                    // Virtual put: eligible for placeholders with the requested grid, no cursor draw.
+                    storeKittyVirtualPlacement(targetId, *target);
+                }
+            }
             else
             {
+                // Re-putting the same (i, p) replaces the prior placement (move/resize); that
+                // replacement is now handled inside displayKittyPlacement, which erases the prior
+                // placement's cells ONLY once the new placement is known to succeed. This avoids
+                // destroying an existing placement when a relative re-put fails to resolve.
                 displayKittyPlacement(targetId, *target);
                 if (success)
                 {
@@ -729,6 +873,12 @@ void KittyParser::_ProcessCommand(const Control& command, const std::string_view
                     else
                     {
                         _erasePlacementsForImage(imageId);
+                        // A virtual (U=1) placement is itself a placement, deleted by i/I/n/N/r/R
+                        // regardless of case (spec); only the image DATA free is case-gated, so drop
+                        // the virtual grid here so a later placeholder doesn't re-render it.
+                        std::erase_if(_virtualIds, [&](const auto& entry) {
+                            return entry.first.first == imageId;
+                        });
                         _eraseImagePlacements(imageId);
                         if (freeData)
                         {
@@ -757,6 +907,9 @@ void KittyParser::_ProcessCommand(const Control& command, const std::string_view
                         else
                         {
                             _erasePlacementsForImage(targetId);
+                            std::erase_if(_virtualIds, [&](const auto& entry) {
+                                return entry.first.first == targetId;
+                            });
                             _eraseImagePlacements(targetId);
                             if (freeData)
                             {
@@ -1001,6 +1154,9 @@ void KittyParser::_eraseImage(const uint32_t id)
         }
     }
     _images.erase(it);
+    std::erase_if(_virtualIds, [&](const auto& entry) {
+        return entry.first.first == id;
+    });
     for (auto placement = _placements.begin(); placement != _placements.end();)
     {
         placement = placement->first.first == id ? _placements.erase(placement) : std::next(placement);
@@ -1056,6 +1212,7 @@ try
     _images.clear();
     _imageNumbers.clear();
     _imageOrder.clear();
+    _virtualIds.clear();
     _placements.clear();
     _anonymousPlacements.clear();
     _totalPixelBytes = 0;
@@ -1082,11 +1239,13 @@ KittyParser::BufferState KittyParser::_takeBufferState() noexcept
     state.images = std::move(_images);
     state.imageNumbers = std::move(_imageNumbers);
     state.imageOrder = std::move(_imageOrder);
+    state.virtualIds = std::move(_virtualIds);
     state.placements = std::move(_placements);
     state.anonymousPlacements = std::move(_anonymousPlacements);
     _images.clear();
     _imageNumbers.clear();
     _imageOrder.clear();
+    _virtualIds.clear();
     _placements.clear();
     _anonymousPlacements.clear();
     return state;
@@ -1100,6 +1259,7 @@ void KittyParser::_restoreBufferState(BufferState&& state) noexcept
     _images = std::move(state.images);
     _imageNumbers = std::move(state.imageNumbers);
     _imageOrder = std::move(state.imageOrder);
+    _virtualIds = std::move(state.virtualIds);
     _placements = std::move(state.placements);
     _anonymousPlacements = std::move(state.anonymousPlacements);
 }
@@ -1279,6 +1439,54 @@ KittyParser::TargetSize KittyParser::_targetPixels(const int64_t cropW, const in
     return { safeCropW, safeCropH };
 }
 
+// Records the fixed grid geometry of a virtual (U=1) placement so later Unicode-placeholder
+// rendering slices the image by a STABLE rows x cols grid. The grid is the cell span the same
+// image would occupy if drawn at the cursor (shared _targetPixels), so c-only/r-only
+// keep aspect. Omitted placeholder coordinates are resolved from persistent left-cell metadata,
+// not placement-global state, so re-storing does not disturb already-written placeholder text.
+void KittyParser::_storeVirtualPlacement(const uint32_t id, const uint32_t placementId, const Image& image, const uint32_t cols, const uint32_t rows, const uint32_t srcX, const uint32_t srcY, const uint32_t srcW, const uint32_t srcH, const int32_t zIndex, const uint64_t layerId)
+{
+    constexpr uint32_t maxCells = 8192;
+    const auto cellSize = _dispatcher._api.GetCellSize();
+    const int64_t cellWidth = std::max(1, cellSize.width);
+    const int64_t cellHeight = std::max(1, cellSize.height);
+    const auto imageWidth = static_cast<int64_t>(image.width);
+    const auto imageHeight = static_cast<int64_t>(image.height);
+    // Source crop rect (pixels), clamped to the image; w/h=0 (or past the edge) extends to the
+    // right/bottom edge. Matches _placeImage so a U=1 placement samples the same sub-rect
+    // a direct c/r draw would, and the grid aspect follows the CROP (not the full image).
+    const auto cropX = std::min<int64_t>(srcX, imageWidth);
+    const auto cropY = std::min<int64_t>(srcY, imageHeight);
+    const auto cropW = srcW == 0 ? imageWidth - cropX : std::min<int64_t>(std::min<int64_t>(srcW, imageWidth), imageWidth - cropX);
+    const auto cropH = srcH == 0 ? imageHeight - cropY : std::min<int64_t>(std::min<int64_t>(srcH, imageHeight), imageHeight - cropY);
+    if (cropW <= 0 || cropH <= 0)
+    {
+        // An empty crop (x/y at or past the image edge) displays nothing, matching _placeImage.
+        // Register no virtual grid -- and drop any prior one on re-put -- so a later placeholder for
+        // this id draws nothing rather than sampling outside the crop (which would read the adjacent
+        // pixel row and leak cropped-out data).
+        _virtualIds.erase({ id, placementId });
+        return;
+    }
+    const auto [targetW, targetH] = _targetPixels(cropW, cropH, cols, rows, cellWidth, cellHeight);
+    const auto gridCols = std::clamp<int64_t>((targetW + cellWidth - 1) / cellWidth, 1, maxCells);
+    const auto gridRows = std::clamp<int64_t>((targetH + cellHeight - 1) / cellHeight, 1, maxCells);
+    auto& placement = _virtualIds[{ id, placementId }];
+    placement.cols = static_cast<uint32_t>(gridCols);
+    placement.rows = static_cast<uint32_t>(gridRows);
+    placement.cropX = static_cast<uint32_t>(cropX);
+    placement.cropY = static_cast<uint32_t>(cropY);
+    placement.cropW = static_cast<uint32_t>(cropW);
+    placement.cropH = static_cast<uint32_t>(cropH);
+    // Keep the exact scaled target size (64-bit: aspect-preserving scaling can exceed 2^32) so
+    // placeholder sampling matches _placeImage's continuous scaling (not a per-cell source
+    // split) for non-divisible geometry -- storing it narrower would truncate and diverge.
+    placement.targetW = static_cast<uint64_t>(std::max<int64_t>(targetW, 1));
+    placement.targetH = static_cast<uint64_t>(std::max<int64_t>(targetH, 1));
+    placement.layerId = layerId;
+    placement.zIndex = zIndex;
+}
+
 void KittyParser::_registerPlacement(const Placement& placement)
 {
     if (placement.imageId == 0 || placement.placementId == 0)
@@ -1298,6 +1506,10 @@ void KittyParser::_registerPlacement(const Placement& placement)
         const auto victimKey = victim->first;
         const auto victimValue = victim->second;
         _erasePlacementCells(victimValue);
+        if (victimValue.isVirtual)
+        {
+            _virtualIds.erase(victimKey);
+        }
         _placements.erase(victim);
         std::deque<std::pair<uint32_t, uint32_t>> removed{ victimKey };
         _cascadePlacementChildren(removed, 0);
@@ -1588,6 +1800,10 @@ void KittyParser::_erasePlacementsForImage(const uint32_t imageId)
         }
     }
 
+    std::erase_if(_virtualIds, [&](const auto& entry) {
+        return entry.first.first == imageId;
+    });
+
     _cascadePlacementChildren(removed, imageId);
 }
 
@@ -1640,6 +1856,10 @@ void KittyParser::_cascadePlacementChildren(std::deque<std::pair<uint32_t, uint3
             if (child.hasParent && child.parentImageId == parent.first && child.parentPlacementId == parent.second)
             {
                 _erasePlacementCells(child);
+                if (child.isVirtual)
+                {
+                    _virtualIds.erase(placement->first);
+                }
                 removed.push_back(placement->first);
                 placement = _placements.erase(placement);
             }
@@ -1688,6 +1908,7 @@ void KittyParser::_deletePlacement(const uint32_t imageId, const uint32_t placem
     _erasePlacementCells(placement->second);
     std::deque<std::pair<uint32_t, uint32_t>> removed{ { imageId, placementId } };
     _placements.erase(placement);
+    _virtualIds.erase({ imageId, placementId });
     _cascadePlacementChildren(removed, freeData ? 0 : imageId);
 }
 
@@ -1917,6 +2138,9 @@ void KittyParser::_deleteImagesInIdRange(const uint32_t lo, const uint32_t hi, c
     for (const auto imageId : imageIds)
     {
         _erasePlacementsForImage(imageId);
+        std::erase_if(_virtualIds, [&](const auto& entry) {
+            return entry.first.first == imageId;
+        });
         if (freeData)
         {
             _eraseImage(imageId);
@@ -1946,10 +2170,14 @@ void KittyParser::_deletePlacementsByZ(const int32_t zIndex, const bool freeData
                 {
                     const auto physical =
                         std::any_of(_placements.begin(), _placements.end(), [&](const auto& entry) {
-                            return entry.second.imageId == key.imageId && entry.second.layerId == key.layerId;
+                            return !entry.second.isVirtual &&
+                                   entry.second.imageId == key.imageId &&
+                                   entry.second.layerId == key.layerId;
                         }) ||
                         std::any_of(_anonymousPlacements.begin(), _anonymousPlacements.end(), [&](const Placement& placement) {
-                            return placement.imageId == key.imageId && placement.layerId == key.layerId;
+                            return !placement.isVirtual &&
+                                   placement.imageId == key.imageId &&
+                                   placement.layerId == key.layerId;
                         });
                     if (physical)
                     {
@@ -1964,14 +2192,14 @@ void KittyParser::_deletePlacementsByZ(const int32_t zIndex, const bool freeData
         for (const auto& [key, placement] : _placements)
         {
             static_cast<void>(key);
-            if (placement.zIndex == zIndex)
+            if (!placement.isVirtual && placement.zIndex == zIndex)
             {
                 layerIds.push_back(placement.layerId);
             }
         }
         for (const auto& placement : _anonymousPlacements)
         {
-            if (placement.zIndex == zIndex)
+            if (!placement.isVirtual && placement.zIndex == zIndex)
             {
                 layerIds.push_back(placement.layerId);
             }
@@ -1986,7 +2214,8 @@ void KittyParser::_deletePlacementsByZ(const int32_t zIndex, const bool freeData
     }
 
     const auto selected = [&](const Placement& placement) {
-        return std::binary_search(layerIds.begin(), layerIds.end(), placement.layerId);
+        return !placement.isVirtual &&
+               std::binary_search(layerIds.begin(), layerIds.end(), placement.layerId);
     };
 
     std::vector<std::pair<uint32_t, uint32_t>> selectedPlacements;
@@ -2060,7 +2289,7 @@ void KittyParser::_deletePlacementsByZ(const int32_t zIndex, const bool freeData
 
 std::optional<til::point> KittyParser::_derivePlacementAnchor(const Placement& placement) const
 {
-    if (placement.layerId == 0)
+    if (placement.layerId == 0 || placement.isVirtual)
     {
         return std::nullopt;
     }
@@ -2081,6 +2310,41 @@ std::optional<til::point> KittyParser::_derivePlacementAnchor(const Placement& p
         found = true;
     }
     return found ? std::optional<til::point>{ til::point{ minCol, minRow } } : std::nullopt;
+}
+
+// Derives the on-screen anchor of a virtual (U=1) parent from its Unicode-placeholder cells:
+// the top-left is the minimum x/y over its direct-renderer fragments. Returns nullopt if no
+// placeholder fragment for the image is currently on screen.
+// Protocol: https://sw.kovidgoyal.net/kitty/graphics-protocol/#relative-placements
+std::optional<til::point> KittyParser::_deriveVirtualPlacementAnchor(const uint32_t imageId, const uint32_t placementId) const
+{
+    const auto virtualPlacement = _virtualIds.find({ imageId, placementId });
+    if (imageId == 0 || virtualPlacement == _virtualIds.end())
+    {
+        return std::nullopt;
+    }
+    const auto layerId = virtualPlacement->second.layerId;
+    auto page = _dispatcher._pages.ActivePage();
+    auto& buffer = page.Buffer();
+    auto minRow = page.Bottom();
+    auto minCol = page.Width();
+    auto found = false;
+    for (const auto& image : buffer.GetImages().All())
+    {
+        if (image.Identity() != ImagePlacement::Key{ imageId, layerId, ImagePlacement::Key::Protocol::Kitty })
+        {
+            continue;
+        }
+        const auto bounds = image.CellBounds();
+        minRow = std::min(minRow, bounds.top);
+        minCol = std::min(minCol, bounds.left);
+        found = true;
+    }
+    if (!found)
+    {
+        return std::nullopt;
+    }
+    return til::point{ minCol, minRow };
 }
 
 std::optional<til::point> KittyParser::_resolvePlacementAnchor(const uint32_t parentImageId,
@@ -2138,6 +2402,29 @@ std::optional<til::point> KittyParser::_resolvePlacementAnchor(const uint32_t pa
         const auto placement = _placements.find(key);
         if (placement == _placements.end())
         {
+            // Not a registered placement. An ANONYMOUS virtual image (U=1 with no placement id)
+            // is still a valid parent referenced as (imageId, 0): its anchor comes from the
+            // on-screen Unicode-placeholder cells owned by that image id. A non-zero Q that
+            // matched no registered placement is a dangling reference -> ENOPARENT.
+            if (key.second == 0 && _virtualIds.count(key) != 0)
+            {
+                const auto derived = _deriveVirtualPlacementAnchor(key.first, key.second);
+                if (!derived)
+                {
+                    code = L"ENOPARENT:relative parent not found";
+                    return std::nullopt;
+                }
+                if (depth == 1)
+                {
+                    immediateAnchor = derived;
+                }
+                if (!descendantsFit(depth))
+                {
+                    code = L"ETOODEEP:relative placement chain too deep";
+                    return std::nullopt;
+                }
+                return immediateAnchor; // a virtual image is always a chain leaf
+            }
             code = L"ENOPARENT:relative parent not found";
             return std::nullopt;
         }
@@ -2145,14 +2432,14 @@ std::optional<til::point> KittyParser::_resolvePlacementAnchor(const uint32_t pa
         const auto& parent = placement->second;
         if (depth == 1)
         {
-            immediateAnchor = _derivePlacementAnchor(parent);
+            immediateAnchor = parent.isVirtual ? _deriveVirtualPlacementAnchor(key.first, key.second) : _derivePlacementAnchor(parent);
             if (!immediateAnchor)
             {
                 code = L"ENOPARENT:relative parent not found";
                 return std::nullopt;
             }
         }
-        if (!parent.hasParent)
+        if (parent.isVirtual || !parent.hasParent)
         {
             if (!descendantsFit(depth))
             {
@@ -2165,6 +2452,636 @@ std::optional<til::point> KittyParser::_resolvePlacementAnchor(const uint32_t pa
     }
     code = L"ETOODEEP:relative placement chain too deep";
     return std::nullopt;
+}
+
+// Maps a kitty row/column combining diacritic to its 0-based index, or -1 if the glyph isn't a
+// placeholder diacritic. This is the full 297-entry kitty "rowcolumn-diacritics" table, sorted
+// ascending so a binary search resolves the index; entries past U+FFFF (musical-symbol combining
+// marks, indices 283-296) address grids larger than 283 cells in a dimension. Vendored from the
+// kitty graphics protocol spec (the list is identical across implementations). The optional 3rd
+// diacritic (high byte of a >24-bit id) and 256-color ids are handled by the caller.
+// Protocol: https://sw.kovidgoyal.net/kitty/graphics-protocol/#unicode-placeholders
+int KittyParser::_PlaceholderDiacriticIndex(const char32_t ch) noexcept
+{
+    static constexpr char32_t table[] = {
+        0x0305,
+        0x030D,
+        0x030E,
+        0x0310,
+        0x0312,
+        0x033D,
+        0x033E,
+        0x033F,
+        0x0346,
+        0x034A,
+        0x034B,
+        0x034C,
+        0x0350,
+        0x0351,
+        0x0352,
+        0x0357,
+        0x035B,
+        0x0363,
+        0x0364,
+        0x0365,
+        0x0366,
+        0x0367,
+        0x0368,
+        0x0369,
+        0x036A,
+        0x036B,
+        0x036C,
+        0x036D,
+        0x036E,
+        0x036F,
+        0x0483,
+        0x0484,
+        0x0485,
+        0x0486,
+        0x0487,
+        0x0592,
+        0x0593,
+        0x0594,
+        0x0595,
+        0x0597,
+        0x0598,
+        0x0599,
+        0x059C,
+        0x059D,
+        0x059E,
+        0x059F,
+        0x05A0,
+        0x05A1,
+        0x05A8,
+        0x05A9,
+        0x05AB,
+        0x05AC,
+        0x05AF,
+        0x05C4,
+        0x0610,
+        0x0611,
+        0x0612,
+        0x0613,
+        0x0614,
+        0x0615,
+        0x0616,
+        0x0617,
+        0x0657,
+        0x0658,
+        0x0659,
+        0x065A,
+        0x065B,
+        0x065D,
+        0x065E,
+        0x06D6,
+        0x06D7,
+        0x06D8,
+        0x06D9,
+        0x06DA,
+        0x06DB,
+        0x06DC,
+        0x06DF,
+        0x06E0,
+        0x06E1,
+        0x06E2,
+        0x06E4,
+        0x06E7,
+        0x06E8,
+        0x06EB,
+        0x06EC,
+        0x0730,
+        0x0732,
+        0x0733,
+        0x0735,
+        0x0736,
+        0x073A,
+        0x073D,
+        0x073F,
+        0x0740,
+        0x0741,
+        0x0743,
+        0x0745,
+        0x0747,
+        0x0749,
+        0x074A,
+        0x07EB,
+        0x07EC,
+        0x07ED,
+        0x07EE,
+        0x07EF,
+        0x07F0,
+        0x07F1,
+        0x07F3,
+        0x0816,
+        0x0817,
+        0x0818,
+        0x0819,
+        0x081B,
+        0x081C,
+        0x081D,
+        0x081E,
+        0x081F,
+        0x0820,
+        0x0821,
+        0x0822,
+        0x0823,
+        0x0825,
+        0x0826,
+        0x0827,
+        0x0829,
+        0x082A,
+        0x082B,
+        0x082C,
+        0x082D,
+        0x0951,
+        0x0953,
+        0x0954,
+        0x0F82,
+        0x0F83,
+        0x0F86,
+        0x0F87,
+        0x135D,
+        0x135E,
+        0x135F,
+        0x17DD,
+        0x193A,
+        0x1A17,
+        0x1A75,
+        0x1A76,
+        0x1A77,
+        0x1A78,
+        0x1A79,
+        0x1A7A,
+        0x1A7B,
+        0x1A7C,
+        0x1B6B,
+        0x1B6D,
+        0x1B6E,
+        0x1B6F,
+        0x1B70,
+        0x1B71,
+        0x1B72,
+        0x1B73,
+        0x1CD0,
+        0x1CD1,
+        0x1CD2,
+        0x1CDA,
+        0x1CDB,
+        0x1CE0,
+        0x1DC0,
+        0x1DC1,
+        0x1DC3,
+        0x1DC4,
+        0x1DC5,
+        0x1DC6,
+        0x1DC7,
+        0x1DC8,
+        0x1DC9,
+        0x1DCB,
+        0x1DCC,
+        0x1DD1,
+        0x1DD2,
+        0x1DD3,
+        0x1DD4,
+        0x1DD5,
+        0x1DD6,
+        0x1DD7,
+        0x1DD8,
+        0x1DD9,
+        0x1DDA,
+        0x1DDB,
+        0x1DDC,
+        0x1DDD,
+        0x1DDE,
+        0x1DDF,
+        0x1DE0,
+        0x1DE1,
+        0x1DE2,
+        0x1DE3,
+        0x1DE4,
+        0x1DE5,
+        0x1DE6,
+        0x1DFE,
+        0x20D0,
+        0x20D1,
+        0x20D4,
+        0x20D5,
+        0x20D6,
+        0x20D7,
+        0x20DB,
+        0x20DC,
+        0x20E1,
+        0x20E7,
+        0x20E9,
+        0x20F0,
+        0x2CEF,
+        0x2CF0,
+        0x2CF1,
+        0x2DE0,
+        0x2DE1,
+        0x2DE2,
+        0x2DE3,
+        0x2DE4,
+        0x2DE5,
+        0x2DE6,
+        0x2DE7,
+        0x2DE8,
+        0x2DE9,
+        0x2DEA,
+        0x2DEB,
+        0x2DEC,
+        0x2DED,
+        0x2DEE,
+        0x2DEF,
+        0x2DF0,
+        0x2DF1,
+        0x2DF2,
+        0x2DF3,
+        0x2DF4,
+        0x2DF5,
+        0x2DF6,
+        0x2DF7,
+        0x2DF8,
+        0x2DF9,
+        0x2DFA,
+        0x2DFB,
+        0x2DFC,
+        0x2DFD,
+        0x2DFE,
+        0x2DFF,
+        0xA66F,
+        0xA67C,
+        0xA67D,
+        0xA6F0,
+        0xA6F1,
+        0xA8E0,
+        0xA8E1,
+        0xA8E2,
+        0xA8E3,
+        0xA8E4,
+        0xA8E5,
+        0xA8E6,
+        0xA8E7,
+        0xA8E8,
+        0xA8E9,
+        0xA8EA,
+        0xA8EB,
+        0xA8EC,
+        0xA8ED,
+        0xA8EE,
+        0xA8EF,
+        0xA8F0,
+        0xA8F1,
+        0xAAB0,
+        0xAAB2,
+        0xAAB3,
+        0xAAB7,
+        0xAAB8,
+        0xAABE,
+        0xAABF,
+        0xAAC1,
+        0xFE20,
+        0xFE21,
+        0xFE22,
+        0xFE23,
+        0xFE24,
+        0xFE25,
+        0xFE26,
+        0x10A0F,
+        0x10A38,
+        0x1D185,
+        0x1D186,
+        0x1D187,
+        0x1D188,
+        0x1D189,
+        0x1D1AA,
+        0x1D1AB,
+        0x1D1AC,
+        0x1D1AD,
+        0x1D242,
+        0x1D243,
+        0x1D244,
+    };
+    const auto it = std::lower_bound(std::begin(table), std::end(table), ch);
+    if (it != std::end(table) && *it == ch)
+    {
+        return static_cast<int>(it - std::begin(table));
+    }
+    return -1;
+}
+
+// Registers one visible cell fragment of a Unicode placeholder. The renderer samples
+// the complete scaled placement, so adjacent fragments share one source surface.
+bool KittyParser::_placeImageCellRef(const Image& image, const uint32_t imageId, const til::CoordType column, const til::CoordType row, const uint32_t cellRow, const uint32_t cellCol, const VirtualPlacement& place, std::vector<ImagePlacement>& fragments)
+{
+    if (!image.pixels || image.pixels->empty() || image.width == 0 || image.height == 0)
+    {
+        return false;
+    }
+    auto page = _dispatcher._pages.ActivePage();
+    if (column < 0 || column >= page.Width() || row < 0 || row >= page.Bottom())
+    {
+        return false;
+    }
+    const auto cellSize = _dispatcher._api.GetCellSize();
+    const auto cellWidth = std::max(1, cellSize.width);
+    const auto cellHeight = std::max(1, cellSize.height);
+    const til::size clampedCellSize{ cellWidth, cellHeight };
+    const auto gridCols = std::max<uint32_t>(place.cols, 1);
+    const auto gridRows = std::max<uint32_t>(place.rows, 1);
+    // An explicit row/column outside the placement grid selects no tile: draw nothing rather
+    // than clamping to (and duplicating) the edge tile.
+    if (cellCol >= gridCols || cellRow >= gridRows)
+    {
+        return false;
+    }
+    // Crop rect (absolute image pixels) captured at store time; 0 = unset => full image. targetW/H
+    // is the exact scaled size; fall back to the grid-filled size if a legacy entry lacks it.
+    const auto cropX = static_cast<til::CoordType>(place.cropX);
+    const auto cropY = static_cast<til::CoordType>(place.cropY);
+    const auto cropW = std::max<til::CoordType>(static_cast<til::CoordType>(place.cropW != 0 ? place.cropW : image.width), 1);
+    const auto cropH = std::max<til::CoordType>(static_cast<til::CoordType>(place.cropH != 0 ? place.cropH : image.height), 1);
+    const auto targetW = std::max<int64_t>(place.targetW != 0 ? static_cast<int64_t>(place.targetW) : static_cast<int64_t>(gridCols) * cellWidth, 1);
+    const auto targetH = std::max<int64_t>(place.targetH != 0 ? static_cast<int64_t>(place.targetH) : static_cast<int64_t>(gridRows) * cellHeight, 1);
+    auto surface = image.surface;
+    const auto newSurface = !surface;
+    if (newSurface)
+    {
+        surface = std::make_shared<::Image>(
+            til::size{ gsl::narrow_cast<til::CoordType>(image.width), gsl::narrow_cast<til::CoordType>(image.height) },
+            image.pixels);
+    }
+
+    const auto originalLeft = gsl::narrow<til::CoordType>(static_cast<int64_t>(column) - cellCol);
+    const auto originalTop = gsl::narrow<til::CoordType>(static_cast<int64_t>(row) - cellRow);
+    const til::rect originalBounds{
+        originalLeft,
+        originalTop,
+        gsl::narrow<til::CoordType>(static_cast<int64_t>(originalLeft) + gridCols),
+        gsl::narrow<til::CoordType>(static_cast<int64_t>(originalTop) + gridRows),
+    };
+    auto fragment = ImagePlacement::FromFragment(
+        { imageId, place.layerId, ImagePlacement::Key::Protocol::Kitty },
+        surface,
+        { column, row, column + 1, row + 1 },
+        originalBounds,
+        place.zIndex,
+        { cropX, cropY, cropX + cropW, cropY + cropH },
+        {
+            .cellSize = clampedCellSize,
+            .targetWidth = gsl::narrow_cast<uint64_t>(targetW),
+            .targetHeight = gsl::narrow_cast<uint64_t>(targetH),
+        });
+    fragments.emplace_back(std::move(fragment));
+    if (newSurface)
+    {
+        image.surface = std::move(surface);
+    }
+    return true;
+}
+
+// True when a grapheme cluster is made up entirely of kitty rowcolumn diacritics, i.e. it is the
+// tail of a placeholder cell whose write was split, not a cell of its own.
+bool KittyParser::_IsPlaceholderDiacriticRun(const std::wstring_view cluster) noexcept
+{
+    if (cluster.empty())
+    {
+        return false;
+    }
+    for (size_t i = 0; i < cluster.size(); ++i)
+    {
+        auto cp = static_cast<char32_t>(cluster[i]);
+        if (til::is_leading_surrogate(cluster[i]) && i + 1 < cluster.size() && til::is_trailing_surrogate(cluster[i + 1]))
+        {
+            cp = til::combine_surrogates(cluster[i], cluster[i + 1]);
+            ++i;
+        }
+        if (_PlaceholderDiacriticIndex(cp) < 0)
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+// True when a run opens with a kitty rowcolumn diacritic. Such a run carries no U+10EEEE of its
+// own, but its leading marks join - and so re-complete - the placeholder cell the previous write
+// left behind, which is why the writer still has to route it through RenderPlaceholders.
+bool KittyParser::StartsWithPlaceholderDiacritic(const std::wstring_view text) noexcept
+{
+    if (text.empty())
+    {
+        return false;
+    }
+    auto cp = static_cast<char32_t>(text[0]);
+    if (til::is_leading_surrogate(text[0]) && text.size() > 1 && til::is_trailing_surrogate(text[1]))
+    {
+        cp = til::combine_surrogates(text[0], text[1]);
+    }
+    return _PlaceholderDiacriticIndex(cp) >= 0;
+}
+
+// Overlays each U+10EEEE placeholder in one just-written segment with its sub-rect of the
+// (virtual) image named by the cell's foreground (24-bit RGB or a 256-color index = the id).
+// The grid (rows x cols) is the geometry recorded when the image was stored virtually, so it
+// stays constant however the cells are chunked across writes. A cell's grid (row,col) comes
+// from its kitty combining diacritics (1st = row, 2nd = col). Missing values inherit only from
+// the immediate-left placeholder when the protocol's foreground/underline and adjacency gates
+// match; otherwise they default to zero. The resolved coordinates and image-id high byte are
+// stored with the text cell so inheritance survives separate writes, scrolling, and reflow.
+// The screen column steps by each glyph's real width (NavigateToNext), so a wide (CJK) glyph
+// before a placeholder doesn't shift it. Called per segment with the segment's true post-wrap
+// row and start column.
+// Protocol: https://sw.kovidgoyal.net/kitty/graphics-protocol/#unicode-placeholders
+void KittyParser::RenderPlaceholders(const std::wstring_view segment, const til::CoordType screenRow, const til::CoordType startColumn)
+{
+    auto page = _dispatcher._pages.ActivePage();
+    auto& buffer = page.Buffer();
+    auto& row = buffer.GetMutableRowByOffset(screenRow);
+    auto column = startColumn;
+    // Track the drawn placeholder cell span so ONE bounded redraw covers the whole segment/row,
+    // instead of a TriggerRedraw per cell on the text-output hot path (matches _placeImage).
+    auto firstDrawnCol = page.Width();
+    auto lastDrawnCol = static_cast<til::CoordType>(-1);
+    std::vector<ImagePlacement> fragments;
+    fragments.reserve(std::min(segment.size(), static_cast<size_t>(page.Width())));
+    const auto recordDraw = [&](const til::CoordType drawnColumn) noexcept {
+        firstDrawnCol = std::min(firstDrawnCol, drawnColumn);
+        lastDrawnCol = std::max(lastDrawnCol, drawnColumn);
+    };
+    for (size_t i = 0; i < segment.size();)
+    {
+        const auto next = buffer.GraphemeNext(segment, i);
+        const auto cluster = segment.substr(i, next - i);
+        // A write may be split anywhere, including before or between a placeholder's diacritics -
+        // the console write path chunks long runs. The orphaned marks then open the next segment,
+        // where they join the cell the previous segment already wrote, occupying no column of
+        // their own. Counting them as a cell shifted every placeholder that followed one column
+        // right, onto a cell carrying no image foreground, so that tile was silently dropped and
+        // the grid rendered with a hole in it.
+        if (i == 0 && _IsPlaceholderDiacriticRun(cluster))
+        {
+            // The joined cell was resolved from whatever part of its cluster had arrived, so a
+            // split ahead of the first mark left it addressing grid (0,0). The row now holds the
+            // finished grapheme, so resolve that cell again from it - at its own column, which
+            // keeps the write column where it is.
+            const auto previous = row.NavigateToPrevious(startColumn);
+            if (previous < startColumn && _renderPlaceholderCell(row, row.GlyphAt(previous), previous, screenRow, fragments))
+            {
+                recordDraw(previous);
+            }
+            i = next;
+            continue;
+        }
+        if (_renderPlaceholderCell(row, cluster, column, screenRow, fragments))
+        {
+            recordDraw(column);
+        }
+        // Advance by the glyph's real cell width; guard against a non-advancing step.
+        const auto nextColumn = row.NavigateToNext(column);
+        column = nextColumn > column ? nextColumn : column + 1;
+        i = next;
+    }
+    buffer.GetMutableImages().AddOrReplaceAreas(std::move(fragments));
+    // One bounded redraw for every placeholder tile drawn in this segment (avoids a per-cell
+    // TriggerRedraw on the text hot path; mirrors _placeImage's single-redraw model).
+    if (lastDrawnCol >= firstDrawnCol)
+    {
+        buffer.TriggerRedraw(Viewport::FromExclusive({ firstDrawnCol, screenRow, std::min<til::CoordType>(lastDrawnCol + 1, page.Width()), screenRow + 1 }));
+    }
+}
+
+// Resolves one text cell that stands in for an image cell, from its complete grapheme cluster,
+// and stages the tile it addresses. Anything that is not a placeholder base is left alone.
+// Returns true if a tile was staged, so the caller can extend its redraw span.
+bool KittyParser::_renderPlaceholderCell(ROW& row, const std::wstring_view cluster, const til::CoordType column, const til::CoordType screenRow, std::vector<ImagePlacement>& fragments)
+{
+    if (cluster.size() < 2 || cluster[0] != PlaceholderCodePointHigh || cluster[1] != PlaceholderCodePointLow)
+    {
+        return false;
+    }
+    const auto colorId = [](const TextColor color) noexcept {
+        if (color.IsRgb())
+        {
+            const auto rgb = color.GetRGB();
+            return (static_cast<uint32_t>(GetRValue(rgb)) << 16) | (static_cast<uint32_t>(GetGValue(rgb)) << 8) | GetBValue(rgb);
+        }
+        return color.IsIndex256() ? static_cast<uint32_t>(color.GetIndex()) : 0u;
+    };
+    // The first two recognized diacritics in the cluster give row then column; an optional
+    // third gives the most significant byte of a >24-bit image id (composed below).
+    // idHighByte starts at -1 (absent) so a 4th+ diacritic cannot overwrite an explicit 3rd
+    // diacritic of index 0 (the spec ignores extras); absent or 0 leaves a plain 24-bit id.
+    auto rowDiacritic = -1;
+    auto colDiacritic = -1;
+    auto idHighByte = -1;
+    for (auto j = size_t{ 2 }; j < cluster.size(); ++j)
+    {
+        // A row/col diacritic may be an astral combining mark (index >= 283 in the
+        // rowcolumn-diacritics table), stored as a UTF-16 surrogate pair; decode it to a
+        // full codepoint before the lookup so large grids address the right row/column.
+        auto cp = static_cast<char32_t>(cluster[j]);
+        if (til::is_leading_surrogate(cluster[j]) && j + 1 < cluster.size() && til::is_trailing_surrogate(cluster[j + 1]))
+        {
+            cp = til::combine_surrogates(cluster[j], cluster[j + 1]);
+            ++j;
+        }
+        if (const auto idx = _PlaceholderDiacriticIndex(cp); idx >= 0)
+        {
+            if (rowDiacritic < 0)
+            {
+                rowDiacritic = idx;
+            }
+            else if (colDiacritic < 0)
+            {
+                colDiacritic = idx;
+            }
+            else if (idHighByte < 0)
+            {
+                idHighByte = idx;
+            }
+        }
+    }
+    const auto attributes = row.GetAttrByColumn(column);
+    const auto fg = attributes.GetForeground();
+    if (!(fg.IsRgb() || fg.IsIndex256()) || idHighByte > 255)
+    {
+        return false;
+    }
+    const auto imageIdLow = colorId(fg);
+
+    // Kitty's omission rules are positional:
+    //  * no diacritics: inherit row, left column + 1, and high byte;
+    //  * row only: inherit column + 1/high byte only when the rows match;
+    //  * row+column: inherit only the high byte when the coordinates are adjacent.
+    // Every inheritance case also requires matching foreground image-id and underline
+    // placement-id color values. At column 0 or after any failed gate, omitted values
+    // remain zero.
+    auto cellRow = rowDiacritic >= 0 ? static_cast<uint32_t>(rowDiacritic) : 0u;
+    auto cellCol = colDiacritic >= 0 ? static_cast<uint32_t>(colDiacritic) : 0u;
+    auto highByte = idHighByte >= 0 ? static_cast<uint8_t>(idHighByte) : uint8_t{ 0 };
+    const auto left = column > 0 ? row.GetImageCellRef(column - 1) : nullptr;
+    const auto leftAttributes = left ? row.GetAttrByColumn(column - 1) : TextAttribute{};
+    const auto attributesMatch = left &&
+                                 colorId(leftAttributes.GetForeground()) == imageIdLow &&
+                                 colorId(leftAttributes.GetUnderlineColor()) == colorId(attributes.GetUnderlineColor());
+    if (rowDiacritic < 0)
+    {
+        if (attributesMatch)
+        {
+            cellRow = left->row;
+            cellCol = static_cast<uint32_t>(left->column) + 1;
+            highByte = left->imageIdHighByte;
+        }
+    }
+    else if (colDiacritic < 0)
+    {
+        if (attributesMatch && left->row == cellRow)
+        {
+            cellCol = static_cast<uint32_t>(left->column) + 1;
+            highByte = left->imageIdHighByte;
+        }
+    }
+    else if (idHighByte < 0)
+    {
+        if (attributesMatch && left->row == cellRow && static_cast<uint32_t>(left->column) + 1 == cellCol)
+        {
+            highByte = left->imageIdHighByte;
+        }
+    }
+
+    // Compose the effective id only after resolving an omitted high byte from the
+    // left cell. A non-zero byte selects a >24-bit image; a missing image/placement
+    // draws nothing but the resolved cell metadata remains available to its right.
+    const auto imageId = highByte > 0 ? (imageIdLow | (static_cast<uint32_t>(highByte) << 24)) : imageIdLow;
+    const auto placementId = colorId(attributes.GetUnderlineColor());
+    const auto placement = _virtualIds.find({ imageId, placementId });
+    const auto imageEntry = _images.find(imageId);
+    const auto layerId = placement != _virtualIds.end() ? placement->second.layerId : 0;
+    auto drawn = false;
+    if (placement != _virtualIds.end() && imageEntry != _images.end())
+    {
+        const auto& place = placement->second;
+        drawn = _placeImageCellRef(imageEntry->second, imageId, column, screenRow, cellRow, cellCol, place, fragments);
+        if (drawn)
+        {
+            imageEntry->second.hasRenderedPlacements = true;
+        }
+    }
+    // A layer id is only recorded once that layer has actually received this
+    // cell's pixels. A placeholder outside the placement grid draws nothing, and
+    // claiming a layer it has no pixels in would tell reflow to carry across a
+    // region the layer does not cover. The grid coordinates are recorded either
+    // way, because the cell to the right resolves its own column and image-id
+    // high byte from them.
+    row.SetImageCellRef(column, ImageCellRef{
+                                    .layerId = drawn ? layerId : 0,
+                                    .column = cellCol,
+                                    .row = gsl::narrow_cast<uint16_t>(cellRow),
+                                    .imageIdHighByte = highByte,
+                                    .valid = true,
+                                });
+    return drawn;
 }
 
 bool KittyParser::_DecodeBase64(const std::string_view input, std::vector<uint8_t>& output) noexcept
