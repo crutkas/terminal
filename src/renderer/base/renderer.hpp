@@ -77,8 +77,10 @@ namespace Microsoft::Console::Render
         void UpdateLastHoveredInterval(const std::optional<interval_tree::IntervalTree<til::point, size_t>::interval>& newInterval);
 
     protected:
-        // The real host calls this from the render thread. Tests can use a derived
-        // renderer to paint synchronously without depending on thread scheduling.
+        // Paints one frame on the calling thread. The render thread is the only caller in
+        // a real host, which is why this is not public; it is reachable by a derived class
+        // so that DummyRenderer can offer tests a paint that does not depend on a thread
+        // being scheduled.
         [[nodiscard]] HRESULT PaintFrame();
 
     private:
