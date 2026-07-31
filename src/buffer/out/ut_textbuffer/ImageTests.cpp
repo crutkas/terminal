@@ -35,6 +35,7 @@ class ImageTests
     TEST_METHOD(TextBufferResetRowErasesOnlyThatImageRow);
     TEST_METHOD(TextBufferWritesEraseOnlyOverwrittenImageCells);
     TEST_METHOD(TextBufferWritesEraseWholeBisectedWideGlyph);
+    TEST_METHOD(TextBufferMixedAttributeWritesEraseOnlyTextCells);
     TEST_METHOD(FillRectCoalescesImageErasure);
     TEST_METHOD(CircularAndRegionalScrollUseLogicalRows);
     TEST_METHOD(RectangularCopyAndErasePreserveSampling);
@@ -597,6 +598,25 @@ void ImageTests::TextBufferWritesEraseWholeBisectedWideGlyph()
     verifyWrite([](TextBuffer& buffer) {
         buffer.FillRect({ 2, 0, 3, 1 }, L"x", TextAttribute{});
     });
+}
+
+void ImageTests::TextBufferMixedAttributeWritesEraseOnlyTextCells()
+{
+    DummyRenderer renderer;
+    TextBuffer buffer{ til::size{ 5, 1 }, TextAttribute{}, 0, false, &renderer };
+    buffer.GetMutableImages().Add(MakePlacement({ 1, 1 }, { 0, 0, 5, 1 }));
+
+    const std::array cells{
+        OutputCell{ L"x", DbcsAttribute::Single, TextAttribute{} },
+        OutputCell{ OutputCellView{ {}, DbcsAttribute::Single, TextAttribute{ FOREGROUND_RED }, TextAttributeBehavior::StoredOnly } },
+        OutputCell{ L"y", DbcsAttribute::Single, TextAttribute{} },
+    };
+    buffer.WriteLine(OutputCellIterator{ std::span<const OutputCell>{ cells } }, { 1, 0 });
+
+    VERIFY_ARE_EQUAL(size_t{ 3 }, buffer.GetImages().Size());
+    VERIFY_IS_FALSE(PlacementCoversCell(buffer, 1, { 1, 0 }));
+    VERIFY_IS_TRUE(PlacementCoversCell(buffer, 1, { 2, 0 }));
+    VERIFY_IS_FALSE(PlacementCoversCell(buffer, 1, { 3, 0 }));
 }
 
 void ImageTests::FillRectCoalescesImageErasure()

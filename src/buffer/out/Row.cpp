@@ -425,7 +425,7 @@ void ROW::ClearCell(const til::CoordType column)
 // - limitRight - right inclusive column ID for the last write in this row. (optional, will just write to the end of row if nullopt)
 // Return Value:
 // - iterator to first cell that was not written to this row.
-OutputCellIterator ROW::WriteCells(OutputCellIterator it, const til::CoordType columnBegin, const std::optional<bool> wrap, std::optional<til::CoordType> limitRight, til::CoordType* const columnBeginDirty, til::CoordType* const columnEndDirty)
+OutputCellIterator ROW::WriteCells(OutputCellIterator it, const til::CoordType columnBegin, const std::optional<bool> wrap, std::optional<til::CoordType> limitRight, til::CoordType* const columnBeginDirty, til::CoordType* const columnEndDirty, std::vector<RowTextDirtyRange>* const textDirtyRanges)
 {
     THROW_HR_IF(E_INVALIDARG, columnBegin >= size());
     THROW_HR_IF(E_INVALIDARG, limitRight.value_or(0) >= size());
@@ -448,6 +448,19 @@ OutputCellIterator ROW::WriteCells(OutputCellIterator it, const til::CoordType c
         til::CoordType endDirty = begin;
         ReplaceCharacters(begin, width, chars, &beginDirty, &endDirty);
         recordDirty(beginDirty, endDirty);
+        if (textDirtyRanges && beginDirty < endDirty)
+        {
+            if (!textDirtyRanges->empty() && beginDirty <= textDirtyRanges->back().columnEnd)
+            {
+                auto& range = textDirtyRanges->back();
+                range.columnBegin = std::min(range.columnBegin, beginDirty);
+                range.columnEnd = std::max(range.columnEnd, endDirty);
+            }
+            else
+            {
+                textDirtyRanges->push_back({ beginDirty, endDirty });
+            }
+        }
     };
 
     while (it && currentIndex <= finalColumnInRow)
@@ -557,7 +570,6 @@ OutputCellIterator ROW::WriteCells(OutputCellIterator it, const til::CoordType c
     {
         *columnEndDirty = dirtyEnd;
     }
-
     return it;
 }
 

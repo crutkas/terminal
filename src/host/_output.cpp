@@ -64,6 +64,24 @@ struct FillConsoleResult
     til::CoordType cellsModified = 0;
 };
 
+static void EraseSharedImageCells(TextBuffer& buffer, const til::point at, const til::CoordType distance)
+{
+    const auto width = buffer.GetSize().Width();
+    auto x = at.x;
+    auto y = at.y;
+    auto distanceRemaining = distance;
+    std::vector<til::rect> areas;
+    while (distanceRemaining > 0)
+    {
+        const auto rowDistance = std::min(distanceRemaining, width - x);
+        areas.emplace_back(x, y, x + rowDistance, y + 1);
+        distanceRemaining -= rowDistance;
+        x = 0;
+        ++y;
+    }
+    buffer.GetMutableImages().EraseAreas(areas);
+}
+
 static FillConsoleResult FillConsoleImpl(SCREEN_INFORMATION& screenInfo, FillConsoleMode mode, const void* data, const size_t lengthToWrite, const til::point startingCoordinate)
 {
     if (lengthToWrite == 0)
@@ -250,7 +268,13 @@ static FillConsoleResult FillConsoleImpl(SCREEN_INFORMATION& screenInfo, FillCon
         result.cellsModified = done.GetCellDistance(it);
 
         // If we've overwritten image content, it needs to be erased.
-        ImageSlice::EraseCells(screenInfo.GetTextBuffer(), startingCoordinate, result.cellsModified);
+        ImageSlice::EraseCells(screenBuffer.GetTextBuffer(), startingCoordinate, result.cellsModified);
+    }
+
+    // These attribute APIs historically erase image content even though they don't replace text.
+    if (mode == FillConsoleMode::WriteAttribute || mode == FillConsoleMode::FillAttribute)
+    {
+        EraseSharedImageCells(screenBuffer.GetTextBuffer(), startingCoordinate, result.cellsModified);
     }
 
     if (result.cellsModified > 0)

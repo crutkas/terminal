@@ -760,11 +760,18 @@ OutputCellIterator TextBuffer::WriteLine(const OutputCellIterator givenIt,
     auto& row = GetMutableRowByOffset(target.y);
     auto columnBeginDirty = target.x;
     auto columnEndDirty = target.x;
-    const auto newIt = row.WriteCells(givenIt, target.x, wrap, limitRight, &columnBeginDirty, &columnEndDirty);
+    std::vector<RowTextDirtyRange> textDirtyRanges;
+    const auto newIt = row.WriteCells(givenIt, target.x, wrap, limitRight, &columnBeginDirty, &columnEndDirty, &textDirtyRanges);
 
     // Take the cell distance written and notify that it needs to be repainted.
     const auto paint = Viewport::FromExclusive({ columnBeginDirty, target.y, columnEndDirty, target.y + 1 });
-    _images.EraseArea(paint.ToExclusive());
+    std::vector<til::rect> textDirtyAreas;
+    textDirtyAreas.reserve(textDirtyRanges.size());
+    for (const auto range : textDirtyRanges)
+    {
+        textDirtyAreas.emplace_back(range.columnBegin, target.y, range.columnEnd, target.y + 1);
+    }
+    _images.EraseAreas(textDirtyAreas);
     TriggerRedraw(paint);
 
     return newIt;
