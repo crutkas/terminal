@@ -4946,6 +4946,10 @@ void AdaptDispatch::_ReturnApcResponse(const std::wstring_view response) const
 
 ITermDispatch::StringHandler AdaptDispatch::KittyGraphics()
 {
+    if (_api.IsConPTY())
+    {
+        return [](const wchar_t) noexcept { return true; };
+    }
     if (!_kittyParser)
     {
         _kittyParser = std::make_unique<KittyParser>(*this);

@@ -222,7 +222,7 @@ public:
 
     bool IsConPTY() const noexcept override
     {
-        return false;
+        return _isPty;
     }
 
     StateMachine& GetStateMachine() override
@@ -5485,12 +5485,40 @@ public:
         VERIFY_ARE_EQUAL(0, CountImageRows(*_testGetSet->_textBuffer));
     }
 
-    TEST_METHOD(KittyGraphicsPngQueryDoesNotDecode)
+    TEST_METHOD(KittyGraphicsPngQueryValidatesWithoutSideEffects)
     {
         _testGetSet->PrepData();
-        _stateMachine->ProcessString(L"\x1b_Ga=q,i=1,f=100;iVBORw0K\x1b\\");
-        _testGetSet->ValidateInputEvent(L"\x1b_Gi=1;OK\x1b\\");
-        VERIFY_ARE_EQUAL(0, _testGetSet->_decodeImageCallCount);
+        _stateMachine->ProcessString(L"\x1b_Ga=T,I=7,f=24,s=1,v=1;/wAA\x1b\\");
+
+        auto& kitty = _kitty();
+        const auto nextImageId = kitty._nextImageId;
+        const auto nextLayerId = kitty._nextLayerId;
+        const auto totalPixelBytes = kitty._totalPixelBytes;
+        const auto imageCount = kitty._images.size();
+        const auto imageNumbers = kitty._imageNumbers;
+        const auto imageOrder = kitty._imageOrder;
+        const auto cursorPosition = _testGetSet->_textBuffer->GetCursor().GetPosition();
+        const auto placementCount = _testGetSet->_textBuffer->GetImages().Size();
+        const auto placementRevision = _testGetSet->_textBuffer->GetImages().Revision();
+
+        _testGetSet->_response.clear();
+        _stateMachine->ProcessString(L"\x1b_Ga=q,f=100;iVBORw0K\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_G;OK\x1b\\");
+
+        _testGetSet->_decodeImageSucceeds = false;
+        _stateMachine->ProcessString(L"\x1b_Ga=q,f=100;iVBORw0K\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_G;EBADPNG:could not decode image\x1b\\");
+
+        VERIFY_ARE_EQUAL(2, _testGetSet->_decodeImageCallCount);
+        VERIFY_ARE_EQUAL(nextImageId, kitty._nextImageId);
+        VERIFY_ARE_EQUAL(nextLayerId, kitty._nextLayerId);
+        VERIFY_ARE_EQUAL(totalPixelBytes, kitty._totalPixelBytes);
+        VERIFY_ARE_EQUAL(imageCount, kitty._images.size());
+        VERIFY_IS_TRUE(imageNumbers == kitty._imageNumbers);
+        VERIFY_IS_TRUE(imageOrder == kitty._imageOrder);
+        VERIFY_ARE_EQUAL(cursorPosition, _testGetSet->_textBuffer->GetCursor().GetPosition());
+        VERIFY_ARE_EQUAL(placementCount, _testGetSet->_textBuffer->GetImages().Size());
+        VERIFY_ARE_EQUAL(placementRevision, _testGetSet->_textBuffer->GetImages().Revision());
     }
 
     TEST_METHOD(KittyGraphicsUsesHostCellSize)
@@ -5524,6 +5552,24 @@ public:
         _testGetSet->ValidateInputEvent(L"\x1b_Gi=1,I=7;OK\x1b\\");
         _stateMachine->ProcessString(L"\x1b_Ga=t,I=7,f=24,s=1,v=1;AAAA\x1b\\");
         _testGetSet->ValidateInputEvent(L"\x1b_Gi=2,I=7;OK\x1b\\");
+    }
+
+    TEST_METHOD(KittyGraphicsDuplicateNumberPromotesPreviousAfterDelete)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1b_Ga=t,I=7,f=32,s=1,v=1;/wAA/w==\x1b\\"); // red, id 1
+        _stateMachine->ProcessString(L"\x1b_Ga=t,I=7,f=32,s=1,v=1;AP8A/w==\x1b\\"); // green, id 2
+        _stateMachine->ProcessString(L"\x1b_Ga=d,d=I,i=2;\x1b\\");
+
+        _testGetSet->_response.clear();
+        _stateMachine->ProcessString(L"\x1b_Ga=p,I=7;\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_GI=7;OK\x1b\\");
+
+        til::CoordType imageRow = -1;
+        const auto slice = FindFirstImageSlice(*_testGetSet->_textBuffer, imageRow);
+        VERIFY_IS_NOT_NULL(slice);
+        VERIFY_IS_TRUE(SliceContainsColor(slice, 255, 0, 0));
+        VERIFY_IS_FALSE(SliceContainsColor(slice, 0, 255, 0));
     }
 
     TEST_METHOD(KittyGraphicsDeleteByNumber)
@@ -5692,6 +5738,37 @@ public:
         _testGetSet->ValidateInputEvent(L"\x1b_Gi=1;OK\x1b\\"); // survived
         _stateMachine->ProcessString(L"\x1b_Ga=p,i=2;\x1b\\");
         _testGetSet->ValidateInputEvent(L"\x1b_Gi=2;ENOENT:image not found\x1b\\"); // evicted
+    }
+
+    TEST_METHOD(KittyGraphicsRegistryEvictsUnplacedBeforePlaced)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,f=24,s=1,v=1;AAAA\x1b\\");
+        for (auto i = 2; i <= 4096; ++i)
+        {
+            _stateMachine->ProcessString(L"\x1b_Ga=t,i=" + std::to_wstring(i) + L",f=24,s=1,v=1;AAAA\x1b\\");
+        }
+
+        _stateMachine->ProcessString(L"\x1b_Ga=t,i=4097,f=24,s=1,v=1;AAAA\x1b\\");
+        VERIFY_IS_TRUE(_kitty()._images.contains(1u), L"a visible image must survive while an unplaced image can be evicted");
+        VERIFY_IS_FALSE(_kitty()._images.contains(2u), L"the least-recently used unplaced image should be evicted");
+        VERIFY_IS_TRUE(_kitty()._images.contains(4097u));
+    }
+
+    TEST_METHOD(KittyGraphicsSuccessfulPutRefreshesEvictionRecency)
+    {
+        _testGetSet->PrepData();
+        for (auto i = 1; i <= 4096; ++i)
+        {
+            _stateMachine->ProcessString(L"\x1b_Ga=t,i=" + std::to_wstring(i) + L",f=24,s=1,v=1;AAAA\x1b\\");
+        }
+        _stateMachine->ProcessString(L"\x1b_Ga=p,i=1;\x1b\\");
+        _stateMachine->ProcessString(L"\x1b_Ga=d,d=i,i=1;\x1b\\");
+
+        _stateMachine->ProcessString(L"\x1b_Ga=t,i=4097,f=24,s=1,v=1;AAAA\x1b\\");
+        VERIFY_IS_TRUE(_kitty()._images.contains(1u), L"a successfully used image should become most recently used");
+        VERIFY_IS_FALSE(_kitty()._images.contains(2u), L"the next-oldest image should be evicted after the recency refresh");
+        VERIFY_IS_TRUE(_kitty()._images.contains(4097u));
     }
 
     TEST_METHOD(KittyGraphicsLocalMediaAreOffByDefault)
@@ -5867,6 +5944,23 @@ public:
         shorter += L",i=1234";
         _stateMachine->ProcessString(L"\x1b_G" + shorter + L";/wAA\x1b\\");
         VERIFY_IS_TRUE(_kitty()._images.contains(1234u), L"a long but in-bounds control block still parses");
+    }
+
+    TEST_METHOD(KittyGraphicsIsNotParsedByConpty)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_isPty = true;
+        const auto cursorPosition = _testGetSet->_textBuffer->GetCursor().GetPosition();
+        const auto imageRevision = _testGetSet->_textBuffer->GetImages().Revision();
+
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,f=100;iVBORw0K\x1b\\");
+
+        VERIFY_IS_NULL(_pDispatch->_kittyParser.get(), L"ConPTY must leave Kitty parsing to the downstream terminal");
+        VERIFY_IS_TRUE(_testGetSet->_response.empty(), L"ConPTY must not emit a Kitty response");
+        VERIFY_ARE_EQUAL(0, _testGetSet->_decodeImageCallCount);
+        VERIFY_ARE_EQUAL(cursorPosition, _testGetSet->_textBuffer->GetCursor().GetPosition());
+        VERIFY_IS_TRUE(_testGetSet->_textBuffer->GetImages().Empty());
+        VERIFY_ARE_EQUAL(imageRevision, _testGetSet->_textBuffer->GetImages().Revision());
     }
 
     TEST_METHOD(NonKittyApcIgnored)

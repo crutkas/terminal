@@ -379,6 +379,30 @@ void KittyParser::_ProcessCommand(const Control& command, const std::string_view
                 }
             }
 
+            std::vector<RGBQUAD> decoded;
+            til::size decodedSize;
+            if (!directPixels)
+            {
+                const auto decodedSuccessfully =
+                    !bytes.empty() &&
+                    _dispatcher._api.DecodeImageToBgra(bytes, decoded, decodedSize) &&
+                    decodedSize.width > 0 && decodedSize.height > 0 &&
+                    decoded.size() == static_cast<size_t>(decodedSize.width) * decodedSize.height;
+                if (decodedSuccessfully &&
+                    (decodedSize.width > ::Image::MaximumDimension || decodedSize.height > ::Image::MaximumDimension))
+                {
+                    success = false;
+                    code = L"EFBIG:image dimensions exceed renderer limit";
+                    break;
+                }
+                if (!decodedSuccessfully)
+                {
+                    success = false;
+                    code = L"EBADPNG:could not decode image";
+                    break;
+                }
+            }
+
             if (action != L'q')
             {
                 Image image;
@@ -391,26 +415,6 @@ void KittyParser::_ProcessCommand(const Control& command, const std::string_view
                 }
                 else
                 {
-                    std::vector<RGBQUAD> decoded;
-                    til::size decodedSize;
-                    const auto decodedSuccessfully =
-                        !bytes.empty() &&
-                        _dispatcher._api.DecodeImageToBgra(bytes, decoded, decodedSize) &&
-                        decodedSize.width > 0 && decodedSize.height > 0 &&
-                        decoded.size() == static_cast<size_t>(decodedSize.width) * decodedSize.height;
-                    if (decodedSuccessfully &&
-                        (decodedSize.width > ::Image::MaximumDimension || decodedSize.height > ::Image::MaximumDimension))
-                    {
-                        success = false;
-                        code = L"EFBIG:image dimensions exceed renderer limit";
-                        break;
-                    }
-                    if (!decodedSuccessfully)
-                    {
-                        success = false;
-                        code = L"EBADPNG:could not decode image";
-                        break;
-                    }
                     image.width = static_cast<uint32_t>(decodedSize.width);
                     image.height = static_cast<uint32_t>(decodedSize.height);
                     image.pixels = std::make_shared<std::vector<RGBQUAD>>(std::move(decoded));
@@ -450,13 +454,14 @@ void KittyParser::_ProcessCommand(const Control& command, const std::string_view
             else if (haveNumber)
             {
                 const auto reverse = _imageNumbers.find(imageNumber);
-                if (reverse != _imageNumbers.end())
+                if (reverse != _imageNumbers.end() && !reverse->second.empty())
                 {
-                    const auto it = _images.find(reverse->second);
+                    const auto targetImageId = reverse->second.back();
+                    const auto it = _images.find(targetImageId);
                     if (it != _images.end())
                     {
                         target = &it->second;
-                        targetId = reverse->second;
+                        targetId = targetImageId;
                     }
                 }
             }
@@ -468,6 +473,10 @@ void KittyParser::_ProcessCommand(const Control& command, const std::string_view
             else
             {
                 displayKittyPlacement(targetId, *target);
+                if (success)
+                {
+                    _touchImage(targetId);
+                }
             }
             break;
         }
@@ -501,9 +510,9 @@ void KittyParser::_ProcessCommand(const Control& command, const std::string_view
                 if (haveNumber)
                 {
                     const auto it = _imageNumbers.find(imageNumber);
-                    if (it != _imageNumbers.end())
+                    if (it != _imageNumbers.end() && !it->second.empty())
                     {
-                        const auto targetId = it->second;
+                        const auto targetId = it->second.back();
                         _eraseImagePlacements(targetId);
                         if (freeData)
                         {
@@ -603,24 +612,28 @@ bool KittyParser::_registerImage(const uint32_t id, Image&& image)
     auto projectedBytes = retainedBytes + (_totalPixelBytes - existingBytes) + newBytes;
     auto projectedCount = _images.size() - (existing != _images.end() ? 1 : 0) + 1;
     std::vector<uint32_t> victims;
-    for (const auto candidateId : _imageOrder)
-    {
-        if (projectedBytes <= MaxTotalBytes && projectedCount <= MaxImages)
+    const auto selectVictims = [&](const bool placed) {
+        for (const auto candidateId : _imageOrder)
         {
-            break;
+            if (projectedBytes <= MaxTotalBytes && projectedCount <= MaxImages)
+            {
+                break;
+            }
+            if (candidateId == id || _isImagePlaced(candidateId) != placed)
+            {
+                continue;
+            }
+            const auto candidate = _images.find(candidateId);
+            if (candidate != _images.end())
+            {
+                projectedBytes -= candidate->second.PixelBytes();
+                --projectedCount;
+                victims.push_back(candidateId);
+            }
         }
-        if (candidateId == id)
-        {
-            continue;
-        }
-        const auto candidate = _images.find(candidateId);
-        if (candidate != _images.end())
-        {
-            projectedBytes -= candidate->second.PixelBytes();
-            --projectedCount;
-            victims.push_back(candidateId);
-        }
-    }
+    };
+    selectVictims(false);
+    selectVictims(true);
     if (projectedBytes > MaxTotalBytes || projectedCount > MaxImages)
     {
         return false;
@@ -639,7 +652,7 @@ bool KittyParser::_registerImage(const uint32_t id, Image&& image)
     _totalPixelBytes += newBytes;
     if (number != 0)
     {
-        _imageNumbers[number] = id;
+        _imageNumbers[number].push_back(id);
     }
     return true;
 }
@@ -655,9 +668,14 @@ void KittyParser::_eraseImage(const uint32_t id)
     if (it->second.number != 0)
     {
         const auto reverse = _imageNumbers.find(it->second.number);
-        if (reverse != _imageNumbers.end() && reverse->second == id)
+        if (reverse != _imageNumbers.end())
         {
-            _imageNumbers.erase(reverse);
+            auto& ids = reverse->second;
+            ids.erase(std::remove(ids.begin(), ids.end(), id), ids.end());
+            if (ids.empty())
+            {
+                _imageNumbers.erase(reverse);
+            }
         }
     }
     _images.erase(it);
@@ -669,6 +687,36 @@ void KittyParser::_eraseImage(const uint32_t id)
     {
         _imageOrder.erase(std::remove(_imageOrder.begin(), _imageOrder.end(), id), _imageOrder.end());
     }
+}
+
+void KittyParser::_touchImage(const uint32_t id) noexcept
+{
+    const auto it = std::find(_imageOrder.begin(), _imageOrder.end(), id);
+    if (it != _imageOrder.end())
+    {
+        std::rotate(it, std::next(it), _imageOrder.end());
+    }
+}
+
+bool KittyParser::_isImagePlaced(const uint32_t id) const
+{
+    auto found = false;
+    _dispatcher._pages.ForEachPage([&](const Page page) {
+        if (found)
+        {
+            return;
+        }
+        for (const auto& placement : page.Buffer().GetImages().All())
+        {
+            const auto identity = placement.Identity();
+            if (identity.protocol == ImagePlacement::Key::Protocol::Kitty && identity.imageId == id)
+            {
+                found = true;
+                break;
+            }
+        }
+    });
+    return found;
 }
 
 void KittyParser::_clearImages() noexcept

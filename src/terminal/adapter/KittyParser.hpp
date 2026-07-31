@@ -10,6 +10,7 @@
 #include <deque>
 #include <optional>
 #include <unordered_map>
+#include <vector>
 
 // fwdecl unittest classes
 #ifdef UNIT_TESTING
@@ -78,13 +79,15 @@ namespace Microsoft::Console::VirtualTerminal
             }
         };
 
+        using ImageNumberMap = std::unordered_map<uint32_t, std::vector<uint32_t>>;
+
         struct BufferState
         {
             uint32_t nextImageId = 1;
             uint64_t nextLayerId = 1;
             size_t totalPixelBytes = 0;
             std::unordered_map<uint32_t, Image> images;
-            std::unordered_map<uint32_t, uint32_t> imageNumbers;
+            ImageNumberMap imageNumbers;
             std::deque<uint32_t> imageOrder;
         };
 
@@ -100,6 +103,8 @@ namespace Microsoft::Console::VirtualTerminal
         uint32_t _assignImageId();
         bool _registerImage(uint32_t id, Image&& image);
         void _eraseImage(uint32_t id);
+        void _touchImage(uint32_t id) noexcept;
+        bool _isImagePlaced(uint32_t id) const;
         void _clearImages() noexcept;
         BufferState _takeBufferState() noexcept;
         void _restoreBufferState(BufferState&& state) noexcept;
@@ -116,7 +121,7 @@ namespace Microsoft::Console::VirtualTerminal
         uint64_t _nextLayerId = 1;
         size_t _totalPixelBytes = 0;
         std::unordered_map<uint32_t, Image> _images;
-        std::unordered_map<uint32_t, uint32_t> _imageNumbers;
+        ImageNumberMap _imageNumbers;
         std::deque<uint32_t> _imageOrder;
         std::optional<BufferState> _mainBufferState;
 
