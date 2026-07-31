@@ -81,7 +81,7 @@ namespace Microsoft::Console::VirtualTerminal
         // discarded with it.
         void SaveMainBufferState() noexcept;
         void DiscardBufferState() noexcept;
-        void RestoreMainBufferState() noexcept;
+        void RestoreMainBufferState();
 
     private:
         class PlacementMutationGuard;
@@ -131,6 +131,10 @@ namespace Microsoft::Console::VirtualTerminal
 
         struct AnimationFrame
         {
+            // Conservatively covers the retained vector object, shared-pointer control
+            // block, and allocator bookkeeping that the pixel byte count cannot see.
+            static constexpr size_t RetainedAllocationOverhead = 128;
+
             FramePixelStorage pixels;
             int32_t gapMilliseconds = 0;
         };
@@ -153,12 +157,17 @@ namespace Microsoft::Console::VirtualTerminal
             std::chrono::steady_clock::time_point nextFrameTime{};
             mutable ::Image::Pointer surface;
 
-            size_t PixelBytes() const noexcept
+            size_t RetainedBytes() const noexcept
             {
                 auto bytes = pixels ? pixels->size() * sizeof(RGBQUAD) : 0;
+                const auto add = [&](const size_t value) {
+                    bytes = value > SIZE_MAX - bytes ? SIZE_MAX : bytes + value;
+                };
+                add(animationFrames.capacity() * sizeof(AnimationFrame));
                 for (const auto& frame : animationFrames)
                 {
-                    bytes += frame.pixels ? frame.pixels->size() * sizeof(RGBQUAD) : 0;
+                    add(AnimationFrame::RetainedAllocationOverhead);
+                    add(frame.pixels ? frame.pixels->size() * sizeof(RGBQUAD) : 0);
                 }
                 return bytes;
             }
@@ -229,7 +238,7 @@ namespace Microsoft::Console::VirtualTerminal
         {
             uint32_t nextImageId = 1;
             uint64_t nextLayerId = 1;
-            size_t totalPixelBytes = 0;
+            size_t totalRetainedBytes = 0;
             std::unordered_map<uint32_t, Image> images;
             ImageNumberMap imageNumbers;
             std::deque<uint32_t> imageOrder;
@@ -262,10 +271,12 @@ namespace Microsoft::Console::VirtualTerminal
         static FramePixelStorage* _frameStorage(Image& image, uint32_t frameNumber) noexcept;
         static const FramePixelStorage* _frameStorage(const Image& image, uint32_t frameNumber) noexcept;
         static int32_t* _frameGap(Image& image, uint32_t frameNumber) noexcept;
-        void _updateImageSurface(uint32_t imageId, const FramePixelStorage& pixels);
-        void _scheduleAnimation(uint32_t imageId, Image& image, std::chrono::steady_clock::time_point now);
+        void _updateImageSurface(uint32_t imageId);
+        void _updateImageSurfaces(std::span<const uint32_t> imageIds);
+        void _scheduleAnimation(uint32_t imageId, Image& image, std::chrono::steady_clock::time_point now, std::vector<uint32_t>* updatedImageIds = nullptr);
         void _scheduleAnimationTimer();
-        bool _advanceImage(uint32_t imageId, Image& image, std::chrono::steady_clock::time_point now);
+        std::optional<std::chrono::steady_clock::time_point> _nextAnimationDeadline(uint32_t replacementImageId = 0, const Image* replacement = nullptr, std::span<const uint32_t> omittedImageIds = {}) const noexcept;
+        bool _advanceImage(uint32_t imageId, Image& image, std::chrono::steady_clock::time_point now, std::vector<uint32_t>* updatedImageIds = nullptr);
         bool _processAnimationFrame(const Control& command, const std::string_view payload, bool payloadValid, bool payloadTooLarge, uint32_t imageId, std::wstring_view& code);
         bool _processAnimationControl(const Control& command, uint32_t imageId, std::wstring_view& code);
         bool _processFrameComposition(const Control& command, uint32_t imageId, std::wstring_view& code);
@@ -275,10 +286,11 @@ namespace Microsoft::Console::VirtualTerminal
         void _eraseImage(uint32_t id);
         void _touchImage(uint32_t id) noexcept;
         bool _isImagePlaced(uint32_t id) const;
+        void _eraseImageRegistryEntry(uint32_t id) noexcept;
         void _clearImages() noexcept;
         BufferState _takeBufferState() noexcept;
         void _restoreBufferState(BufferState&& state) noexcept;
-        size_t _retainedPixelBytes() const noexcept;
+        size_t _retainedBytes() const noexcept;
         void _releaseImageSurface(Image& image) noexcept;
         std::vector<ImageCacheState> _snapshotImageCacheStates() const;
         void _restoreImageCacheStates(const std::vector<ImageCacheState>& states) noexcept;
@@ -318,7 +330,7 @@ namespace Microsoft::Console::VirtualTerminal
         static constexpr size_t MaxPlacements = MaxImages * 4;
         uint32_t _nextImageId = 1;
         uint64_t _nextLayerId = 1;
-        size_t _totalPixelBytes = 0;
+        size_t _totalRetainedBytes = 0;
         std::unordered_map<uint32_t, Image> _images;
         ImageNumberMap _imageNumbers;
         std::deque<uint32_t> _imageOrder;

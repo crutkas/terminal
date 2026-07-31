@@ -186,8 +186,11 @@ public:
                               std::span<const ProtocolReplacement> replacements);
     void Clear() noexcept;
     size_t EraseProtocol(ImagePlacement::Key::Protocol protocol) noexcept;
-    bool Erase(ImagePlacement::Key key);
-    size_t EraseImage(ImagePlacement::Key::Protocol protocol, uint32_t imageId);
+    bool Erase(ImagePlacement::Key key) noexcept;
+    size_t EraseImage(ImagePlacement::Key::Protocol protocol, uint32_t imageId) noexcept;
+    size_t EraseImagesAndPlacements(ImagePlacement::Key::Protocol protocol,
+                                    std::span<const uint32_t> imageIds,
+                                    std::span<const ImagePlacement::Key> placements) noexcept;
     void EraseArea(ImagePlacement::Key key, til::rect area);
     void EraseArea(til::rect area);
     void EraseAreas(std::span<const til::rect> areas);
