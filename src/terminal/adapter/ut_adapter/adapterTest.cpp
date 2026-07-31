@@ -8057,10 +8057,11 @@ public:
         _testGetSet->_cellSize = { 1, 1 };
         _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,p=1,f=24,s=1,v=1,C=1;/wAA\x1b\\");
         _stateMachine->ProcessString(L"\x1b_Ga=T,i=2,p=1,P=1,Q=1,H=1,f=24,s=1,v=1,C=1;AP8A\x1b\\");
+        // Fill the registry with placed images so the repaired unplaced-first policy
+        // reaches the oldest placed parent and exercises its relative cascade.
         for (auto id = 3u; id <= KittyParser::MaxImages; ++id)
         {
-            _kitty()._images.emplace(id, KittyParser::Image{});
-            _kitty()._imageOrder.push_back(id);
+            _stateMachine->ProcessString(L"\x1b_Ga=T,i=" + std::to_wstring(id) + L",q=2,f=24,s=1,v=1,C=1;AAAA\x1b\\");
         }
         VERIFY_ARE_EQUAL(KittyParser::MaxImages, _kitty()._images.size());
 
