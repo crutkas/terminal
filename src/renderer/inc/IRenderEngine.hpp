@@ -16,6 +16,7 @@ Author(s):
 
 #include <algorithm>
 #include <d2d1.h>
+#include <functional>
 
 #include "CursorOptions.h"
 #include "Cluster.hpp"
@@ -73,8 +74,20 @@ namespace Microsoft::Console::Render
         };
 
         std::span<const ImagePlacement> placements;
+        // Sorted by Image pointer identity and unique, so engines can find a
+        // placement's surface without scanning the frame for every draw.
         std::span<const Surface> surfaces;
         til::point viewportOrigin;
+
+        static void BuildSurfaceSnapshot(std::span<const ImagePlacement> placements, std::vector<Surface>& surfaces);
+
+        [[nodiscard]] static const Surface* FindSurface(const Image* const image, const std::span<const Surface> surfaces) noexcept
+        {
+            const auto found = std::ranges::lower_bound(surfaces, image, std::less<>{}, [](const Surface& surface) noexcept {
+                return surface.image.get();
+            });
+            return found != surfaces.end() && found->image.get() == image ? &*found : nullptr;
+        }
 
         // An image cache entry keyed by `image` is stale once that image no longer
         // appears among this frame's `surfaces` (it scrolled or was erased out of
@@ -83,9 +96,7 @@ namespace Microsoft::Console::Render
         // came or went; that is reserved for genuine allocation exhaustion.
         [[nodiscard]] static bool ImageCacheEntryIsStale(const Image* const image, const std::span<const Surface> surfaces) noexcept
         {
-            return std::ranges::none_of(surfaces, [&](const Surface& surface) noexcept {
-                return surface.image.get() == image;
-            });
+            return FindSurface(image, surfaces) == nullptr;
         }
     };
 

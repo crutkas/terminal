@@ -894,13 +894,11 @@ void BackendD2D::_drawImages(const RenderingPayload& p, const ShapedRow& row, co
 void BackendD2D::_drawImage(const RenderingPayload& p, const ImagePlacement& placement, const D2D1_RECT_F& clip)
 {
     const auto& image = placement.SurfacePointer();
-    const auto snapshot = std::ranges::find(p.imageSurfaces, image.get(), [](const auto& surface) {
-        return surface.image.get();
-    });
+    const auto snapshot = ImageFrameInfo::FindSurface(image.get(), p.imageSurfaces);
     // A shaped row can briefly outlive its frame snapshot after an image is erased.
     // Skip that stale placement, while device calls below still throw so genuine
     // device-lost failures are recovered as usual.
-    if (snapshot == p.imageSurfaces.end())
+    if (!snapshot)
     {
         return;
     }

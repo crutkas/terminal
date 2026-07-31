@@ -1990,12 +1990,10 @@ void BackendD3D::_pruneImageCache(const RenderingPayload& p)
 void BackendD3D::_drawImage(const RenderingPayload& p, const ImagePlacement& placement, const i32r& clip)
 {
     const auto& image = placement.SurfacePointer();
-    const auto snapshot = std::ranges::find(p.imageSurfaces, image.get(), [](const auto& surface) {
-        return surface.image.get();
-    });
+    const auto snapshot = ImageFrameInfo::FindSurface(image.get(), p.imageSurfaces);
     // A shaped row can briefly outlive its frame snapshot after an image is erased.
     // Skip stale or malformed data, while device failures still propagate.
-    if (snapshot == p.imageSurfaces.end() || !_uploadImage(p, *snapshot))
+    if (!snapshot || !_uploadImage(p, *snapshot))
     {
         return;
     }

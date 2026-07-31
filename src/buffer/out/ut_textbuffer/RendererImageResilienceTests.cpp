@@ -6,6 +6,7 @@
 //   * A malformed image snapshot is skipped, not fatal (ImageFrameInfo::Surface::IsRenderable).
 //   * An image that leaves the frame is evicted individually, never by resetting an
 //     unrelated cache such as the glyph atlas (ImageFrameInfo::ImageCacheEntryIsStale).
+//   * Shared surfaces are deduplicated and indexed independently of placement order.
 // The decision logic lives in the shared header so every backend agrees and so it
 // can be exercised here without a graphics device.
 
@@ -33,6 +34,8 @@ class RendererImageResilienceTests
     TEST_METHOD(StaleShapedRowSurfaceRemovalIsHarmless);
     TEST_METHOD(DefaultBackgroundMaskRightBoundStaysInBounds);
     TEST_METHOD(DoubleWidthImageMaskCoordinateDivergence);
+    TEST_METHOD(SurfaceSnapshotDeduplicatesNonAdjacentPlacements);
+    TEST_METHOD(SurfaceLookupFindsMultipleZFragments);
 
     static Image::Pointer MakeImage(const til::size pixelSize)
     {
@@ -49,6 +52,13 @@ class RendererImageResilienceTests
             .size = pixelSize,
             .revision = image->Revision(),
         };
+    }
+
+    static void SortSurfaces(std::vector<ImageFrameInfo::Surface>& surfaces)
+    {
+        std::ranges::sort(surfaces, std::less<>{}, [](const auto& surface) noexcept {
+            return surface.image.get();
+        });
     }
 
     // Reproduces Renderer::_buildImageRowBackgrounds: one mask byte per visible
@@ -142,7 +152,8 @@ void RendererImageResilienceTests::StaleEntryIsEvictedIndividually()
     const auto b = MakeSurface({ 4, 3 });
     const auto goneImage = MakeImage({ 4, 3 });
 
-    const std::vector<ImageFrameInfo::Surface> surfaces{ a, b };
+    std::vector<ImageFrameInfo::Surface> surfaces{ a, b };
+    SortSurfaces(surfaces);
     const std::span<const ImageFrameInfo::Surface> frame{ surfaces };
 
     // Live images are retained...
@@ -160,10 +171,12 @@ void RendererImageResilienceTests::SurfaceRemovalMarksEntryStale()
     const auto stays = MakeSurface({ 4, 3 });
     const auto removed = MakeSurface({ 4, 3 });
 
-    const std::vector<ImageFrameInfo::Surface> before{ stays, removed };
+    std::vector<ImageFrameInfo::Surface> before{ stays, removed };
+    SortSurfaces(before);
     VERIFY_IS_FALSE(ImageFrameInfo::ImageCacheEntryIsStale(removed.image.get(), std::span{ before }));
 
-    const std::vector<ImageFrameInfo::Surface> after{ stays };
+    std::vector<ImageFrameInfo::Surface> after{ stays };
+    SortSurfaces(after);
     VERIFY_IS_TRUE(ImageFrameInfo::ImageCacheEntryIsStale(removed.image.get(), std::span{ after }));
     VERIFY_IS_FALSE(ImageFrameInfo::ImageCacheEntryIsStale(stays.image.get(), std::span{ after }));
 }
@@ -173,7 +186,7 @@ void RendererImageResilienceTests::StaleShapedRowSurfaceRemovalIsHarmless()
     // A row can still carry a placement after its surface is erased/scrolled away
     // (a "stale shaped row"). The frame's surface list is what the backends look the
     // placement up in; when the lookup misses, the draw path skips just that image.
-    // This mirrors the std::ranges::find(...) == end() skip in BackendD2D::_drawImage
+    // This mirrors the FindSurface(...) == nullptr skip in BackendD2D::_drawImage
     // and BackendD3D::_drawImage, and the missing-cache skip in
     // GdiEngine::_PaintDirectImage.
     const til::rect bounds{ 0, 0, 4, 1 };
@@ -189,10 +202,8 @@ void RendererImageResilienceTests::StaleShapedRowSurfaceRemovalIsHarmless()
     // erase). The lookup the backends perform therefore misses, so the placement is
     // skipped and the rest of the frame (text, other images) is unaffected.
     const std::vector<ImageFrameInfo::Surface> frameSurfaces{ MakeSurface({ 4, 3 }) };
-    const auto found = std::ranges::find(frameSurfaces, stalePlacementImage, [](const auto& surface) {
-        return surface.image.get();
-    });
-    VERIFY_IS_TRUE(found == frameSurfaces.end(), L"a stale placement finds no snapshot and is skipped");
+    const auto found = ImageFrameInfo::FindSurface(stalePlacementImage, frameSurfaces);
+    VERIFY_IS_TRUE(found == nullptr, L"a stale placement finds no snapshot and is skipped");
     VERIFY_IS_TRUE(ImageFrameInfo::ImageCacheEntryIsStale(stalePlacementImage, std::span{ frameSurfaces }));
 
     // A surface that survives but was emptied (e.g. mid-resize) is likewise skipped
@@ -290,4 +301,63 @@ void RendererImageResilienceTests::DoubleWidthImageMaskCoordinateDivergence()
     // The safety guarantee (no out-of-bounds mask access) holds regardless of the
     // divergence determination above; that is what the shipped change guarantees.
     VERIFY_IS_TRUE(true);
+}
+
+void RendererImageResilienceTests::SurfaceSnapshotDeduplicatesNonAdjacentPlacements()
+{
+    const auto shared = MakeImage({ 4, 1 });
+    const auto middle = MakeImage({ 4, 1 });
+    const auto last = MakeImage({ 4, 1 });
+    std::vector<ImagePlacement> placements;
+    placements.emplace_back(ImagePlacement::Key{ 1, 1 }, shared, til::rect{ 0, 0, 4, 1 }, 20);
+    placements.emplace_back(ImagePlacement::Key{ 2, 2 }, middle, til::rect{ 0, 0, 4, 1 }, -5);
+    placements.emplace_back(ImagePlacement::FromFragment(ImagePlacement::Key{ 3, 3 },
+                                                         shared,
+                                                         til::rect{ 2, 0, 4, 1 },
+                                                         til::rect{ 0, 0, 4, 1 },
+                                                         -20));
+    placements.emplace_back(ImagePlacement::Key{ 4, 4 }, last, til::rect{ 0, 0, 4, 1 }, 5);
+    placements.emplace_back(ImagePlacement::Key{ 5, 5 }, shared, til::rect{ 0, 0, 2, 1 }, 0);
+
+    std::vector<ImageFrameInfo::Surface> surfaces;
+    ImageFrameInfo::BuildSurfaceSnapshot(placements, surfaces);
+
+    VERIFY_ARE_EQUAL(size_t{ 3 }, surfaces.size(), L"nonadjacent placements sharing an image produce one surface");
+    VERIFY_IS_TRUE(std::ranges::is_sorted(surfaces, std::less<>{}, [](const auto& surface) noexcept {
+        return surface.image.get();
+    }));
+    VERIFY_IS_TRUE(ImageFrameInfo::FindSurface(shared.get(), surfaces) != nullptr);
+    VERIFY_IS_TRUE(ImageFrameInfo::FindSurface(middle.get(), surfaces) != nullptr);
+    VERIFY_IS_TRUE(ImageFrameInfo::FindSurface(last.get(), surfaces) != nullptr);
+}
+
+void RendererImageResilienceTests::SurfaceLookupFindsMultipleZFragments()
+{
+    const auto shared = MakeImage({ 4, 1 });
+    const auto between = MakeImage({ 4, 1 });
+    std::vector<ImagePlacement> placements;
+    placements.emplace_back(ImagePlacement::Key{ 1, 1 }, shared, til::rect{ 0, 0, 4, 1 }, 20);
+    placements.emplace_back(ImagePlacement::Key{ 2, 2 }, between, til::rect{ 0, 0, 4, 1 }, 0);
+    placements.emplace_back(ImagePlacement::FromFragment(ImagePlacement::Key{ 3, 3 },
+                                                         shared,
+                                                         til::rect{ 1, 0, 3, 1 },
+                                                         til::rect{ 0, 0, 4, 1 },
+                                                         -20));
+    std::ranges::sort(placements, {}, [](const auto& placement) noexcept {
+        return placement.ZIndex();
+    });
+
+    std::vector<ImageFrameInfo::Surface> surfaces;
+    ImageFrameInfo::BuildSurfaceSnapshot(placements, surfaces);
+
+    for (const auto& placement : placements)
+    {
+        const auto snapshot = ImageFrameInfo::FindSurface(placement.SurfacePointer().get(), surfaces);
+        VERIFY_IS_TRUE(snapshot != nullptr, L"every backend draw finds its frame snapshot");
+        VERIFY_ARE_EQUAL(placement.SurfacePointer().get(), snapshot->image.get());
+    }
+    const auto missing = MakeImage({ 4, 1 });
+    VERIFY_IS_TRUE(ImageFrameInfo::FindSurface(missing.get(), surfaces) == nullptr);
+    VERIFY_IS_FALSE(ImageFrameInfo::ImageCacheEntryIsStale(shared.get(), surfaces));
+    VERIFY_IS_TRUE(ImageFrameInfo::ImageCacheEntryIsStale(missing.get(), surfaces));
 }

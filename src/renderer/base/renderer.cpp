@@ -17,6 +17,31 @@ static constexpr unsigned int maxRetriesForRenderEngine = 5;
 // The renderer will wait this number of milliseconds * 2^tries before trying again.
 static constexpr DWORD renderBackoffBaseTimeMilliseconds = 100;
 
+void ImageFrameInfo::BuildSurfaceSnapshot(const std::span<const ImagePlacement> placements, std::vector<Surface>& surfaces)
+{
+    surfaces.clear();
+    surfaces.reserve(placements.size());
+    for (const auto& placement : placements)
+    {
+        surfaces.emplace_back(Surface{ .image = placement.SurfacePointer() });
+    }
+
+    const auto imageIdentity = [](const Surface& surface) noexcept {
+        return surface.image.get();
+    };
+    std::ranges::sort(surfaces, std::less<>{}, imageIdentity);
+    const auto duplicates = std::ranges::unique(surfaces, std::ranges::equal_to{}, imageIdentity);
+    surfaces.erase(duplicates.begin(), duplicates.end());
+
+    for (auto& surface : surfaces)
+    {
+        const auto& image = surface.image;
+        surface.pixels = image->Storage();
+        surface.size = image->PixelSize();
+        surface.revision = image->Revision();
+    }
+}
+
 // Routine Description:
 // - Creates a new renderer controller for a console.
 // Arguments:
@@ -1185,23 +1210,7 @@ void Renderer::_prepareImageFrame()
         return std::tuple{ lhs.ZIndex(), lhsKey.protocol, lhsKey.imageId, lhsKey.layerId } <
                std::tuple{ rhs.ZIndex(), rhsKey.protocol, rhsKey.imageId, rhsKey.layerId };
     });
-    _imageSurfaces.reserve(_imagePlacements.size());
-    for (const auto& placement : _imagePlacements)
-    {
-        const auto& image = placement.SurfacePointer();
-        const auto found = std::ranges::find(_imageSurfaces, image.get(), [](const auto& surface) {
-            return surface.image.get();
-        });
-        if (found == _imageSurfaces.end())
-        {
-            _imageSurfaces.emplace_back(ImageFrameInfo::Surface{
-                .image = image,
-                .pixels = image->Storage(),
-                .size = image->PixelSize(),
-                .revision = image->Revision(),
-            });
-        }
-    }
+    ImageFrameInfo::BuildSurfaceSnapshot(_imagePlacements, _imageSurfaces);
 }
 
 bool Renderer::_rowHasDirectImages(const til::CoordType row, ImagePlacement::RenderPosition* const underlay) const noexcept
