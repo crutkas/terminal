@@ -61,6 +61,14 @@ namespace Microsoft::Console::VirtualTerminal
         std::shared_ptr<MutationSnapshot> CreateMutationSnapshot() const;
         void RestoreMutationSnapshot(MutationSnapshot& snapshot) noexcept;
 
+        // Runs every animated image forward to the given time, then reports when it
+        // next needs to be called. The host calls this when the deadline it was last
+        // given comes due.
+        void AdvanceAnimations(std::chrono::steady_clock::time_point now);
+
+        // Refreshes animated shared surfaces after a page or buffer transition.
+        void RefreshImageSurfaces();
+
         // Drops every image, every placement, and any transfer in progress.
         void HardReset() noexcept;
 
@@ -97,6 +105,8 @@ namespace Microsoft::Console::VirtualTerminal
             uint32_t srcH = 0;
             uint32_t cellOffsetX = 0;
             uint32_t cellOffsetY = 0;
+            uint32_t upperX = 0; // X=: animation replacement mode or composition source x
+            uint32_t upperY = 0; // Y=: animation background RGBA or composition source y
             bool moreChunks = false;
             bool mPresent = false;
             bool haveId = false;
@@ -117,18 +127,40 @@ namespace Microsoft::Console::VirtualTerminal
             bool haveParent = false;
         };
 
+        using FramePixelStorage = ::Image::PixelStorage;
+
+        struct AnimationFrame
+        {
+            FramePixelStorage pixels;
+            int32_t gapMilliseconds = 0;
+        };
+
         struct Image
         {
             uint32_t number = 0;
             uint32_t width = 0;
             uint32_t height = 0;
-            ::Image::PixelStorage pixels;
+            FramePixelStorage pixels;
+            int32_t rootGapMilliseconds = 0;
+            std::vector<AnimationFrame> animationFrames;
+            uint32_t currentFrame = 1;
+            uint32_t animationState = 1;
+            uint32_t loopCount = 1;
+            uint32_t loopsRemaining = UINT32_MAX;
+            uint32_t presentedFrame = 1;
+            bool waitingForFrames = false;
             bool hasRenderedPlacements = false;
+            std::chrono::steady_clock::time_point nextFrameTime{};
             mutable ::Image::Pointer surface;
 
             size_t PixelBytes() const noexcept
             {
-                return pixels ? pixels->size() * sizeof(RGBQUAD) : 0;
+                auto bytes = pixels ? pixels->size() * sizeof(RGBQUAD) : 0;
+                for (const auto& frame : animationFrames)
+                {
+                    bytes += frame.pixels ? frame.pixels->size() * sizeof(RGBQUAD) : 0;
+                }
+                return bytes;
             }
         };
 
@@ -223,6 +255,21 @@ namespace Microsoft::Console::VirtualTerminal
         static bool _DecodeBase64(std::string_view input, std::vector<uint8_t>& output) noexcept;
         static bool _inflateZlib(const std::vector<uint8_t>& input, std::vector<uint8_t>& output, size_t cap) noexcept;
         static std::vector<RGBQUAD> _decodePixels(uint32_t format, const std::vector<uint8_t>& bytes);
+        static RGBQUAD _rgbaColor(uint32_t rgba) noexcept;
+        static void _compositePixels(std::span<RGBQUAD> destination, std::span<const RGBQUAD> source, bool replace) noexcept;
+        static size_t _frameCount(const Image& image) noexcept;
+        static const std::vector<RGBQUAD>* _framePixels(const Image& image, uint32_t frameNumber) noexcept;
+        static FramePixelStorage* _frameStorage(Image& image, uint32_t frameNumber) noexcept;
+        static const FramePixelStorage* _frameStorage(const Image& image, uint32_t frameNumber) noexcept;
+        static int32_t* _frameGap(Image& image, uint32_t frameNumber) noexcept;
+        void _updateImageSurface(uint32_t imageId, const FramePixelStorage& pixels);
+        void _scheduleAnimation(uint32_t imageId, Image& image, std::chrono::steady_clock::time_point now);
+        void _scheduleAnimationTimer();
+        bool _advanceImage(uint32_t imageId, Image& image, std::chrono::steady_clock::time_point now);
+        bool _processAnimationFrame(const Control& command, const std::string_view payload, bool payloadValid, bool payloadTooLarge, uint32_t imageId, std::wstring_view& code);
+        bool _processAnimationControl(const Control& command, uint32_t imageId, std::wstring_view& code);
+        bool _processFrameComposition(const Control& command, uint32_t imageId, std::wstring_view& code);
+        void _deleteAnimationFrames(uint32_t imageId, uint32_t frameNumber, bool freeData);
         uint32_t _assignImageId();
         bool _registerImage(uint32_t id, Image&& image);
         void _eraseImage(uint32_t id);
@@ -266,6 +313,7 @@ namespace Microsoft::Console::VirtualTerminal
         static constexpr size_t MaxControl = 1024;
         static constexpr size_t MaxPayload = 32 * 1024 * 1024;
         static constexpr size_t MaxTotalBytes = 320 * 1024 * 1024;
+        static constexpr size_t MaxFramesPerImage = 4096;
         static constexpr int MaxPlacementDepth = 8;
         static constexpr size_t MaxPlacements = MaxImages * 4;
         uint32_t _nextImageId = 1;

@@ -176,6 +176,7 @@ void KittyParser::SaveMainBufferState() noexcept
 {
     _mainBufferState.emplace(_takeBufferState());
     _clearChunk();
+    _scheduleAnimationTimer();
 }
 
 void KittyParser::DiscardBufferState() noexcept
@@ -192,6 +193,8 @@ void KittyParser::RestoreMainBufferState() noexcept
         _mainBufferState.reset();
         _restoreBufferState(std::move(state));
     }
+    RefreshImageSurfaces();
+    _scheduleAnimationTimer();
 }
 
 // Handles the Kitty graphics protocol (APC G <control>;<payload> ST). The parser
@@ -324,9 +327,11 @@ KittyParser::Control KittyParser::_ParseControl(const std::wstring_view control)
                 break;
             case L'X':
                 c.cellOffsetX = _ParseUint(value);
+                c.upperX = c.cellOffsetX;
                 break;
             case L'Y':
                 c.cellOffsetY = _ParseUint(value);
+                c.upperY = c.cellOffsetY;
                 break;
             case L'o':
                 c.compression = value.front();
@@ -1008,6 +1013,42 @@ void KittyParser::_ProcessCommand(const Control& command, const std::string_view
             }
             break;
         }
+        case L'f':
+        case L'a':
+        case L'c':
+        {
+            uint32_t targetId = 0;
+            if (haveId)
+            {
+                targetId = imageId;
+            }
+            else if (haveNumber)
+            {
+                const auto it = _imageNumbers.find(imageNumber);
+                if (it != _imageNumbers.end())
+                {
+                    targetId = it->second;
+                }
+            }
+            if (targetId == 0)
+            {
+                success = false;
+                code = L"ENOENT:image not found";
+            }
+            else if (action == L'f')
+            {
+                success = _processAnimationFrame(command, payload, payloadValid, payloadTooLarge, targetId, code);
+            }
+            else if (action == L'a')
+            {
+                success = _processAnimationControl(command, targetId, code);
+            }
+            else
+            {
+                success = _processFrameComposition(command, targetId, code);
+            }
+            break;
+        }
         case L'd':
         {
             const auto freeData = deleteTarget >= L'A' && deleteTarget <= L'Z';
@@ -1133,6 +1174,28 @@ void KittyParser::_ProcessCommand(const Control& command, const std::string_view
                     _deletePlacementsByZ(command.zIndex, freeData, til::point{ x, y });
                 }
                 break;
+            case L'f':
+            case L'F':
+            {
+                uint32_t targetId = 0;
+                if (haveId)
+                {
+                    targetId = imageId;
+                }
+                else if (haveNumber)
+                {
+                    const auto it = _imageNumbers.find(imageNumber);
+                    if (it != _imageNumbers.end())
+                    {
+                        targetId = it->second;
+                    }
+                }
+                if (targetId != 0)
+                {
+                    _deleteAnimationFrames(targetId, command.rows == 0 ? 1 : command.rows, freeData);
+                }
+                break;
+            }
             default:
                 success = false;
                 code = L"EINVAL:unsupported delete target";
@@ -1306,6 +1369,7 @@ void KittyParser::_eraseImage(const uint32_t id)
         return;
     }
     _totalPixelBytes -= it->second.PixelBytes();
+    const auto wasAnimating = it->second.animationState == 2 || it->second.animationState == 3;
     if (it->second.number != 0)
     {
         const auto reverse = _imageNumbers.find(it->second.number);
@@ -1355,6 +1419,10 @@ void KittyParser::_eraseImage(const uint32_t id)
     {
         _imageOrder.erase(std::remove(_imageOrder.begin(), _imageOrder.end(), id), _imageOrder.end());
     }
+    if (wasAnimating)
+    {
+        _scheduleAnimationTimer();
+    }
 }
 
 void KittyParser::_touchImage(const uint32_t id) noexcept
@@ -1397,6 +1465,7 @@ try
     _placements.clear();
     _anonymousPlacements.clear();
     _totalPixelBytes = 0;
+    _scheduleAnimationTimer();
     const auto visiblePageNumber = _dispatcher._pages.VisiblePage().Number();
     _dispatcher._pages.ForEachPage([&](const Page page) {
         auto& buffer = page.Buffer();
@@ -1526,6 +1595,756 @@ std::vector<RGBQUAD> KittyParser::_decodePixels(const uint32_t format, const std
     return pixels;
 }
 
+RGBQUAD KittyParser::_rgbaColor(const uint32_t rgba) noexcept
+{
+    const auto alpha = rgba & 0xffu;
+    RGBQUAD pixel{};
+    pixel.rgbRed = static_cast<BYTE>(((rgba >> 24) & 0xffu) * alpha / 255u);
+    pixel.rgbGreen = static_cast<BYTE>(((rgba >> 16) & 0xffu) * alpha / 255u);
+    pixel.rgbBlue = static_cast<BYTE>(((rgba >> 8) & 0xffu) * alpha / 255u);
+    pixel.rgbReserved = static_cast<BYTE>(alpha);
+    return pixel;
+}
+
+void KittyParser::_compositePixels(const std::span<RGBQUAD> destination, const std::span<const RGBQUAD> source, const bool replace) noexcept
+{
+    const auto count = std::min(destination.size(), source.size());
+    for (size_t i = 0; i < count; ++i)
+    {
+        const auto& src = source[i];
+        auto& dst = destination[i];
+        if (replace)
+        {
+            dst = src;
+            continue;
+        }
+        const auto inverseAlpha = 255u - src.rgbReserved;
+        dst.rgbRed = static_cast<BYTE>(std::min(255u, static_cast<uint32_t>(src.rgbRed) + (static_cast<uint32_t>(dst.rgbRed) * inverseAlpha + 127u) / 255u));
+        dst.rgbGreen = static_cast<BYTE>(std::min(255u, static_cast<uint32_t>(src.rgbGreen) + (static_cast<uint32_t>(dst.rgbGreen) * inverseAlpha + 127u) / 255u));
+        dst.rgbBlue = static_cast<BYTE>(std::min(255u, static_cast<uint32_t>(src.rgbBlue) + (static_cast<uint32_t>(dst.rgbBlue) * inverseAlpha + 127u) / 255u));
+        dst.rgbReserved = static_cast<BYTE>(std::min(255u, static_cast<uint32_t>(src.rgbReserved) + (static_cast<uint32_t>(dst.rgbReserved) * inverseAlpha + 127u) / 255u));
+    }
+}
+
+size_t KittyParser::_frameCount(const Image& image) noexcept
+{
+    return !image.pixels || image.pixels->empty() ? 0 : image.animationFrames.size() + 1;
+}
+
+const std::vector<RGBQUAD>* KittyParser::_framePixels(const Image& image, const uint32_t frameNumber) noexcept
+{
+    if (frameNumber == 1)
+    {
+        return image.pixels.get();
+    }
+    const auto index = static_cast<size_t>(frameNumber) - 2;
+    return index < image.animationFrames.size() ? image.animationFrames[index].pixels.get() : nullptr;
+}
+
+KittyParser::FramePixelStorage* KittyParser::_frameStorage(Image& image, const uint32_t frameNumber) noexcept
+{
+    if (frameNumber == 1)
+    {
+        return image.pixels ? &image.pixels : nullptr;
+    }
+    const auto index = static_cast<size_t>(frameNumber) - 2;
+    return index < image.animationFrames.size() && image.animationFrames[index].pixels ?
+               &image.animationFrames[index].pixels :
+               nullptr;
+}
+
+const KittyParser::FramePixelStorage* KittyParser::_frameStorage(const Image& image, const uint32_t frameNumber) noexcept
+{
+    if (frameNumber == 1)
+    {
+        return image.pixels ? &image.pixels : nullptr;
+    }
+    const auto index = static_cast<size_t>(frameNumber) - 2;
+    return index < image.animationFrames.size() && image.animationFrames[index].pixels ?
+               &image.animationFrames[index].pixels :
+               nullptr;
+}
+
+int32_t* KittyParser::_frameGap(Image& image, const uint32_t frameNumber) noexcept
+{
+    if (frameNumber == 1)
+    {
+        return &image.rootGapMilliseconds;
+    }
+    const auto index = static_cast<size_t>(frameNumber) - 2;
+    return index < image.animationFrames.size() ? &image.animationFrames[index].gapMilliseconds : nullptr;
+}
+
+void KittyParser::_updateImageSurface(const uint32_t imageId, const FramePixelStorage& storage)
+{
+    const auto image = _images.find(imageId);
+    if (image == _images.end() || !storage)
+    {
+        return;
+    }
+    const auto visiblePageNumber = _dispatcher._pages.VisiblePage().Number();
+    auto surface = image->second.surface;
+    auto foundPlacement = false;
+    _dispatcher._pages.ForEachPage([&](const Page page) {
+        auto& buffer = page.Buffer();
+        auto firstRow = page.Bottom();
+        auto lastRow = 0;
+        for (const auto& placement : buffer.GetImages().All())
+        {
+            const auto key = placement.Identity();
+            if (key.protocol == ImagePlacement::Key::Protocol::Kitty && key.imageId == imageId)
+            {
+                foundPlacement = true;
+                surface = surface ? surface : placement.SurfacePointer();
+                const auto bounds = placement.CellBounds();
+                firstRow = std::min(firstRow, bounds.top);
+                lastRow = std::max(lastRow, bounds.bottom - 1);
+            }
+        }
+        if (page.Number() == visiblePageNumber && firstRow <= lastRow)
+        {
+            buffer.TriggerRedraw(Viewport::FromExclusive({ 0, firstRow, page.Width(), lastRow + 1 }));
+        }
+    });
+    image->second.hasRenderedPlacements = foundPlacement;
+    if (foundPlacement && surface)
+    {
+        image->second.surface = surface;
+        surface->UpdatePixels(storage);
+    }
+    else
+    {
+        _releaseImageSurface(image->second);
+    }
+}
+
+void KittyParser::RefreshImageSurfaces()
+{
+    for (const auto& [imageId, image] : _images)
+    {
+        if (image.animationFrames.empty())
+        {
+            continue;
+        }
+        if (const auto pixels = _frameStorage(image, image.presentedFrame))
+        {
+            _updateImageSurface(imageId, *pixels);
+        }
+    }
+    _scheduleAnimationTimer();
+}
+
+bool KittyParser::_processAnimationFrame(const Control& command, const std::string_view payload, const bool payloadValid, const bool payloadTooLarge, const uint32_t imageId, std::wstring_view& code)
+try
+{
+    auto imageIt = _images.find(imageId);
+    if (imageIt == _images.end())
+    {
+        code = L"ENOENT:image not found";
+        return false;
+    }
+    if (command.medium != L'd' || command.compression != 0)
+    {
+        code = command.medium != L'd' ? L"EINVAL:unsupported transmission medium" : L"EINVAL:unsupported compression";
+        return false;
+    }
+    if (command.format != 24 && command.format != 32 && command.format != 100)
+    {
+        code = L"EINVAL:unsupported format";
+        return false;
+    }
+    if (command.upperX > 1)
+    {
+        code = L"EINVAL:invalid frame composition mode";
+        return false;
+    }
+
+    std::vector<uint8_t> bytes;
+    if (!payloadValid || !_DecodeBase64(payload, bytes))
+    {
+        code = payloadTooLarge ? L"EFBIG:payload exceeds maximum size" : L"EINVAL:bad payload";
+        return false;
+    }
+
+    uint32_t frameWidth = 0;
+    uint32_t frameHeight = 0;
+    std::vector<RGBQUAD> framePixels;
+    if (command.format == 24 || command.format == 32)
+    {
+        const auto depth = command.format == 24 ? 3u : 4u;
+        if (command.width == 0 || command.height == 0)
+        {
+            code = L"EINVAL:missing frame dimensions";
+            return false;
+        }
+        const auto area = static_cast<uint64_t>(command.width) * command.height;
+        if (area > bytes.size() / depth || area * depth != bytes.size())
+        {
+            code = L"EINVAL:payload size mismatch";
+            return false;
+        }
+        frameWidth = command.width;
+        frameHeight = command.height;
+        framePixels = _decodePixels(command.format, bytes);
+    }
+    else
+    {
+        til::size decodedSize;
+        if (bytes.empty() ||
+            !_dispatcher._api.DecodeImageToBgra(bytes, framePixels, decodedSize) ||
+            decodedSize.width <= 0 || decodedSize.height <= 0 ||
+            framePixels.size() != static_cast<size_t>(decodedSize.width) * decodedSize.height)
+        {
+            code = L"EBADPNG:could not decode frame";
+            return false;
+        }
+        frameWidth = static_cast<uint32_t>(decodedSize.width);
+        frameHeight = static_cast<uint32_t>(decodedSize.height);
+    }
+
+    auto& image = imageIt->second;
+    if (command.srcX > image.width || command.srcY > image.height ||
+        frameWidth > image.width - command.srcX || frameHeight > image.height - command.srcY)
+    {
+        code = L"EINVAL:frame rectangle out of bounds";
+        return false;
+    }
+
+    const auto editFrame = command.rows;
+    const auto backgroundFrame = command.cols;
+    if (editFrame != 0 && backgroundFrame != 0)
+    {
+        code = L"EINVAL:cannot edit and create a frame simultaneously";
+        return false;
+    }
+    if (editFrame == 0 && _frameCount(image) >= MaxFramesPerImage)
+    {
+        code = L"ENOSPC:frame count limit exceeded";
+        return false;
+    }
+    if (editFrame != 0 && !_framePixels(image, editFrame))
+    {
+        code = L"ENOENT:frame not found";
+        return false;
+    }
+    if (editFrame == 0 && backgroundFrame != 0 && !_framePixels(image, backgroundFrame))
+    {
+        code = L"ENOENT:background frame not found";
+        return false;
+    }
+
+    const auto frameBytes = image.pixels->size() * sizeof(RGBQUAD);
+    std::vector<uint32_t> victims;
+    if (editFrame == 0)
+    {
+        // A victim whose placement is an ancestor of the target would cascade-delete
+        // the image we are extending. Build the target's bounded parent ancestry once,
+        // then exclude those image ids from the eviction plan.
+        std::vector<uint32_t> protectedImageIds{ imageId };
+        const auto protectAncestors = [&](std::pair<uint32_t, uint32_t> parent) {
+            for (auto depth = 0; depth < MaxPlacementDepth; ++depth)
+            {
+                if (std::find(protectedImageIds.begin(), protectedImageIds.end(), parent.first) == protectedImageIds.end())
+                {
+                    protectedImageIds.push_back(parent.first);
+                }
+                const auto placement = _placements.find(parent);
+                if (placement == _placements.end() || !placement->second.hasParent)
+                {
+                    break;
+                }
+                parent = { placement->second.parentImageId, placement->second.parentPlacementId };
+            }
+        };
+        for (const auto& [key, placement] : _placements)
+        {
+            if (key.first == imageId && placement.hasParent)
+            {
+                protectAncestors({ placement.parentImageId, placement.parentPlacementId });
+            }
+        }
+        for (const auto& placement : _anonymousPlacements)
+        {
+            if (placement.imageId == imageId && placement.hasParent)
+            {
+                protectAncestors({ placement.parentImageId, placement.parentPlacementId });
+            }
+        }
+
+        const auto retainedBytes = _retainedPixelBytes();
+        const auto requiredBytes = retainedBytes > MaxTotalBytes - frameBytes ?
+                                       retainedBytes - (MaxTotalBytes - frameBytes) :
+                                       size_t{ 0 };
+        auto reclaimableBytes = size_t{ 0 };
+        if (requiredBytes != 0)
+        {
+            for (const auto candidateId : _imageOrder)
+            {
+                if (std::find(protectedImageIds.begin(), protectedImageIds.end(), candidateId) != protectedImageIds.end())
+                {
+                    continue;
+                }
+                const auto candidate = _images.find(candidateId);
+                if (candidate == _images.end())
+                {
+                    continue;
+                }
+                victims.push_back(candidateId);
+                reclaimableBytes += candidate->second.PixelBytes();
+                if (reclaimableBytes >= requiredBytes)
+                {
+                    break;
+                }
+            }
+        }
+        if (reclaimableBytes < requiredBytes)
+        {
+            code = L"ENOSPC:image storage limit exceeded";
+            return false;
+        }
+    }
+
+    auto canvas = std::vector<RGBQUAD>{};
+    if (editFrame != 0)
+    {
+        canvas = *_framePixels(imageIt->second, editFrame);
+    }
+    else if (backgroundFrame != 0)
+    {
+        canvas = *_framePixels(imageIt->second, backgroundFrame);
+    }
+    else
+    {
+        canvas.assign(imageIt->second.pixels->size(), _rgbaColor(command.upperY));
+    }
+
+    for (uint32_t row = 0; row < frameHeight; ++row)
+    {
+        const auto srcOffset = static_cast<size_t>(row) * frameWidth;
+        const auto dstOffset = static_cast<size_t>(command.srcY + row) * imageIt->second.width + command.srcX;
+        _compositePixels(std::span{ canvas }.subspan(dstOffset, frameWidth),
+                         std::span{ framePixels }.subspan(srcOffset, frameWidth),
+                         command.upperX == 1);
+    }
+
+    auto appendedFrame = FramePixelStorage{};
+    if (editFrame == 0)
+    {
+        // Allocate every fallible part of the append before eviction mutates unrelated
+        // images. The subsequent frame move cannot allocate once capacity is reserved.
+        appendedFrame = std::make_shared<std::vector<RGBQUAD>>(std::move(canvas));
+        imageIt->second.animationFrames.reserve(imageIt->second.animationFrames.size() + 1);
+        for (const auto victimId : victims)
+        {
+            if (_images.count(victimId) == 0)
+            {
+                continue;
+            }
+            _erasePlacementsForImage(victimId);
+            _eraseImagePlacements(victimId);
+            _eraseImage(victimId);
+        }
+        imageIt = _images.find(imageId);
+        WI_ASSERT(imageIt != _images.end());
+    }
+
+    auto& storedImage = imageIt->second;
+    uint32_t changedFrame = 0;
+    if (editFrame != 0)
+    {
+        *_frameStorage(storedImage, editFrame) = std::make_shared<std::vector<RGBQUAD>>(std::move(canvas));
+        changedFrame = editFrame;
+        if (command.haveZ && command.zIndex != 0)
+        {
+            *_frameGap(storedImage, editFrame) = command.zIndex;
+        }
+    }
+    else
+    {
+        AnimationFrame frame;
+        frame.pixels = std::move(appendedFrame);
+        frame.gapMilliseconds = command.haveZ && command.zIndex != 0 ? command.zIndex : 40;
+        storedImage.animationFrames.push_back(std::move(frame));
+        _totalPixelBytes += frameBytes;
+        changedFrame = gsl::narrow_cast<uint32_t>(_frameCount(storedImage));
+    }
+
+    if (storedImage.presentedFrame == changedFrame)
+    {
+        _updateImageSurface(imageId, *_frameStorage(storedImage, changedFrame));
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (storedImage.animationState == 2 && storedImage.waitingForFrames)
+    {
+        storedImage.waitingForFrames = false;
+        _advanceImage(imageId, storedImage, now);
+    }
+    else if (storedImage.currentFrame == changedFrame &&
+             command.haveZ && command.zIndex != 0 &&
+             (storedImage.animationState == 2 || storedImage.animationState == 3))
+    {
+        _scheduleAnimation(imageId, storedImage, now);
+    }
+    _scheduleAnimationTimer();
+    return true;
+}
+catch (const std::bad_alloc&)
+{
+    code = L"ENOSPC:could not allocate frame";
+    return false;
+}
+
+bool KittyParser::_processAnimationControl(const Control& command, const uint32_t imageId, std::wstring_view& code)
+{
+    const auto imageIt = _images.find(imageId);
+    if (imageIt == _images.end())
+    {
+        code = L"ENOENT:image not found";
+        return false;
+    }
+    auto& image = imageIt->second;
+    if (command.width > 3)
+    {
+        code = L"EINVAL:invalid animation state";
+        return false;
+    }
+    if (command.cols != 0 && !_framePixels(image, command.cols))
+    {
+        code = L"ENOENT:frame not found";
+        return false;
+    }
+    if (command.rows != 0 && !_frameGap(image, command.rows))
+    {
+        code = L"ENOENT:frame not found";
+        return false;
+    }
+
+    auto reschedule = false;
+    if (command.cols != 0)
+    {
+        image.currentFrame = command.cols;
+        image.presentedFrame = image.currentFrame;
+        _updateImageSurface(imageId, *_frameStorage(image, image.currentFrame));
+        reschedule = true;
+    }
+    if (command.rows != 0 && command.haveZ && command.zIndex != 0)
+    {
+        *_frameGap(image, command.rows) = command.zIndex;
+        reschedule |= command.rows == image.currentFrame;
+    }
+    if (command.height != 0)
+    {
+        image.loopCount = command.height;
+        image.loopsRemaining = command.height == 1 ? UINT32_MAX : command.height - 1;
+    }
+    if (command.width != 0)
+    {
+        image.animationState = command.width;
+        image.waitingForFrames = false;
+        image.nextFrameTime = {};
+        image.loopsRemaining = image.loopCount == 1 ? UINT32_MAX : image.loopCount - 1;
+        reschedule = true;
+    }
+
+    if (image.animationState == 1)
+    {
+        image.nextFrameTime = {};
+        image.waitingForFrames = false;
+    }
+    else if (reschedule)
+    {
+        _scheduleAnimation(imageId, image, std::chrono::steady_clock::now());
+    }
+    _scheduleAnimationTimer();
+    return true;
+}
+
+bool KittyParser::_processFrameComposition(const Control& command, const uint32_t imageId, std::wstring_view& code)
+try
+{
+    const auto imageIt = _images.find(imageId);
+    if (imageIt == _images.end())
+    {
+        code = L"ENOENT:image not found";
+        return false;
+    }
+    auto& image = imageIt->second;
+    const auto sourceFrame = command.rows;
+    const auto destinationFrame = command.cols;
+    const auto* source = _framePixels(image, sourceFrame);
+    const auto* destination = _framePixels(image, destinationFrame);
+    if (sourceFrame == 0 || destinationFrame == 0 || !source || !destination)
+    {
+        code = L"ENOENT:frame not found";
+        return false;
+    }
+
+    const auto width = command.srcW == 0 ? image.width : command.srcW;
+    const auto height = command.srcH == 0 ? image.height : command.srcH;
+    if (width == 0 || height == 0 ||
+        command.srcX > image.width || command.srcY > image.height ||
+        command.upperX > image.width || command.upperY > image.height ||
+        width > image.width - command.srcX || height > image.height - command.srcY ||
+        width > image.width - command.upperX || height > image.height - command.upperY)
+    {
+        code = L"EINVAL:composition rectangle out of bounds";
+        return false;
+    }
+
+    const til::rect sourceRect{
+        gsl::narrow_cast<til::CoordType>(command.upperX),
+        gsl::narrow_cast<til::CoordType>(command.upperY),
+        gsl::narrow_cast<til::CoordType>(command.upperX + width),
+        gsl::narrow_cast<til::CoordType>(command.upperY + height),
+    };
+    const til::rect destinationRect{
+        gsl::narrow_cast<til::CoordType>(command.srcX),
+        gsl::narrow_cast<til::CoordType>(command.srcY),
+        gsl::narrow_cast<til::CoordType>(command.srcX + width),
+        gsl::narrow_cast<til::CoordType>(command.srcY + height),
+    };
+    const auto rectanglesOverlap = sourceRect.left < destinationRect.right &&
+                                   destinationRect.left < sourceRect.right &&
+                                   sourceRect.top < destinationRect.bottom &&
+                                   destinationRect.top < sourceRect.bottom;
+    if (sourceFrame == destinationFrame && rectanglesOverlap)
+    {
+        code = L"EINVAL:overlapping self-composition";
+        return false;
+    }
+
+    std::vector<RGBQUAD> sourcePixels(static_cast<size_t>(width) * height);
+    for (uint32_t row = 0; row < height; ++row)
+    {
+        const auto srcOffset = static_cast<size_t>(command.upperY + row) * image.width + command.upperX;
+        std::copy_n(source->begin() + srcOffset, width, sourcePixels.begin() + static_cast<size_t>(row) * width);
+    }
+    auto composed = *destination;
+    for (uint32_t row = 0; row < height; ++row)
+    {
+        const auto dstOffset = static_cast<size_t>(command.srcY + row) * image.width + command.srcX;
+        _compositePixels(std::span{ composed }.subspan(dstOffset, width),
+                         std::span{ sourcePixels }.subspan(static_cast<size_t>(row) * width, width),
+                         command.noCursorMovement);
+    }
+    *_frameStorage(image, destinationFrame) = std::make_shared<std::vector<RGBQUAD>>(std::move(composed));
+    if (image.presentedFrame == destinationFrame)
+    {
+        _updateImageSurface(imageId, *_frameStorage(image, destinationFrame));
+    }
+    return true;
+}
+catch (const std::bad_alloc&)
+{
+    code = L"ENOSPC:could not compose frame";
+    return false;
+}
+
+void KittyParser::_scheduleAnimation(const uint32_t imageId, Image& image, const std::chrono::steady_clock::time_point now)
+{
+    if (image.animationState != 2 && image.animationState != 3)
+    {
+        image.nextFrameTime = {};
+        return;
+    }
+    const auto* gap = _frameGap(image, image.currentFrame);
+    if (!gap)
+    {
+        image.animationState = 1;
+        image.nextFrameTime = {};
+        return;
+    }
+    if (*gap > 0)
+    {
+        image.waitingForFrames = false;
+        if (image.presentedFrame != image.currentFrame)
+        {
+            image.presentedFrame = image.currentFrame;
+            _updateImageSurface(imageId, *_frameStorage(image, image.presentedFrame));
+        }
+        image.nextFrameTime = now + std::chrono::milliseconds(*gap);
+    }
+    else
+    {
+        image.nextFrameTime = now;
+        _advanceImage(imageId, image, now);
+    }
+}
+
+bool KittyParser::_advanceImage(const uint32_t imageId, Image& image, const std::chrono::steady_clock::time_point now)
+{
+    if (image.animationState != 2 && image.animationState != 3)
+    {
+        image.nextFrameTime = {};
+        return false;
+    }
+
+    const auto frameCount = gsl::narrow_cast<uint32_t>(_frameCount(image));
+    if (frameCount < 2)
+    {
+        image.waitingForFrames = image.animationState == 2;
+        image.nextFrameTime = {};
+        return false;
+    }
+
+    // A full pass is enough to prove that every frame is gapless. Stop rather
+    // than spin forever on an animation that can never present a frame.
+    for (uint32_t skipped = 0; skipped <= frameCount; ++skipped)
+    {
+        if (image.currentFrame < frameCount)
+        {
+            ++image.currentFrame;
+        }
+        else if (image.animationState == 2)
+        {
+            image.waitingForFrames = true;
+            image.nextFrameTime = {};
+            return false;
+        }
+        else
+        {
+            if (image.loopsRemaining != UINT32_MAX)
+            {
+                if (image.loopsRemaining == 0)
+                {
+                    image.animationState = 1;
+                    image.nextFrameTime = {};
+                    return false;
+                }
+                --image.loopsRemaining;
+            }
+            image.currentFrame = 1;
+        }
+
+        const auto* gap = _frameGap(image, image.currentFrame);
+        if (gap && *gap > 0)
+        {
+            image.waitingForFrames = false;
+            image.presentedFrame = image.currentFrame;
+            _updateImageSurface(imageId, *_frameStorage(image, image.currentFrame));
+            image.nextFrameTime = now + std::chrono::milliseconds(*gap);
+            return true;
+        }
+    }
+
+    image.animationState = 1;
+    image.nextFrameTime = {};
+    return false;
+}
+
+void KittyParser::AdvanceAnimations(const std::chrono::steady_clock::time_point now)
+{
+    for (auto& [imageId, image] : _images)
+    {
+        if ((image.animationState == 2 || image.animationState == 3) &&
+            image.nextFrameTime != std::chrono::steady_clock::time_point{} &&
+            image.nextFrameTime <= now)
+        {
+            _advanceImage(imageId, image, now);
+        }
+    }
+    _scheduleAnimationTimer();
+}
+
+// Animated images advance on their own schedule, with nothing arriving in the
+// stream to drive them. Work out when the soonest one is due and tell the host,
+// which owns the render thread and decides how to arrange the wakeup. Whether
+// that deadline is honoured early, late, or coalesced with other work is the
+// host's business; this only reports when there is something to do.
+void KittyParser::_scheduleAnimationTimer()
+{
+    auto earliest = std::chrono::steady_clock::time_point::max();
+    for (const auto& [id, image] : _images)
+    {
+        static_cast<void>(id);
+        if ((image.animationState == 2 || image.animationState == 3) &&
+            image.nextFrameTime != std::chrono::steady_clock::time_point{})
+        {
+            earliest = std::min(earliest, image.nextFrameTime);
+        }
+    }
+    _dispatcher._api.RequestTimedContentUpdate(earliest == std::chrono::steady_clock::time_point::max() ?
+                                                   std::nullopt :
+                                                   std::optional{ earliest });
+}
+
+void KittyParser::_deleteAnimationFrames(const uint32_t imageId, const uint32_t frameNumber, const bool freeData)
+{
+    const auto imageIt = _images.find(imageId);
+    if (imageIt == _images.end())
+    {
+        return;
+    }
+    auto& image = imageIt->second;
+    const auto frameCount = gsl::narrow_cast<uint32_t>(_frameCount(image));
+    if (frameNumber == 0 || frameNumber > frameCount)
+    {
+        return;
+    }
+    if (frameCount <= 1)
+    {
+        if (freeData)
+        {
+            _erasePlacementsForImage(imageId);
+            _eraseImagePlacements(imageId);
+            _eraseImage(imageId);
+        }
+        _scheduleAnimationTimer();
+        return;
+    }
+    const auto frameBytes = image.pixels->size() * sizeof(RGBQUAD);
+    if (frameNumber == 1)
+    {
+        auto promoted = std::move(image.animationFrames.front());
+        image.animationFrames.erase(image.animationFrames.begin());
+        image.pixels = std::move(promoted.pixels);
+        image.rootGapMilliseconds = promoted.gapMilliseconds;
+    }
+    else
+    {
+        image.animationFrames.erase(image.animationFrames.begin() + (frameNumber - 2));
+    }
+    _totalPixelBytes -= frameBytes;
+
+    const auto remaining = gsl::narrow_cast<uint32_t>(_frameCount(image));
+    if (image.currentFrame > frameNumber)
+    {
+        --image.currentFrame;
+    }
+    else if (image.currentFrame == frameNumber)
+    {
+        image.currentFrame = std::min(frameNumber, remaining);
+    }
+    if (image.presentedFrame > frameNumber)
+    {
+        --image.presentedFrame;
+    }
+    else if (image.presentedFrame == frameNumber)
+    {
+        image.presentedFrame = std::min(frameNumber, remaining);
+    }
+
+    if (remaining == 1)
+    {
+        image.animationState = 1;
+        image.waitingForFrames = false;
+        image.nextFrameTime = {};
+    }
+    _updateImageSurface(imageId, *_frameStorage(image, image.presentedFrame));
+
+    if (freeData && remaining == 1)
+    {
+        _erasePlacementsForImage(imageId);
+        _eraseImagePlacements(imageId);
+        _eraseImage(imageId);
+    }
+    else if (image.animationState == 2 || image.animationState == 3)
+    {
+        _scheduleAnimation(imageId, image, std::chrono::steady_clock::now());
+    }
+    _scheduleAnimationTimer();
+}
+
 til::size KittyParser::_placeImage(const Image& image,
                                    const bool moveCursor,
                                    const uint32_t imageId,
@@ -1541,7 +2360,9 @@ til::size KittyParser::_placeImage(const Image& image,
                                    const int32_t zIndex,
                                    const std::optional<til::point> anchor)
 {
-    if (!image.pixels || image.pixels->empty() || image.width == 0 || image.height == 0)
+    const auto frameStorage = _frameStorage(image, image.presentedFrame);
+    const auto framePixels = frameStorage ? frameStorage->get() : nullptr;
+    if (!framePixels || framePixels->empty() || image.width == 0 || image.height == 0)
     {
         return {};
     }
@@ -1586,16 +2407,16 @@ til::size KittyParser::_placeImage(const Image& image,
     if (drawnColumns > 0 && drawnRows > 0)
     {
         auto surface = image.surface;
-        if (!surface)
+        const auto newSurface = !surface;
+        if (newSurface)
         {
-            surface = std::make_shared<::Image>(til::size{ imageWidth, imageHeight }, image.pixels);
-            image.surface = surface;
+            surface = std::make_shared<::Image>(til::size{ imageWidth, imageHeight }, *frameStorage);
         }
 
         const ImagePlacement::Key key{ imageId, layerId, ImagePlacement::Key::Protocol::Kitty };
         buffer.GetMutableImages().AddOrReplace(ImagePlacement{
             key,
-            std::move(surface),
+            surface,
             { columnBegin, origin.y, columnEnd, redrawBottom },
             zIndex,
             { cropX, cropY, cropX + cropW, cropY + cropH },
@@ -1609,6 +2430,10 @@ til::size KittyParser::_placeImage(const Image& image,
         if (const auto entry = _images.find(imageId); entry != _images.end())
         {
             entry->second.hasRenderedPlacements = true;
+        }
+        if (newSurface)
+        {
+            image.surface = std::move(surface);
         }
     }
     buffer.TriggerRedraw(Viewport::FromExclusive({ 0, redrawTop, page.Width(), redrawBottom }));
@@ -2369,6 +3194,7 @@ void KittyParser::_deleteAllPlacements(const bool freeData)
             }
         }
     }
+    _scheduleAnimationTimer();
 }
 
 void KittyParser::_deleteImagesIntersecting(const til::CoordType left,
@@ -3131,7 +3957,8 @@ int KittyParser::_PlaceholderDiacriticIndex(const char32_t ch) noexcept
 // the complete scaled placement, so adjacent fragments share one source surface.
 bool KittyParser::_placeImageCellRef(const Image& image, const uint32_t imageId, const til::CoordType column, const til::CoordType row, const uint32_t cellRow, const uint32_t cellCol, const VirtualPlacement& place, std::vector<ImagePlacement>& fragments)
 {
-    if (!image.pixels || image.pixels->empty() || image.width == 0 || image.height == 0)
+    const auto frameStorage = _frameStorage(image, image.presentedFrame);
+    if (!frameStorage || !*frameStorage || (*frameStorage)->empty() || image.width == 0 || image.height == 0)
     {
         return false;
     }
@@ -3166,7 +3993,7 @@ bool KittyParser::_placeImageCellRef(const Image& image, const uint32_t imageId,
     {
         surface = std::make_shared<::Image>(
             til::size{ gsl::narrow_cast<til::CoordType>(image.width), gsl::narrow_cast<til::CoordType>(image.height) },
-            image.pixels);
+            *frameStorage);
     }
 
     const auto originalLeft = gsl::narrow<til::CoordType>(static_cast<int64_t>(column) - cellCol);

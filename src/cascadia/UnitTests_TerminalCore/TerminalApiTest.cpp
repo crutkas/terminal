@@ -157,6 +157,9 @@ namespace
         try
         {
             const auto guard = _lock.lock_exclusive();
+            ++_imageFramePreparationCalls;
+            const auto result = std::exchange(_nextImageFrameResult, S_OK);
+            RETURN_IF_FAILED(result);
             _framePlacements.assign(info.placements.begin(), info.placements.end());
             _frameSurfaces.assign(info.surfaces.begin(), info.surfaces.end());
             _imageViewportOrigin = info.viewportOrigin;
@@ -323,6 +326,18 @@ namespace
             };
         }
 
+        void FailNextImagePreparation(const HRESULT result) noexcept
+        {
+            const auto guard = _lock.lock_exclusive();
+            _nextImageFrameResult = result;
+        }
+
+        size_t ImageFramePreparationCalls() const noexcept
+        {
+            const auto guard = _lock.lock_shared();
+            return _imageFramePreparationCalls;
+        }
+
     protected:
         HRESULT _DoUpdateTitle(const std::wstring_view /*title*/) noexcept override
         {
@@ -338,6 +353,8 @@ namespace
         std::vector<ImagePlacement> _framePlacements;
         std::vector<ImageFrameInfo::Surface> _frameSurfaces;
         til::point _imageViewportOrigin;
+        HRESULT _nextImageFrameResult = S_OK;
+        size_t _imageFramePreparationCalls = 0;
         std::unordered_map<const Image*, uint64_t> _surfaceRevisions;
         size_t _imageFramePreparations = 0;
         size_t _surfaceUploads = 0;
@@ -450,6 +467,14 @@ namespace
         VERIFY_IS_TRUE(imageAtPlaceholder, L"the KGP image must remain painted at the placeholder cell");
     }
 
+    bool FrameContainsKittyColor(const PaintedFrame& frame, const uint32_t imageId, const bool green)
+    {
+        return std::ranges::any_of(frame.images, [&](const auto& image) {
+            return image.key.imageId == imageId &&
+                   (green ? image.containsGreen : image.containsRed);
+        });
+    }
+
 }
 
 namespace TerminalCoreUnitTests
@@ -480,8 +505,10 @@ namespace TerminalCoreUnitTests
         TEST_METHOD(GetCellSizeFallsBackWhenFontUnset);
 
         TEST_METHOD(DirectImageRendererPreservesSharedSurfaceGeometryAndLifetime);
+        TEST_METHOD(KittyAnimationSurvivesFontAndRendererRefresh);
         TEST_METHOD(KittyPlaceholderRendersInRealTerminal);
         TEST_METHOD(KittyImageRowCarriesEachCellsBackgroundColor);
+        TEST_METHOD(RendererRetriesImagePreparationFailure);
         TEST_METHOD(KittyPlaceholderSuppressesGlyphOnPaintAndRepaint);
         TEST_METHOD(KittyPlaceholderLeavesUnrecognizedTextUntouched);
         TEST_METHOD(KittyPlaceholderSuppressesGlyphAfterResize);
@@ -997,6 +1024,73 @@ void TerminalApiTest::DirectImageRendererPreservesSharedSurfaceGeometryAndLifeti
     VERIFY_ARE_EQUAL(size_t{ 1 }, frame.surfaceEvictions, L"deletion must release the backend cache entry");
 }
 
+void TerminalApiTest::KittyAnimationSurvivesFontAndRendererRefresh()
+{
+    KittyRenderFixture fixture{ { 6, 3 }, 0 };
+    auto& buffer = *fixture.terminal._mainBuffer;
+    auto& stateMachine = *fixture.terminal._stateMachine;
+
+    stateMachine.ProcessString(L"\x1b_Ga=T,i=7,f=24,s=1,v=1,c=1,r=1,C=1,z=5000,q=2;/wAA\x1b\\");
+    stateMachine.ProcessString(L"\x1b_Ga=f,i=7,f=24,s=1,v=1,z=1000,q=2;AP8A\x1b\\");
+    stateMachine.ProcessString(L"\x1b_Ga=a,i=7,c=1,r=1,z=5000,s=3,v=1,q=2;\x1b\\");
+    fixture.StartPainting();
+    auto frame = fixture.engine.Snapshot();
+    VERIFY_IS_TRUE(FrameContainsKittyColor(frame, 7, false), L"frame 1 must be visible before the lifecycle transition");
+    VERIFY_ARE_EQUAL(size_t{ 1 }, frame.imageFramePreparations);
+    VERIFY_ARE_EQUAL(size_t{ 1 }, frame.surfaceUploads, L"the complete image must upload once per shared surface");
+
+    const auto placements = buffer.GetImages().All();
+    VERIFY_ARE_EQUAL(size_t{ 1 }, placements.size());
+    const auto surface = placements.front().SurfacePointer();
+    VERIFY_IS_NOT_NULL(surface.get());
+
+    // Simulate an out-of-date backend-facing surface while the animation source of
+    // truth remains frame 1 (red). A font refresh must update the same shared object.
+    auto stalePixels = std::make_shared<std::vector<RGBQUAD>>(1, RGBQUAD{ 0, 255, 0, 0 });
+    fixture.terminal.LockConsole();
+    auto unlockAfterStaleSurface = wil::scope_exit([&fixture]() {
+        fixture.terminal.UnlockConsole();
+    });
+    surface->UpdatePixels(std::move(stalePixels));
+    unlockAfterStaleSurface.reset();
+    fixture.Repaint();
+    frame = fixture.engine.Snapshot();
+    VERIFY_IS_TRUE(FrameContainsKittyColor(frame, 7, true), L"the test must reproduce a stale shared animation surface");
+    VERIFY_ARE_EQUAL(size_t{ 0 }, frame.surfaceUploads);
+    VERIFY_ARE_EQUAL(size_t{ 1 }, frame.surfaceRefreshes, L"a revision change must refresh rather than allocate another surface");
+
+    fixture.terminal.LockConsole();
+    auto unlockAfterFontChange = wil::scope_exit([&fixture]() {
+        fixture.terminal.UnlockConsole();
+    });
+    fixture.terminal.SetFontInfo(FontInfo{ DEFAULT_FONT_FACE, TMPF_TRUETYPE, 10, { 12, 24 }, CP_UTF8, false });
+    unlockAfterFontChange.reset();
+    fixture.Repaint();
+    frame = fixture.engine.Snapshot();
+    VERIFY_IS_TRUE(FrameContainsKittyColor(frame, 7, false), L"font/DPI recreation must restore the current animation frame");
+    if (!frame.images.empty())
+    {
+        VERIFY_ARE_EQUAL(surface.get(), frame.images.front().surface, L"refresh must retain the complete shared surface");
+    }
+    VERIFY_ARE_EQUAL(size_t{ 1 }, frame.surfaceRefreshes);
+
+    fixture.terminal.LockConsole();
+    stateMachine.ProcessString(L"\x1b_Ga=a,i=7,r=1,z=20,q=2;\x1b\\");
+    fixture.terminal.UnlockConsole();
+    // Painting ticks the renderer's timers, so the frame the animation is waiting to
+    // show arrives by painting again once its gap has elapsed -- no render thread, and
+    // no waiting on one to be scheduled. The gap is 20ms; sleep a little and repaint
+    // until the next frame appears.
+    auto advanced = FrameContainsKittyColor(fixture.engine.Snapshot(), 7, true);
+    for (auto attempt = 0; attempt < 50 && !advanced; ++attempt)
+    {
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        fixture.Repaint();
+        advanced = FrameContainsKittyColor(fixture.engine.Snapshot(), 7, true);
+    }
+    VERIFY_IS_TRUE(advanced, L"animation playback must continue to the next frame after recreation");
+}
+
 void TerminalApiTest::KittyPlaceholderRendersInRealTerminal()
 {
     Terminal term{ Terminal::TestDummyMarker{} };
@@ -1052,6 +1146,19 @@ void TerminalApiTest::KittyImageRowCarriesEachCellsBackgroundColor()
     VERIFY_ARE_EQUAL(RGB(4, 5, 6), painted->cellBackgrounds.at(1), L"a cell's own background color must survive to the engine");
     VERIFY_ARE_EQUAL(painted->cellBackgrounds.at(2), painted->cellBackgrounds.at(3), L"the default-background cells must agree");
     VERIFY_ARE_NOT_EQUAL(RGB(4, 5, 6), painted->cellBackgrounds.at(2), L"a default cell must not inherit the colored one");
+}
+
+void TerminalApiTest::RendererRetriesImagePreparationFailure()
+{
+    KittyRenderFixture fixture{ { 8, 3 }, 0 };
+    fixture.terminal._stateMachine->ProcessString(L"X");
+    fixture.engine.FailNextImagePreparation(E_OUTOFMEMORY);
+
+    fixture.StartPainting();
+
+    VERIFY_ARE_EQUAL(size_t{ 2 }, fixture.engine.ImageFramePreparationCalls(), L"a failed image preparation must escape the engine frame and trigger the renderer retry path");
+    const auto frame = fixture.engine.Snapshot();
+    VERIFY_IS_TRUE(std::ranges::any_of(frame.clusters, [](const auto& cluster) { return cluster.text.find(L'X') != std::wstring::npos; }), L"the retry must re-invalidate content consumed by the aborted frame");
 }
 
 void TerminalApiTest::KittyPlaceholderSuppressesGlyphOnPaintAndRepaint()
