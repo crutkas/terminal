@@ -8,7 +8,6 @@
 #include "CommonState.hpp"
 
 #include "../../buffer/out/Image.hpp"
-#include "../../buffer/out/ImageSlice.hpp"
 #include "ApiRoutines.h"
 #include "getset.h"
 #include "dbcs.h"
@@ -66,16 +65,11 @@ class ApiRoutinesTests
         const til::rect imageBounds{ target.x, target.y, target.x + 1, target.y + 1 };
         const auto surface = std::make_shared<Image>(til::size{ 1, 1 }, std::vector<RGBQUAD>(1));
         buffer.GetMutableImages().Add(ImagePlacement{ { 1, 1 }, surface, imageBounds, 0 });
-
-        auto slice = std::make_unique<ImageSlice>(til::size{ 1, 1 });
-        slice->MutablePixels(target.x, target.x + 1);
-        buffer.GetMutableRowByOffset(target.y).SetImageSlice(std::move(slice));
     }
 
-    static void VerifyImageContentErased(const TextBuffer& buffer, const til::point target)
+    static void VerifyImageContentErased(const TextBuffer& buffer)
     {
         VERIFY_IS_TRUE(buffer.GetImages().Empty());
-        VERIFY_IS_NULL(buffer.GetRowByOffset(target.y).GetImageSlice());
     }
 
     TEST_METHOD(ApiWriteConsoleOutputAttributeErasesImages)
@@ -91,7 +85,7 @@ class ApiRoutinesTests
         VERIFY_SUCCEEDED(_Routines.WriteConsoleOutputAttributeImpl(screenInfo, attributes, target, used));
 
         VERIFY_ARE_EQUAL(size_t{ 1 }, used);
-        VerifyImageContentErased(buffer, target);
+        VerifyImageContentErased(buffer);
     }
 
     TEST_METHOD(ApiFillConsoleOutputAttributeErasesImages)
@@ -106,7 +100,7 @@ class ApiRoutinesTests
         VERIFY_SUCCEEDED(_Routines.FillConsoleOutputAttributeImpl(screenInfo, FOREGROUND_RED, 1, target, used, false));
 
         VERIFY_ARE_EQUAL(size_t{ 1 }, used);
-        VerifyImageContentErased(buffer, target);
+        VerifyImageContentErased(buffer);
     }
 
     BOOL _fPrevInsertMode;

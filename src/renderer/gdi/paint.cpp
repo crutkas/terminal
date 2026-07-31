@@ -873,32 +873,12 @@ try
     if (cached.allOpaque)
     {
         SetStretchBltMode(_hdcMemoryContext, COLORONCOLOR);
-        RETURN_HR_IF(E_FAIL, !StretchBlt(_hdcMemoryContext,
-                                        x,
-                                        y,
-                                        width,
-                                        height,
-                                        cached.context.get(),
-                                        source.left,
-                                        source.top,
-                                        source.width(),
-                                        source.height(),
-                                        SRCCOPY));
+        RETURN_HR_IF(E_FAIL, !StretchBlt(_hdcMemoryContext, x, y, width, height, cached.context.get(), source.left, source.top, source.width(), source.height(), SRCCOPY));
     }
     else
     {
         constexpr BLENDFUNCTION blend{ .BlendOp = AC_SRC_OVER, .BlendFlags = 0, .SourceConstantAlpha = 255, .AlphaFormat = AC_SRC_ALPHA };
-        RETURN_HR_IF(E_FAIL, !GdiAlphaBlend(_hdcMemoryContext,
-                                           x,
-                                           y,
-                                           width,
-                                           height,
-                                           cached.context.get(),
-                                           source.left,
-                                           source.top,
-                                           source.width(),
-                                           source.height(),
-                                           blend));
+        RETURN_HR_IF(E_FAIL, !GdiAlphaBlend(_hdcMemoryContext, x, y, width, height, cached.context.get(), source.left, source.top, source.width(), source.height(), blend));
     }
     return S_OK;
 }
