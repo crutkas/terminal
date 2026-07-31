@@ -718,10 +718,10 @@ void ImageCollection::EraseAreas(const std::span<const til::rect> areas)
         effectiveAreas = coalescedAreas;
     }
 
-    const auto current = All();
-    const auto intersects = std::any_of(current.begin(), current.end(), [&](const auto& image) {
-        return std::any_of(effectiveAreas.begin(), effectiveAreas.end(), [&](const auto area) {
-            return !(image.CellBounds() & area).empty();
+    const auto intersects = std::any_of(effectiveAreas.begin(), effectiveAreas.end(), [&](const auto area) {
+        const auto candidates = IntersectingRows(std::max(area.top, til::CoordType{ 0 }), area.bottom);
+        return std::any_of(candidates.begin(), candidates.end(), [&](const auto& image) {
+            return !(image->CellBounds() & area).empty();
         });
     });
     if (!intersects)
@@ -729,6 +729,7 @@ void ImageCollection::EraseAreas(const std::span<const til::rect> areas)
         return;
     }
 
+    const auto current = All();
     _replace(_eraseAreas(current, effectiveAreas));
 }
 

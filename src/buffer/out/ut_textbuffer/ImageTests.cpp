@@ -17,6 +17,8 @@ class ImageTests
     TEST_METHOD(RowQueryIsHalfOpenAndZOrdered);
     TEST_METHOD(RowIndexRebuildsAfterMutation);
     TEST_METHOD(EraseOutsideImageIsNoOp);
+    TEST_METHOD(NonintersectingEraseDoesNotMaterializeLogicalPlacements);
+    TEST_METHOD(EraseUsesClippedLogicalRowsAfterAdvance);
     TEST_METHOD(EraseSplitsWithoutCopyingTheSurface);
     TEST_METHOD(AddOrReplaceCollapsesFragments);
     TEST_METHOD(AddOrReplacePreservesScrolledPlacements);
@@ -104,6 +106,46 @@ void ImageTests::EraseOutsideImageIsNoOp()
     const auto visible = images.IntersectingRows(0, 2);
     VERIFY_ARE_EQUAL(size_t{ 1 }, visible.size());
     VERIFY_ARE_EQUAL(1u, visible[0]->Identity().imageId);
+}
+
+void ImageTests::NonintersectingEraseDoesNotMaterializeLogicalPlacements()
+{
+    auto placement = MakePlacement({ 1, 1 }, { 0, 2, 2, 4 });
+    const auto surface = placement.SurfacePointer();
+    ImageCollection images;
+    images.Add(std::move(placement));
+    images.All();
+    images.PrepareRowIndex();
+    images.AdvanceRows(1, 10);
+    const auto revision = images.Revision();
+    const auto surfaceReferences = surface.use_count();
+
+    images.EraseArea({ 4, 1, 6, 3 });
+    images.EraseArea({ 0, -2, 2, 1 });
+
+    VERIFY_ARE_EQUAL(revision, images.Revision());
+    VERIFY_ARE_EQUAL(surfaceReferences, surface.use_count(), L"a nonintersecting erase must not materialize logical placement copies");
+    const auto visible = images.IntersectingRows(1, 3);
+    VERIFY_ARE_EQUAL(size_t{ 1 }, visible.size());
+    VERIFY_ARE_EQUAL(1u, visible[0]->Identity().imageId);
+}
+
+void ImageTests::EraseUsesClippedLogicalRowsAfterAdvance()
+{
+    ImageCollection images;
+    images.Add(MakePlacement({ 1, 1 }, { 0, 0, 4, 2 }));
+    images.AdvanceRows(1, 10);
+    const auto revision = images.Revision();
+
+    images.EraseArea({ 1, 0, 3, 1 });
+
+    VERIFY_ARE_EQUAL(revision + 1, images.Revision());
+    const auto visible = images.IntersectingRows(0, 1);
+    VERIFY_ARE_EQUAL(size_t{ 2 }, visible.size());
+    const til::rect expectedLeft{ 0, 0, 1, 1 };
+    const til::rect expectedRight{ 3, 0, 4, 1 };
+    VERIFY_ARE_EQUAL(expectedLeft, visible[0]->CellBounds());
+    VERIFY_ARE_EQUAL(expectedRight, visible[1]->CellBounds());
 }
 
 void ImageTests::EraseSplitsWithoutCopyingTheSurface()
