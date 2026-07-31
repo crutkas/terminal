@@ -7431,16 +7431,20 @@ public:
         VERIFY_IS_TRUE(BufferContainsColor(*_testGetSet->_textBuffer, 255, 0, 0), L"id 1 must be drawn before eviction.");
         VERIFY_ARE_EQUAL(1, CountImageRows(*_testGetSet->_textBuffer));
 
-        // Flood MaxImages + 1 store-only transmits (a=t) to exceed the count
-        // cap and evict id 1, the oldest. Store-only entries draw nothing themselves.
-        for (auto n = 2; n <= static_cast<int>(KittyParser::MaxImages) + 2; ++n)
+        // Fill the registry with placed images so the unplaced-first eviction policy
+        // must eventually evict id 1 as the least-recently used placed image.
+        for (auto n = 2; n <= static_cast<int>(KittyParser::MaxImages); ++n)
         {
-            _stateMachine->ProcessString(L"\x1b_Ga=t,i=" + std::to_wstring(n) + L",f=24,s=1,v=1;AAAA\x1b\\");
+            _stateMachine->ProcessString(L"\x1b_Ga=T,i=" + std::to_wstring(n) + L",q=2,f=24,s=1,v=1,C=1;AAAA\x1b\\");
         }
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=" + std::to_wstring(KittyParser::MaxImages + 1) + L",q=2,f=24,s=1,v=1,C=1;AAAA\x1b\\");
 
         VERIFY_ARE_EQUAL(static_cast<size_t>(0), _kitty()._images.count(1), L"id 1 must be evicted from the registry.");
         VERIFY_IS_FALSE(BufferContainsColor(*_testGetSet->_textBuffer, 255, 0, 0), L"Eviction must un-draw id 1's on-screen pixels, not just the registry entry.");
-        VERIFY_ARE_EQUAL(0, CountImageRows(*_testGetSet->_textBuffer), L"No orphaned ghost row may remain after eviction.");
+        VERIFY_IS_FALSE(std::ranges::any_of(_testGetSet->_textBuffer->GetImages().All(), [](const ImagePlacement& placement) {
+                            return placement.Identity().imageId == 1;
+                        }),
+                        L"No orphaned id 1 layer may remain after eviction.");
     }
 
     TEST_METHOD(KittyGraphicsEraseDisplayClearsPlacementsButKeepsImage)
