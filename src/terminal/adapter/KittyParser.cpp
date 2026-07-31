@@ -364,6 +364,10 @@ void KittyParser::_ProcessCommand(const Control& command, const std::string_view
         }
         if (drawn.width <= 0 || drawn.height <= 0)
         {
+            if (placementId != 0 && priorPlacement)
+            {
+                _deletePlacement(targetImageId, placementId, false);
+            }
             return;
         }
 
@@ -1329,29 +1333,59 @@ void KittyParser::_eraseImagePlacements(const uint32_t imageId)
 
 void KittyParser::_deleteAllPlacements(const bool freeData)
 {
-    if (freeData)
+    std::vector<std::pair<uint32_t, uint32_t>> namedPlacements;
+    std::vector<uint64_t> anonymousLayers;
+    std::vector<uint32_t> affectedImageIds;
+
+    for (const auto& [key, placement] : _placements)
     {
-        _clearImages();
-        return;
+        // Directly rendered placements own a positive footprint. Later virtual prototypes
+        // retain an empty footprint and must not be selected by d=a/A.
+        if (placement.cols > 0 && placement.rows > 0)
+        {
+            namedPlacements.push_back(key);
+            affectedImageIds.push_back(placement.imageId);
+        }
+    }
+    for (const auto& placement : _anonymousPlacements)
+    {
+        if (placement.cols > 0 && placement.rows > 0)
+        {
+            anonymousLayers.push_back(placement.layerId);
+            affectedImageIds.push_back(placement.imageId);
+        }
+    }
+    std::sort(anonymousLayers.begin(), anonymousLayers.end());
+    std::sort(affectedImageIds.begin(), affectedImageIds.end());
+    affectedImageIds.erase(std::unique(affectedImageIds.begin(), affectedImageIds.end()), affectedImageIds.end());
+
+    for (const auto& key : namedPlacements)
+    {
+        _deletePlacement(key.first, key.second, false);
+    }
+    for (auto placement = _anonymousPlacements.begin(); placement != _anonymousPlacements.end();)
+    {
+        if (std::binary_search(anonymousLayers.begin(), anonymousLayers.end(), placement->layerId))
+        {
+            _erasePlacementCells(*placement);
+            placement = _anonymousPlacements.erase(placement);
+        }
+        else
+        {
+            ++placement;
+        }
     }
 
-    const auto visiblePageNumber = _dispatcher._pages.VisiblePage().Number();
-    _dispatcher._pages.ForEachPage([&](const Page page) {
-        auto& buffer = page.Buffer();
-        const auto removed = buffer.GetMutableImages().EraseProtocol(ImagePlacement::Key::Protocol::Kitty);
-        if (removed != 0 && page.Number() == visiblePageNumber)
-        {
-            buffer.TriggerRedraw(Viewport::FromExclusive({ 0, 0, page.Width(), page.Bottom() }));
-        }
-    });
-    for (auto& [id, image] : _images)
+    if (freeData)
     {
-        static_cast<void>(id);
-        image.hasRenderedPlacements = false;
-        _releaseImageSurface(image);
+        for (const auto imageId : affectedImageIds)
+        {
+            if (!_imageHasPlacements(imageId) && !_imageHasRenderedPlacements(imageId))
+            {
+                _eraseImage(imageId);
+            }
+        }
     }
-    _placements.clear();
-    _anonymousPlacements.clear();
 }
 
 void KittyParser::_deleteImagesIntersecting(const til::CoordType left,
@@ -1371,29 +1405,90 @@ void KittyParser::_deleteImagesIntersecting(const til::CoordType left,
         return;
     }
 
-    std::vector<uint32_t> affected;
+    std::vector<std::pair<uint32_t, uint64_t>> physicalPlacements;
+    for (const auto& [key, placement] : _placements)
+    {
+        static_cast<void>(key);
+        if (placement.cols > 0 && placement.rows > 0)
+        {
+            physicalPlacements.emplace_back(placement.imageId, placement.layerId);
+        }
+    }
+    for (const auto& placement : _anonymousPlacements)
+    {
+        if (placement.cols > 0 && placement.rows > 0)
+        {
+            physicalPlacements.emplace_back(placement.imageId, placement.layerId);
+        }
+    }
+    std::sort(physicalPlacements.begin(), physicalPlacements.end());
+    physicalPlacements.erase(std::unique(physicalPlacements.begin(), physicalPlacements.end()), physicalPlacements.end());
+
+    std::vector<std::pair<uint32_t, uint64_t>> selectedPlacements;
     const til::rect target{ columnBegin, rowBegin, columnEnd, rowEnd };
     for (const auto& placement : buffer.GetImages().IntersectingRows(rowBegin, rowEnd))
     {
         const auto key = placement.Identity();
+        const std::pair<uint32_t, uint64_t> identity{ key.imageId, key.layerId };
         if (key.protocol != ImagePlacement::Key::Protocol::Kitty ||
-            (placement.CellBounds() & target).empty())
+            (placement.CellBounds() & target).empty() ||
+            !std::binary_search(physicalPlacements.begin(), physicalPlacements.end(), identity))
         {
             continue;
         }
-        if (std::find(affected.begin(), affected.end(), key.imageId) == affected.end())
+        selectedPlacements.push_back(identity);
+    }
+    std::sort(selectedPlacements.begin(), selectedPlacements.end());
+    selectedPlacements.erase(std::unique(selectedPlacements.begin(), selectedPlacements.end()), selectedPlacements.end());
+
+    std::vector<std::pair<uint32_t, uint32_t>> namedPlacements;
+    std::vector<uint32_t> affectedImageIds;
+    for (const auto& [key, placement] : _placements)
+    {
+        const std::pair<uint32_t, uint64_t> identity{ placement.imageId, placement.layerId };
+        if (std::binary_search(selectedPlacements.begin(), selectedPlacements.end(), identity))
         {
-            affected.push_back(key.imageId);
+            namedPlacements.push_back(key);
+            affectedImageIds.push_back(placement.imageId);
+        }
+    }
+    for (const auto& placement : _anonymousPlacements)
+    {
+        const std::pair<uint32_t, uint64_t> identity{ placement.imageId, placement.layerId };
+        if (std::binary_search(selectedPlacements.begin(), selectedPlacements.end(), identity))
+        {
+            affectedImageIds.push_back(placement.imageId);
+        }
+    }
+    std::sort(affectedImageIds.begin(), affectedImageIds.end());
+    affectedImageIds.erase(std::unique(affectedImageIds.begin(), affectedImageIds.end()), affectedImageIds.end());
+
+    for (const auto& key : namedPlacements)
+    {
+        _deletePlacement(key.first, key.second, false);
+    }
+    for (auto placement = _anonymousPlacements.begin(); placement != _anonymousPlacements.end();)
+    {
+        const std::pair<uint32_t, uint64_t> identity{ placement->imageId, placement->layerId };
+        if (std::binary_search(selectedPlacements.begin(), selectedPlacements.end(), identity))
+        {
+            _erasePlacementCells(*placement);
+            placement = _anonymousPlacements.erase(placement);
+        }
+        else
+        {
+            ++placement;
         }
     }
 
-    for (const auto imageId : affected)
+    if (freeData)
     {
-        _erasePlacementsForImage(imageId);
-        _eraseImagePlacements(imageId);
-        if (freeData)
+        for (const auto imageId : affectedImageIds)
         {
-            _eraseImage(imageId);
+            if (!_imageHasPlacements(imageId) && !_imageHasRenderedPlacements(imageId))
+            {
+                _eraseImage(imageId);
+            }
         }
     }
 }

@@ -5387,6 +5387,37 @@ public:
         VERIFY_ARE_EQUAL(static_cast<size_t>(0), _kitty()._images.count(9));
     }
 
+    TEST_METHOD(KittyGraphicsDeleteAllUppercaseFreesOnlyPlacedImages)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        auto page = _pDispatch->_pages.ActivePage();
+        auto& buffer = page.Buffer();
+
+        _stateMachine->ProcessString(L"\x1b_Ga=t,i=1,f=24,s=1,v=1;/wAA\x1b\\");
+        _stateMachine->ProcessString(L"\x1b_Ga=t,i=2,f=24,s=1,v=1;AP8A\x1b\\");
+        _stateMachine->ProcessString(L"\x1b_Ga=t,i=3,f=24,s=1,v=1;AAD/\x1b\\");
+        buffer.GetCursor().SetPosition({ 1, page.Top() });
+        _stateMachine->ProcessString(L"\x1b_Ga=p,i=1,p=1,C=1;\x1b\\");
+        buffer.GetCursor().SetPosition({ 3, page.Top() });
+        _stateMachine->ProcessString(L"\x1b_Ga=p,i=2,C=1;\x1b\\");
+        VERIFY_ARE_EQUAL(sizeof(RGBQUAD) * 3, _kitty()._totalPixelBytes);
+
+        _stateMachine->ProcessString(L"\x1b_Ga=d,d=A;\x1b\\");
+
+        VERIFY_ARE_EQUAL(size_t{ 0 }, _kitty()._images.count(1));
+        VERIFY_ARE_EQUAL(size_t{ 0 }, _kitty()._images.count(2));
+        VERIFY_ARE_EQUAL(size_t{ 1 }, _kitty()._images.count(3), L"unplaced image data is outside the d=A target set");
+        VERIFY_ARE_EQUAL(sizeof(RGBQUAD), _kitty()._totalPixelBytes);
+        VERIFY_ARE_EQUAL(sizeof(RGBQUAD), _kitty()._retainedPixelBytes());
+        VERIFY_IS_TRUE(_kitty()._placements.empty());
+        VERIFY_IS_TRUE(_kitty()._anonymousPlacements.empty());
+
+        _testGetSet->_response.clear();
+        _stateMachine->ProcessString(L"\x1b_Ga=p,i=3,C=1;\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=3;OK\x1b\\");
+    }
+
     TEST_METHOD(KittyGraphicsQuietTwoSuppressesErrors)
     {
         _testGetSet->PrepData();
@@ -6449,6 +6480,104 @@ public:
         }
     }
 
+    TEST_METHOD(KittyGraphicsGeometryDeleteTargetsExactPlacementIdentities)
+    {
+        struct SelectorCase
+        {
+            wchar_t target;
+            std::wstring_view firstArgs;
+            std::wstring_view secondArgs;
+        };
+        constexpr std::array selectors{
+            SelectorCase{ L'c', L"", L"" },
+            SelectorCase{ L'C', L"", L"" },
+            SelectorCase{ L'p', L",x=3,y=3", L",x=7,y=7" },
+            SelectorCase{ L'P', L",x=3,y=3", L",x=7,y=7" },
+            SelectorCase{ L'x', L",x=3", L",x=7" },
+            SelectorCase{ L'X', L",x=3", L",x=7" },
+            SelectorCase{ L'y', L",y=3", L",y=7" },
+            SelectorCase{ L'Y', L",y=3", L",y=7" },
+        };
+
+        for (const auto& selector : selectors)
+        {
+            _testGetSet->PrepData();
+            _testGetSet->_cellSize = { 1, 1 };
+            auto page = _pDispatch->_pages.ActivePage();
+            auto& buffer = page.Buffer();
+            const til::point target{ 2, page.Top() + 2 };
+            const til::point sibling{ 6, page.Top() + 6 };
+            _stateMachine->ProcessString(L"\x1b_Ga=t,i=1,f=24,s=1,v=1;/wAA\x1b\\");
+
+            buffer.GetCursor().SetPosition(target);
+            _stateMachine->ProcessString(L"\x1b_Ga=p,i=1,p=1,C=1;\x1b\\");
+            _stateMachine->ProcessString(L"\x1b_Ga=p,i=1,C=1;\x1b\\");
+            const auto targetNamedLayer = _kitty()._placements.at({ 1u, 1u }).layerId;
+            const auto targetAnonymousLayer = _kitty()._anonymousPlacements.back().layerId;
+
+            buffer.GetCursor().SetPosition(sibling);
+            _stateMachine->ProcessString(L"\x1b_Ga=p,i=1,p=2,C=1;\x1b\\");
+            _stateMachine->ProcessString(L"\x1b_Ga=p,i=1,C=1;\x1b\\");
+            const auto siblingNamedLayer = _kitty()._placements.at({ 1u, 2u }).layerId;
+            const auto siblingAnonymousLayer = _kitty()._anonymousPlacements.back().layerId;
+
+            buffer.GetCursor().SetPosition(target);
+            _stateMachine->ProcessString(fmt::format(FMT_COMPILE(L"\x1b_Ga=d,d={}{};\x1b\\"), selector.target, selector.firstArgs));
+
+            VERIFY_ARE_EQUAL(size_t{ 0 }, _kitty()._placements.count({ 1u, 1u }));
+            VERIFY_ARE_EQUAL(size_t{ 1 }, _kitty()._placements.count({ 1u, 2u }));
+            VERIFY_ARE_EQUAL(size_t{ 1 }, _kitty()._anonymousPlacements.size());
+            VERIFY_ARE_EQUAL(siblingAnonymousLayer, _kitty()._anonymousPlacements.front().layerId);
+            const auto* targetSlice = DirectImageSlice(buffer, target.y);
+            VERIFY_IS_TRUE(targetSlice == nullptr || (!targetSlice->ContainsPlacement(targetNamedLayer) && !targetSlice->ContainsPlacement(targetAnonymousLayer)));
+            const auto* siblingSlice = DirectImageSlice(buffer, sibling.y);
+            VERIFY_IS_NOT_NULL(siblingSlice);
+            VERIFY_IS_TRUE(siblingSlice->ContainsPlacement(siblingNamedLayer));
+            VERIFY_IS_TRUE(siblingSlice->ContainsPlacement(siblingAnonymousLayer));
+            VERIFY_ARE_EQUAL(size_t{ 1 }, _kitty()._images.count(1));
+            VERIFY_ARE_EQUAL(sizeof(RGBQUAD), _kitty()._totalPixelBytes);
+
+            buffer.GetCursor().SetPosition(sibling);
+            _stateMachine->ProcessString(fmt::format(FMT_COMPILE(L"\x1b_Ga=d,d={}{};\x1b\\"), selector.target, selector.secondArgs));
+
+            VERIFY_IS_TRUE(_kitty()._placements.empty());
+            VERIFY_IS_TRUE(_kitty()._anonymousPlacements.empty());
+            const auto freesData = selector.target >= L'A' && selector.target <= L'Z';
+            VERIFY_ARE_EQUAL(freesData ? size_t{ 0 } : size_t{ 1 }, _kitty()._images.count(1));
+            VERIFY_ARE_EQUAL(freesData ? size_t{ 0 } : sizeof(RGBQUAD), _kitty()._totalPixelBytes);
+        }
+    }
+
+    TEST_METHOD(KittyGraphicsGeometryDeleteErasesCopiedScrolledFragmentsOnly)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        auto page = _pDispatch->_pages.ActivePage();
+        auto& buffer = page.Buffer();
+        const auto origin = buffer.GetCursor().GetPosition();
+        _stateMachine->ProcessString(L"\x1b_Ga=t,i=1,f=24,s=1,v=1;/wAA\x1b\\");
+
+        buffer.GetCursor().SetPosition({ 1, origin.y });
+        _stateMachine->ProcessString(L"\x1b_Ga=p,i=1,p=1,C=1;\x1b\\");
+        buffer.GetCursor().SetPosition({ 4, origin.y });
+        _stateMachine->ProcessString(L"\x1b_Ga=p,i=1,p=2,C=1;\x1b\\");
+        const auto firstLayer = _kitty()._placements.at({ 1u, 1u }).layerId;
+        const auto secondLayer = _kitty()._placements.at({ 1u, 2u }).layerId;
+
+        buffer.ScrollRows(origin.y, 1, 1);
+        const auto movedRow = origin.y + 1;
+        const auto vtRow = movedRow - page.Top() + 1;
+        _pDispatch->CopyRectangularArea(vtRow, 2, vtRow, 2, 1, vtRow, 8, 1);
+        _stateMachine->ProcessString(fmt::format(FMT_COMPILE(L"\x1b_Ga=d,d=p,x=2,y={};\x1b\\"), vtRow));
+
+        const auto* slice = DirectImageSlice(buffer, movedRow);
+        VERIFY_IS_NOT_NULL(slice);
+        VERIFY_IS_FALSE(slice->ContainsPlacement(firstLayer), L"selecting one fragment erases every copy of that placement identity");
+        VERIFY_IS_TRUE(slice->ContainsPlacement(secondLayer), L"the same-image sibling survives geometry deletion");
+        VERIFY_ARE_EQUAL(size_t{ 0 }, _kitty()._placements.count({ 1u, 1u }));
+        VERIFY_ARE_EQUAL(size_t{ 1 }, _kitty()._placements.count({ 1u, 2u }));
+    }
+
     TEST_METHOD(KittyGraphicsCursorPolicyNoMove)
     {
         _testGetSet->PrepData();
@@ -6545,6 +6674,36 @@ public:
         const auto& placement = _kitty()._placements.at({ 1u, 1u });
         VERIFY_ARE_EQUAL(movedPos.x, placement.anchorCol);
         VERIFY_ARE_EQUAL(movedPos.y, placement.anchorRow);
+    }
+
+    TEST_METHOD(KittyRePutEmptyCropRemovesPriorPlacement)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        auto& buffer = *_testGetSet->_textBuffer;
+        _stateMachine->ProcessString(L"\x1b_Ga=t,i=1,f=24,s=2,v=2;/wAA/wAA/wAA/wAA\x1b\\");
+
+        buffer.GetCursor().SetPosition({ 2, 22 });
+        _stateMachine->ProcessString(L"\x1b_Ga=p,i=1,p=7,C=1;\x1b\\");
+        const auto firstLayer = _kitty()._placements.at({ 1u, 7u }).layerId;
+        _testGetSet->_response.clear();
+        _stateMachine->ProcessString(L"\x1b_Ga=p,i=1,p=7,x=2,w=1,C=1;\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=1,p=7;OK\x1b\\");
+        VERIFY_ARE_EQUAL(size_t{ 0 }, _kitty()._placements.count({ 1u, 7u }));
+        const auto* firstSlice = DirectImageSlice(buffer, 22);
+        VERIFY_IS_TRUE(firstSlice == nullptr || !firstSlice->ContainsPlacement(firstLayer));
+
+        buffer.GetCursor().SetPosition({ 4, 24 });
+        _stateMachine->ProcessString(L"\x1b_Ga=p,i=1,p=7,C=1;\x1b\\");
+        const auto secondLayer = _kitty()._placements.at({ 1u, 7u }).layerId;
+        _testGetSet->_response.clear();
+        _stateMachine->ProcessString(L"\x1b_Ga=p,i=1,p=7,y=2,h=1,C=1;\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=1,p=7;OK\x1b\\");
+        VERIFY_ARE_EQUAL(size_t{ 0 }, _kitty()._placements.count({ 1u, 7u }));
+        const auto* secondSlice = DirectImageSlice(buffer, 24);
+        VERIFY_IS_TRUE(secondSlice == nullptr || !secondSlice->ContainsPlacement(secondLayer));
+        VERIFY_ARE_EQUAL(size_t{ 1 }, _kitty()._images.count(1));
+        VERIFY_ARE_EQUAL(sizeof(RGBQUAD) * 4, _kitty()._totalPixelBytes);
     }
 
     TEST_METHOD(KittyPlacementIdEchoedInAck)
