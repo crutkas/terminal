@@ -38,6 +38,7 @@ SOURCES= \
     ..\ThemeUtils.cpp \
     ..\ScreenInfoUiaProviderBase.cpp \
     ..\sgrStack.cpp \
+    ..\sharedMemory.cpp \
     ..\UiaTextRangeBase.cpp \
     ..\UiaTracing.cpp \
     ..\TermControlUiaProvider.cpp \

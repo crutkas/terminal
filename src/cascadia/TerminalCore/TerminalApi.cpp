@@ -503,6 +503,20 @@ til::size Terminal::GetCellSize() const noexcept
     return size;
 }
 
+til::read_file_result Terminal::ReadLocalFile(const std::wstring_view path, uint64_t offset, uint64_t size, bool deleteAfter, const std::wstring_view deleteNameMarker, std::vector<uint8_t>& out) noexcept
+{
+    // Windows Terminal is the final terminal in the chain, so it owns deletion of a t=t
+    // temporary file (conhost suppresses its own delete under ConPTY). The shared helper
+    // still enforces local fixed-drive reads and temp-dir + marker containment before it
+    // removes anything.
+    return til::read_file_as_bytes(path, offset, size, deleteAfter, deleteNameMarker, out);
+}
+
+Microsoft::Console::Utils::ReadSharedMemoryResult Terminal::ReadSharedMemory(const std::wstring_view name, uint64_t offset, uint64_t size, std::vector<uint8_t>& out) noexcept
+{
+    return Microsoft::Console::Utils::ReadSharedMemory(name, offset, size, out);
+}
+
 void Terminal::NotifyBufferRotation(const int delta)
 {
     // Update our selection, so it doesn't move as the buffer is cycled

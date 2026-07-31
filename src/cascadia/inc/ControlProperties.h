@@ -50,6 +50,7 @@
     X(bool, SuppressApplicationTitle)                                                                             \
     X(bool, ForceVTInput, false)                                                                                  \
     X(bool, AllowKittyKeyboardMode, true)                                                                         \
+    X(bool, AllowKittyLocalMedia, false)                                                                          \
     X(winrt::hstring, StartingTitle)                                                                              \
     X(bool, DetectURLs, true)                                                                                     \
     X(bool, AutoMarkPrompts)                                                                                      \
