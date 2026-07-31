@@ -508,6 +508,10 @@ public:
         // Return a synthetic image payload (not the real file contents) so unit tests
         // never touch the filesystem. Tests set _kittyFileBytes to match their f=/s=/v=.
         out = _kittyFileBytes;
+        if (deleteAfter)
+        {
+            _deleteLocalFileCallCount++;
+        }
         return til::read_file_result::ok;
     }
 
@@ -715,6 +719,7 @@ public:
     bool _readLocalFileSucceeds = true;
     til::read_file_result _readLocalFileResult{ til::read_file_result::read_error };
     int _readLocalFileCallCount = 0;
+    int _deleteLocalFileCallCount = 0;
     std::wstring _lastKittyFilePath;
     uint64_t _lastKittyFileOffset = 0;
     uint64_t _lastKittyFileSize = 0;
@@ -7609,16 +7614,49 @@ public:
         _testGetSet->ValidateInputEvent(L"\x1b_Gi=10;ENOENT:image not found\x1b\\");
     }
 
-    // a=q over t=t must NOT request deletion: a query is not a real transmit, so the
-    // temporary file is left intact (only a=t/a=T of a t=t file deletes).
-    TEST_METHOD(KittyGraphicsTempFileQueryDoesNotDelete)
+    // Kitty consumes t=t resources even for a=q after the read succeeds. The query still
+    // stores nothing, allocates no id, and leaves eviction/accounting state untouched.
+    TEST_METHOD(KittyGraphicsTempFileQueryDeletesAfterSuccessfulRead)
     {
         _prepDataWithKittyLocalMedia();
+        _stateMachine->ProcessString(L"\x1b_Ga=t,i=1,f=24,s=1,v=1;/wAA\x1b\\");
+        const auto imagesBefore = _kitty()._images.size();
+        const auto orderBefore = _kitty()._imageOrder;
+        const auto bytesBefore = _kitty()._totalPixelBytes;
+        const auto nextIdBefore = _kitty()._nextImageId;
+
         _testGetSet->_kittyFileBytes = { 255, 0, 0 };
         _stateMachine->ProcessString(L"\x1b_Ga=q,i=11,f=24,s=1,v=1,t=t;L3RtcC94\x1b\\");
         _testGetSet->ValidateInputEvent(L"\x1b_Gi=11;OK\x1b\\");
         VERIFY_IS_TRUE(_testGetSet->_readLocalFileCallCount > 0, L"a=q must still read the file to validate.");
-        VERIFY_IS_FALSE(_testGetSet->_lastKittyFileDeleteAfter, L"a=q,t=t must never request deletion.");
+        VERIFY_IS_TRUE(_testGetSet->_lastKittyFileDeleteAfter, L"a=q,t=t must consume the temporary file after a successful read.");
+        VERIFY_ARE_EQUAL(1, _testGetSet->_deleteLocalFileCallCount);
+        VERIFY_ARE_EQUAL(imagesBefore, _kitty()._images.size());
+        VERIFY_IS_TRUE(_kitty()._images.contains(1));
+        VERIFY_IS_FALSE(_kitty()._images.contains(11));
+        VERIFY_IS_TRUE(orderBefore == _kitty()._imageOrder);
+        VERIFY_ARE_EQUAL(bytesBefore, _kitty()._totalPixelBytes);
+        VERIFY_ARE_EQUAL(nextIdBefore, _kitty()._nextImageId);
+    }
+
+    TEST_METHOD(KittyGraphicsTempFileQueryFailureDoesNotDeleteOrMutate)
+    {
+        _prepDataWithKittyLocalMedia();
+        _stateMachine->ProcessString(L"\x1b_Ga=t,i=1,f=24,s=1,v=1;/wAA\x1b\\");
+        const auto orderBefore = _kitty()._imageOrder;
+        const auto bytesBefore = _kitty()._totalPixelBytes;
+        const auto nextIdBefore = _kitty()._nextImageId;
+
+        _testGetSet->_readLocalFileSucceeds = false;
+        _testGetSet->_readLocalFileResult = til::read_file_result::read_error;
+        _stateMachine->ProcessString(L"\x1b_Ga=q,i=11,f=24,s=1,v=1,t=t;L3RtcC94\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=11;EBADF:could not read file\x1b\\");
+        VERIFY_IS_TRUE(_testGetSet->_lastKittyFileDeleteAfter, L"the host may delete only if its read succeeds.");
+        VERIFY_ARE_EQUAL(0, _testGetSet->_deleteLocalFileCallCount, L"a failed read must leave the temporary file intact.");
+        VERIFY_ARE_EQUAL(static_cast<size_t>(1), _kitty()._images.size());
+        VERIFY_IS_TRUE(orderBefore == _kitty()._imageOrder);
+        VERIFY_ARE_EQUAL(bytesBefore, _kitty()._totalPixelBytes);
+        VERIFY_ARE_EQUAL(nextIdBefore, _kitty()._nextImageId);
     }
 
     // Delete-all does not affect virtual placements, so later placeholder text can reuse the grid.
@@ -8864,6 +8902,8 @@ public:
             { L"\x1b_Ga=q,i=34,f=24,s=1,v=1,t=t;L3RtcC94\x1b\\", L"\x1b_Gi=34;EINVAL:unsupported transmission medium\x1b\\" },
             // The refusal is indistinguishable from a medium the protocol has never heard of.
             { L"\x1b_Ga=t,i=35,f=24,s=1,v=1,t=x;AAAA\x1b\\", L"\x1b_Gi=35;EINVAL:unsupported transmission medium\x1b\\" },
+            { L"\x1b_Ga=t,i=38,f=24,s=1,v=1,t=f,m=1;L3Rtc\x1b\\", L"\x1b_Gi=38;EINVAL:unsupported transmission medium\x1b\\" },
+            { L"\x1b_Ga=t,i=39,f=24,s=1,v=1,t=x,m=1;AAAA\x1b\\", L"\x1b_Gi=39;EINVAL:unsupported transmission medium\x1b\\" },
         };
 
         for (const auto& [sequence, expected] : cases)
@@ -8874,7 +8914,10 @@ public:
             VERIFY_ARE_EQUAL(0, _testGetSet->_readLocalFileCallCount, L"a gated medium must never reach the host file read.");
             VERIFY_ARE_EQUAL(0, _testGetSet->_readSharedMemoryCallCount, L"a gated medium must never reach the host shared memory read.");
             VERIFY_IS_FALSE(_testGetSet->_lastKittyFileDeleteAfter, L"a gated t=t must never ask for a deletion.");
+            VERIFY_ARE_EQUAL(0, _testGetSet->_deleteLocalFileCallCount, L"a gated t=t must never delete.");
             VERIFY_IS_TRUE(_kitty()._images.empty(), L"a gated medium must not register an image.");
+            VERIFY_IS_FALSE(_kitty()._chunkActive, L"a gated medium must not retain chunk state.");
+            VERIFY_IS_TRUE(_kitty()._chunkPayload.empty(), L"a gated medium must not retain payload bytes.");
         }
     }
 
@@ -11587,6 +11630,164 @@ public:
         VERIFY_ARE_EQUAL(oldMetadata.column + 1, inherited->column);
         VERIFY_ARE_EQUAL(1u, DirectImageSlice(buffer, firstParent.y)->ColumnOwner(firstParent.x + 1));
         VERIFY_ARE_EQUAL(L'K', buffer.GetRowByOffset(textPosition.y).GlyphAt(textPosition.x).front());
+    }
+
+    TEST_METHOD(KittyAnimationFrameLocalMediaAreOffByDefault)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1b_Ga=t,i=80,f=24,s=1,v=1;AAAA\x1b\\");
+        const auto orderBefore = _kitty()._imageOrder;
+        const auto bytesBefore = _kitty()._totalPixelBytes;
+        const std::wstring_view cases[]{
+            L"\x1b_Ga=f,i=80,f=24,s=1,v=1,t=f;L3RtcC94\x1b\\",
+            L"\x1b_Ga=f,i=80,f=24,s=1,v=1,t=t;L3RtcC94\x1b\\",
+            L"\x1b_Ga=f,i=80,f=24,s=1,v=1,t=s;TG9jYWxca2l0dHktc2htLXRlc3Q=\x1b\\",
+            L"\x1b_Ga=f,i=80,f=24,s=1,v=1,t=f,o=z;L3RtcC94\x1b\\",
+            L"\x1b_Ga=f,i=80,f=24,s=1,v=1,t=x;AAAA\x1b\\",
+            L"\x1b_Ga=f,i=80,f=24,s=1,v=1,t=t,m=1;L3Rtc\x1b\\",
+            L"\x1b_Ga=f,i=80,f=24,s=1,v=1,t=x,m=1;AAAA\x1b\\",
+        };
+
+        for (const auto sequence : cases)
+        {
+            _stateMachine->ProcessString(sequence);
+            _testGetSet->ValidateInputEvent(L"\x1b_Gi=80;EINVAL:unsupported transmission medium\x1b\\");
+        }
+
+        VERIFY_ARE_EQUAL(0, _testGetSet->_readLocalFileCallCount);
+        VERIFY_ARE_EQUAL(0, _testGetSet->_readSharedMemoryCallCount);
+        VERIFY_ARE_EQUAL(0, _testGetSet->_deleteLocalFileCallCount);
+        VERIFY_ARE_EQUAL(0, _testGetSet->_decodeImageCallCount);
+        VERIFY_ARE_EQUAL(static_cast<size_t>(1), _kitty()._frameCount(_kitty()._images.at(80)));
+        VERIFY_IS_TRUE(orderBefore == _kitty()._imageOrder);
+        VERIFY_ARE_EQUAL(bytesBefore, _kitty()._totalPixelBytes);
+        VERIFY_IS_FALSE(_kitty()._chunkActive);
+        VERIFY_IS_TRUE(_kitty()._chunkPayload.empty());
+    }
+
+    TEST_METHOD(KittyAnimationFrameLoadsRawLocalMedia)
+    {
+        _prepDataWithKittyLocalMedia();
+        _stateMachine->ProcessString(L"\x1b_Ga=t,i=81,f=24,s=1,v=1;AAAA\x1b\\");
+
+        _testGetSet->_kittyFileBytes = { 0, 255, 0 };
+        _stateMachine->ProcessString(L"\x1b_Ga=f,i=81,f=24,s=1,v=1,t=f,O=7,S=3;L3RtcC94\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=81;OK\x1b\\");
+        VERIFY_ARE_EQUAL(static_cast<uint64_t>(7), _testGetSet->_lastKittyFileOffset);
+        VERIFY_ARE_EQUAL(static_cast<uint64_t>(3), _testGetSet->_lastKittyFileSize);
+
+        _testGetSet->_kittyFileBytes = { 0, 0, 255 };
+        _stateMachine->ProcessString(L"\x1b_Ga=f,i=81,f=24,s=1,v=1,t=t;L3RtcC94\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=81;OK\x1b\\");
+        VERIFY_ARE_EQUAL(1, _testGetSet->_deleteLocalFileCallCount);
+
+        _testGetSet->_kittySharedMemoryBytes = { 9, 9, 255, 0, 0 };
+        _stateMachine->ProcessString(L"\x1b_Ga=f,i=81,f=24,s=1,v=1,t=s,O=2;TG9jYWxca2l0dHktc2htLXRlc3Q=\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=81;OK\x1b\\");
+        VERIFY_ARE_EQUAL(static_cast<uint64_t>(2), _testGetSet->_lastKittySharedMemoryOffset);
+        VERIFY_ARE_EQUAL(static_cast<uint64_t>(3), _testGetSet->_lastKittySharedMemorySize);
+
+        const auto& frames = _kitty()._images.at(81).animationFrames;
+        VERIFY_ARE_EQUAL(static_cast<size_t>(3), frames.size());
+        VERIFY_ARE_EQUAL(static_cast<BYTE>(255), frames[0].pixels->front().rgbGreen);
+        VERIFY_ARE_EQUAL(static_cast<BYTE>(255), frames[1].pixels->front().rgbBlue);
+        VERIFY_ARE_EQUAL(static_cast<BYTE>(255), frames[2].pixels->front().rgbRed);
+    }
+
+    TEST_METHOD(KittyAnimationFrameLoadsPngLocalMedia)
+    {
+        _prepDataWithKittyLocalMedia();
+        _stateMachine->ProcessString(L"\x1b_Ga=t,i=82,f=24,s=2,v=2;AAAAAAAAAAAAAAAA\x1b\\");
+        _testGetSet->_kittyFileBytes = { 0x89, 0x50, 0x4e, 0x47 };
+
+        _stateMachine->ProcessString(L"\x1b_Ga=f,i=82,f=100,t=f;L3RtcC94\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=82;OK\x1b\\");
+        _stateMachine->ProcessString(L"\x1b_Ga=f,i=82,f=100,t=t;L3RtcC94\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=82;OK\x1b\\");
+
+        _testGetSet->_kittySharedMemoryBytes = { 0x89, 0x50, 0x4e, 0x47 };
+        _stateMachine->ProcessString(L"\x1b_Ga=f,i=82,f=100,t=s,S=4;TG9jYWxca2l0dHktc2htLXRlc3Q=\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=82;OK\x1b\\");
+
+        VERIFY_ARE_EQUAL(3, _testGetSet->_decodeImageCallCount);
+        VERIFY_ARE_EQUAL(1, _testGetSet->_deleteLocalFileCallCount);
+        const auto& frames = _kitty()._images.at(82).animationFrames;
+        VERIFY_ARE_EQUAL(static_cast<size_t>(3), frames.size());
+        for (const auto& frame : frames)
+        {
+            VERIFY_ARE_EQUAL(static_cast<size_t>(4), frame.pixels->size());
+            VERIFY_ARE_EQUAL(static_cast<BYTE>(255), frame.pixels->front().rgbBlue);
+        }
+    }
+
+    TEST_METHOD(KittyAnimationFrameLoadsZlibLocalMediaAndChunksNames)
+    {
+        const std::vector<uint8_t> c12{ 0x78, 0xda, 0x63, 0x64, 0x62, 0x66, 0x61, 0x65, 0x63, 0xe7, 0xe0, 0xe4, 0xe2, 0xe6, 0x01, 0x00, 0x01, 0x78, 0x00, 0x4f };
+        _prepDataWithKittyLocalMedia();
+        _stateMachine->ProcessString(L"\x1b_Ga=t,i=83,f=24,s=2,v=2;AAAAAAAAAAAAAAAA\x1b\\");
+
+        _testGetSet->_kittyFileBytes = c12;
+        _testGetSet->_response.clear();
+        _stateMachine->ProcessString(L"\x1b_Ga=f,i=83,f=24,s=2,v=2,t=f,o=z,m=1;L3Rtc\x1b\\");
+        VERIFY_IS_TRUE(_testGetSet->_response.empty(), L"a chunked file name must not be read before its final chunk.");
+        _stateMachine->ProcessString(L"\x1b_Ga=f,m=0;C94\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=83;OK\x1b\\");
+        VERIFY_ARE_EQUAL(1, _testGetSet->_readLocalFileCallCount);
+
+        _stateMachine->ProcessString(L"\x1b_Ga=f,i=83,f=24,s=2,v=2,t=t,o=z;L3RtcC94\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=83;OK\x1b\\");
+        VERIFY_ARE_EQUAL(1, _testGetSet->_deleteLocalFileCallCount);
+
+        _testGetSet->_kittySharedMemoryBytes = c12;
+        _stateMachine->ProcessString(L"\x1b_Ga=f,i=83,f=24,s=2,v=2,t=s,S=20,o=z,m=1;TG9jYWxca2l0dHktc2htLXRlc3Q=\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=83;OK\x1b\\");
+        VERIFY_ARE_EQUAL(1, _testGetSet->_readSharedMemoryCallCount, L"m= is ignored for a shared-memory resource name.");
+
+        const auto& frames = _kitty()._images.at(83).animationFrames;
+        VERIFY_ARE_EQUAL(static_cast<size_t>(3), frames.size());
+        for (const auto& frame : frames)
+        {
+            VERIFY_ARE_EQUAL(static_cast<size_t>(4), frame.pixels->size());
+            VERIFY_ARE_EQUAL(static_cast<BYTE>(1), frame.pixels->front().rgbRed);
+            VERIFY_ARE_EQUAL(static_cast<BYTE>(12), frame.pixels->back().rgbBlue);
+        }
+    }
+
+    TEST_METHOD(KittyAnimationFrameLocalMediaFailuresDoNotMutate)
+    {
+        _prepDataWithKittyLocalMedia();
+        _stateMachine->ProcessString(L"\x1b_Ga=t,i=84,f=24,s=1,v=1;AAAA\x1b\\");
+        const auto orderBefore = _kitty()._imageOrder;
+        const auto bytesBefore = _kitty()._totalPixelBytes;
+
+        _testGetSet->_readLocalFileSucceeds = false;
+        for (const auto result : { til::read_file_result::not_found,
+                                   til::read_file_result::invalid,
+                                   til::read_file_result::read_error })
+        {
+            _testGetSet->_readLocalFileResult = result;
+            for (const auto medium : { L'f', L't' })
+            {
+                const auto sequence = L"\x1b_Ga=f,i=84,f=24,s=1,v=1,t=" + std::wstring{ medium } + L";L3RtcC94\x1b\\";
+                _stateMachine->ProcessString(sequence);
+                _testGetSet->ValidateInputEvent(L"\x1b_Gi=84;EBADF:could not read file\x1b\\");
+            }
+        }
+        VERIFY_ARE_EQUAL(0, _testGetSet->_deleteLocalFileCallCount, L"failed t=t frame reads must not delete.");
+
+        _testGetSet->_readSharedMemorySucceeds = false;
+        for (const auto result : { Microsoft::Console::Utils::ReadSharedMemoryResult::not_found,
+                                   Microsoft::Console::Utils::ReadSharedMemoryResult::invalid,
+                                   Microsoft::Console::Utils::ReadSharedMemoryResult::read_error })
+        {
+            _testGetSet->_readSharedMemoryResult = result;
+            _stateMachine->ProcessString(L"\x1b_Ga=f,i=84,f=24,s=1,v=1,t=s;TG9jYWxca2l0dHktc2htLXRlc3Q=\x1b\\");
+            _testGetSet->ValidateInputEvent(L"\x1b_Gi=84;EBADF:could not read shared memory\x1b\\");
+        }
+
+        VERIFY_ARE_EQUAL(static_cast<size_t>(1), _kitty()._frameCount(_kitty()._images.at(84)));
+        VERIFY_IS_TRUE(orderBefore == _kitty()._imageOrder);
+        VERIFY_ARE_EQUAL(bytesBefore, _kitty()._totalPixelBytes);
     }
 
     TEST_METHOD(KittyAnimationFrameTransferCreatesFullFrame)

@@ -413,6 +413,16 @@ void KittyParser::_HandleSequence(const std::wstring_view control, const std::st
         return;
     }
 
+    const auto hasTransmissionPayload = command.action == L't' || command.action == L'T' || command.action == L'q' || command.action == L'f';
+    if (hasTransmissionPayload && !_transmissionMediumAllowed(command))
+    {
+        // Do not retain even one chunk of a denied local resource name. Unknown media
+        // take the same path, so the default-off response and side effects are identical.
+        _clearChunk();
+        _ProcessCommand(command, payload, payloadValid, payloadTooLarge);
+        return;
+    }
+
     const auto repeatsActiveAction = _chunkActive &&
                                      command.action == _chunkControl.action &&
                                      !command.hasNonChunkKeyOtherThanAction;
@@ -474,6 +484,119 @@ bool KittyParser::_localMediaAllowed() const noexcept
     return _dispatcher._optionalFeatures.test(ITermDispatch::OptionalFeature::KittyLocalMedia);
 }
 
+bool KittyParser::_transmissionMediumAllowed(const Control& command) const noexcept
+{
+    return command.medium == L'd' ||
+           ((command.medium == L'f' || command.medium == L't' || command.medium == L's') && _localMediaAllowed());
+}
+
+bool KittyParser::_loadTransmissionData(const Control& command, const std::string_view payload, const bool payloadValid, const bool payloadTooLarge, std::vector<uint8_t>& bytes, std::wstring_view& code)
+{
+    const auto medium = command.medium;
+    if (!_transmissionMediumAllowed(command))
+    {
+        // Local media names resources chosen by the terminal writer. Reject it before
+        // decoding the name or touching any host resource, using the unknown-medium
+        // response so the denial cannot reveal machine state.
+        code = L"EINVAL:unsupported transmission medium";
+        return false;
+    }
+    if (command.compression != 0 && command.compression != L'z')
+    {
+        code = L"EINVAL:unsupported compression";
+        return false;
+    }
+    if (!payloadValid || !_DecodeBase64(payload, bytes))
+    {
+        code = payloadTooLarge ? L"EFBIG:payload exceeds maximum size" : L"EINVAL:bad payload";
+        return false;
+    }
+
+    const auto decodeResourceName = [](const std::vector<uint8_t>& encodedName, const size_t maxBytes, std::wstring& result) {
+        if (encodedName.empty() || encodedName.size() > maxBytes ||
+            std::find(encodedName.begin(), encodedName.end(), uint8_t{ 0 }) != encodedName.end())
+        {
+            return false;
+        }
+
+        const std::string utf8(encodedName.begin(), encodedName.end());
+        const auto length = static_cast<int>(utf8.size());
+        const auto needed = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, utf8.data(), length, nullptr, 0);
+        if (needed <= 0)
+        {
+            return false;
+        }
+
+        result.resize(static_cast<size_t>(needed));
+        if (MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, utf8.data(), length, result.data(), needed) != needed)
+        {
+            result.clear();
+            return false;
+        }
+        return true;
+    };
+
+    if (medium == L'f' || medium == L't')
+    {
+        static constexpr std::wstring_view temporaryFileMarker{ L"tty-graphics-protocol" };
+
+        std::wstring path;
+        if (!decodeResourceName(bytes, static_cast<size_t>(INT_MAX), path))
+        {
+            code = L"EINVAL:invalid image file request";
+            return false;
+        }
+
+        std::vector<uint8_t> fileBytes;
+        if (_dispatcher._api.ReadLocalFile(path, command.fileOffset, command.fileSize, medium == L't', temporaryFileMarker, fileBytes) != til::read_file_result::ok)
+        {
+            code = L"EBADF:could not read file";
+            return false;
+        }
+        bytes = std::move(fileBytes);
+    }
+    else if (medium == L's')
+    {
+        std::wstring name;
+        constexpr size_t maxMappingNameBytes = 32767;
+        if (!decodeResourceName(bytes, maxMappingNameBytes, name))
+        {
+            code = L"EINVAL:invalid shared memory request";
+            return false;
+        }
+
+        auto readSize = command.fileSize;
+        if (readSize == 0 && command.compression != L'z' && (command.format == 24 || command.format == 32) && command.width != 0 && command.height != 0)
+        {
+            const auto depth = command.format == 24 ? 3ull : 4ull;
+            const auto area = static_cast<uint64_t>(command.width) * command.height;
+            readSize = area <= UINT64_MAX / depth ? area * depth : UINT64_MAX;
+        }
+
+        std::vector<uint8_t> sharedBytes;
+        if (_dispatcher._api.ReadSharedMemory(name, command.fileOffset, readSize, sharedBytes) != ReadSharedMemoryResult::ok)
+        {
+            code = L"EBADF:could not read shared memory";
+            return false;
+        }
+        bytes = std::move(sharedBytes);
+    }
+
+    if (command.compression == L'z')
+    {
+        std::vector<uint8_t> inflated;
+        const auto allowSharedMemoryPadding = medium == L's' && command.fileSize == 0;
+        if (!_inflateZlib(bytes, inflated, MaxPayload, allowSharedMemoryPadding))
+        {
+            code = L"EINVAL:invalid compressed data";
+            return false;
+        }
+        bytes = std::move(inflated);
+    }
+
+    return true;
+}
+
 void KittyParser::_ProcessCommand(const Control& command, const std::string_view payload, const bool payloadValid, const bool payloadTooLarge)
 {
     const auto action = command.action;
@@ -484,10 +607,8 @@ void KittyParser::_ProcessCommand(const Control& command, const std::string_view
     const auto format = command.format;
     const auto width = command.width;
     const auto height = command.height;
-    const auto compression = command.compression;
     const auto haveId = command.haveId;
     const auto haveNumber = command.haveNumber;
-    const auto medium = command.medium;
     const auto moveCursor = !command.noCursorMovement;
 
     auto success = true;
@@ -824,26 +945,6 @@ void KittyParser::_ProcessCommand(const Control& command, const std::string_view
                 code = L"EINVAL:unsupported format";
                 break;
             }
-            if (medium != L'd' && medium != L'f' && medium != L't' && medium != L's')
-            {
-                // t=d (direct), t=f (file), t=t (temporary file), and t=s (shared
-                // memory) are supported. Reject every unrecognized medium.
-                success = false;
-                code = L"EINVAL:unsupported transmission medium";
-                break;
-            }
-            if (medium != L'd' && !_localMediaAllowed())
-            {
-                // t=f, t=t, and t=s do not carry the image: they carry the NAME of a
-                // local resource, chosen by whatever is writing to the terminal, that we
-                // are then asked to open -- and for t=t, to delete. That is off unless
-                // the host opts in. Refuse all three with the code an unrecognized medium
-                // gets, before the payload is even decoded, so nothing is looked up or
-                // deleted and the refusal reveals nothing about the machine.
-                success = false;
-                code = L"EINVAL:unsupported transmission medium";
-                break;
-            }
             if (command.virtualPlacement && command.haveParent)
             {
                 // A virtual (U=1) placement cannot itself be relative. This is a conflict
@@ -855,141 +956,10 @@ void KittyParser::_ProcessCommand(const Control& command, const std::string_view
                 code = L"EINVAL:virtual placements cannot be relative";
                 break;
             }
-            if (compression != 0 && compression != L'z')
+            if (!_loadTransmissionData(command, payload, payloadValid, payloadTooLarge, bytes, code))
             {
                 success = false;
-                code = L"EINVAL:unsupported compression";
                 break;
-            }
-            if (!payloadValid || !_DecodeBase64(payload, bytes))
-            {
-                success = false;
-                code = payloadTooLarge ? L"EFBIG:payload exceeds maximum size" : L"EINVAL:bad payload";
-                break;
-            }
-            // File and shared-memory payloads carry a UTF-8 resource name rather than
-            // image bytes. Decode strictly and reject embedded NULs so Win32 cannot
-            // silently open a truncated name.
-            const auto decodeResourceName = [](const std::vector<uint8_t>& encodedName, const size_t maxBytes, std::wstring& result) {
-                if (encodedName.empty() || encodedName.size() > maxBytes ||
-                    std::find(encodedName.begin(), encodedName.end(), uint8_t{ 0 }) != encodedName.end())
-                {
-                    return false;
-                }
-
-                const std::string utf8(encodedName.begin(), encodedName.end());
-                const auto length = static_cast<int>(utf8.size());
-                const auto needed = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, utf8.data(), length, nullptr, 0);
-                if (needed <= 0)
-                {
-                    return false;
-                }
-
-                result.resize(static_cast<size_t>(needed));
-                if (MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, utf8.data(), length, result.data(), needed) != needed)
-                {
-                    result.clear();
-                    return false;
-                }
-                return true;
-            };
-
-            if (medium == L'f' || medium == L't')
-            {
-                // For file/temporary transmission the decoded payload is not image
-                // data but the image FILE PATH (UTF-8 bytes). Read the file contents
-                // into `bytes` so the format-specific validation/decode below treats
-                // it exactly like a direct payload. The host bounds the read to a safe
-                // size (MaxPayload), so a hostile S= cannot force a huge alloc, and
-                // restricts reads to local fixed-drive files (see ReadLocalFile).
-                //
-                // A temporary file (t=t) is deleted by the host after a successful read,
-                // but only when it resides under the system temp directory and carries the
-                // marker below. Kitty names its temporary files "tty-graphics-protocol-*",
-                // and this is the only layer that knows that, so this is where the marker
-                // lives. A query (a=q) validates the request without storing, so it must
-                // NOT delete: only a real transmit (a=t / a=T) of a t=t file requests it.
-                //
-                // Protocol (transmission media): https://sw.kovidgoyal.net/kitty/graphics-protocol/#transferring-data
-                //
-                // Convert the UTF-8 path with MB_ERR_INVALID_CHARS so a malformed path is
-                // rejected here (path stays empty -> EBADF below) rather than silently
-                // mangled into U+FFFD substitutions: unlike til::u8u16, which uses no
-                // flags and substitutes, this rejects invalid input deterministically.
-                static constexpr std::wstring_view temporaryFileMarker{ L"tty-graphics-protocol" };
-
-                std::wstring path;
-                if (!decodeResourceName(bytes, static_cast<size_t>(INT_MAX), path))
-                {
-                    // The payload never named a file, so nothing was looked up. This says
-                    // only that the request itself was malformed.
-                    success = false;
-                    code = L"EINVAL:invalid image file request";
-                    break;
-                }
-                const auto deleteAfter = (medium == L't') && (action != L'q');
-                std::vector<uint8_t> fileBytes;
-                if (_dispatcher._api.ReadLocalFile(path, command.fileOffset, command.fileSize, deleteAfter, temporaryFileMarker, fileBytes) != til::read_file_result::ok)
-                {
-                    // Every failure from here on reports the same code. Separating "no such
-                    // file" from "exists but could not be read" from "rejected before we
-                    // opened it" would answer, one path per sequence, questions about the
-                    // machine that the writer is not entitled to ask.
-                    success = false;
-                    code = L"EBADF:could not read file";
-                    break;
-                }
-                bytes = std::move(fileBytes);
-            }
-            else if (medium == L's')
-            {
-                // The payload names a Windows file mapping. The host accepts only the
-                // current-session namespace, opens FILE_MAP_READ, copies at most 32 MiB,
-                // and closes the view/handle before returning. Per the Kitty spec there
-                // is no unlink operation on Windows.
-                std::wstring name;
-                constexpr size_t maxMappingNameBytes = 32767;
-                if (!decodeResourceName(bytes, maxMappingNameBytes, name))
-                {
-                    success = false;
-                    code = L"EINVAL:invalid shared memory request";
-                    break;
-                }
-
-                auto readSize = command.fileSize;
-                if (readSize == 0 && compression != L'z' && (format == 24 || format == 32) && width != 0 && height != 0)
-                {
-                    // CreateFileMapping rounds section sizes to whole pages, so a mapping
-                    // has no discoverable byte-exact tail. For raw pixels the protocol's
-                    // dimensions provide that exact length when S= is omitted.
-                    const auto depth = format == 24 ? 3ull : 4ull;
-                    const auto area = static_cast<uint64_t>(width) * height;
-                    readSize = area <= UINT64_MAX / depth ? area * depth : UINT64_MAX;
-                }
-
-                std::vector<uint8_t> sharedBytes;
-                if (_dispatcher._api.ReadSharedMemory(name, command.fileOffset, readSize, sharedBytes) != ReadSharedMemoryResult::ok)
-                {
-                    // Collapsed for the same reason as the file media above: whether a named
-                    // mapping exists, and whether it could be opened, are not facts this
-                    // protocol gets to report back to whoever asked.
-                    success = false;
-                    code = L"EBADF:could not read shared memory";
-                    break;
-                }
-                bytes = std::move(sharedBytes);
-            }
-            if (compression == L'z')
-            {
-                std::vector<uint8_t> inflated;
-                const auto allowSharedMemoryPadding = medium == L's' && command.fileSize == 0;
-                if (!_inflateZlib(bytes, inflated, MaxPayload, allowSharedMemoryPadding))
-                {
-                    success = false;
-                    code = L"EINVAL:invalid compressed data";
-                    break;
-                }
-                bytes = std::move(inflated);
             }
 
             const auto depth = format == 24 ? 3u : (format == 32 ? 4u : 0u);
@@ -1972,16 +1942,6 @@ try
         code = L"ENOENT:image not found";
         return false;
     }
-    if (command.medium != L'd')
-    {
-        code = L"EINVAL:unsupported transmission medium";
-        return false;
-    }
-    if (command.compression != 0 && command.compression != L'z')
-    {
-        code = L"EINVAL:unsupported compression";
-        return false;
-    }
     if (command.format != 24 && command.format != 32 && command.format != 100)
     {
         code = L"EINVAL:unsupported format";
@@ -1992,11 +1952,9 @@ try
         code = L"EINVAL:invalid frame composition mode";
         return false;
     }
-
     std::vector<uint8_t> bytes;
-    if (!payloadValid || !_DecodeBase64(payload, bytes))
+    if (!_loadTransmissionData(command, payload, payloadValid, payloadTooLarge, bytes, code))
     {
-        code = payloadTooLarge ? L"EFBIG:payload exceeds maximum size" : L"EINVAL:bad payload";
         return false;
     }
     if (command.compression == L'z')

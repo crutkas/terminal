@@ -258,6 +258,8 @@ namespace Microsoft::Console::VirtualTerminal
 
         static Control _ParseControl(std::wstring_view control) noexcept;
         bool _localMediaAllowed() const noexcept;
+        bool _transmissionMediumAllowed(const Control& command) const noexcept;
+        bool _loadTransmissionData(const Control& command, std::string_view payload, bool payloadValid, bool payloadTooLarge, std::vector<uint8_t>& bytes, std::wstring_view& code);
         void _HandleSequence(std::wstring_view control, std::string_view payload, bool controlValid, bool payloadValid, bool payloadTooLarge);
         void _ProcessCommand(const Control& command, std::string_view payload, bool payloadValid, bool payloadTooLarge);
         void _clearChunk() noexcept;
