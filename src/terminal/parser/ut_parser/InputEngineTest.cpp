@@ -265,7 +265,7 @@ class Microsoft::Console::VirtualTerminal::InputEngineTest
     TEST_METHOD(AltBackspaceEnterTest);
     TEST_METHOD(ChunkedSequence);
     TEST_METHOD(ApcResponseReachesTheApplication);
-    TEST_METHOD(ApcResponseSplitAcrossReads);
+    TEST_METHOD(ApcResponseSplitAcrossEveryReadBoundary);
     TEST_METHOD(SGRMouseTest_ButtonClick);
     TEST_METHOD(SGRMouseTest_Modifiers);
     TEST_METHOD(SGRMouseTest_Movement);
@@ -1078,27 +1078,41 @@ void InputEngineTest::ApcResponseReachesTheApplication()
     VERIFY_ARE_EQUAL(ack + ack, RunInputSequences({ ack + ack }), L"consecutive responses are both delivered");
 }
 
-void InputEngineTest::ApcResponseSplitAcrossReads()
+void InputEngineTest::ApcResponseSplitAcrossEveryReadBoundary()
 {
-    // The input pipe splits wherever the reads land, so the response routinely arrives in
-    // pieces. Whatever buffering the engine does has to span ProcessString calls and still
-    // deliver exactly one copy of the sequence.
+    // Pipe reads can split at every character boundary. Exercise each boundary independently,
+    // then exercise all of them at once. For 7-bit APC this includes ESC | _ and ESC _ | G at
+    // the introducer, plus ESC | \ inside ST. For C1 APC it includes APC | G and the boundary
+    // immediately before C1 ST.
     const std::wstring ack = L"\x1b_Gi=1;OK\x1b\\";
-    VERIFY_ARE_EQUAL(ack, RunInputSequences({ L"\x1b_Gi=", L"1;OK", L"\x1b\\" }), L"a response split across reads is reassembled");
-    VERIFY_ARE_EQUAL(ack, RunInputSequences({ L"\x1b_Gi=1;OK", L"\x1b\\" }), L"a response split before the terminator is reassembled");
-    VERIFY_ARE_EQUAL(ack, RunInputSequences({ L"\x1b_Gi=1;OK\x1b", L"\\" }, false, true), L"a response split inside the terminator is reassembled");
+    const std::wstring c1Ack = L"\x9f"
+                               L"Gi=1;OK\x9c";
+    const auto verifyEveryBoundary = [](const std::wstring& response, const bool acceptC1) {
+        for (size_t split = 1; split < response.size(); ++split)
+        {
+            const std::vector reads{ response.substr(0, split), response.substr(split) };
+            VERIFY_ARE_EQUAL(response,
+                             RunInputSequences(reads, acceptC1, true),
+                             NoThrowString().Format(L"the response must survive a read boundary at offset %zu", split));
+        }
 
-    // One split is not covered, and it is not specific to APC. Claiming nothing for a
-    // string makes the parser enter its ignore state (_EnterSosPmString for APC,
-    // _EnterDcsIgnore for DCS), and that discards whatever partial run had been cached -
-    // here, the lone escape from the previous read. A DCS response, which has always taken
-    // this path, is truncated in exactly the same way, so this is a property of the
-    // parser's caching rules rather than of the APC handling added here.
-    // (win32-input-mode is primed so the trailing-escape Alt+key heuristic, which would
-    // otherwise consume the escape first, is out of the way.)
+        std::vector<std::wstring> singleCharacterReads;
+        singleCharacterReads.reserve(response.size());
+        for (const auto ch : response)
+        {
+            singleCharacterReads.emplace_back(1, ch);
+        }
+        VERIFY_ARE_EQUAL(response,
+                         RunInputSequences(singleCharacterReads, acceptC1, true),
+                         L"the response must survive every read boundary at once");
+    };
+    verifyEveryBoundary(ack, false);
+    verifyEveryBoundary(c1Ack, true);
+
+    // Keep the established DCS behavior unchanged. A DCS response split after its first
+    // ESC still loses that cached byte when the unclaimed string enters DcsIgnore.
     const std::wstring da3 = L"\x1bP!|00000000\x1b\\";
     VERIFY_ARE_EQUAL(da3.substr(1), RunInputSequences({ L"\x1b", L"P!|00000000\x1b", L"\\" }, false, true), L"a DCS response split at the escape loses it");
-    VERIFY_ARE_EQUAL(ack.substr(1), RunInputSequences({ L"\x1b", L"_Gi=1;OK\x1b", L"\\" }, false, true), L"an APC response split at the escape behaves identically to DCS");
 }
 
 // Method Description:

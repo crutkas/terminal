@@ -134,8 +134,8 @@ namespace Microsoft::Console::VirtualTerminal
         void _EnterDcsIgnore() noexcept;
         void _EnterDcsIntermediate() noexcept;
         void _EnterDcsPassThrough() noexcept;
-        void _EnterSosPmString() noexcept;
-        void _EnterApcEntry() noexcept;
+        void _EnterSosPmString(const bool preserveCachedSequence) noexcept;
+        void _EnterApcEntry(const bool preserveCachedSequence) noexcept;
         void _EnterApcPassThrough() noexcept;
         void _EnterApcIgnore() noexcept;
 

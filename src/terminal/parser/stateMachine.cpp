@@ -791,7 +791,7 @@ void StateMachine::_ActionApcDispatch(const wchar_t wch)
     {
         // Nothing claimed it, so it degrades to the string every APC used to
         // be: reported as unknown, and otherwise ignored to its terminator.
-        _EnterSosPmString();
+        _EnterSosPmString(_isEngineForInput);
     }
 }
 
@@ -1084,13 +1084,17 @@ void StateMachine::_EnterDcsPassThrough() noexcept
 //   2. When the Pm character is seen after an Escape entry
 //   3. When the Apc character is seen after an Escape entry
 // Arguments:
-// - <none>
+// - preserveCachedSequence - true if an input sequence may need to be passed
+//                           through once its string terminator arrives.
 // Return Value:
 // - <none>
-void StateMachine::_EnterSosPmString() noexcept
+void StateMachine::_EnterSosPmString(const bool preserveCachedSequence) noexcept
 {
     _state = VTStates::SosPmString;
-    _cachedSequence.reset();
+    if (!preserveCachedSequence)
+    {
+        _cachedSequence.reset();
+    }
     _engine->UnknownSequence();
     _trace.TraceStateChange(L"SosPmString");
 }
@@ -1101,13 +1105,17 @@ void StateMachine::_EnterSosPmString() noexcept
 //   1. When the Apc character is seen after an Escape entry
 //   The next character identifies the application the string is addressed to.
 // Arguments:
-// - <none>
+// - preserveCachedSequence - true if an input sequence may need to be passed
+//                           through once its string terminator arrives.
 // Return Value:
 // - <none>
-void StateMachine::_EnterApcEntry() noexcept
+void StateMachine::_EnterApcEntry(const bool preserveCachedSequence) noexcept
 {
     _state = VTStates::ApcEntry;
-    _cachedSequence.reset();
+    if (!preserveCachedSequence)
+    {
+        _cachedSequence.reset();
+    }
     _trace.TraceStateChange(L"ApcEntry");
 }
 
@@ -1220,11 +1228,11 @@ void StateMachine::_EventEscape(const wchar_t wch)
         }
         else if (_isSosIndicator(wch) || _isPmIndicator(wch))
         {
-            _EnterSosPmString();
+            _EnterSosPmString(false);
         }
         else if (_isApcIndicator(wch))
         {
-            _EnterApcEntry();
+            _EnterApcEntry(_isEngineForInput);
         }
         else
         {
