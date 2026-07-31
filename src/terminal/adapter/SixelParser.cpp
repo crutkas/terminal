@@ -272,8 +272,20 @@ void SixelParser::_executeNextLine()
 void SixelParser::_executeMoveToHome()
 {
     _executeCarriageReturn();
-    _maybeFlushImageBuffer();
-    _imageCursor.y = 0;
+    if (_imageOriginCell != _textCursor)
+    {
+        _maybeFlushImageBuffer(false, true);
+        _imageOriginCell = _textCursor;
+        _imageCursor = {};
+        _imageWidth = 0;
+        _imageBuffer.clear();
+        _resizeImageBuffer(_sixelHeight);
+    }
+    else
+    {
+        _maybeFlushImageBuffer();
+        _imageCursor.y = 0;
+    }
     _availablePixelHeight = _textMargins.height() * _cellSize.height;
 }
 
@@ -693,7 +705,7 @@ void SixelParser::_initImageBuffer()
     _imageOriginCell = _textCursor;
     _imageCursor = {};
     _imageWidth = 0;
-    _imageMaxWidth = std::min(_availablePixelWidth, Image::MaximumDimension);
+    _imageMaxWidth = _availablePixelWidth;
     _imageLineCount = 0;
     _resizeImageBuffer(_sixelHeight);
 
@@ -719,19 +731,44 @@ ImagePlacement::Key SixelParser::_allocateImageKey() noexcept
     return key;
 }
 
+til::CoordType SixelParser::_maximumImageBufferHeight() const noexcept
+{
+    if (_imageMaxWidth <= 0)
+    {
+        return 0;
+    }
+
+    const auto width = static_cast<size_t>(_imageMaxWidth);
+    const auto heightFromBudget = MAX_STAGING_PIXELS / width;
+    return gsl::narrow_cast<til::CoordType>(heightFromBudget);
+}
+
 void SixelParser::_resizeImageBuffer(const til::CoordType requiredHeight)
 {
     THROW_HR_IF(E_INVALIDARG, requiredHeight <= 0 || _imageCursor.y < 0 || _imageMaxWidth <= 0);
+    const auto maximumHeight = _maximumImageBufferHeight();
+    THROW_HR_IF(E_OUTOFMEMORY, maximumHeight < requiredHeight);
+
     auto height = static_cast<uint64_t>(_imageCursor.y) + static_cast<uint64_t>(requiredHeight);
-    if (height > Image::MaximumDimension && !_displayMode)
+    if (height > static_cast<uint64_t>(maximumHeight))
     {
         _maybeFlushImageBuffer(false, true);
+
+        const auto rowsToDelete = _imageCursor.y / _cellSize.height;
+        if (rowsToDelete > 0)
+        {
+            _eraseImageBufferRows(rowsToDelete);
+            _imageOriginCell.y += rowsToDelete;
+        }
+
         height = static_cast<uint64_t>(_imageCursor.y) + static_cast<uint64_t>(requiredHeight);
     }
-    THROW_HR_IF(E_NOTIMPL, height > Image::MaximumDimension);
+    THROW_HR_IF(E_OUTOFMEMORY, height > static_cast<uint64_t>(maximumHeight));
+
     const auto width = gsl::narrow<size_t>(_imageMaxWidth);
     THROW_HR_IF(E_INVALIDARG, height > SIZE_MAX / width);
     const auto requiredSize = gsl::narrow<size_t>(height) * width;
+    THROW_HR_IF(E_OUTOFMEMORY, requiredSize > MAX_STAGING_PIXELS);
     if (requiredSize > _imageBuffer.size())
     {
         static constexpr auto transparentPixel = IndexedPixel{ .transparent = true };
@@ -750,10 +787,17 @@ void SixelParser::_fillImageBackground()
         // none were given, up to the page boundaries). The actual image output
         // isn't limited by the background dimensions though.
         const auto backgroundHeight = std::min(_backgroundSize.height, _availablePixelHeight);
-        const auto backgroundWidth = std::min(_backgroundSize.width, _availablePixelWidth);
-        THROW_HR_IF(E_NOTIMPL, backgroundWidth > Image::MaximumDimension);
-        _resizeImageBuffer(backgroundHeight);
-        _fillImageBackground(backgroundHeight);
+        const auto maximumHeight = _maximumImageBufferHeight();
+        const auto cursorRowOffset = _imageCursor.y % _cellSize.height;
+        if (backgroundHeight > maximumHeight - cursorRowOffset)
+        {
+            _fillImageBackgroundInChunks(backgroundHeight);
+        }
+        else
+        {
+            _resizeImageBuffer(backgroundHeight);
+            _fillImageBackground(backgroundHeight);
+        }
         // When the image extends beyond the page boundaries, and the screen is
         // scrolled, we also need to fill the newly exposed lines, so we keep a
         // record of the area filled so far. Initially this is considered to be
@@ -763,11 +807,11 @@ void SixelParser::_fillImageBackground()
     }
 }
 
-void SixelParser::_fillImageBackground(const int backgroundHeight)
+void SixelParser::_fillImageBackground(const til::CoordType backgroundHeight)
 {
     static constexpr auto backgroundPixel = IndexedPixel{};
     const auto backgroundWidth = std::min({ _backgroundSize.width, _availablePixelWidth, _imageMaxWidth });
-    const auto backgroundOffset = _imageCursor.y * _imageMaxWidth;
+    const auto backgroundOffset = gsl::narrow<size_t>(_imageCursor.y) * gsl::narrow<size_t>(_imageMaxWidth);
     auto dst = std::next(_imageBuffer.begin(), backgroundOffset);
     for (auto i = 0; i < backgroundHeight; i++)
     {
@@ -775,6 +819,49 @@ void SixelParser::_fillImageBackground(const int backgroundHeight)
         std::advance(dst, _imageMaxWidth);
     }
     _imageWidth = std::max(_imageWidth, backgroundWidth);
+}
+
+void SixelParser::_fillImageBackgroundInChunks(const til::CoordType backgroundHeight)
+{
+    const auto maximumHeight = _maximumImageBufferHeight();
+    const auto alignedMaximumHeight = maximumHeight / _cellSize.height * _cellSize.height;
+    THROW_HR_IF(E_OUTOFMEMORY, alignedMaximumHeight <= 0);
+
+    const auto originalOrigin = _imageOriginCell;
+    const auto originalCursor = _imageCursor;
+    const auto originalWidth = _imageWidth;
+    auto filledHeight = til::CoordType{ 0 };
+
+    while (filledHeight < backgroundHeight)
+    {
+        const auto pixelOffset = static_cast<int64_t>(originalCursor.y) + filledHeight;
+        const auto rowOffset = gsl::narrow<til::CoordType>(pixelOffset / _cellSize.height);
+        const auto pixelRowOffset = gsl::narrow<til::CoordType>(pixelOffset % _cellSize.height);
+        const auto fillHeight = std::min(backgroundHeight - filledHeight, alignedMaximumHeight - pixelRowOffset);
+        THROW_HR_IF(E_OUTOFMEMORY, fillHeight <= 0);
+
+        _imageOriginCell.y = gsl::narrow<til::CoordType>(static_cast<int64_t>(originalOrigin.y) + rowOffset);
+        _imageCursor = { 0, pixelRowOffset };
+        _imageWidth = 0;
+
+        const auto bufferHeight = pixelRowOffset + fillHeight;
+        const auto bufferSize = gsl::narrow<size_t>(bufferHeight) * gsl::narrow<size_t>(_imageMaxWidth);
+        THROW_HR_IF(E_OUTOFMEMORY, bufferSize > MAX_STAGING_PIXELS);
+        static constexpr auto transparentPixel = IndexedPixel{ .transparent = true };
+        _imageBuffer.assign(bufferSize, transparentPixel);
+        _fillImageBackground(fillHeight);
+        _maybeFlushImageBuffer(false, true);
+
+        filledHeight += fillHeight;
+    }
+
+    const auto rowOffset = originalCursor.y / _cellSize.height;
+    _imageOriginCell = originalOrigin;
+    _imageOriginCell.y = gsl::narrow<til::CoordType>(static_cast<int64_t>(originalOrigin.y) + rowOffset);
+    _imageCursor = { originalCursor.x, originalCursor.y % _cellSize.height };
+    _imageWidth = originalWidth;
+    _imageBuffer.clear();
+    _resizeImageBuffer(_sixelHeight);
 }
 
 void SixelParser::_fillImageBackgroundWhenScrolled()
@@ -816,12 +903,7 @@ void SixelParser::_writeToImageBuffer(int sixelValue, int repeatCount)
     // is received. So if we haven't filled it yet, we need to do so now.
     _fillImageBackground();
 
-    if (_availablePixelWidth > Image::MaximumDimension &&
-        repeatCount > Image::MaximumDimension - _imageCursor.x)
-    {
-        THROW_HR(E_NOTIMPL);
-    }
-    repeatCount = std::min(repeatCount, _imageMaxWidth - _imageCursor.x);
+    repeatCount = std::min(repeatCount, _availablePixelWidth - _imageCursor.x);
     if (repeatCount <= 0)
     {
         return;

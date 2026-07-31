@@ -4934,6 +4934,168 @@ public:
         VERIFY_ARE_EQUAL(_testGetSet->_viewport.bottom, cursor.GetPosition().y, L"the cursor must remain aligned with the next sixel row after scrolling");
     }
 
+    TEST_METHOD(SixelDisplayModeBeyondMaximumSurfaceHeightUsesTiles)
+    {
+        _testGetSet->PrepData();
+        constexpr auto pageRows = 411;
+        constexpr auto finalBandTop = 684 * 12;
+        static_assert(pageRows * 20 > Image::MaximumDimension);
+        static_assert(finalBandTop > Image::MaximumDimension);
+        _testGetSet->_textBuffer = std::make_unique<TextBuffer>(til::size{ 4, pageRows }, TextAttribute{}, 0, false, &_testGetSet->_renderer);
+        _testGetSet->_viewport = { 0, 0, 4, pageRows };
+        auto& buffer = *_testGetSet->_textBuffer;
+        auto& cursor = buffer.GetCursor();
+        cursor.SetPosition({ 0, 0 });
+        cursor.SetIsVisible(true);
+        _stateMachine->ProcessString(L"\x1b[?80h");
+
+        auto handler = _pDispatch->DefineSixelImage(0, DispatchTypes::SixelBackground::Transparent, {});
+        VERIFY_IS_TRUE(static_cast<bool>(handler));
+        const auto send = [&](const std::wstring_view text) {
+            for (const auto ch : text)
+            {
+                VERIFY_IS_TRUE(handler(ch), L"the large display-mode image must not abort");
+            }
+        };
+
+        send(L"#0;2;100;0;0");
+        for (auto band = 0; band < 684; ++band)
+        {
+            send(L"~-");
+        }
+        send(L"#1;2;0;0;100~");
+        _pDispatch->_sixelParser->_maybeFlushImageBuffer(false, true);
+
+        const auto& parser = *_pDispatch->_sixelParser;
+        const auto stagingHeight = parser._imageBuffer.size() / gsl::narrow<size_t>(parser._imageMaxWidth);
+        VERIFY_IS_TRUE(stagingHeight > Image::MaximumDimension,
+                       L"parser staging must not inherit the renderer surface-height limit");
+        VERIFY_IS_TRUE(parser._imageBuffer.size() <= SixelParser::MAX_STAGING_PIXELS);
+        VERIFY_ARE_EQUAL(pageRows, CountImageRows(buffer));
+        VERIFY_IS_TRUE(BufferContainsColor(buffer, 255, 0, 0));
+        VERIFY_IS_TRUE(BufferContainsColor(buffer, 0, 0, 255), L"content beyond 8192 device pixels must reach the final page row");
+        VERIFY_IS_TRUE(std::ranges::all_of(buffer.GetImages().All(), [](const auto& placement) {
+            const auto size = placement.Surface().PixelSize();
+            return size.width <= Image::MaximumDimension && size.height <= Image::MaximumDimension;
+        }));
+
+        send(L"#0;2;0;100;0$");
+        _pDispatch->_sixelParser->_maybeFlushImageBuffer(false, true);
+        VERIFY_IS_FALSE(BufferContainsColor(buffer, 255, 0, 0));
+        VERIFY_IS_TRUE(BufferContainsColor(buffer, 0, 255, 0),
+                       L"palette redefinition must refresh rows already committed by an incremental flush");
+
+        VERIFY_IS_TRUE(handler(L'\x1b'));
+        VERIFY_IS_TRUE(cursor.IsVisible());
+        VERIFY_IS_TRUE(parser._imageBuffer.empty());
+    }
+
+    TEST_METHOD(SixelOpaqueBackgroundBeyondMaximumSurfaceHeightUsesTiles)
+    {
+        _testGetSet->PrepData();
+        constexpr auto pageRows = 411;
+        static_assert(pageRows * 20 > Image::MaximumDimension);
+        _testGetSet->_textBuffer = std::make_unique<TextBuffer>(til::size{ 4, pageRows }, TextAttribute{}, 0, false, &_testGetSet->_renderer);
+        _testGetSet->_viewport = { 0, 0, 4, pageRows };
+        auto& buffer = *_testGetSet->_textBuffer;
+        buffer.GetCursor().SetPosition({ 0, 0 });
+
+        _stateMachine->ProcessString(L"\x1bPq#1;2;100;0;0~\x1b\\");
+
+        VERIFY_ARE_EQUAL(pageRows, CountImageRows(buffer));
+        const auto finalRow = DirectImageSlice(buffer, pageRows - 1);
+        VERIFY_IS_NOT_NULL(finalRow);
+        VERIFY_ARE_EQUAL(static_cast<BYTE>(255), SlicePixelAt(finalRow, 0, 0).rgbReserved, L"background initialization must remain opaque beyond one renderer surface height");
+        VERIFY_IS_TRUE(std::ranges::all_of(buffer.GetImages().All(), [](const auto& placement) {
+            const auto size = placement.Surface().PixelSize();
+            return size.width <= Image::MaximumDimension && size.height <= Image::MaximumDimension;
+        }));
+        VERIFY_IS_TRUE(_pDispatch->_sixelParser->_imageBuffer.empty());
+    }
+
+    TEST_METHOD(SixelWideRepeatBeyondMaximumSurfaceWidthUsesTiles)
+    {
+        _testGetSet->PrepData();
+        constexpr auto pageColumns = 821;
+        constexpr auto repeatedPixels = 8201;
+        static_assert(pageColumns * 10 > Image::MaximumDimension);
+        static_assert(repeatedPixels > Image::MaximumDimension);
+        _testGetSet->_textBuffer = std::make_unique<TextBuffer>(til::size{ pageColumns, 4 }, TextAttribute{}, 0, false, &_testGetSet->_renderer);
+        _testGetSet->_viewport = { 0, 0, pageColumns, 4 };
+        auto& buffer = *_testGetSet->_textBuffer;
+        buffer.GetCursor().SetPosition({ 0, 0 });
+
+        _stateMachine->ProcessString(L"\x1bP0;1q#0;2;100;0;0!8201~$#1;2;0;0;100!8200?~\x1b\\");
+
+        const auto placements = buffer.GetImages().All();
+        VERIFY_ARE_EQUAL(size_t{ 2 }, placements.size(), L"wide Sixel output must split at renderer-safe tile boundaries");
+        VERIFY_IS_TRUE(std::ranges::all_of(placements, [](const auto& placement) {
+            const auto size = placement.Surface().PixelSize();
+            return placement.Identity().protocol == ImagePlacement::Key::Protocol::Sixel &&
+                   size.width <= Image::MaximumDimension &&
+                   size.height <= Image::MaximumDimension;
+        }));
+
+        const auto slice = DirectImageSlice(buffer, 0);
+        VERIFY_IS_NOT_NULL(slice);
+        VERIFY_ARE_EQUAL(pageColumns * 10, slice->PixelWidth());
+        VERIFY_IS_TRUE(SlicePixelIs(slice, 0, 0, 255, 0, 0));
+        VERIFY_IS_TRUE(SlicePixelIs(slice, 8200, 0, 0, 0, 255),
+                       L"a transparent overlay beyond the first 8192 pixels must reach the second tile");
+        VERIFY_IS_TRUE(_pDispatch->_sixelParser->_imageBuffer.empty());
+    }
+
+    TEST_METHOD(SixelOpaqueBackgroundBeyondMaximumSurfaceWidthUsesTiles)
+    {
+        _testGetSet->PrepData();
+        constexpr auto pageColumns = 821;
+        static_assert(pageColumns * 10 > Image::MaximumDimension);
+        _testGetSet->_textBuffer = std::make_unique<TextBuffer>(til::size{ pageColumns, 4 }, TextAttribute{}, 0, false, &_testGetSet->_renderer);
+        _testGetSet->_viewport = { 0, 0, pageColumns, 4 };
+        auto& buffer = *_testGetSet->_textBuffer;
+        buffer.GetCursor().SetPosition({ 0, 0 });
+
+        _stateMachine->ProcessString(L"\x1bPq\"1;1;8210;20#1;2;100;0;0~\x1b\\");
+
+        const auto placements = buffer.GetImages().All();
+        VERIFY_ARE_EQUAL(size_t{ 2 }, placements.size());
+        VERIFY_IS_TRUE(std::ranges::all_of(placements, [](const auto& placement) {
+            return placement.Surface().PixelSize().width <= Image::MaximumDimension;
+        }));
+        const auto slice = DirectImageSlice(buffer, 0);
+        VERIFY_IS_NOT_NULL(slice);
+        VERIFY_ARE_EQUAL(pageColumns * 10, slice->PixelWidth());
+        VERIFY_ARE_EQUAL(static_cast<BYTE>(255), SlicePixelAt(slice, 8209, 0).rgbReserved, L"opaque raster initialization must cover the second horizontal tile");
+        VERIFY_IS_TRUE(_pDispatch->_sixelParser->_imageBuffer.empty());
+    }
+
+    TEST_METHOD(SixelStagingBudgetFailureReleasesParserState)
+    {
+        _testGetSet->PrepData();
+        constexpr auto pageColumns = 821;
+        constexpr auto pageRows = 411;
+        _testGetSet->_textBuffer = std::make_unique<TextBuffer>(til::size{ pageColumns, pageRows }, TextAttribute{}, 0, false, &_testGetSet->_renderer);
+        _testGetSet->_viewport = { 0, 0, pageColumns, pageRows };
+        auto& buffer = *_testGetSet->_textBuffer;
+        auto& cursor = buffer.GetCursor();
+        cursor.SetPosition({ 0, 0 });
+        cursor.SetIsVisible(true);
+
+        auto handler = _pDispatch->DefineSixelImage(0, DispatchTypes::SixelBackground::Transparent, {});
+        VERIFY_IS_TRUE(static_cast<bool>(handler));
+        for (const auto ch : std::wstring_view{ L"\"9999;1" })
+        {
+            VERIFY_IS_TRUE(handler(ch));
+        }
+        VERIFY_IS_FALSE(handler(L'#'), L"a single raster row larger than the fixed staging budget must be rejected");
+
+        const auto& parser = *_pDispatch->_sixelParser;
+        VERIFY_IS_TRUE(parser._imageBuffer.empty());
+        VERIFY_IS_TRUE(parser._activeTiles.empty());
+        VERIFY_IS_TRUE(buffer.GetImages().Empty());
+        VERIFY_IS_TRUE(cursor.IsVisible(), L"staging failure must restore cursor visibility");
+    }
+
     TEST_METHOD(SixelFinalizationReleasesParserSurface)
     {
         _testGetSet->PrepData();

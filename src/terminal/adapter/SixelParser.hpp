@@ -42,6 +42,10 @@ namespace Microsoft::Console::VirtualTerminal
         // change the IndexType to uint16_t, and use a bit field in IndexedPixel
         // to retain the 16-bit size.
         static constexpr size_t MAX_COLORS = 256;
+        // This preserves the old worst-case staging allocation while allowing
+        // either axis to exceed a renderer surface dimension.
+        static constexpr size_t MAX_STAGING_PIXELS =
+            static_cast<size_t>(Image::MaximumDimension) * Image::MaximumDimension;
         using IndexType = uint8_t;
         struct alignas(int16_t) IndexedPixel
         {
@@ -110,9 +114,11 @@ namespace Microsoft::Console::VirtualTerminal
         bool _colorTableChanged = false;
 
         void _initImageBuffer();
+        til::CoordType _maximumImageBufferHeight() const noexcept;
         void _resizeImageBuffer(const til::CoordType requiredHeight);
         void _fillImageBackground();
-        void _fillImageBackground(const int backgroundHeight);
+        void _fillImageBackground(const til::CoordType backgroundHeight);
+        void _fillImageBackgroundInChunks(const til::CoordType backgroundHeight);
         void _fillImageBackgroundWhenScrolled();
         void _decreaseFilledBackgroundHeight(const int decreasedHeight) noexcept;
         void _writeToImageBuffer(const int sixelValue, const int repeatCount);
