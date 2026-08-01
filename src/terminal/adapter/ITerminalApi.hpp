@@ -52,6 +52,8 @@ namespace Microsoft::Console::VirtualTerminal
         virtual StateMachine& GetStateMachine() = 0;
         virtual BufferState GetBufferAndViewport() = 0;
         virtual void SetViewportPosition(const til::point position) = 0;
+        virtual void SetViewportPositionInternal(const til::point position) = 0;
+        virtual void RestoreViewportPositionInternal(const til::point position) = 0;
 
         virtual bool IsVtInputEnabled() const = 0;
 

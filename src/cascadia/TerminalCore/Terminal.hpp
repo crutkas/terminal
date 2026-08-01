@@ -138,6 +138,8 @@ public:
     Microsoft::Console::VirtualTerminal::StateMachine& GetStateMachine() noexcept override;
     BufferState GetBufferAndViewport() noexcept override;
     void SetViewportPosition(const til::point position) noexcept override;
+    void SetViewportPositionInternal(const til::point position) override;
+    void RestoreViewportPositionInternal(const til::point position) override;
     void SetSystemMode(const Mode mode, const bool enabled) noexcept override;
     bool GetSystemMode(const Mode mode) const noexcept override;
     void ReturnAnswerback() override;
@@ -413,6 +415,7 @@ private:
     std::unique_ptr<TextBuffer> _mainBuffer;
     std::unique_ptr<TextBuffer> _altBuffer;
     Microsoft::Console::Types::Viewport _mutableViewport;
+    std::optional<til::point> _speculativeViewportOrigin;
     til::CoordType _scrollbackLines = 0;
     bool _detectURLs = false;
     bool _clipboardOperationsAllowed = true;

@@ -44,6 +44,7 @@ class ImageTests
     TEST_METHOD(ResizeRetainsMixedCellSizesWithoutRowStorage);
     TEST_METHOD(ReflowAppliesDirectPlacementPolicy);
     TEST_METHOD(ReflowDistinguishesPlaceholderProtocol);
+    TEST_METHOD(InvalidImageCellRefDoesNotAllocateStorage);
 
     static constexpr til::size CellSize{ 2, 3 };
 
@@ -131,6 +132,24 @@ void ImageTests::RowIndexRebuildsAfterMutation()
 
     VERIFY_IS_TRUE(images.Erase({ 2, 2 }));
     VERIFY_ARE_EQUAL(size_t{ 0 }, images.IntersectingRows(5, 6).size());
+}
+
+void ImageTests::InvalidImageCellRefDoesNotAllocateStorage()
+{
+    TextBuffer buffer{ til::size{ 4, 1 }, TextAttribute{}, 0, false, nullptr };
+    auto& row = buffer.GetMutableRowByOffset(0);
+    VERIFY_IS_NULL(row._imageCellRefs.get());
+
+    row.SetImageCellRef(0, {});
+    row.RestoreImageCellRefNoAlloc(0, {});
+    VERIFY_IS_NULL(row._imageCellRefs.get(), L"invalid metadata must not materialize row metadata storage");
+
+    ImageCellRef valid{
+        .valid = true,
+    };
+    row.SetImageCellRef(0, valid);
+    VERIFY_IS_NOT_NULL(row._imageCellRefs.get());
+    VERIFY_IS_NOT_NULL(row.GetImageCellRef(0));
 }
 
 void ImageTests::EraseOutsideImageIsNoOp()

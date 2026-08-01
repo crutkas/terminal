@@ -297,6 +297,14 @@ try
     {
         return S_FALSE;
     }
+    const auto synchronizeImagePlacements = [&]() {
+        if (!_stateMachine)
+        {
+            return true;
+        }
+        auto& engine = reinterpret_cast<OutputStateMachineEngine&>(_stateMachine->Engine());
+        return static_cast<AdaptDispatch&>(engine.Dispatch()).SynchronizeImagePlacements();
+    };
 
     if (_inAltBuffer())
     {
@@ -304,19 +312,33 @@ try
         // Deferring the reflow of the main buffer has the benefit that it avoids destroying the state
         // of the text buffer any more than necessary. For ConPTY in particular a reflow is destructive,
         // because it "forgets" text that wraps beyond the top of its viewport when shrinking it.
-        _deferredResize = viewportSize;
+        const auto previousDeferredResize = _deferredResize;
+        const auto previousAltBufferSize = _altBufferSize;
+        const auto previousMutableViewport = _mutableViewport;
+        auto altSnapshot = _altBuffer->CreateResizeSnapshot();
 
         // GH#3494: We don't need to reflow the alt buffer. Apps that use the alt buffer will
         // redraw themselves. This prevents graphical artifacts and is consistent with VTE.
         _altBuffer->ResizeTraditional(viewportSize);
 
         _altBufferSize = viewportSize;
+        if (!synchronizeImagePlacements())
+        {
+            _altBuffer->RestoreResizeSnapshot(*altSnapshot);
+            _deferredResize = previousDeferredResize;
+            _altBufferSize = previousAltBufferSize;
+            _mutableViewport = previousMutableViewport;
+            LOG_HR(E_FAIL);
+            return E_FAIL;
+        }
+        _deferredResize = viewportSize;
         _altBuffer->TriggerRedrawAll();
         return S_OK;
     }
 
     const auto newBufferHeight = std::clamp(viewportSize.height + _scrollbackLines, 1, SHRT_MAX);
     const til::size bufferSize{ viewportSize.width, newBufferHeight };
+    const auto previousMutableViewport = _mutableViewport;
 
     // If the original buffer had _no_ scroll offset, then we should be at the
     // bottom in the new buffer as well. Track that case now.
@@ -455,6 +477,13 @@ try
     _mutableViewport = Viewport::FromDimensions({ 0, proposedTop }, viewportSize);
 
     _mainBuffer.swap(newTextBuffer);
+    if (!synchronizeImagePlacements())
+    {
+        // Reflow is speculative until the relative image registry follows it.
+        _mainBuffer.swap(newTextBuffer);
+        _mutableViewport = previousMutableViewport;
+        return E_FAIL;
+    }
 
     // GH#3494: Maintain scrollbar position during resize
     // Make sure that we don't scroll past the mutableViewport at the bottom of the buffer

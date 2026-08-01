@@ -22,6 +22,137 @@ KittyParser::KittyParser(AdaptDispatch& dispatcher) noexcept :
 {
 }
 
+class KittyParser::PlacementMutationGuard final
+{
+public:
+    PlacementMutationGuard(KittyParser& parser, const bool active) :
+        _parser{ parser },
+        _active{ active }
+    {
+        if (!_active)
+        {
+            return;
+        }
+
+        try
+        {
+            _state.nextImageId = parser._nextImageId;
+            _state.nextLayerId = parser._nextLayerId;
+            _state.totalPixelBytes = parser._totalPixelBytes;
+            _state.images = parser._images;
+            _state.imageNumbers = parser._imageNumbers;
+            _state.imageOrder = parser._imageOrder;
+            _state.virtualIds = parser._virtualIds;
+            _state.placements = parser._placements;
+            _state.anonymousPlacements = parser._anonymousPlacements;
+            parser._dispatcher._pages.ForEachPage([&](const Page page) {
+                _pages.push_back({
+                    .page = page,
+                    .images = page.Buffer().GetImages().Snapshot(),
+                    .cursor = page.Buffer().GetCursor().GetState(),
+                });
+            });
+        }
+        catch (const std::bad_alloc&)
+        {
+            _ready = false;
+        }
+        catch (const wil::ResultException&)
+        {
+            _ready = false;
+        }
+        catch (const std::exception&)
+        {
+            _ready = false;
+        }
+    }
+
+    ~PlacementMutationGuard() noexcept
+    {
+        if (_active && _ready && !_committed)
+        {
+            _restore();
+        }
+    }
+
+    bool Ready() const noexcept
+    {
+        return _ready;
+    }
+
+    void Commit() noexcept
+    {
+        _committed = true;
+    }
+
+private:
+    struct PageSnapshot
+    {
+        Page page;
+        ImageCollection images;
+        Cursor::State cursor;
+    };
+
+    void _restore() noexcept
+    {
+        _parser._nextImageId = _state.nextImageId;
+        _parser._nextLayerId = _state.nextLayerId;
+        _parser._totalPixelBytes = _state.totalPixelBytes;
+        _parser._images.swap(_state.images);
+        _parser._imageNumbers.swap(_state.imageNumbers);
+        _parser._imageOrder.swap(_state.imageOrder);
+        _parser._virtualIds.swap(_state.virtualIds);
+        _parser._placements.swap(_state.placements);
+        _parser._anonymousPlacements.swap(_state.anonymousPlacements);
+        for (auto& snapshot : _pages)
+        {
+            snapshot.page.Buffer().GetMutableImages() = std::move(snapshot.images);
+            snapshot.page.Buffer().GetCursor().RestoreState(snapshot.cursor);
+        }
+    }
+
+    KittyParser& _parser;
+    bool _active = false;
+    bool _ready = true;
+    bool _committed = false;
+    BufferState _state;
+    std::vector<PageSnapshot> _pages;
+};
+
+class KittyParser::MutationSnapshot final
+{
+public:
+    BufferState state;
+};
+
+std::shared_ptr<KittyParser::MutationSnapshot> KittyParser::CreateMutationSnapshot() const
+{
+    auto snapshot = std::make_shared<MutationSnapshot>();
+    snapshot->state.nextImageId = _nextImageId;
+    snapshot->state.nextLayerId = _nextLayerId;
+    snapshot->state.totalPixelBytes = _totalPixelBytes;
+    snapshot->state.images = _images;
+    snapshot->state.imageNumbers = _imageNumbers;
+    snapshot->state.imageOrder = _imageOrder;
+    snapshot->state.virtualIds = _virtualIds;
+    snapshot->state.placements = _placements;
+    snapshot->state.anonymousPlacements = _anonymousPlacements;
+    return snapshot;
+}
+
+void KittyParser::RestoreMutationSnapshot(MutationSnapshot& snapshot) noexcept
+{
+    _nextImageId = snapshot.state.nextImageId;
+    _nextLayerId = snapshot.state.nextLayerId;
+    _totalPixelBytes = snapshot.state.totalPixelBytes;
+    _images.swap(snapshot.state.images);
+    _imageNumbers.swap(snapshot.state.imageNumbers);
+    _imageOrder.swap(snapshot.state.imageOrder);
+    _virtualIds.swap(snapshot.state.virtualIds);
+    _placements.swap(snapshot.state.placements);
+    _anonymousPlacements.swap(snapshot.state.anonymousPlacements);
+}
+
 void KittyParser::HardReset() noexcept
 {
     _clearImages();
@@ -31,7 +162,14 @@ void KittyParser::HardReset() noexcept
 
 void KittyParser::ErasePlacements()
 {
+    PlacementMutationGuard mutation{ *this, true };
+    if (!mutation.Ready())
+    {
+        LOG_HR(E_OUTOFMEMORY);
+        return;
+    }
     _deleteAllPlacements(false);
+    mutation.Commit();
 }
 
 void KittyParser::SaveMainBufferState() noexcept
@@ -336,6 +474,12 @@ void KittyParser::_ProcessCommand(const Control& command, const std::string_view
     auto success = true;
     std::wstring_view code = L"OK";
     auto assignedId = imageId;
+    PlacementMutationGuard mutation{ *this, action != L'q' };
+    if (!mutation.Ready())
+    {
+        success = false;
+        code = L"ENOMEM:image layer memory limit exceeded";
+    }
 
     const auto displayKittyPlacement = [&](const uint32_t targetImageId, const Image& image) {
         const auto placementId = command.havePlacementId ? command.placementId : 0u;
@@ -384,13 +528,15 @@ void KittyParser::_ProcessCommand(const Control& command, const std::string_view
             }
             while (_anonymousPlacements.size() >= MaxPlacements)
             {
-                const auto& victim = _anonymousPlacements.front();
+                const auto victim = _anonymousPlacements.front();
                 _erasePlacementCells(victim);
+                _anonymousPlacements.erase(_anonymousPlacements.begin());
                 if (victim.isVirtual)
                 {
                     _virtualIds.erase({ victim.imageId, 0u });
+                    std::deque<std::pair<uint32_t, uint32_t>> removed{ { victim.imageId, 0 } };
+                    _cascadePlacementChildren(removed, 0);
                 }
-                _anonymousPlacements.erase(_anonymousPlacements.begin());
             }
             _anonymousPlacements.push_back(placement);
         };
@@ -590,12 +736,19 @@ void KittyParser::_ProcessCommand(const Control& command, const std::string_view
             if (placementId != 0)
             {
                 _placements.erase({ targetImageId, placementId });
+                std::deque<std::pair<uint32_t, uint32_t>> removed{ { targetImageId, placementId } };
+                _cascadePlacementChildren(removed, targetImageId);
             }
             else
             {
                 std::erase_if(_anonymousPlacements, [&](const auto& placement) {
                     return placement.layerId == priorPlacement->layerId;
                 });
+                if (priorPlacement->isVirtual)
+                {
+                    std::deque<std::pair<uint32_t, uint32_t>> removed{ { targetImageId, 0 } };
+                    _cascadePlacementChildren(removed, targetImageId);
+                }
             }
         }
 
@@ -618,24 +771,26 @@ void KittyParser::_ProcessCommand(const Control& command, const std::string_view
         {
             while (_anonymousPlacements.size() >= MaxPlacements)
             {
-                const auto& victim = _anonymousPlacements.front();
+                const auto victim = _anonymousPlacements.front();
                 _erasePlacementCells(victim);
+                _anonymousPlacements.erase(_anonymousPlacements.begin());
                 if (victim.isVirtual)
                 {
                     _virtualIds.erase({ victim.imageId, 0u });
+                    std::deque<std::pair<uint32_t, uint32_t>> removed{ { victim.imageId, 0 } };
+                    _cascadePlacementChildren(removed, 0);
                 }
-                _anonymousPlacements.erase(_anonymousPlacements.begin());
             }
             _anonymousPlacements.push_back(placement);
         }
     };
 
-    if (haveId && haveNumber)
+    if (success && haveId && haveNumber)
     {
         success = false;
         code = L"EINVAL:i and I are mutually exclusive";
     }
-    else
+    else if (success)
     {
         switch (action)
         {
@@ -992,6 +1147,11 @@ void KittyParser::_ProcessCommand(const Control& command, const std::string_view
         }
     }
 
+    if (success)
+    {
+        mutation.Commit();
+    }
+
     if (success && quiet >= 1)
     {
         return;
@@ -1077,6 +1237,11 @@ uint32_t KittyParser::_assignImageId()
 
 bool KittyParser::_registerImage(const uint32_t id, Image&& image)
 {
+    PlacementMutationGuard mutation{ *this, true };
+    if (!mutation.Ready())
+    {
+        return false;
+    }
     const auto number = image.number;
     const auto newBytes = image.PixelBytes();
     const auto existing = _images.find(id);
@@ -1129,6 +1294,7 @@ bool KittyParser::_registerImage(const uint32_t id, Image&& image)
     {
         _imageNumbers[number].push_back(id);
     }
+    mutation.Commit();
     return true;
 }
 
@@ -1161,11 +1327,26 @@ void KittyParser::_eraseImage(const uint32_t id)
     {
         placement = placement->first.first == id ? _placements.erase(placement) : std::next(placement);
     }
-    _anonymousPlacements.erase(
-        std::remove_if(_anonymousPlacements.begin(), _anonymousPlacements.end(), [id](const Placement& placement) noexcept {
-            return placement.imageId == id;
-        }),
-        _anonymousPlacements.end());
+    std::deque<std::pair<uint32_t, uint32_t>> removed;
+    for (auto placement = _anonymousPlacements.begin(); placement != _anonymousPlacements.end();)
+    {
+        if (placement->imageId == id)
+        {
+            if (placement->isVirtual)
+            {
+                removed.push_back({ placement->imageId, 0 });
+            }
+            placement = _anonymousPlacements.erase(placement);
+        }
+        else
+        {
+            ++placement;
+        }
+    }
+    if (!removed.empty())
+    {
+        _cascadePlacementChildren(removed, 0);
+    }
     if (!_imageOrder.empty() && _imageOrder.front() == id)
     {
         _imageOrder.pop_front();
@@ -1273,6 +1454,33 @@ size_t KittyParser::_retainedPixelBytes() const noexcept
 void KittyParser::_releaseImageSurface(Image& image) noexcept
 {
     image.surface.reset();
+}
+
+std::vector<KittyParser::ImageCacheState> KittyParser::_snapshotImageCacheStates() const
+{
+    std::vector<ImageCacheState> states;
+    states.reserve(_images.size());
+    for (const auto& [id, image] : _images)
+    {
+        states.push_back({
+            .id = id,
+            .hasRenderedPlacements = image.hasRenderedPlacements,
+            .surface = image.surface,
+        });
+    }
+    return states;
+}
+
+void KittyParser::_restoreImageCacheStates(const std::vector<ImageCacheState>& states) noexcept
+{
+    for (const auto& state : states)
+    {
+        if (const auto image = _images.find(state.id); image != _images.end())
+        {
+            image->second.hasRenderedPlacements = state.hasRenderedPlacements;
+            image->second.surface = state.surface;
+        }
+    }
 }
 
 void KittyParser::_clearChunk() noexcept
@@ -1516,13 +1724,13 @@ void KittyParser::_registerPlacement(const Placement& placement)
     }
 }
 
-bool KittyParser::_movePlacementChildren(const std::pair<uint32_t, uint32_t>& parent, const til::point parentAnchor, const bool apply, std::wstring_view& code)
+bool KittyParser::_movePlacementChildren(const std::pair<uint32_t, uint32_t>& parent, const std::optional<til::point> parentAnchor, const bool apply, std::wstring_view& code)
 {
     using PlacementKey = std::pair<uint32_t, uint32_t>;
     struct PendingParent
     {
         PlacementKey key;
-        til::point anchor;
+        std::optional<til::point> anchor;
         int depth = 0;
     };
     struct MovePlan
@@ -1531,206 +1739,338 @@ bool KittyParser::_movePlacementChildren(const std::pair<uint32_t, uint32_t>& pa
         size_t anonymousIndex = 0;
         Placement previous;
         std::optional<til::point> oldAnchor;
-        til::point anchor;
+        std::optional<til::point> anchor;
+    };
+    struct PageSnapshot
+    {
+        Page page;
+        ImageCollection images;
     };
 
-    std::map<PlacementKey, std::vector<PlacementKey>> registeredChildren;
-    for (const auto& entry : _placements)
-    {
-        const auto& child = entry.second;
-        if (child.hasParent)
-        {
-            registeredChildren[{ child.parentImageId, child.parentPlacementId }].push_back(entry.first);
-        }
-    }
-    std::map<PlacementKey, std::vector<size_t>> anonymousChildren;
-    for (size_t i = 0; i < _anonymousPlacements.size(); ++i)
-    {
-        const auto& child = _anonymousPlacements[i];
-        if (child.hasParent)
-        {
-            anonymousChildren[{ child.parentImageId, child.parentPlacementId }].push_back(i);
-        }
-    }
-
-    auto page = _dispatcher._pages.ActivePage();
-    const auto maxCol = std::max(0, page.Width() - 1);
-    const auto maxRow = std::max(0, page.Bottom() - 1);
-    const auto childAnchorFor = [&](const Placement& child, const til::point anchor) {
-        return til::point{
-            static_cast<til::CoordType>(std::clamp<int64_t>(static_cast<int64_t>(anchor.x) + child.offsetH, 0, maxCol)),
-            static_cast<til::CoordType>(std::clamp<int64_t>(static_cast<int64_t>(anchor.y) + child.offsetV, 0, maxRow)),
-        };
-    };
-
-    std::deque<PendingParent> pending{ { parent, parentAnchor, 0 } };
-    std::set<PlacementKey> visited;
+    auto failureCountdown = apply ? std::exchange(_testMovePlacementFailureCountdown, std::nullopt) :
+                                    std::optional<size_t>{};
     std::vector<MovePlan> plan;
-    while (!pending.empty())
+    std::map<PlacementKey, Placement> placementsBefore;
+    std::vector<Placement> anonymousBefore;
+    std::vector<PageSnapshot> pagesBefore;
+    std::vector<ImageCacheState> imageCachesBefore;
+    try
     {
-        const auto current = pending.front();
-        pending.pop_front();
-        if (current.depth > MaxPlacementDepth || !visited.emplace(current.key).second)
+        std::map<PlacementKey, std::vector<PlacementKey>> registeredChildren;
+        for (const auto& entry : _placements)
         {
-            code = current.depth > MaxPlacementDepth ?
-                       L"ETOODEEP:relative placement chain too deep" :
-                       L"ECYCLE:relative placement cycle";
-            return false;
-        }
-        if (const auto children = registeredChildren.find(current.key); children != registeredChildren.end())
-        {
-            for (const auto& childKey : children->second)
+            const auto& child = entry.second;
+            if (child.hasParent)
             {
-                const auto childIt = _placements.find(childKey);
-                if (childIt == _placements.end())
-                {
-                    code = L"ENOPARENT:relative child not found";
-                    return false;
-                }
-                const auto& child = childIt->second;
-                const auto anchor = childAnchorFor(child, current.anchor);
-                const auto oldAnchor = _derivePlacementAnchor(child);
-                if (!oldAnchor || *oldAnchor != anchor)
-                {
-                    plan.push_back({ childKey, 0, child, oldAnchor, anchor });
-                }
-                pending.push_back({ childKey, anchor, current.depth + 1 });
+                registeredChildren[{ child.parentImageId, child.parentPlacementId }].push_back(entry.first);
+            }
+        }
+        std::map<PlacementKey, std::vector<size_t>> anonymousChildren;
+        for (size_t i = 0; i < _anonymousPlacements.size(); ++i)
+        {
+            const auto& child = _anonymousPlacements[i];
+            if (child.hasParent)
+            {
+                anonymousChildren[{ child.parentImageId, child.parentPlacementId }].push_back(i);
             }
         }
 
-        if (const auto children = anonymousChildren.find(current.key); children != anonymousChildren.end())
-        {
-            for (const auto childIndex : children->second)
+        auto page = _dispatcher._pages.ActivePage();
+        const auto maxCol = std::max(0, page.Width() - 1);
+        const auto maxRow = std::max(0, page.Bottom() - 1);
+        const auto childAnchorFor = [&](const Placement& child, const std::optional<til::point> anchor) -> std::optional<til::point> {
+            if (!anchor)
             {
-                const auto& child = _anonymousPlacements[childIndex];
-                const auto anchor = childAnchorFor(child, current.anchor);
-                const auto oldAnchor = _derivePlacementAnchor(child);
-                if (!oldAnchor || *oldAnchor != anchor)
+                return std::nullopt;
+            }
+            return til::point{
+                static_cast<til::CoordType>(std::clamp<int64_t>(static_cast<int64_t>(anchor->x) + child.offsetH, 0, maxCol)),
+                static_cast<til::CoordType>(std::clamp<int64_t>(static_cast<int64_t>(anchor->y) + child.offsetV, 0, maxRow)),
+            };
+        };
+
+        std::deque<PendingParent> pending{ { parent, parentAnchor, 0 } };
+        std::set<PlacementKey> visited;
+        while (!pending.empty())
+        {
+            const auto current = pending.front();
+            pending.pop_front();
+            if (current.depth > MaxPlacementDepth || !visited.emplace(current.key).second)
+            {
+                code = current.depth > MaxPlacementDepth ?
+                           L"ETOODEEP:relative placement chain too deep" :
+                           L"ECYCLE:relative placement cycle";
+                return false;
+            }
+            if (const auto children = registeredChildren.find(current.key); children != registeredChildren.end())
+            {
+                for (const auto& childKey : children->second)
                 {
-                    plan.push_back({ std::nullopt, childIndex, child, oldAnchor, anchor });
+                    const auto childIt = _placements.find(childKey);
+                    if (childIt == _placements.end())
+                    {
+                        code = L"ENOPARENT:relative child not found";
+                        return false;
+                    }
+                    const auto& child = childIt->second;
+                    const auto anchor = childAnchorFor(child, current.anchor);
+                    const auto oldAnchor = _derivePlacementAnchor(child);
+                    const auto registryMatches = anchor &&
+                                                 child.anchorCol == anchor->x &&
+                                                 child.anchorRow == anchor->y;
+                    if (oldAnchor != anchor || !registryMatches)
+                    {
+                        plan.push_back({ childKey, 0, child, oldAnchor, anchor });
+                    }
+                    pending.push_back({ childKey, anchor, current.depth + 1 });
+                }
+            }
+
+            if (const auto children = anonymousChildren.find(current.key); children != anonymousChildren.end())
+            {
+                for (const auto childIndex : children->second)
+                {
+                    const auto& child = _anonymousPlacements[childIndex];
+                    const auto anchor = childAnchorFor(child, current.anchor);
+                    const auto oldAnchor = _derivePlacementAnchor(child);
+                    const auto registryMatches = anchor &&
+                                                 child.anchorCol == anchor->x &&
+                                                 child.anchorRow == anchor->y;
+                    if (oldAnchor != anchor || !registryMatches)
+                    {
+                        plan.push_back({ std::nullopt, childIndex, child, oldAnchor, anchor });
+                    }
+                    // An anonymous physical child does not define a parent identity. The
+                    // { imageId, 0 } key only names an anonymous virtual prototype.
                 }
             }
         }
-    }
 
-    if (!apply)
-    {
-        return std::ranges::all_of(plan, [&](const auto& move) {
-            if (_images.contains(move.previous.imageId))
-            {
-                return true;
-            }
-            code = L"ENOENT:relative child image not found";
-            return false;
+        if (!apply)
+        {
+            return std::ranges::all_of(plan, [&](const auto& move) {
+                if (_images.contains(move.previous.imageId))
+                {
+                    return true;
+                }
+                code = L"ENOENT:relative child image not found";
+                return false;
+            });
+        }
+        if (plan.empty())
+        {
+            return true;
+        }
+
+        placementsBefore = _placements;
+        anonymousBefore = _anonymousPlacements;
+        _dispatcher._pages.ForEachPage([&](const Page currentPage) {
+            pagesBefore.push_back({ currentPage, currentPage.Buffer().GetImages().Snapshot() });
         });
+        imageCachesBefore = _snapshotImageCacheStates();
+    }
+    catch (const std::bad_alloc&)
+    {
+        code = L"ENOMEM:image layer memory limit exceeded";
+        return false;
     }
 
-    for (const auto& move : plan)
-    {
-        _erasePlacementCells(move.previous);
-    }
-
-    auto succeeded = true;
-    for (const auto& move : plan)
-    {
-        const auto image = _images.find(move.previous.imageId);
-        if (image == _images.end())
+    const auto rollback = [&]() noexcept {
+        _placements.swap(placementsBefore);
+        _anonymousPlacements.swap(anonymousBefore);
+        for (auto& snapshot : pagesBefore)
         {
-            succeeded = false;
-            code = L"ENOENT:relative child image not found";
-            continue;
+            snapshot.page.Buffer().GetMutableImages() = std::move(snapshot.images);
         }
-        til::size drawn;
-        try
+        _restoreImageCacheStates(imageCachesBefore);
+        // Do not call TriggerRedraw here: it is not noexcept, and mutation paths
+        // already invalidate their affected regions.
+    };
+    const auto failMutation = [&]() {
+        if (_testPersistentMovePlacementFailure)
         {
-            drawn = _placeImage(image->second,
-                                false,
-                                move.previous.imageId,
-                                move.previous.layerId,
-                                move.previous.displayCols,
-                                move.previous.displayRows,
-                                move.previous.srcX,
-                                move.previous.srcY,
-                                move.previous.srcW,
-                                move.previous.srcH,
-                                move.previous.cellOffsetX,
-                                move.previous.cellOffsetY,
-                                move.previous.zIndex,
-                                move.anchor);
+            throw std::bad_alloc{};
         }
-        catch (const std::bad_alloc&)
+        if (failureCountdown)
         {
-            if (succeeded)
+            if (*failureCountdown == 0)
             {
-                code = L"ENOMEM:image layer memory limit exceeded";
+                throw std::bad_alloc{};
             }
-            succeeded = false;
-            continue;
+            --*failureCountdown;
         }
-        if (drawn.width <= 0 || drawn.height <= 0)
+    };
+    auto mutationStarted = false;
+    try
+    {
+        for (const auto& move : plan)
         {
-            if (succeeded)
+            if (move.oldAnchor != move.anchor)
+            {
+                failMutation();
+                mutationStarted = true;
+                _erasePlacementCells(move.previous);
+            }
+        }
+
+        for (const auto& move : plan)
+        {
+            if (!move.anchor)
+            {
+                continue;
+            }
+
+            auto* child = move.key ?
+                              &_placements.at(*move.key) :
+                              &_anonymousPlacements.at(move.anonymousIndex);
+            if (move.oldAnchor == move.anchor)
+            {
+                mutationStarted = true;
+                child->anchorCol = move.anchor->x;
+                child->anchorRow = move.anchor->y;
+                continue;
+            }
+
+            const auto image = _images.find(move.previous.imageId);
+            if (image == _images.end())
+            {
+                code = L"ENOENT:relative child image not found";
+                rollback();
+                return false;
+            }
+            failMutation();
+            mutationStarted = true;
+            const auto drawn = _placeImage(image->second,
+                                           false,
+                                           move.previous.imageId,
+                                           move.previous.layerId,
+                                           move.previous.displayCols,
+                                           move.previous.displayRows,
+                                           move.previous.srcX,
+                                           move.previous.srcY,
+                                           move.previous.srcW,
+                                           move.previous.srcH,
+                                           move.previous.cellOffsetX,
+                                           move.previous.cellOffsetY,
+                                           move.previous.zIndex,
+                                           *move.anchor);
+            if (drawn.width <= 0 || drawn.height <= 0)
             {
                 code = L"EINVAL:relative child has empty geometry";
+                rollback();
+                return false;
             }
-            succeeded = false;
-            continue;
-        }
 
-        auto* child = move.key ?
-                          &_placements.at(*move.key) :
-                          &_anonymousPlacements.at(move.anonymousIndex);
-        child->anchorCol = move.anchor.x;
-        child->anchorRow = move.anchor.y;
-        child->cols = drawn.width;
-        child->rows = drawn.height;
+            child->anchorCol = move.anchor->x;
+            child->anchorRow = move.anchor->y;
+            child->cols = drawn.width;
+            child->rows = drawn.height;
+        }
+        return true;
     }
-    if (succeeded)
+    catch (const std::bad_alloc&)
+    {
+        if (mutationStarted)
+        {
+            rollback();
+        }
+        code = L"ENOMEM:image layer memory limit exceeded";
+        return false;
+    }
+}
+
+bool KittyParser::SynchronizeVirtualPlacementChildren()
+{
+    using PlacementKey = std::pair<uint32_t, uint32_t>;
+    struct PageSnapshot
+    {
+        Page page;
+        ImageCollection images;
+    };
+
+    std::set<std::pair<uint32_t, uint32_t>> parents;
+    try
+    {
+        const auto rememberParent = [&](const Placement& child) {
+            const std::pair<uint32_t, uint32_t> key{ child.parentImageId, child.parentPlacementId };
+            if (child.hasParent && _virtualIds.contains(key))
+            {
+                parents.emplace(key);
+            }
+        };
+        for (const auto& [key, child] : _placements)
+        {
+            static_cast<void>(key);
+            rememberParent(child);
+        }
+        for (const auto& child : _anonymousPlacements)
+        {
+            rememberParent(child);
+        }
+    }
+    catch (const std::bad_alloc&)
+    {
+        LOG_HR(E_OUTOFMEMORY);
+        return false;
+    }
+    if (parents.empty())
     {
         return true;
     }
 
-    for (const auto& move : plan)
+    std::map<PlacementKey, Placement> placementsBefore;
+    std::vector<Placement> anonymousBefore;
+    std::vector<PageSnapshot> pagesBefore;
+    std::vector<ImageCacheState> imageCachesBefore;
+    try
     {
-        _erasePlacementCells(move.previous);
+        placementsBefore = _placements;
+        anonymousBefore = _anonymousPlacements;
+        _dispatcher._pages.ForEachPage([&](const Page page) {
+            pagesBefore.push_back({ page, page.Buffer().GetImages().Snapshot() });
+        });
+        imageCachesBefore = _snapshotImageCacheStates();
     }
-    for (const auto& move : plan)
+    catch (const std::bad_alloc&)
     {
-        auto* child = move.key ?
-                          &_placements.at(*move.key) :
-                          &_anonymousPlacements.at(move.anonymousIndex);
-        *child = move.previous;
-        if (!move.oldAnchor)
+        LOG_HR(E_OUTOFMEMORY);
+        return false;
+    }
+    const auto rollback = [&]() noexcept {
+        _placements.swap(placementsBefore);
+        _anonymousPlacements.swap(anonymousBefore);
+        for (auto& snapshot : pagesBefore)
         {
-            continue;
+            snapshot.page.Buffer().GetMutableImages() = std::move(snapshot.images);
         }
-        const auto image = _images.find(move.previous.imageId);
-        if (image == _images.end())
+        _restoreImageCacheStates(imageCachesBefore);
+        // Do not call TriggerRedraw here: it is not noexcept, and mutation paths
+        // already invalidate their affected regions.
+    };
+
+    for (const auto& key : parents)
+    {
+        std::wstring_view code;
+        if (!_movePlacementChildren(key, _deriveVirtualPlacementAnchor(key.first, key.second), true, code))
         {
-            continue;
-        }
-        try
-        {
-            _placeImage(image->second,
-                        false,
-                        move.previous.imageId,
-                        move.previous.layerId,
-                        move.previous.displayCols,
-                        move.previous.displayRows,
-                        move.previous.srcX,
-                        move.previous.srcY,
-                        move.previous.srcW,
-                        move.previous.srcH,
-                        move.previous.cellOffsetX,
-                        move.previous.cellOffsetY,
-                        move.previous.zIndex,
-                        *move.oldAnchor);
-        }
-        catch (const std::bad_alloc&)
-        {
+            rollback();
+            LOG_HR(code == L"ENOMEM:image layer memory limit exceeded" ? E_OUTOFMEMORY : E_FAIL);
+            return false;
         }
     }
-    return false;
+    return true;
+}
+
+bool KittyParser::HasRelativeVirtualDescendants() const noexcept
+{
+    const auto hasVirtualParent = [&](const Placement& placement) {
+        return placement.hasParent &&
+               _virtualIds.contains({ placement.parentImageId, placement.parentPlacementId });
+    };
+    return std::ranges::any_of(_placements, [&](const auto& entry) {
+               return hasVirtualParent(entry.second);
+           }) ||
+           std::ranges::any_of(_anonymousPlacements, hasVirtualParent);
 }
 
 void KittyParser::_erasePlacementCells(const Placement& placement)
@@ -1791,6 +2131,10 @@ void KittyParser::_erasePlacementsForImage(const uint32_t imageId)
     {
         if (placement->imageId == imageId)
         {
+            if (placement->isVirtual)
+            {
+                removed.push_back({ placement->imageId, 0 });
+            }
             _erasePlacementCells(*placement);
             placement = _anonymousPlacements.erase(placement);
         }
@@ -1845,6 +2189,17 @@ bool KittyParser::_imageHasRenderedPlacements(const uint32_t id) const
 
 void KittyParser::_cascadePlacementChildren(std::deque<std::pair<uint32_t, uint32_t>>& removed, const uint32_t keepImageId)
 {
+    auto failureCountdown = std::exchange(_testCascadeFailureAfterEraseCountdown, std::nullopt);
+    const auto failAfterErase = [&]() {
+        if (failureCountdown)
+        {
+            if (*failureCountdown == 0)
+            {
+                throw std::bad_alloc{};
+            }
+            --*failureCountdown;
+        }
+    };
     auto guard = MaxPlacements + 1;
     while (!removed.empty() && guard-- > 0)
     {
@@ -1856,6 +2211,7 @@ void KittyParser::_cascadePlacementChildren(std::deque<std::pair<uint32_t, uint3
             if (child.hasParent && child.parentImageId == parent.first && child.parentPlacementId == parent.second)
             {
                 _erasePlacementCells(child);
+                failAfterErase();
                 if (child.isVirtual)
                 {
                     _virtualIds.erase(placement->first);
@@ -1875,6 +2231,7 @@ void KittyParser::_cascadePlacementChildren(std::deque<std::pair<uint32_t, uint3
             {
                 const auto anonymousImageId = placement->imageId;
                 _erasePlacementCells(*placement);
+                failAfterErase();
                 placement = _anonymousPlacements.erase(placement);
                 if (anonymousImageId != keepImageId && _images.count(anonymousImageId) != 0 && !_imageHasPlacements(anonymousImageId))
                 {
@@ -2893,8 +3250,28 @@ bool KittyParser::StartsWithPlaceholderDiacritic(const std::wstring_view text) n
 // before a placeholder doesn't shift it. Called per segment with the segment's true post-wrap
 // row and start column.
 // Protocol: https://sw.kovidgoyal.net/kitty/graphics-protocol/#unicode-placeholders
-void KittyParser::RenderPlaceholders(const std::wstring_view segment, const til::CoordType screenRow, const til::CoordType startColumn)
+bool KittyParser::RenderPlaceholders(const std::wstring_view segment,
+                                     const til::CoordType screenRow,
+                                     const til::CoordType startColumn,
+                                     const ImageCellRef* const leadingCellMetadataBeforeWrite)
 {
+    using PlacementKey = std::pair<uint32_t, uint32_t>;
+    struct MetadataSnapshot
+    {
+        til::CoordType column = 0;
+        ImageCellRef value;
+    };
+    struct StaleFragment
+    {
+        ImagePlacement::Key key;
+        til::rect area;
+    };
+    struct PageSnapshot
+    {
+        Page page;
+        ImageCollection images;
+    };
+
     auto page = _dispatcher._pages.ActivePage();
     auto& buffer = page.Buffer();
     auto& row = buffer.GetMutableRowByOffset(screenRow);
@@ -2903,51 +3280,222 @@ void KittyParser::RenderPlaceholders(const std::wstring_view segment, const til:
     // instead of a TriggerRedraw per cell on the text-output hot path (matches _placeImage).
     auto firstDrawnCol = page.Width();
     auto lastDrawnCol = static_cast<til::CoordType>(-1);
-    std::vector<ImagePlacement> fragments;
-    fragments.reserve(std::min(segment.size(), static_cast<size_t>(page.Width())));
-    const auto recordDraw = [&](const til::CoordType drawnColumn) noexcept {
-        firstDrawnCol = std::min(firstDrawnCol, drawnColumn);
-        lastDrawnCol = std::max(lastDrawnCol, drawnColumn);
+    std::vector<MetadataSnapshot> metadataBefore;
+    std::vector<PageSnapshot> pagesBefore;
+    std::map<PlacementKey, Placement> placementsBefore;
+    std::vector<Placement> anonymousBefore;
+    std::vector<ImageCacheState> imageCachesBefore;
+    auto registrySnapshot = false;
+    const auto rollback = [&]() noexcept {
+        if (registrySnapshot)
+        {
+            _placements.swap(placementsBefore);
+            _anonymousPlacements.swap(anonymousBefore);
+        }
+        for (auto& snapshot : pagesBefore)
+        {
+            auto& snapshotBuffer = snapshot.page.Buffer();
+            snapshotBuffer.GetMutableImages() = std::move(snapshot.images);
+        }
+        for (const auto& snapshot : metadataBefore)
+        {
+            row.RestoreImageCellRefNoAlloc(snapshot.column, snapshot.value);
+        }
+        _restoreImageCacheStates(imageCachesBefore);
+        // Do not call TriggerRedraw here: it is not noexcept, and mutation paths
+        // already invalidate their affected regions.
     };
-    for (size_t i = 0; i < segment.size();)
+
+    try
     {
-        const auto next = buffer.GraphemeNext(segment, i);
-        const auto cluster = segment.substr(i, next - i);
-        // A write may be split anywhere, including before or between a placeholder's diacritics -
-        // the console write path chunks long runs. The orphaned marks then open the next segment,
-        // where they join the cell the previous segment already wrote, occupying no column of
-        // their own. Counting them as a cell shifted every placeholder that followed one column
-        // right, onto a cell carrying no image foreground, so that tile was silently dropped and
-        // the grid rendered with a hole in it.
-        if (i == 0 && _IsPlaceholderDiacriticRun(cluster))
-        {
-            // The joined cell was resolved from whatever part of its cluster had arrived, so a
-            // split ahead of the first mark left it addressing grid (0,0). The row now holds the
-            // finished grapheme, so resolve that cell again from it - at its own column, which
-            // keeps the write column where it is.
-            const auto previous = row.NavigateToPrevious(startColumn);
-            if (previous < startColumn && _renderPlaceholderCell(row, row.GlyphAt(previous), previous, screenRow, fragments))
+        imageCachesBefore = _snapshotImageCacheStates();
+        std::set<PlacementKey> parentsWithChildren;
+        const auto rememberParent = [&](const Placement& child) {
+            if (child.hasParent && _virtualIds.contains({ child.parentImageId, child.parentPlacementId }))
             {
-                recordDraw(previous);
+                parentsWithChildren.emplace(child.parentImageId, child.parentPlacementId);
             }
-            i = next;
-            continue;
-        }
-        if (_renderPlaceholderCell(row, cluster, column, screenRow, fragments))
+        };
+        for (const auto& [key, child] : _placements)
         {
-            recordDraw(column);
+            static_cast<void>(key);
+            rememberParent(child);
         }
-        // Advance by the glyph's real cell width; guard against a non-advancing step.
-        const auto nextColumn = row.NavigateToNext(column);
-        column = nextColumn > column ? nextColumn : column + 1;
-        i = next;
+        for (const auto& child : _anonymousPlacements)
+        {
+            rememberParent(child);
+        }
+
+        const auto rememberMetadata = [&](const til::CoordType targetColumn, const ImageCellRef* const metadataBeforeWrite = nullptr) {
+            if (targetColumn < 0 || targetColumn >= page.Width() ||
+                std::ranges::any_of(metadataBefore, [&](const auto& snapshot) { return snapshot.column == targetColumn; }))
+            {
+                return;
+            }
+            if (metadataBeforeWrite)
+            {
+                metadataBefore.push_back({ targetColumn, *metadataBeforeWrite });
+            }
+            else
+            {
+                const auto existing = row.GetImageCellRef(targetColumn);
+                metadataBefore.push_back({ targetColumn, existing ? *existing : ImageCellRef{} });
+            }
+        };
+        const auto virtualKeyForLayer = [&](const uint64_t layerId) -> std::optional<PlacementKey> {
+            const auto placement = std::ranges::find_if(_virtualIds, [&](const auto& entry) {
+                return entry.second.layerId == layerId;
+            });
+            return placement == _virtualIds.end() ? std::nullopt : std::optional<PlacementKey>{ placement->first };
+        };
+
+        std::vector<ImagePlacement> fragments;
+        fragments.reserve(std::min(segment.size(), static_cast<size_t>(page.Width())));
+        std::vector<StaleFragment> stale;
+        std::set<PlacementKey> touchedParents;
+        const auto recordDraw = [&](const til::CoordType drawnColumn) noexcept {
+            firstDrawnCol = std::min(firstDrawnCol, drawnColumn);
+            lastDrawnCol = std::max(lastDrawnCol, drawnColumn);
+        };
+        const auto renderCell = [&](const std::wstring_view cluster, const til::CoordType targetColumn, const ImageCellRef* const metadataBeforeWrite = nullptr) {
+            rememberMetadata(targetColumn, metadataBeforeWrite);
+            const auto oldMetadata = row.GetImageCellRef(targetColumn);
+            const auto oldValue = oldMetadata ? std::optional<ImageCellRef>{ *oldMetadata } : std::nullopt;
+            std::vector<PlacementKey> oldKeys;
+            const auto rememberOldKey = [&](const std::optional<PlacementKey> key) {
+                if (key && std::ranges::find(oldKeys, *key) == oldKeys.end())
+                {
+                    oldKeys.push_back(*key);
+                    touchedParents.emplace(*key);
+                }
+            };
+            rememberOldKey(oldValue && oldValue->layerId != 0 ? virtualKeyForLayer(oldValue->layerId) : std::nullopt);
+            for (const auto image : buffer.GetImages().IntersectingRows(screenRow, screenRow + 1))
+            {
+                const auto bounds = image.CellBounds();
+                if (bounds.left <= targetColumn && targetColumn < bounds.right)
+                {
+                    const auto key = image.Identity();
+                    if (key.protocol == ImagePlacement::Key::Protocol::Kitty)
+                    {
+                        rememberOldKey(virtualKeyForLayer(key.layerId));
+                    }
+                }
+            }
+            const auto drawn = _renderPlaceholderCell(row, cluster, targetColumn, screenRow, fragments);
+            const auto newMetadata = row.GetImageCellRef(targetColumn);
+            const auto newKey = newMetadata && newMetadata->layerId != 0 ? virtualKeyForLayer(newMetadata->layerId) : std::nullopt;
+            if (newKey)
+            {
+                touchedParents.emplace(*newKey);
+            }
+            for (const auto& oldKey : oldKeys)
+            {
+                if (oldKey != newKey)
+                {
+                    const auto virtualPlacement = _virtualIds.find(oldKey);
+                    if (virtualPlacement != _virtualIds.end())
+                    {
+                        stale.push_back({
+                            { oldKey.first, virtualPlacement->second.layerId, ImagePlacement::Key::Protocol::Kitty },
+                            { targetColumn, screenRow, targetColumn + 1, screenRow + 1 },
+                        });
+                    }
+                }
+            }
+            if (drawn)
+            {
+                recordDraw(targetColumn);
+            }
+        };
+
+        for (size_t i = 0; i < segment.size();)
+        {
+            const auto next = buffer.GraphemeNext(segment, i);
+            const auto cluster = segment.substr(i, next - i);
+            // A write may be split anywhere, including before or between a placeholder's diacritics -
+            // the console write path chunks long runs. The orphaned marks then open the next segment,
+            // where they join the cell the previous segment already wrote, occupying no column of
+            // their own. Counting them as a cell shifted every placeholder that followed one column
+            // right, onto a cell carrying no image foreground, so that tile was silently dropped and
+            // the grid rendered with a hole in it.
+            if (i == 0 && _IsPlaceholderDiacriticRun(cluster))
+            {
+                // The joined cell was resolved from whatever part of its cluster had arrived, so a
+                // split ahead of the first mark left it addressing grid (0,0). The row now holds the
+                // finished grapheme, so resolve that cell again from it - at its own column, which
+                // keeps the write column where it is.
+                const auto previous = row.NavigateToPrevious(startColumn);
+                if (previous < startColumn)
+                {
+                    renderCell(row.GlyphAt(previous), previous, leadingCellMetadataBeforeWrite);
+                }
+                i = next;
+                continue;
+            }
+            renderCell(cluster, column);
+            // Advance by the glyph's real cell width; guard against a non-advancing step.
+            const auto nextColumn = row.NavigateToNext(column);
+            column = nextColumn > column ? nextColumn : column + 1;
+            i = next;
+        }
+
+        std::vector<std::pair<PlacementKey, std::optional<til::point>>> anchorsBefore;
+        for (const auto& key : touchedParents)
+        {
+            if (parentsWithChildren.contains(key))
+            {
+                anchorsBefore.emplace_back(key, _deriveVirtualPlacementAnchor(key.first, key.second));
+            }
+        }
+        if (!anchorsBefore.empty() || !stale.empty())
+        {
+            _dispatcher._pages.ForEachPage([&](const Page currentPage) {
+                pagesBefore.push_back({ currentPage, currentPage.Buffer().GetImages().Snapshot() });
+            });
+        }
+        if (!anchorsBefore.empty())
+        {
+            placementsBefore = _placements;
+            anonymousBefore = _anonymousPlacements;
+            registrySnapshot = true;
+        }
+
+        auto& images = buffer.GetMutableImages();
+        images.AddOrReplaceAreas(std::move(fragments));
+        for (const auto& fragment : stale)
+        {
+            images.EraseArea(fragment.key, fragment.area);
+        }
+
+        for (const auto& [key, oldAnchor] : anchorsBefore)
+        {
+            const auto newAnchor = _deriveVirtualPlacementAnchor(key.first, key.second);
+            if (oldAnchor == newAnchor && !touchedParents.contains(key))
+            {
+                continue;
+            }
+            std::wstring_view moveCode = L"OK";
+            if (!_movePlacementChildren(key, newAnchor, true, moveCode))
+            {
+                rollback();
+                return false;
+            }
+        }
+
+        // One bounded redraw for every placeholder tile drawn in this segment (avoids a per-cell
+        // TriggerRedraw on the text hot path; mirrors _placeImage's single-redraw model).
+        if (lastDrawnCol >= firstDrawnCol)
+        {
+            buffer.TriggerRedraw(Viewport::FromExclusive({ firstDrawnCol, screenRow, std::min<til::CoordType>(lastDrawnCol + 1, page.Width()), screenRow + 1 }));
+        }
+        return true;
     }
-    buffer.GetMutableImages().AddOrReplaceAreas(std::move(fragments));
-    // One bounded redraw for every placeholder tile drawn in this segment (avoids a per-cell
-    // TriggerRedraw on the text hot path; mirrors _placeImage's single-redraw model).
-    if (lastDrawnCol >= firstDrawnCol)
+    catch (const std::bad_alloc&)
     {
-        buffer.TriggerRedraw(Viewport::FromExclusive({ firstDrawnCol, screenRow, std::min<til::CoordType>(lastDrawnCol + 1, page.Width()), screenRow + 1 }));
+        rollback();
+        LOG_HR(E_OUTOFMEMORY);
+        return false;
     }
 }
 

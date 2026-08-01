@@ -357,6 +357,8 @@ void ROW::CopyFrom(const ROW& source)
 {
     _lineRendition = source._lineRendition;
     _wrapForced = source._wrapForced;
+    _doubleBytePadded = source._doubleBytePadded;
+    _promptData = source._promptData;
     _imageCellRefs.reset();
 
     RowCopyTextFromState state{
@@ -367,6 +369,60 @@ void ROW::CopyFrom(const ROW& source)
 
     _attr = source.Attributes();
     _attr.resize_trailing_extent(_columnCount);
+}
+
+class ROW::Snapshot final
+{
+public:
+    std::vector<wchar_t> chars;
+    std::vector<uint16_t> charOffsets;
+    std::unique_ptr<wchar_t[]> charsHeap;
+    size_t charsCapacity = 0;
+    RowAttributes attributes;
+    std::unique_ptr<ImageCellRef[]> imageCellRefs;
+    LineRendition lineRendition = LineRendition::SingleWidth;
+    bool wrapForced = false;
+    bool doubleBytePadded = false;
+    std::optional<ScrollbarData> promptData;
+};
+
+std::shared_ptr<ROW::Snapshot> ROW::CreateSnapshot() const
+{
+    auto snapshot = std::make_shared<Snapshot>();
+    snapshot->chars.assign(_charsBuffer, _charsBuffer + _columnCount);
+    snapshot->charOffsets.assign(_charOffsets.begin(), _charOffsets.end());
+    snapshot->charsCapacity = _chars.size();
+    if (_charsHeap)
+    {
+        snapshot->charsHeap = std::make_unique<wchar_t[]>(snapshot->charsCapacity);
+        std::copy_n(_charsHeap.get(), snapshot->charsCapacity, snapshot->charsHeap.get());
+    }
+    snapshot->attributes = _attr;
+    if (_imageCellRefs)
+    {
+        snapshot->imageCellRefs = std::make_unique<ImageCellRef[]>(_columnCount);
+        std::copy_n(_imageCellRefs.get(), _columnCount, snapshot->imageCellRefs.get());
+    }
+    snapshot->lineRendition = _lineRendition;
+    snapshot->wrapForced = _wrapForced;
+    snapshot->doubleBytePadded = _doubleBytePadded;
+    snapshot->promptData = _promptData;
+    return snapshot;
+}
+
+void ROW::RestoreSnapshot(Snapshot& snapshot) noexcept
+{
+    std::copy_n(snapshot.chars.data(), _columnCount, _charsBuffer);
+    std::copy_n(snapshot.charOffsets.data(), _charOffsets.size(), _charOffsets.data());
+    std::swap(_charsHeap, snapshot.charsHeap);
+    _chars = _charsHeap ? std::span<wchar_t>{ _charsHeap.get(), snapshot.charsCapacity } :
+                          std::span<wchar_t>{ _charsBuffer, _columnCount };
+    std::swap(_attr, snapshot.attributes);
+    std::swap(_imageCellRefs, snapshot.imageCellRefs);
+    _lineRendition = snapshot.lineRendition;
+    _wrapForced = snapshot.wrapForced;
+    _doubleBytePadded = snapshot.doubleBytePadded;
+    std::swap(_promptData, snapshot.promptData);
 }
 
 // Returns the previous possible cursor position, preceding the given column.
@@ -1186,8 +1242,24 @@ void ROW::SetImageCellRef(const til::CoordType column, const ImageCellRef& metad
 
     if (!_imageCellRefs)
     {
+        if (!metadata.valid)
+        {
+            return;
+        }
         _imageCellRefs = std::make_unique<ImageCellRef[]>(_columnCount);
     }
+    til::at(_imageCellRefs, column) = metadata;
+}
+
+void ROW::RestoreImageCellRefNoAlloc(const til::CoordType column, const ImageCellRef& metadata) noexcept
+{
+    if (column < 0 || column >= _columnCount || !_imageCellRefs)
+    {
+        // A valid snapshot necessarily came from existing storage. Invalid
+        // metadata is deliberately ignored when no storage was allocated.
+        return;
+    }
+
     til::at(_imageCellRefs, column) = metadata;
 }
 

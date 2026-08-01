@@ -130,6 +130,16 @@ public:
     void UpdateFont(const FontInfo* newFont);
     void RefreshFontWithRenderer();
     [[nodiscard]] NTSTATUS SetViewportOrigin(bool absolute, til::point coordWindowOrigin, bool updateBottom);
+    struct ViewportState
+    {
+        Microsoft::Console::Types::Viewport viewport;
+        til::CoordType virtualBottom = 0;
+    };
+    ViewportState CaptureViewportState() const noexcept;
+    void SetViewportOriginInternal(til::point coordWindowOrigin) noexcept;
+    bool HasSpeculativeViewportOrigin() const noexcept;
+    void RestoreViewportOriginInternal() noexcept;
+    void PrepareViewportNotificationReplay() noexcept;
     const Microsoft::Console::Types::Viewport& GetViewport() const noexcept;
     void SetViewport(const Microsoft::Console::Types::Viewport& newViewport, bool updateBottom);
     void SetViewportSize(const til::size* size);
@@ -218,6 +228,7 @@ private:
     //  affected by the user scrolling the viewport, only when API calls cause
     //  the viewport to move (SetBufferInfo, WriteConsole, etc)
     til::CoordType _virtualBottom = 0;
+    std::optional<ViewportState> _speculativeViewportState;
     std::optional<til::size> _deferredPtyResize;
     std::atomic<bool> _conptyCursorPositionMayBeWrong = false;
 

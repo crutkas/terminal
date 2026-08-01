@@ -36,6 +36,8 @@ public:
     Microsoft::Console::VirtualTerminal::StateMachine& GetStateMachine() override;
     BufferState GetBufferAndViewport() override;
     void SetViewportPosition(const til::point position) override;
+    void SetViewportPositionInternal(const til::point position) override;
+    void RestoreViewportPositionInternal(const til::point position) override;
 
     void SetSystemMode(const Mode mode, const bool enabled) override;
     bool GetSystemMode(const Mode mode) const override;

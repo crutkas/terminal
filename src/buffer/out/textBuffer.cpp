@@ -267,7 +267,12 @@ const ROW& TextBuffer::GetRowByOffset(const til::CoordType index) const
 ROW& TextBuffer::GetMutableRowByOffset(const til::CoordType index)
 {
     _lastMutationId++;
-    return _getRow(index);
+    auto& row = _getRow(index);
+    if (_mutationJournal)
+    {
+        _mutationJournal->SaveRow(*this, row, index);
+    }
+    return row;
 }
 
 const ImageCollection& TextBuffer::GetImages() const noexcept
@@ -311,6 +316,78 @@ ROW& TextBuffer::GetScratchpadRow(const TextAttribute& attributes)
 void TextBuffer::CopyProperties(const TextBuffer& OtherBuffer) noexcept
 {
     GetCursor().CopyProperties(OtherBuffer.GetCursor());
+}
+
+TextBuffer::MutationState TextBuffer::CreateMutationState() const
+{
+    return {
+        .images = _images.Snapshot(),
+        .cursor = _cursor.GetState(),
+        .currentAttributes = _currentAttributes,
+        .firstRow = _firstRow,
+        .lastMutationId = _lastMutationId,
+    };
+}
+
+void TextBuffer::RestoreMutationState(MutationState&& state) noexcept
+{
+    _images = std::move(state.images);
+    _cursor.RestoreState(state.cursor);
+    _currentAttributes = state.currentAttributes;
+    _firstRow = state.firstRow;
+    _lastMutationId = state.lastMutationId;
+}
+
+void TextBuffer::SetMutationJournal(MutationJournal* const journal) noexcept
+{
+    _mutationJournal = journal;
+}
+
+std::unique_ptr<TextBuffer::ResizeSnapshot> TextBuffer::CreateResizeSnapshot() const
+{
+    auto snapshot = std::make_unique<ResizeSnapshot>();
+    auto copy = std::make_unique<TextBuffer>(GetSize().Dimensions(),
+                                             _initialAttributes,
+                                             _cursor.GetSize(),
+                                             _isActiveBuffer,
+                                             _renderer);
+    copy->_firstRow = _firstRow;
+    for (size_t row = 0; row <= _height; ++row)
+    {
+        auto& source = const_cast<TextBuffer*>(this)->_getRowByOffsetDirect(row);
+        copy->_getRowByOffsetDirect(row).CopyFrom(source);
+    }
+    copy->_images = _images.Snapshot();
+    copy->_hyperlinkMap = _hyperlinkMap;
+    copy->_hyperlinkCustomIdMap = _hyperlinkCustomIdMap;
+    copy->_currentHyperlinkId = _currentHyperlinkId;
+    copy->_currentAttributes = _currentAttributes;
+    copy->_lastMutationId = _lastMutationId;
+    copy->_cursor.CopyProperties(_cursor);
+    snapshot->buffer = std::move(copy);
+    return snapshot;
+}
+
+void TextBuffer::RestoreResizeSnapshot(ResizeSnapshot& snapshot) noexcept
+{
+    auto& source = *snapshot.buffer;
+    std::swap(_images, source._images);
+    std::swap(_hyperlinkMap, source._hyperlinkMap);
+    std::swap(_hyperlinkCustomIdMap, source._hyperlinkCustomIdMap);
+    std::swap(_currentHyperlinkId, source._currentHyperlinkId);
+    std::swap(_buffer, source._buffer);
+    std::swap(_bufferEnd, source._bufferEnd);
+    std::swap(_commitWatermark, source._commitWatermark);
+    std::swap(_initialAttributes, source._initialAttributes);
+    std::swap(_bufferRowStride, source._bufferRowStride);
+    std::swap(_bufferOffsetChars, source._bufferOffsetChars);
+    std::swap(_bufferOffsetCharOffsets, source._bufferOffsetCharOffsets);
+    std::swap(_width, source._width);
+    std::swap(_height, source._height);
+    std::swap(_currentAttributes, source._currentAttributes);
+    std::swap(_firstRow, source._firstRow);
+    std::swap(_lastMutationId, source._lastMutationId);
+    _cursor.CopyProperties(source._cursor);
 }
 
 // Routine Description:

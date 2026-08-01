@@ -720,6 +720,51 @@ void SCREEN_INFORMATION::SetViewportSize(const til::size* const pcoordSize)
     return STATUS_SUCCESS;
 }
 
+SCREEN_INFORMATION::ViewportState SCREEN_INFORMATION::CaptureViewportState() const noexcept
+{
+    return {
+        .viewport = _viewport,
+        .virtualBottom = _virtualBottom,
+    };
+}
+
+void SCREEN_INFORMATION::SetViewportOriginInternal(til::point position) noexcept
+{
+    if (!_speculativeViewportState)
+    {
+        _speculativeViewportState = CaptureViewportState();
+    }
+    const auto viewSize = _viewport.Dimensions();
+    const auto bufferSize = GetBufferSize().Dimensions();
+    position.x = std::clamp(position.x, 0, bufferSize.width - viewSize.width);
+    position.y = std::clamp(position.y, 0, bufferSize.height - viewSize.height);
+    _viewport = Viewport::FromDimensions(position, viewSize);
+    if (_virtualBottom < _viewport.BottomInclusive())
+    {
+        _virtualBottom = _viewport.BottomInclusive();
+    }
+}
+
+bool SCREEN_INFORMATION::HasSpeculativeViewportOrigin() const noexcept
+{
+    return _speculativeViewportState.has_value();
+}
+
+void SCREEN_INFORMATION::RestoreViewportOriginInternal() noexcept
+{
+    if (_speculativeViewportState)
+    {
+        _viewport = _speculativeViewportState->viewport;
+        _virtualBottom = _speculativeViewportState->virtualBottom;
+        _speculativeViewportState.reset();
+    }
+}
+
+void SCREEN_INFORMATION::PrepareViewportNotificationReplay() noexcept
+{
+    RestoreViewportOriginInternal();
+}
+
 bool SCREEN_INFORMATION::SendNotifyBeep() const
 {
     if (IsActiveScreenBuffer())
@@ -1285,18 +1330,21 @@ try
     // GH#3848 - We'll initialize the new buffer with the default attributes,
     // but after the resize, we'll want to make sure that the new buffer's current
     // attributes (the ones used for printing new text) match the old buffer's.
+    auto& oldTextBuffer = *_textBuffer;
     auto newTextBuffer = std::make_unique<TextBuffer>(coordNewScreenSize,
                                                       TextAttribute{},
                                                       0, // temporarily set size to 0 so it won't render.
-                                                      _textBuffer->IsActiveBuffer(),
-                                                      _textBuffer->GetRenderer());
+                                                      oldTextBuffer.IsActiveBuffer(),
+                                                      oldTextBuffer.GetRenderer());
+    const auto previousViewport = _viewport;
+    const auto previousVirtualBottom = _virtualBottom;
 
     // Save cursor's relative height versus the viewport
-    const auto sCursorHeightInViewportBefore = _textBuffer->GetCursor().GetPosition().y - _viewport.Top();
+    const auto sCursorHeightInViewportBefore = oldTextBuffer.GetCursor().GetPosition().y - _viewport.Top();
     // Also save the distance to the virtual bottom so it can be restored after the resize
-    const auto cursorDistanceFromBottom = _virtualBottom - _textBuffer->GetCursor().GetPosition().y;
+    const auto cursorDistanceFromBottom = _virtualBottom - oldTextBuffer.GetCursor().GetPosition().y;
 
-    TextBuffer::Reflow(*_textBuffer.get(), *newTextBuffer.get());
+    TextBuffer::Reflow(oldTextBuffer, *newTextBuffer);
 
     // Since the reflow doesn't preserve the virtual bottom, we try and
     // estimate where it ought to be by making it the same distance from
@@ -1317,11 +1365,34 @@ try
     const auto sCursorHeightInViewportAfter = cursorRow - _viewport.Top();
     til::point coordCursorHeightDiff;
     coordCursorHeightDiff.y = sCursorHeightInViewportAfter - sCursorHeightInViewportBefore;
-    LOG_IF_FAILED(SetViewportOrigin(false, coordCursorHeightDiff, false));
+    auto speculativeOrigin = previousViewport.Origin() + coordCursorHeightDiff;
+    auto speculativeViewport = Viewport::FromDimensions(speculativeOrigin, previousViewport.Dimensions());
+    const auto& gci = ServiceLocator::LocateGlobals().getConsoleInformation();
+    if (gci.IsTerminalScrolling() && speculativeViewport.BottomInclusive() > _virtualBottom)
+    {
+        speculativeOrigin.y += _virtualBottom - speculativeViewport.BottomInclusive();
+        speculativeViewport = Viewport::FromDimensions(speculativeOrigin, previousViewport.Dimensions());
+    }
 
-    newTextBuffer->SetCurrentAttributes(_textBuffer->GetCurrentAttributes());
+    newTextBuffer->SetCurrentAttributes(oldTextBuffer.GetCurrentAttributes());
 
+    auto previousTextBuffer = std::move(_textBuffer);
     _textBuffer = std::move(newTextBuffer);
+    _viewport = speculativeViewport;
+    if (_stateMachine)
+    {
+        auto& engine = reinterpret_cast<OutputStateMachineEngine&>(_stateMachine->Engine());
+        if (!static_cast<AdaptDispatch&>(engine.Dispatch()).SynchronizeImagePlacements())
+        {
+            newTextBuffer = std::move(_textBuffer);
+            _textBuffer = std::move(previousTextBuffer);
+            _viewport = previousViewport;
+            _virtualBottom = previousVirtualBottom;
+            return STATUS_UNSUCCESSFUL;
+        }
+    }
+    _viewport = previousViewport;
+    LOG_IF_FAILED(SetViewportOrigin(true, speculativeOrigin, false));
     return STATUS_SUCCESS;
 }
 NT_CATCH_RETURN()

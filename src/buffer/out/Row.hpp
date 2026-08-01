@@ -151,6 +151,10 @@ public:
     ROW(ROW&& other) = default;
     ROW& operator=(ROW&& other) = default;
 
+    class Snapshot;
+    std::shared_ptr<Snapshot> CreateSnapshot() const;
+    void RestoreSnapshot(Snapshot& snapshot) noexcept;
+
     void SetWrapForced(const bool wrap) noexcept;
     bool WasWrapForced() const noexcept;
     void SetDoubleBytePadded(const bool doubleBytePadded) noexcept;
@@ -190,6 +194,7 @@ public:
     std::wstring_view GetText(til::CoordType columnBegin, til::CoordType columnEnd) const noexcept;
     const ImageCellRef* GetImageCellRef(til::CoordType column) const noexcept;
     void SetImageCellRef(til::CoordType column, const ImageCellRef& metadata);
+    void RestoreImageCellRefNoAlloc(til::CoordType column, const ImageCellRef& metadata) noexcept;
     void CopyImageCellRefs(const ROW& source, til::CoordType sourceColumnBegin, til::CoordType columnBegin, til::CoordType columnEnd);
     til::CoordType GetLeadingColumnAtCharOffset(ptrdiff_t offset) const noexcept;
     til::CoordType GetTrailingColumnAtCharOffset(ptrdiff_t offset) const noexcept;
@@ -212,6 +217,9 @@ public:
 private:
     // WriteHelper exists because other forms of abstracting this functionality away (like templates with lambdas)
     // where only very poorly optimized by MSVC as it failed to inline the templates.
+#ifdef UNIT_TESTING
+    friend class ImageTests;
+#endif
     struct WriteHelper
     {
         explicit WriteHelper(ROW& row, til::CoordType columnBegin, til::CoordType columnLimit, const std::wstring_view& chars) noexcept;

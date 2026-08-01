@@ -295,9 +295,22 @@ public:
         return { *_textBuffer.get(), viewport, true };
     }
 
-    void SetViewportPosition(const til::point /*position*/) override
+    void SetViewportPosition(const til::point position) override
     {
         Log::Comment(L"SetViewportPosition MOCK called...");
+        _viewportPositions.push_back(position);
+    }
+
+    void SetViewportPositionInternal(const til::point position) override
+    {
+        const auto width = _viewport.right - _viewport.left;
+        const auto height = _viewport.bottom - _viewport.top;
+        _viewport = { position.x, position.y, position.x + width, position.y + height };
+    }
+
+    void RestoreViewportPositionInternal(const til::point position) override
+    {
+        SetViewportPositionInternal(position);
     }
 
     bool IsVtInputEnabled() const override
@@ -347,6 +360,11 @@ public:
     void UseMainScreenBuffer() override
     {
         Log::Comment(L"UseMainScreenBuffer MOCK called...");
+        if (_mainImagesOnUseMain)
+        {
+            _textBuffer->GetMutableImages() = std::move(*_mainImagesOnUseMain);
+            _mainImagesOnUseMain.reset();
+        }
     }
 
     CursorType GetUserDefaultCursorStyle() const override
@@ -410,9 +428,10 @@ public:
         Log::Comment(L"PlayMidiNote MOCK called...");
     }
 
-    void NotifyBufferRotation(const int /*delta*/) override
+    void NotifyBufferRotation(const int delta) override
     {
         Log::Comment(L"NotifyBufferRotation MOCK called...");
+        _bufferRotations.push_back(delta);
     }
 
     void NotifyShellIntegrationMark() override
@@ -506,6 +525,9 @@ public:
 
         _response.clear();
         _retainResponse = false;
+        _viewportPositions.clear();
+        _bufferRotations.clear();
+        _mainImagesOnUseMain.reset();
     }
 
     void PrepCursor(CursorX xact, CursorY yact)
@@ -594,6 +616,9 @@ public:
 
     std::wstring _response;
     bool _retainResponse{ false };
+    std::vector<til::point> _viewportPositions;
+    std::vector<int> _bufferRotations;
+    std::unique_ptr<ImageCollection> _mainImagesOnUseMain;
 
     auto EnableInputRetentionInScope()
     {
@@ -5387,6 +5412,760 @@ public:
         VERIFY_ARE_EQUAL(2u, childSlice->ColumnOwner(phPos.x + 1), L"child anchored at virtual-parent min(x,y)+(1,1)");
     }
 
+    TEST_METHOD(KittyVirtualParentRepaintMovesRelativeChild)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        auto& buffer = *_testGetSet->_textBuffer;
+        const til::point oldParent{ 5, 5 };
+        const til::point newParent{ 12, 9 };
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,p=1,f=24,s=1,v=1;/wAA\x1b\\");
+
+        buffer.GetCursor().SetPosition(oldParent);
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m\x1b[58:2::0:0:1m");
+        _stateMachine->ProcessString(Placeholder());
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;0m");
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=2,p=1,P=1,Q=1,H=1,V=0,f=24,s=1,v=1,C=1;AP8A\x1b\\");
+
+        const til::point oldChild{ oldParent.x + 1, oldParent.y };
+        VERIFY_ARE_EQUAL(2u, DirectImageSlice(buffer, oldChild.y)->ColumnOwner(oldChild.x));
+
+        buffer.GetCursor().SetPosition(oldParent);
+        _stateMachine->ProcessString(L"\x1b[0mX");
+        const auto* removedSlice = DirectImageSlice(buffer, oldChild.y);
+        VERIFY_IS_TRUE(removedSlice == nullptr || removedSlice->ColumnOwner(oldChild.x) != 2u);
+        buffer.GetCursor().SetPosition(newParent);
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m\x1b[58:2::0:0:1m");
+        _stateMachine->ProcessString(Placeholder());
+
+        const auto* oldSlice = DirectImageSlice(buffer, oldChild.y);
+        VERIFY_IS_TRUE(oldSlice == nullptr || oldSlice->ColumnOwner(oldChild.x) != 2u);
+        const til::point newChild{ newParent.x + 1, newParent.y };
+        const auto* newSlice = DirectImageSlice(buffer, newChild.y);
+        VERIFY_IS_NOT_NULL(newSlice);
+        VERIFY_ARE_EQUAL(2u, newSlice->ColumnOwner(newChild.x));
+        const auto& child = _kitty()._placements.at({ 2u, 1u });
+        VERIFY_ARE_EQUAL(newChild.x, child.anchorCol);
+        VERIFY_ARE_EQUAL(newChild.y, child.anchorRow);
+    }
+
+    TEST_METHOD(KittyParentDeletionFailureRestoresNoOrphan)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        auto& buffer = *_testGetSet->_textBuffer;
+        const til::point parent{ 10, 10 };
+        const til::point child{ parent.x + 1, parent.y };
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,p=1,f=24,s=1,v=1;/wAA\x1b\\");
+        buffer.GetCursor().SetPosition(parent);
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m\x1b[58:2::0:0:1m");
+        _stateMachine->ProcessString(Placeholder());
+        const auto parentMetadata = *buffer.GetRowByOffset(parent.y).GetImageCellRef(parent.x);
+        _stateMachine->ProcessString(L"\x1b[0m");
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=2,p=1,P=1,Q=1,H=1,V=0,f=24,s=1,v=1,C=1;AP8A\x1b\\");
+
+        _kitty()._testMovePlacementFailureCountdown = 0;
+        buffer.GetCursor().SetPosition(parent);
+        _stateMachine->ProcessString(L"X");
+
+        const auto* restoredMetadata = buffer.GetRowByOffset(parent.y).GetImageCellRef(parent.x);
+        VERIFY_IS_NOT_NULL(restoredMetadata);
+        VERIFY_ARE_EQUAL(parentMetadata.layerId, restoredMetadata->layerId);
+        VERIFY_ARE_EQUAL(std::wstring{ Placeholder() }, std::wstring{ buffer.GetRowByOffset(parent.y).GlyphAt(parent.x) });
+        VERIFY_ARE_EQUAL(1u, DirectImageSlice(buffer, parent.y)->ColumnOwner(parent.x));
+        VERIFY_ARE_EQUAL(2u, DirectImageSlice(buffer, child.y)->ColumnOwner(child.x));
+        const auto& placement = _kitty()._placements.at({ 2u, 1u });
+        VERIFY_ARE_EQUAL(child.x, placement.anchorCol);
+        VERIFY_ARE_EQUAL(child.y, placement.anchorRow);
+        VERIFY_IS_FALSE(_kitty()._testMovePlacementFailureCountdown.has_value());
+    }
+
+    TEST_METHOD(KittyNewTextNotificationCommitsOnlyAfterImageTransaction)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        auto& buffer = *_testGetSet->_textBuffer;
+        const til::point parent{ 10, 10 };
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,p=1,f=24,s=1,v=1;/wAA\x1b\\");
+        buffer.GetCursor().SetPosition(parent);
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m\x1b[58:2::0:0:1m");
+        _stateMachine->ProcessString(Placeholder());
+        _stateMachine->ProcessString(L"\x1b[0m");
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=2,p=1,P=1,Q=1,H=1,V=0,f=24,s=1,v=1,C=1;AP8A\x1b\\");
+
+        std::vector<std::wstring> notifications;
+        _pDispatch->_testOnNewTextNotification = [&](const std::wstring_view text) {
+            notifications.emplace_back(text);
+        };
+        const auto clearCallback = wil::scope_exit([&] {
+            _pDispatch->_testOnNewTextNotification = {};
+        });
+
+        _kitty()._testMovePlacementFailureCountdown = 0;
+        buffer.GetCursor().SetPosition(parent);
+        _stateMachine->ProcessString(L"X");
+        VERIFY_IS_TRUE(notifications.empty());
+        VERIFY_IS_NOT_NULL(buffer.GetRowByOffset(parent.y).GetImageCellRef(parent.x));
+
+        _stateMachine->ProcessString(L"Y");
+        VERIFY_ARE_EQUAL(size_t{ 1 }, notifications.size());
+        VERIFY_ARE_EQUAL(std::wstring{ L"Y" }, notifications.front());
+    }
+
+    TEST_METHOD(KittyFillAndCopyFailureRestoreRelativePlacement)
+    {
+        const til::point parent{ 10, 10 };
+        const til::point child{ parent.x + 1, parent.y };
+        const auto setup = [&]() {
+            _testGetSet->PrepData();
+            _testGetSet->_cellSize = { 1, 1 };
+            auto& buffer = *_testGetSet->_textBuffer;
+            _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,p=1,f=24,s=1,v=1;/wAA\x1b\\");
+            buffer.GetCursor().SetPosition(parent);
+            _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m\x1b[58:2::0:0:1m");
+            _stateMachine->ProcessString(Placeholder());
+            _stateMachine->ProcessString(L"\x1b[0m");
+            _stateMachine->ProcessString(L"\x1b_Ga=T,i=2,p=1,P=1,Q=1,H=1,V=0,f=24,s=1,v=1,C=1;AP8A\x1b\\");
+        };
+        const auto verify = [&]() {
+            const auto& buffer = *_testGetSet->_textBuffer;
+            VERIFY_ARE_EQUAL(1u, DirectImageSlice(buffer, parent.y)->ColumnOwner(parent.x));
+            VERIFY_ARE_EQUAL(2u, DirectImageSlice(buffer, child.y)->ColumnOwner(child.x));
+            VERIFY_IS_NOT_NULL(buffer.GetRowByOffset(parent.y).GetImageCellRef(parent.x));
+            const auto& placement = _kitty()._placements.at({ 2u, 1u });
+            VERIFY_ARE_EQUAL(child.x, placement.anchorCol);
+            VERIFY_ARE_EQUAL(child.y, placement.anchorRow);
+            VERIFY_IS_FALSE(_kitty()._testMovePlacementFailureCountdown.has_value());
+        };
+
+        setup();
+        const auto page = _pDispatch->_pages.ActivePage();
+        const auto vtRow = parent.y - page.Top() + 1;
+        const auto vtColumn = parent.x + 1;
+        _kitty()._testMovePlacementFailureCountdown = 0;
+        _pDispatch->EraseRectangularArea(vtRow, vtColumn, vtRow, vtColumn);
+        verify();
+
+        setup();
+        const auto destination = til::point{ parent.x - 3, parent.y };
+        _kitty()._testMovePlacementFailureCountdown = 0;
+        _pDispatch->CopyRectangularArea(vtRow, vtColumn, vtRow, vtColumn, 1, vtRow, destination.x + 1, 1);
+        verify();
+        const auto& buffer = *_testGetSet->_textBuffer;
+        VERIFY_IS_NULL(buffer.GetRowByOffset(destination.y).GetImageCellRef(destination.x));
+    }
+
+    TEST_METHOD(KittyVirtualParentInsertMovesRelativeChild)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        auto& buffer = *_testGetSet->_textBuffer;
+        const til::point parent{ 5, 5 };
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,p=1,f=24,s=1,v=1;/wAA\x1b\\");
+
+        buffer.GetCursor().SetPosition(parent);
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m\x1b[58:2::0:0:1m");
+        _stateMachine->ProcessString(Placeholder());
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;0m");
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=2,p=1,P=1,Q=1,H=1,V=0,f=24,s=1,v=1,C=1;AP8A\x1b\\");
+
+        buffer.GetCursor().SetPosition(parent);
+        _stateMachine->ProcessString(L"\x1b[@");
+
+        const til::point movedParent{ parent.x + 1, parent.y };
+        const til::point movedChild{ movedParent.x + 1, movedParent.y };
+        const auto* slice = DirectImageSlice(buffer, movedChild.y);
+        VERIFY_IS_NOT_NULL(slice);
+        VERIFY_ARE_EQUAL(2u, slice->ColumnOwner(movedChild.x));
+        const auto& child = _kitty()._placements.at({ 2u, 1u });
+        VERIFY_ARE_EQUAL(movedChild.x, child.anchorCol);
+        VERIFY_ARE_EQUAL(movedChild.y, child.anchorRow);
+    }
+
+    TEST_METHOD(KittyInsertFailureRestoresVirtualParentAndNegativeChild)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        auto& buffer = *_testGetSet->_textBuffer;
+        const til::point textPosition{ 1, 1 };
+        const til::point parent{ 5, 5 };
+        const til::point child{ parent.x - 1, parent.y };
+        buffer.GetCursor().SetPosition(textPosition);
+        _stateMachine->ProcessString(L"K");
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,p=1,f=24,s=1,v=1;/wAA\x1b\\");
+        buffer.GetCursor().SetPosition(parent);
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m\x1b[58:2::0:0:1m");
+        _stateMachine->ProcessString(Placeholder());
+        const auto parentMetadata = *buffer.GetRowByOffset(parent.y).GetImageCellRef(parent.x);
+        _stateMachine->ProcessString(L"\x1b[0m");
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=2,p=1,P=1,Q=1,H=-1,V=0,f=24,s=1,v=1,C=1;AP8A\x1b\\");
+        VERIFY_ARE_EQUAL(2u, DirectImageSlice(buffer, child.y)->ColumnOwner(child.x));
+
+        _kitty()._testMovePlacementFailureCountdown = 0;
+        buffer.GetCursor().SetPosition(parent);
+        _stateMachine->ProcessString(L"\x1b[@");
+
+        const auto* restoredMetadata = buffer.GetRowByOffset(parent.y).GetImageCellRef(parent.x);
+        VERIFY_IS_NOT_NULL(restoredMetadata);
+        VERIFY_ARE_EQUAL(parentMetadata.layerId, restoredMetadata->layerId);
+        VERIFY_ARE_EQUAL(1u, DirectImageSlice(buffer, parent.y)->ColumnOwner(parent.x));
+        VERIFY_ARE_EQUAL(2u, DirectImageSlice(buffer, child.y)->ColumnOwner(child.x));
+        VERIFY_IS_NULL(buffer.GetRowByOffset(parent.y).GetImageCellRef(parent.x + 1));
+        VERIFY_ARE_EQUAL(std::wstring{ Placeholder() }, std::wstring{ buffer.GetRowByOffset(parent.y).GlyphAt(parent.x) });
+        VERIFY_ARE_EQUAL(L'K', buffer.GetRowByOffset(textPosition.y).GlyphAt(textPosition.x).front());
+        const auto& placement = _kitty()._placements.at({ 2u, 1u });
+        VERIFY_ARE_EQUAL(child.x, placement.anchorCol);
+        VERIFY_ARE_EQUAL(child.y, placement.anchorRow);
+        VERIFY_IS_FALSE(_kitty()._testMovePlacementFailureCountdown.has_value());
+    }
+
+    TEST_METHOD(KittyMutationJournalKeepsUntouchedRowsLazy)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        auto& buffer = *_testGetSet->_textBuffer;
+        const til::point parent{ 5, 5 };
+        const til::point child{ parent.x - 1, parent.y };
+        constexpr auto untouchedRow = til::CoordType{ 500 };
+        VERIFY_IS_FALSE(buffer._isRowCommitted(untouchedRow));
+
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,p=1,f=24,s=1,v=1;/wAA\x1b\\");
+        buffer.GetCursor().SetPosition(parent);
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m\x1b[58:2::0:0:1m");
+        _stateMachine->ProcessString(Placeholder());
+        _stateMachine->ProcessString(L"\x1b[0m");
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=2,p=1,P=1,Q=1,H=-1,V=0,f=24,s=1,v=1,C=1;AP8A\x1b\\");
+
+        _kitty()._testMovePlacementFailureCountdown = 0;
+        buffer.GetCursor().SetPosition(parent);
+        _stateMachine->ProcessString(L"\x1b[@");
+
+        VERIFY_ARE_EQUAL(2u, DirectImageSlice(buffer, child.y)->ColumnOwner(child.x));
+        VERIFY_IS_FALSE(buffer._isRowCommitted(untouchedRow));
+    }
+
+    TEST_METHOD(KittyWrappedWriteExceptionRestoresRowsAndCursor)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        auto& buffer = *_testGetSet->_textBuffer;
+        const til::point parent{ 10, 5 };
+        const til::point child{ parent.x + 1, parent.y };
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,p=1,f=24,s=1,v=1;/wAA\x1b\\");
+        buffer.GetCursor().SetPosition(parent);
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m\x1b[58:2::0:0:1m");
+        _stateMachine->ProcessString(Placeholder());
+        _stateMachine->ProcessString(L"\x1b[0m");
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=2,p=1,P=1,Q=1,H=1,V=0,f=24,s=1,v=1,C=1;AP8A\x1b\\");
+
+        const til::point writeStart{ buffer.GetSize().Width() - 2, parent.y };
+        buffer.GetCursor().SetPosition(writeStart);
+        const auto cursorBefore = buffer.GetCursor().GetPosition();
+        _pDispatch->_testThrowAfterRowMutationCountdown = 1;
+        VERIFY_THROWS(_pDispatch->PrintString(L"ABC"), std::bad_alloc);
+
+        VERIFY_ARE_EQUAL(cursorBefore, buffer.GetCursor().GetPosition());
+        VERIFY_IS_NOT_NULL(buffer.GetRowByOffset(parent.y).GetImageCellRef(parent.x));
+        VERIFY_ARE_EQUAL(1u, DirectImageSlice(buffer, parent.y)->ColumnOwner(parent.x));
+        VERIFY_ARE_EQUAL(2u, DirectImageSlice(buffer, child.y)->ColumnOwner(child.x));
+        VERIFY_ARE_EQUAL(L' ', buffer.GetRowByOffset(writeStart.y).GlyphAt(writeStart.x).front());
+        VERIFY_ARE_EQUAL(L' ', buffer.GetRowByOffset(writeStart.y + 1).GlyphAt(0).front());
+        VERIFY_IS_FALSE(_pDispatch->_testThrowAfterRowMutationCountdown.has_value());
+    }
+
+    TEST_METHOD(KittyStandaloneCircularLineFeedTransactionsDescendantsAndNotifications)
+    {
+        const til::point parent{ 0, 0 };
+        const til::point child{ 1, 5 };
+        const til::point cursorAtBottom{ 0, 9 };
+        const auto setup = [&]() {
+            _testGetSet->PrepData();
+            _testGetSet->_cellSize = { 1, 1 };
+            _testGetSet->_textBuffer = std::make_unique<TextBuffer>(
+                til::size{ 4, 10 },
+                TextAttribute{},
+                0,
+                false,
+                &_testGetSet->_renderer);
+            _testGetSet->_viewport = { 0, 0, 4, 10 };
+            auto& buffer = *_testGetSet->_textBuffer;
+            _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,p=1,f=24,s=1,v=1;/wAA\x1b\\");
+            buffer.GetCursor().SetPosition(parent);
+            _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m\x1b[58:2::0:0:1m");
+            _stateMachine->ProcessString(Placeholder());
+            _stateMachine->ProcessString(L"\x1b[0m");
+            _stateMachine->ProcessString(L"\x1b_Ga=T,i=2,p=1,P=1,Q=1,H=1,V=5,f=24,s=1,v=1,C=1;AP8A\x1b\\");
+            buffer.GetCursor().SetPosition(cursorAtBottom);
+        };
+        const auto childVisible = [&]() {
+            const auto& buffer = *_testGetSet->_textBuffer;
+            for (auto row = 0; row < buffer.GetSize().Height(); ++row)
+            {
+                if (const auto* slice = DirectImageSlice(buffer, row); slice && slice->Contains(2))
+                {
+                    return true;
+                }
+            }
+            return false;
+        };
+
+        setup();
+        _pDispatch->LineFeed(DispatchTypes::LineFeedType::WithoutReturn);
+        VERIFY_ARE_EQUAL(size_t{ 1 }, _testGetSet->_bufferRotations.size());
+        VERIFY_ARE_EQUAL(1, _testGetSet->_bufferRotations.front());
+        VERIFY_IS_TRUE(_testGetSet->_viewportPositions.empty());
+        VERIFY_IS_FALSE(childVisible());
+
+        setup();
+        auto& buffer = *_testGetSet->_textBuffer;
+        const auto firstRow = buffer.GetFirstRowIndex();
+        _kitty()._testMovePlacementFailureCountdown = 0;
+        _pDispatch->LineFeed(DispatchTypes::LineFeedType::WithoutReturn);
+        VERIFY_ARE_EQUAL(firstRow, buffer.GetFirstRowIndex());
+        VERIFY_ARE_EQUAL(cursorAtBottom, buffer.GetCursor().GetPosition());
+        VERIFY_IS_NOT_NULL(buffer.GetRowByOffset(parent.y).GetImageCellRef(parent.x));
+        VERIFY_ARE_EQUAL(1u, DirectImageSlice(buffer, parent.y)->ColumnOwner(parent.x));
+        VERIFY_ARE_EQUAL(2u, DirectImageSlice(buffer, child.y)->ColumnOwner(child.x));
+        VERIFY_IS_TRUE(_testGetSet->_bufferRotations.empty());
+        VERIFY_IS_TRUE(_testGetSet->_viewportPositions.empty());
+    }
+
+    TEST_METHOD(KittyStandaloneLineFeedCommitsViewportNotificationOnce)
+    {
+        const auto setup = [&]() {
+            _testGetSet->PrepData();
+            _testGetSet->_cellSize = { 1, 1 };
+            auto& buffer = *_testGetSet->_textBuffer;
+            const auto page = _pDispatch->_pages.ActivePage();
+            const til::point parent{ 20, page.Bottom() - 1 };
+            const til::point child{ parent.x + 1, parent.y };
+            _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,p=1,f=24,s=1,v=1;/wAA\x1b\\");
+            buffer.GetCursor().SetPosition(parent);
+            _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m\x1b[58:2::0:0:1m");
+            _stateMachine->ProcessString(Placeholder());
+            _stateMachine->ProcessString(L"\x1b[0m");
+            _stateMachine->ProcessString(L"\x1b_Ga=T,i=2,p=1,P=1,Q=1,H=1,V=0,f=24,s=1,v=1,C=1;AP8A\x1b\\");
+            const til::point wrapStart{ page.Width() - 1, page.Bottom() - 1 };
+            buffer.GetCursor().SetPosition(wrapStart);
+            _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m\x1b[58:2::0:0:1m");
+            return std::tuple{ page, parent, child, wrapStart };
+        };
+
+        {
+            auto [page, parent, child, wrapStart] = setup();
+            auto& buffer = *_testGetSet->_textBuffer;
+            const auto newRow = page.Bottom();
+            VERIFY_IS_NULL(buffer.GetRowByOffset(newRow).GetImageCellRef(0));
+            const auto* before = DirectImageSlice(buffer, newRow);
+            VERIFY_IS_TRUE(before == nullptr || before->ColumnOwner(0) != 1u);
+
+            _stateMachine->ProcessString(std::wstring{ L"X" } + Placeholder());
+
+            VERIFY_ARE_EQUAL(size_t{ 1 }, _testGetSet->_viewportPositions.size());
+            const til::point expectedViewportPosition{ page.XPanOffset(), page.Top() + 1 };
+            VERIFY_ARE_EQUAL(expectedViewportPosition, _testGetSet->_viewportPositions.front());
+            VERIFY_IS_TRUE(_testGetSet->_bufferRotations.empty());
+            VERIFY_IS_NOT_NULL(buffer.GetRowByOffset(newRow).GetImageCellRef(0));
+            VERIFY_ARE_EQUAL(1u, DirectImageSlice(buffer, newRow)->ColumnOwner(0));
+            const auto& placement = _kitty()._placements.at({ 2u, 1u });
+            VERIFY_ARE_EQUAL(1, placement.anchorCol);
+            VERIFY_ARE_EQUAL(parent.y, placement.anchorRow);
+            VERIFY_ARE_EQUAL(2u, DirectImageSlice(buffer, child.y)->ColumnOwner(1));
+        }
+
+        {
+            auto [page, parent, child, wrapStart] = setup();
+            auto& buffer = *_testGetSet->_textBuffer;
+            const auto oldViewport = _testGetSet->_viewport;
+            const auto newRow = page.Bottom();
+            _kitty()._testPersistentMovePlacementFailure = true;
+            _stateMachine->ProcessString(std::wstring{ L"X" } + Placeholder());
+            _kitty()._testPersistentMovePlacementFailure = false;
+
+            VERIFY_ARE_EQUAL(oldViewport, _testGetSet->_viewport);
+            VERIFY_ARE_EQUAL(wrapStart, buffer.GetCursor().GetPosition());
+            VERIFY_IS_NULL(buffer.GetRowByOffset(newRow).GetImageCellRef(0));
+            VERIFY_ARE_EQUAL(1u, DirectImageSlice(buffer, parent.y)->ColumnOwner(parent.x));
+            VERIFY_ARE_EQUAL(2u, DirectImageSlice(buffer, child.y)->ColumnOwner(child.x));
+            const auto& placement = _kitty()._placements.at({ 2u, 1u });
+            VERIFY_ARE_EQUAL(child.x, placement.anchorCol);
+            VERIFY_ARE_EQUAL(child.y, placement.anchorRow);
+            VERIFY_IS_TRUE(_testGetSet->_viewportPositions.empty());
+            VERIFY_IS_TRUE(_testGetSet->_bufferRotations.empty());
+        }
+    }
+
+    TEST_METHOD(KittyVirtualParentMovesAnonymousSiblingChildrenWithSharedImageId)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        auto& buffer = *_testGetSet->_textBuffer;
+        const til::point textPosition{ 1, 1 };
+        const til::point oldParent{ 10, 10 };
+        const til::point newParent{ 20, 15 };
+        buffer.GetCursor().SetPosition(textPosition);
+        _stateMachine->ProcessString(L"K");
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,p=1,f=24,s=1,v=1;/wAA\x1b\\");
+
+        buffer.GetCursor().SetPosition(oldParent);
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m\x1b[58:2::0:0:1m");
+        _stateMachine->ProcessString(Placeholder());
+        _stateMachine->ProcessString(L"\x1b[0m");
+        _stateMachine->ProcessString(L"\x1b_Ga=t,i=2,f=24,s=1,v=1;AP8A\x1b\\");
+        _stateMachine->ProcessString(L"\x1b_Ga=p,i=2,P=1,Q=1,H=1,V=0,c=1,r=1,C=1;\x1b\\");
+        _stateMachine->ProcessString(L"\x1b_Ga=p,i=2,P=1,Q=1,H=3,V=1,c=1,r=1,C=1;\x1b\\");
+
+        VERIFY_ARE_EQUAL(size_t{ 2 }, _kitty()._anonymousPlacements.size());
+        const auto firstLayer = _kitty()._anonymousPlacements[0].layerId;
+        const auto secondLayer = _kitty()._anonymousPlacements[1].layerId;
+        VERIFY_ARE_NOT_EQUAL(firstLayer, secondLayer);
+
+        const til::point prototype{ 50, 5 };
+        _stateMachine->ProcessString(L"\x1b_Ga=p,U=1,i=2,c=1,r=1;\x1b\\");
+        buffer.GetCursor().SetPosition(prototype);
+        _stateMachine->ProcessString(L"\x1b[0m\x1b[38;2;0;0;2m");
+        _stateMachine->ProcessString(Placeholder());
+        _stateMachine->ProcessString(L"\x1b[0m");
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=3,p=1,P=2,Q=0,H=1,V=0,f=24,s=1,v=1,C=1;AAD/\x1b\\");
+        const til::point prototypeChild{ prototype.x + 1, prototype.y };
+        VERIFY_ARE_EQUAL(3u, DirectImageSlice(buffer, prototypeChild.y)->ColumnOwner(prototypeChild.x));
+
+        buffer.GetCursor().SetPosition(oldParent);
+        _stateMachine->ProcessString(L"X");
+        buffer.GetCursor().SetPosition(newParent);
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m\x1b[58:2::0:0:1m");
+        _stateMachine->ProcessString(Placeholder());
+
+        const til::point firstChild{ newParent.x + 1, newParent.y };
+        const til::point secondChild{ newParent.x + 3, newParent.y + 1 };
+        const auto* firstSlice = DirectImageSlice(buffer, firstChild.y);
+        const auto* secondSlice = DirectImageSlice(buffer, secondChild.y);
+        VERIFY_IS_NOT_NULL(firstSlice);
+        VERIFY_IS_NOT_NULL(secondSlice);
+        VERIFY_IS_TRUE(firstSlice->PlacementCoversColumn(firstLayer, firstChild.x));
+        VERIFY_IS_TRUE(secondSlice->PlacementCoversColumn(secondLayer, secondChild.x));
+        const auto& firstPlacement = _kitty()._anonymousPlacements[0];
+        const auto& secondPlacement = _kitty()._anonymousPlacements[1];
+        VERIFY_ARE_EQUAL(firstChild.x, firstPlacement.anchorCol);
+        VERIFY_ARE_EQUAL(firstChild.y, firstPlacement.anchorRow);
+        VERIFY_ARE_EQUAL(secondChild.x, secondPlacement.anchorCol);
+        VERIFY_ARE_EQUAL(secondChild.y, secondPlacement.anchorRow);
+        VERIFY_ARE_EQUAL(1, firstPlacement.cols);
+        VERIFY_ARE_EQUAL(1, firstPlacement.rows);
+        VERIFY_ARE_EQUAL(1, secondPlacement.cols);
+        VERIFY_ARE_EQUAL(1, secondPlacement.rows);
+        VERIFY_IS_TRUE(_testGetSet->_response.find(L"ECYCLE") == std::wstring::npos);
+        VERIFY_ARE_EQUAL(3u, DirectImageSlice(buffer, prototypeChild.y)->ColumnOwner(prototypeChild.x));
+        const auto& prototypePlacement = _kitty()._placements.at({ 3u, 1u });
+        VERIFY_ARE_EQUAL(prototypeChild.x, prototypePlacement.anchorCol);
+        VERIFY_ARE_EQUAL(prototypeChild.y, prototypePlacement.anchorRow);
+        VERIFY_ARE_EQUAL(L'K', buffer.GetRowByOffset(textPosition.y).GlyphAt(textPosition.x).front());
+    }
+
+    TEST_METHOD(KittyVirtualParentRepaintMovesRecursiveNamedDescendants)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        auto& buffer = *_testGetSet->_textBuffer;
+        const til::point textPosition{ 1, 1 };
+        const til::point oldParent{ 10, 10 };
+        const til::point newParent{ 20, 15 };
+        buffer.GetCursor().SetPosition(textPosition);
+        _stateMachine->ProcessString(L"K");
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,p=1,f=24,s=1,v=1;/wAA\x1b\\");
+
+        buffer.GetCursor().SetPosition(oldParent);
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m\x1b[58:2::0:0:1m");
+        _stateMachine->ProcessString(Placeholder());
+        _stateMachine->ProcessString(L"\x1b[0m");
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=2,p=1,P=1,Q=1,H=1,V=0,f=24,s=1,v=1,C=1;AP8A\x1b\\");
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=3,p=1,P=2,Q=1,H=1,V=1,f=24,s=1,v=1,C=1;AAD/\x1b\\");
+
+        const til::point oldChild{ oldParent.x + 1, oldParent.y };
+        const til::point oldGrandchild{ oldParent.x + 2, oldParent.y + 1 };
+        VERIFY_ARE_EQUAL(2u, DirectImageSlice(buffer, oldChild.y)->ColumnOwner(oldChild.x));
+        VERIFY_ARE_EQUAL(3u, DirectImageSlice(buffer, oldGrandchild.y)->ColumnOwner(oldGrandchild.x));
+
+        buffer.GetCursor().SetPosition(oldParent);
+        _stateMachine->ProcessString(L"\x1b[0mX");
+        const auto* oldChildSlice = DirectImageSlice(buffer, oldChild.y);
+        const auto* oldGrandchildSlice = DirectImageSlice(buffer, oldGrandchild.y);
+        VERIFY_IS_TRUE(oldChildSlice == nullptr || oldChildSlice->ColumnOwner(oldChild.x) != 2u);
+        VERIFY_IS_TRUE(oldGrandchildSlice == nullptr || oldGrandchildSlice->ColumnOwner(oldGrandchild.x) != 3u);
+
+        buffer.GetCursor().SetPosition(newParent);
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m\x1b[58:2::0:0:1m");
+        _stateMachine->ProcessString(Placeholder());
+
+        const til::point newChild{ newParent.x + 1, newParent.y };
+        const til::point newGrandchild{ newParent.x + 2, newParent.y + 1 };
+        VERIFY_ARE_EQUAL(2u, DirectImageSlice(buffer, newChild.y)->ColumnOwner(newChild.x));
+        VERIFY_ARE_EQUAL(3u, DirectImageSlice(buffer, newGrandchild.y)->ColumnOwner(newGrandchild.x));
+        const auto& child = _kitty()._placements.at({ 2u, 1u });
+        const auto& grandchild = _kitty()._placements.at({ 3u, 1u });
+        VERIFY_ARE_EQUAL(newChild.x, child.anchorCol);
+        VERIFY_ARE_EQUAL(newChild.y, child.anchorRow);
+        VERIFY_ARE_EQUAL(newGrandchild.x, grandchild.anchorCol);
+        VERIFY_ARE_EQUAL(newGrandchild.y, grandchild.anchorRow);
+        VERIFY_ARE_EQUAL(L'K', buffer.GetRowByOffset(textPosition.y).GlyphAt(textPosition.x).front());
+    }
+
+    TEST_METHOD(KittyVirtualParentReflowMovesRelativeChild)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        auto& buffer = *_testGetSet->_textBuffer;
+        const auto origin = buffer.GetCursor().GetPosition();
+        const til::point parent{ origin.x + 10, origin.y };
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,p=1,f=24,s=1,v=1;/wAA\x1b\\");
+
+        buffer.GetCursor().SetPosition(parent);
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m\x1b[58:2::0:0:1m");
+        _stateMachine->ProcessString(Placeholder());
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;0m");
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=2,p=1,P=1,Q=1,H=1,V=0,f=24,s=1,v=1,C=1;AP8A\x1b\\");
+
+        auto reflowed = std::make_unique<TextBuffer>(til::size{ 5, 600 }, TextAttribute{}, 0, false, &_testGetSet->_renderer);
+        TextBuffer::Reflow(buffer, *reflowed);
+        _testGetSet->_textBuffer = std::move(reflowed);
+
+        const auto parentLayer = _kitty()._virtualIds.at({ 1u, 1u }).layerId;
+        auto foundParent = false;
+        til::point reflowedParent;
+        for (auto y = 0; y < _testGetSet->_textBuffer->GetSize().Height() && !foundParent; ++y)
+        {
+            const auto& row = _testGetSet->_textBuffer->GetRowByOffset(y);
+            for (auto x = 0; x < _testGetSet->_textBuffer->GetSize().Width(); ++x)
+            {
+                if (const auto metadata = row.GetImageCellRef(x);
+                    metadata && metadata->layerId == parentLayer)
+                {
+                    reflowedParent = { x, y };
+                    foundParent = true;
+                    break;
+                }
+            }
+        }
+
+        VERIFY_IS_TRUE(foundParent);
+        const auto* copiedChild = DirectImageSlice(*_testGetSet->_textBuffer, reflowedParent.y);
+        VERIFY_IS_NOT_NULL(copiedChild);
+        VERIFY_ARE_EQUAL(2u, copiedChild->ColumnOwner(reflowedParent.x + 1), L"reflow keeps the child contiguous with its parent");
+        VERIFY_IS_TRUE(_pDispatch->SynchronizeImagePlacements());
+        const auto parentAnchor = _kitty()._deriveVirtualPlacementAnchor(1, 1);
+        VERIFY_IS_TRUE(parentAnchor.has_value());
+        const auto& child = _kitty()._placements.at({ 2u, 1u });
+        VERIFY_ARE_EQUAL(parentAnchor->x + 1, child.anchorCol);
+        VERIFY_ARE_EQUAL(parentAnchor->y, child.anchorRow);
+        const auto* slice = DirectImageSlice(*_testGetSet->_textBuffer, child.anchorRow);
+        VERIFY_IS_NOT_NULL(slice);
+        VERIFY_ARE_EQUAL(2u, slice->ColumnOwner(child.anchorCol));
+    }
+
+    TEST_METHOD(KittyVirtualParentWrappedReflowMovesRelativeChild)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        auto& buffer = *_testGetSet->_textBuffer;
+        const auto origin = buffer.GetCursor().GetPosition();
+        const til::point parent{ origin.x + 1, origin.y + 1 };
+        buffer.GetCursor().SetPosition(origin);
+        _stateMachine->ProcessString(L"A");
+        buffer.GetMutableRowByOffset(origin.y).SetWrapForced(true);
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,p=1,f=24,s=1,v=1;/wAA\x1b\\");
+
+        buffer.GetCursor().SetPosition(parent);
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m\x1b[58:2::0:0:1m");
+        _stateMachine->ProcessString(Placeholder());
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;0m");
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=2,p=1,P=1,Q=1,H=1,V=0,f=24,s=1,v=1,C=1;AP8A\x1b\\");
+
+        auto reflowed = std::make_unique<TextBuffer>(
+            til::size{ buffer.GetSize().Width() * 2, buffer.GetSize().Height() },
+            TextAttribute{},
+            0,
+            false,
+            &_testGetSet->_renderer);
+        TextBuffer::Reflow(buffer, *reflowed);
+        _testGetSet->_textBuffer = std::move(reflowed);
+
+        const auto parentLayer = _kitty()._virtualIds.at({ 1u, 1u }).layerId;
+        auto foundParent = false;
+        til::point reflowedParent;
+        for (auto y = 0; y < _testGetSet->_textBuffer->GetSize().Height() && !foundParent; ++y)
+        {
+            const auto& row = _testGetSet->_textBuffer->GetRowByOffset(y);
+            for (auto x = 0; x < _testGetSet->_textBuffer->GetSize().Width(); ++x)
+            {
+                if (const auto metadata = row.GetImageCellRef(x);
+                    metadata && metadata->layerId == parentLayer)
+                {
+                    reflowedParent = { x, y };
+                    foundParent = true;
+                    break;
+                }
+            }
+        }
+
+        VERIFY_IS_TRUE(foundParent);
+        const auto* copiedChild = DirectImageSlice(*_testGetSet->_textBuffer, reflowedParent.y);
+        VERIFY_IS_NOT_NULL(copiedChild);
+        VERIFY_ARE_EQUAL(2u, copiedChild->ColumnOwner(reflowedParent.x + 1), L"wrapped reflow keeps the child contiguous with its parent");
+        VERIFY_IS_TRUE(_pDispatch->SynchronizeImagePlacements());
+        const auto parentAnchor = _kitty()._deriveVirtualPlacementAnchor(1, 1);
+        VERIFY_IS_TRUE(parentAnchor.has_value());
+        const auto& child = _kitty()._placements.at({ 2u, 1u });
+        VERIFY_ARE_EQUAL(parentAnchor->x + 1, child.anchorCol);
+        VERIFY_ARE_EQUAL(parentAnchor->y, child.anchorRow);
+        const auto* slice = DirectImageSlice(*_testGetSet->_textBuffer, child.anchorRow);
+        VERIFY_IS_NOT_NULL(slice);
+        VERIFY_ARE_EQUAL(2u, slice->ColumnOwner(child.anchorCol));
+    }
+
+    TEST_METHOD(KittyMainBufferRestoreSynchronizesRelativeDescendants)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        auto& buffer = *_testGetSet->_textBuffer;
+        const til::point parent{ 10, 10 };
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,p=1,f=24,s=1,v=1;/wAA\x1b\\");
+        buffer.GetCursor().SetPosition(parent);
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m\x1b[58:2::0:0:1m");
+        _stateMachine->ProcessString(Placeholder());
+        _stateMachine->ProcessString(L"\x1b[0m");
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=2,p=1,P=1,Q=1,H=1,V=0,f=24,s=1,v=1,C=1;AP8A\x1b\\");
+
+        auto mainImages = buffer.GetImages().Snapshot();
+        _kitty().SaveMainBufferState();
+        _kitty().DiscardBufferState();
+        buffer.GetMutableImages() = std::move(mainImages);
+        buffer.GetMutableImages().Translate({ 2, 0 });
+        _kitty().RestoreMainBufferState();
+
+        VERIFY_IS_TRUE(_pDispatch->SynchronizeImagePlacements());
+        const til::point restoredParent{ parent.x + 2, parent.y };
+        const til::point restoredChild{ restoredParent.x + 1, restoredParent.y };
+        const auto& child = _kitty()._placements.at({ 2u, 1u });
+        VERIFY_ARE_EQUAL(restoredChild.x, child.anchorCol);
+        VERIFY_ARE_EQUAL(restoredChild.y, child.anchorRow);
+        const auto* slice = DirectImageSlice(buffer, restoredChild.y);
+        VERIFY_IS_NOT_NULL(slice);
+        VERIFY_ARE_EQUAL(2u, slice->ColumnOwner(restoredChild.x));
+    }
+
+    TEST_METHOD(KittyPersistentMainRestoreFailureRestoresCursorAndFailsClosed)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        auto& buffer = *_testGetSet->_textBuffer;
+        const til::point mainCursor{ 2, 22 };
+        const til::point parent{ 10, 10 };
+        buffer.GetCursor().SetPosition(mainCursor);
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,p=1,f=24,s=1,v=1;/wAA\x1b\\");
+        buffer.GetCursor().SetPosition(parent);
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m\x1b[58:2::0:0:1m");
+        _stateMachine->ProcessString(Placeholder());
+        _stateMachine->ProcessString(L"\x1b[0m");
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=2,p=1,P=1,Q=1,H=1,V=0,f=24,s=1,v=1,C=1;AP8A\x1b\\");
+        buffer.GetCursor().SetPosition(mainCursor);
+
+        const auto parentLayer = _kitty()._virtualIds.at({ 1u, 1u }).layerId;
+        const ImagePlacement::Key parentKey{ 1u, parentLayer, ImagePlacement::Key::Protocol::Kitty };
+        auto mainImages = buffer.GetImages().Snapshot();
+        const auto parentFragment = *std::ranges::find_if(mainImages.All(), [&](const auto& placement) {
+            return placement.Identity() == parentKey;
+        });
+
+        _pDispatch->_SetAlternateScreenBufferMode(true);
+        mainImages.Erase(parentKey);
+        mainImages.Add(parentFragment.Translated({ 3, 0 }));
+        _testGetSet->_mainImagesOnUseMain = std::make_unique<ImageCollection>(std::move(mainImages));
+        buffer.GetCursor().SetPosition({ 20, 20 });
+        _kitty()._testPersistentMovePlacementFailure = true;
+
+        VERIFY_THROWS(_pDispatch->_SetAlternateScreenBufferMode(false), wil::ResultException);
+        VERIFY_IS_FALSE(_pDispatch->_usingAltBuffer);
+        VERIFY_ARE_EQUAL(mainCursor, buffer.GetCursor().GetPosition());
+        VERIFY_IS_TRUE(_kitty()._images.empty());
+        VERIFY_IS_TRUE(buffer.GetImages().Empty());
+
+        _kitty()._testPersistentMovePlacementFailure = false;
+        VERIFY_NO_THROW(_pDispatch->_SetAlternateScreenBufferMode(false));
+        VERIFY_ARE_EQUAL(mainCursor, buffer.GetCursor().GetPosition());
+    }
+
+    TEST_METHOD(KittySynchronizeReportsAndRollsBackDescendantFailure)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        auto& buffer = *_testGetSet->_textBuffer;
+        const til::point parent{ 10, 10 };
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,p=1,f=24,s=1,v=1;/wAA\x1b\\");
+        buffer.GetCursor().SetPosition(parent);
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m\x1b[58:2::0:0:1m");
+        _stateMachine->ProcessString(Placeholder());
+        _stateMachine->ProcessString(L"\x1b[0m");
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=2,p=1,P=1,Q=1,H=1,V=0,f=24,s=1,v=1,C=1;AP8A\x1b\\");
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=3,p=1,P=2,Q=1,H=1,V=1,f=24,s=1,v=1,C=1;AAD/\x1b\\");
+        const til::point oldChild{ parent.x + 1, parent.y };
+        const til::point oldGrandchild{ parent.x + 2, parent.y + 1 };
+
+        const auto parentLayer = _kitty()._virtualIds.at({ 1u, 1u }).layerId;
+        const ImagePlacement::Key parentKey{ 1u, parentLayer, ImagePlacement::Key::Protocol::Kitty };
+        const auto parentFragment = *std::ranges::find_if(buffer.GetImages().All(), [&](const auto& placement) {
+            return placement.Identity() == parentKey;
+        });
+        buffer.GetMutableImages().Erase(parentKey);
+        buffer.GetMutableImages().Add(parentFragment.Translated({ 5, 0 }));
+
+        _kitty()._testMovePlacementFailureCountdown = 1;
+        VERIFY_IS_FALSE(_pDispatch->SynchronizeImagePlacements());
+        VERIFY_IS_FALSE(_kitty()._testMovePlacementFailureCountdown.has_value());
+        VERIFY_ARE_EQUAL(2u, DirectImageSlice(buffer, oldChild.y)->ColumnOwner(oldChild.x));
+        VERIFY_ARE_EQUAL(3u, DirectImageSlice(buffer, oldGrandchild.y)->ColumnOwner(oldGrandchild.x));
+        const auto& child = _kitty()._placements.at({ 2u, 1u });
+        const auto& grandchild = _kitty()._placements.at({ 3u, 1u });
+        VERIFY_ARE_EQUAL(oldChild.x, child.anchorCol);
+        VERIFY_ARE_EQUAL(oldChild.y, child.anchorRow);
+        VERIFY_ARE_EQUAL(oldGrandchild.x, grandchild.anchorCol);
+        VERIFY_ARE_EQUAL(oldGrandchild.y, grandchild.anchorRow);
+    }
+
+    TEST_METHOD(KittyVirtualParentMultiFragmentRepaintMovesRelativeChild)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        auto& buffer = *_testGetSet->_textBuffer;
+        const til::point firstParent{ 12, 5 };
+        const til::point secondParent{ 3, 8 };
+        const til::point replacementParent{ 14, 10 };
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,p=1,f=24,s=1,v=1;/wAA\x1b\\");
+
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m\x1b[58:2::0:0:1m");
+        buffer.GetCursor().SetPosition(firstParent);
+        _stateMachine->ProcessString(Placeholder());
+        buffer.GetCursor().SetPosition(secondParent);
+        _stateMachine->ProcessString(Placeholder());
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;0m");
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=2,p=1,P=1,Q=1,H=1,V=0,f=24,s=1,v=1,C=1;AP8A\x1b\\");
+
+        const til::point oldChild{ secondParent.x + 1, firstParent.y };
+        VERIFY_ARE_EQUAL(2u, DirectImageSlice(buffer, oldChild.y)->ColumnOwner(oldChild.x));
+
+        buffer.GetCursor().SetPosition(secondParent);
+        _stateMachine->ProcessString(L"\x1b[0mX");
+        buffer.GetCursor().SetPosition(replacementParent);
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m\x1b[58:2::0:0:1m");
+        _stateMachine->ProcessString(Placeholder());
+
+        const til::point newChild{ firstParent.x + 1, firstParent.y };
+        const auto* oldSlice = DirectImageSlice(buffer, oldChild.y);
+        VERIFY_IS_TRUE(oldSlice == nullptr || oldSlice->ColumnOwner(oldChild.x) != 2u);
+        const auto* newSlice = DirectImageSlice(buffer, newChild.y);
+        VERIFY_IS_NOT_NULL(newSlice);
+        VERIFY_ARE_EQUAL(2u, newSlice->ColumnOwner(newChild.x));
+    }
+
     // Non-divisible geometry: a 3px-wide image scaled across a 2-cell grid at a 3px cell size
     // (target width 6) has tile boundaries that DON'T fall on source-pixel edges. The placeholder
     // render must STILL equal the direct c/r placement pixel-for-pixel (#35 item 2) -- the old
@@ -10007,6 +10786,415 @@ public:
         {
             VERIFY_ARE_EQUAL(firstSurface.get(), first->SurfacePointer().get(), L"new Sixel output must not replace preserved output");
         }
+    }
+
+    TEST_METHOD(KittyAnonymousVirtualParentDeleteCascadesNamedChild)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        auto& buffer = *_testGetSet->_textBuffer;
+        const til::point parentPosition{ 5, 5 };
+        buffer.GetCursor().SetPosition(parentPosition);
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,f=24,s=1,v=1;/wAA\x1b\\");
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m");
+        _stateMachine->ProcessString(Placeholder());
+        _stateMachine->ProcessString(L"\x1b[0m");
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=2,p=1,P=1,Q=0,H=1,V=0,f=24,s=1,v=1,C=1;AP8A\x1b\\");
+
+        const til::point childPosition{ parentPosition.x + 1, parentPosition.y };
+        VERIFY_ARE_EQUAL(2u, DirectImageSlice(buffer, childPosition.y)->ColumnOwner(childPosition.x));
+        _stateMachine->ProcessString(L"\x1b_Ga=d,d=i,i=1;\x1b\\");
+
+        VERIFY_IS_FALSE(_kitty()._placements.contains({ 2u, 1u }));
+        VERIFY_IS_FALSE(_kitty()._images.contains(2u));
+        const auto* slice = DirectImageSlice(buffer, childPosition.y);
+        VERIFY_IS_TRUE(slice == nullptr || slice->ColumnOwner(childPosition.x) != 2u);
+    }
+
+    TEST_METHOD(KittyAnonymousVirtualParentRetransmitAndReputCascadeNamedChild)
+    {
+        const auto createParentAndChild = [&]() {
+            _testGetSet->PrepData();
+            _testGetSet->_cellSize = { 1, 1 };
+            auto& buffer = *_testGetSet->_textBuffer;
+            buffer.GetCursor().SetPosition({ 5, 5 });
+            _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,f=24,s=1,v=1;/wAA\x1b\\");
+            _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m");
+            _stateMachine->ProcessString(Placeholder());
+            _stateMachine->ProcessString(L"\x1b[0m");
+            _stateMachine->ProcessString(L"\x1b_Ga=T,i=2,p=1,P=1,Q=0,H=1,V=0,f=24,s=1,v=1,C=1;AP8A\x1b\\");
+        };
+
+        createParentAndChild();
+        _stateMachine->ProcessString(L"\x1b_Ga=t,i=1,f=24,s=1,v=1;AAD/\x1b\\");
+        VERIFY_IS_FALSE(_kitty()._placements.contains({ 2u, 1u }), L"retransmitting an anonymous virtual parent cascades its named child");
+        VERIFY_IS_FALSE(_kitty()._images.contains(2u));
+
+        _kitty()._clearImages();
+        createParentAndChild();
+        _stateMachine->ProcessString(L"\x1b_Ga=p,U=1,i=1,c=1,r=1;\x1b\\");
+        VERIFY_IS_FALSE(_kitty()._placements.contains({ 2u, 1u }), L"re-putting an anonymous virtual parent cascades its named child");
+        VERIFY_IS_FALSE(_kitty()._images.contains(2u));
+    }
+
+    TEST_METHOD(KittyAnonymousVirtualParentEvictionCascadesNamedChild)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        auto& buffer = *_testGetSet->_textBuffer;
+        buffer.GetCursor().SetPosition({ 5, 5 });
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,f=24,s=1,v=1;/wAA\x1b\\");
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m");
+        _stateMachine->ProcessString(Placeholder());
+        _stateMachine->ProcessString(L"\x1b[0m");
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=2,p=1,P=1,Q=0,H=1,V=0,f=24,s=1,v=1,C=1;AP8A\x1b\\");
+
+        for (auto id = 3u; id <= KittyParser::MaxImages; ++id)
+        {
+            _kitty()._images.emplace(id, KittyParser::Image{});
+            _kitty()._imageOrder.push_back(id);
+        }
+        VERIFY_IS_TRUE(_kitty()._registerImage(KittyParser::MaxImages + 1, KittyParser::Image{}));
+        VERIFY_IS_FALSE(_kitty()._images.contains(1u));
+        VERIFY_IS_FALSE(_kitty()._images.contains(2u), L"evicting an anonymous virtual parent cascades the named child");
+        VERIFY_IS_FALSE(_kitty()._placements.contains({ 2u, 1u }));
+    }
+
+    TEST_METHOD(KittyAnonymousVirtualParentSurvivesDeleteAllException)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        auto& buffer = *_testGetSet->_textBuffer;
+        buffer.GetCursor().SetPosition({ 5, 5 });
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,f=24,s=1,v=1;/wAA\x1b\\");
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m");
+        _stateMachine->ProcessString(Placeholder());
+        _stateMachine->ProcessString(L"\x1b[0m");
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=2,p=1,P=1,Q=0,H=1,V=0,f=24,s=1,v=1,C=1;AP8A\x1b\\");
+
+        _stateMachine->ProcessString(L"\x1b_Ga=d,d=a;\x1b\\");
+        VERIFY_IS_TRUE(_kitty()._virtualIds.contains({ 1u, 0u }), L"d=a retains the anonymous virtual parent");
+        VERIFY_IS_TRUE(_kitty()._images.contains(1u));
+        VERIFY_IS_FALSE(_kitty()._placements.contains({ 2u, 1u }), L"d=a still removes the physical child");
+    }
+
+    TEST_METHOD(KittyAnonymousCascadeFailureRestoresDeleteReputAndEviction)
+    {
+        const til::point parent{ 10, 10 };
+        const til::point child{ parent.x + 1, parent.y };
+        const til::point grandchild{ parent.x + 2, parent.y + 1 };
+        const auto setup = [&]() {
+            _testGetSet->PrepData();
+            _testGetSet->_cellSize = { 1, 1 };
+            _kitty()._clearImages();
+            auto& buffer = *_testGetSet->_textBuffer;
+            _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,f=24,s=1,v=1;/wAA\x1b\\");
+            buffer.GetCursor().SetPosition(parent);
+            _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m");
+            _stateMachine->ProcessString(Placeholder());
+            _stateMachine->ProcessString(L"\x1b[0m");
+            _stateMachine->ProcessString(L"\x1b_Ga=T,i=2,p=1,P=1,Q=0,H=1,V=0,f=24,s=1,v=1,C=1;AP8A\x1b\\");
+            _stateMachine->ProcessString(L"\x1b_Ga=T,i=3,p=1,P=2,Q=1,H=1,V=1,f=24,s=1,v=1,C=1;AAD/\x1b\\");
+        };
+        const auto verify = [&]() {
+            const auto& buffer = *_testGetSet->_textBuffer;
+            VERIFY_IS_TRUE(_kitty()._virtualIds.contains({ 1u, 0u }));
+            VERIFY_IS_TRUE(_kitty()._placements.contains({ 2u, 1u }));
+            VERIFY_IS_TRUE(_kitty()._placements.contains({ 3u, 1u }));
+            VERIFY_IS_TRUE(_kitty()._images.contains(1u));
+            VERIFY_IS_TRUE(_kitty()._images.contains(2u));
+            VERIFY_IS_TRUE(_kitty()._images.contains(3u));
+            VERIFY_ARE_EQUAL(1u, DirectImageSlice(buffer, parent.y)->ColumnOwner(parent.x));
+            VERIFY_ARE_EQUAL(2u, DirectImageSlice(buffer, child.y)->ColumnOwner(child.x));
+            VERIFY_ARE_EQUAL(3u, DirectImageSlice(buffer, grandchild.y)->ColumnOwner(grandchild.x));
+            VERIFY_IS_FALSE(_kitty()._testCascadeFailureAfterEraseCountdown.has_value());
+        };
+
+        setup();
+        _kitty()._testCascadeFailureAfterEraseCountdown = 0;
+        _stateMachine->ProcessString(L"\x1b_Ga=d,d=i,i=1;\x1b\\");
+        verify();
+
+        setup();
+        _kitty()._testCascadeFailureAfterEraseCountdown = 0;
+        _stateMachine->ProcessString(L"\x1b_Ga=p,U=1,i=1,c=1,r=1;\x1b\\");
+        verify();
+
+        setup();
+        for (auto id = 4u; id <= KittyParser::MaxImages; ++id)
+        {
+            _kitty()._images.emplace(id, KittyParser::Image{});
+            _kitty()._imageOrder.push_back(id);
+        }
+        _kitty()._testCascadeFailureAfterEraseCountdown = 0;
+        VERIFY_THROWS(_kitty()._registerImage(KittyParser::MaxImages + 1, KittyParser::Image{}), std::bad_alloc);
+        verify();
+    }
+
+    TEST_METHOD(KittyNamedVirtualReputCascadesChildrenAndRollsBackFailure)
+    {
+        const til::point parent{ 10, 10 };
+        const til::point child{ parent.x + 1, parent.y };
+        const til::point grandchild{ parent.x + 2, parent.y + 1 };
+        const auto setup = [&]() {
+            _testGetSet->PrepData();
+            _testGetSet->_cellSize = { 1, 1 };
+            _kitty()._clearImages();
+            auto& buffer = *_testGetSet->_textBuffer;
+            _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,p=1,f=24,s=1,v=1;/wAA\x1b\\");
+            buffer.GetCursor().SetPosition(parent);
+            _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m\x1b[58:2::0:0:1m");
+            _stateMachine->ProcessString(Placeholder());
+            _stateMachine->ProcessString(L"\x1b[0m");
+            _stateMachine->ProcessString(L"\x1b_Ga=T,i=2,p=1,P=1,Q=1,H=1,V=0,f=24,s=1,v=1,C=1;AP8A\x1b\\");
+            _stateMachine->ProcessString(L"\x1b_Ga=T,i=3,p=1,P=2,Q=1,H=1,V=1,f=24,s=1,v=1,C=1;AAD/\x1b\\");
+        };
+        const auto verify = [&]() {
+            const auto& buffer = *_testGetSet->_textBuffer;
+            VERIFY_IS_TRUE(_kitty()._virtualIds.contains({ 1u, 1u }));
+            VERIFY_IS_TRUE(_kitty()._placements.contains({ 2u, 1u }));
+            VERIFY_IS_TRUE(_kitty()._placements.contains({ 3u, 1u }));
+            VERIFY_IS_TRUE(_kitty()._images.contains(1u));
+            VERIFY_IS_TRUE(_kitty()._images.contains(2u));
+            VERIFY_IS_TRUE(_kitty()._images.contains(3u));
+            VERIFY_ARE_EQUAL(1u, DirectImageSlice(buffer, parent.y)->ColumnOwner(parent.x));
+            VERIFY_ARE_EQUAL(2u, DirectImageSlice(buffer, child.y)->ColumnOwner(child.x));
+            VERIFY_ARE_EQUAL(3u, DirectImageSlice(buffer, grandchild.y)->ColumnOwner(grandchild.x));
+            VERIFY_IS_FALSE(_kitty()._testCascadeFailureAfterEraseCountdown.has_value());
+        };
+
+        setup();
+        _stateMachine->ProcessString(L"\x1b_Ga=p,U=1,i=1,p=1,c=1,r=1;\x1b\\");
+        VERIFY_IS_FALSE(_kitty()._placements.contains({ 2u, 1u }));
+        VERIFY_IS_FALSE(_kitty()._placements.contains({ 3u, 1u }));
+        VERIFY_IS_FALSE(_kitty()._images.contains(2u));
+        VERIFY_IS_FALSE(_kitty()._images.contains(3u));
+        const auto* oldSlice = DirectImageSlice(*_testGetSet->_textBuffer, parent.y);
+        VERIFY_IS_TRUE(oldSlice == nullptr || oldSlice->ColumnOwner(parent.x) != 1u);
+
+        setup();
+        _kitty()._testCascadeFailureAfterEraseCountdown = 0;
+        _stateMachine->ProcessString(L"\x1b_Ga=p,U=1,i=1,p=1,c=1,r=1;\x1b\\");
+        verify();
+    }
+
+    TEST_METHOD(KittyPhysicalReputFailureRestoresCursorAndDescendants)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        auto& buffer = *_testGetSet->_textBuffer;
+        const til::point textPosition{ 1, 1 };
+        const til::point parent{ 10, 10 };
+        const til::point child{ parent.x + 1, parent.y };
+        const til::point grandchild{ parent.x + 2, parent.y + 1 };
+        buffer.GetCursor().SetPosition(textPosition);
+        _stateMachine->ProcessString(L"K");
+        buffer.GetCursor().SetPosition(parent);
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,p=1,f=24,s=1,v=1,C=1;/wAA\x1b\\");
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=2,p=1,P=1,Q=1,H=1,V=0,f=24,s=1,v=1,C=1;AP8A\x1b\\");
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=3,p=1,P=2,Q=1,H=1,V=1,f=24,s=1,v=1,C=1;AAD/\x1b\\");
+
+        const til::point attemptedParent{ 20, 15 };
+        buffer.GetCursor().SetPosition(attemptedParent);
+        const auto cursorBeforeAttempt = buffer.GetCursor().GetPosition();
+        _kitty()._testMovePlacementFailureCountdown = 0;
+        _stateMachine->ProcessString(L"\x1b_Ga=p,i=1,p=1,c=1,r=1;\x1b\\");
+
+        VERIFY_ARE_EQUAL(cursorBeforeAttempt, buffer.GetCursor().GetPosition());
+        VERIFY_ARE_EQUAL(1u, DirectImageSlice(buffer, parent.y)->ColumnOwner(parent.x));
+        VERIFY_ARE_EQUAL(2u, DirectImageSlice(buffer, child.y)->ColumnOwner(child.x));
+        VERIFY_ARE_EQUAL(3u, DirectImageSlice(buffer, grandchild.y)->ColumnOwner(grandchild.x));
+        const auto& childPlacement = _kitty()._placements.at({ 2u, 1u });
+        const auto& grandchildPlacement = _kitty()._placements.at({ 3u, 1u });
+        VERIFY_ARE_EQUAL(child.x, childPlacement.anchorCol);
+        VERIFY_ARE_EQUAL(child.y, childPlacement.anchorRow);
+        VERIFY_ARE_EQUAL(grandchild.x, grandchildPlacement.anchorCol);
+        VERIFY_ARE_EQUAL(grandchild.y, grandchildPlacement.anchorRow);
+        VERIFY_ARE_EQUAL(L'K', buffer.GetRowByOffset(textPosition.y).GlyphAt(textPosition.x).front());
+        VERIFY_IS_FALSE(_kitty()._testMovePlacementFailureCountdown.has_value());
+    }
+
+    TEST_METHOD(KittyPlaceholderSplitMarksEraseStaleFragmentWhenCompletedCellIsOutsideGrid)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        auto& buffer = *_testGetSet->_textBuffer;
+        const auto origin = buffer.GetCursor().GetPosition();
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,f=24,s=1,v=1,c=1,r=1;/wAA\x1b\\");
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m");
+        _stateMachine->ProcessString(Placeholder());
+        VERIFY_IS_TRUE(BufferContainsColor(buffer, 255, 0, 0));
+
+        _stateMachine->ProcessString(L"\x0305\x030D"); // completed cell is row 0, column 1: outside 1x1
+        const auto* slice = DirectImageSlice(buffer, origin.y);
+        VERIFY_IS_TRUE(slice == nullptr || slice->ColumnOwner(origin.x) == 0u, L"re-resolving to no tile must erase the stale fragment");
+        const auto* metadata = buffer.GetRowByOffset(origin.y).GetImageCellRef(origin.x);
+        VERIFY_IS_NOT_NULL(metadata);
+        VERIFY_ARE_EQUAL(0u, metadata->layerId, L"a no-tile completed grapheme cannot retain old layer ownership");
+    }
+
+    TEST_METHOD(KittyPlaceholderSplitMarksReplaceStaleFragmentWhenIdentityChanges)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        auto& buffer = *_testGetSet->_textBuffer;
+        const auto origin = buffer.GetCursor().GetPosition();
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,f=24,s=1,v=1;/wAA\x1b\\");
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=2,f=24,s=1,v=1;AP8A\x1b\\");
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m");
+        _stateMachine->ProcessString(Placeholder());
+        VERIFY_ARE_EQUAL(1u, DirectImageSlice(buffer, origin.y)->ColumnOwner(origin.x));
+
+        auto& row = buffer.GetMutableRowByOffset(origin.y);
+        RowWriteState marks{
+            .text = L"\x0305",
+            .columnBegin = origin.x + 1,
+        };
+        row.ReplaceText(marks);
+        auto attributes = row.GetAttrByColumn(origin.x);
+        attributes.SetForeground(RGB(0, 0, 2));
+        row.ReplaceAttributes(origin.x, origin.x + 1, attributes);
+        _kitty().RenderPlaceholders(L"\x0305", origin.y, origin.x + 1);
+        const auto* slice = DirectImageSlice(buffer, origin.y);
+        VERIFY_IS_NOT_NULL(slice);
+        VERIFY_ARE_EQUAL(2u, slice->ColumnOwner(origin.x), L"the completed cell must replace image 1 with image 2");
+        VERIFY_IS_FALSE(slice->Contains(1), L"the old image identity must leave no stale fragment");
+    }
+
+    TEST_METHOD(KittyPlaceholderSplitMarksReplaceStaleFragmentWhenLayerChanges)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        auto& buffer = *_testGetSet->_textBuffer;
+        const auto origin = buffer.GetCursor().GetPosition();
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,p=1,f=24,s=1,v=1;/wAA\x1b\\");
+        _stateMachine->ProcessString(L"\x1b_Ga=p,U=1,i=1,p=2,c=1,r=1;\x1b\\");
+        const auto oldLayer = _kitty()._virtualIds.at({ 1u, 1u }).layerId;
+        const auto newLayer = _kitty()._virtualIds.at({ 1u, 2u }).layerId;
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m\x1b[58:2::0:0:1m");
+        _stateMachine->ProcessString(Placeholder());
+        VERIFY_IS_TRUE(DirectImageSlice(buffer, origin.y)->ContainsPlacement(oldLayer));
+
+        auto& row = buffer.GetMutableRowByOffset(origin.y);
+        RowWriteState marks{
+            .text = L"\x0305",
+            .columnBegin = origin.x + 1,
+        };
+        row.ReplaceText(marks);
+        auto attributes = row.GetAttrByColumn(origin.x);
+        attributes.SetUnderlineColor(RGB(0, 0, 2));
+        row.ReplaceAttributes(origin.x, origin.x + 1, attributes);
+        _kitty().RenderPlaceholders(L"\x0305", origin.y, origin.x + 1);
+
+        const auto* slice = DirectImageSlice(buffer, origin.y);
+        VERIFY_IS_NOT_NULL(slice);
+        VERIFY_IS_FALSE(slice->ContainsPlacement(oldLayer), L"the old virtual layer must leave no stale fragment");
+        VERIFY_IS_TRUE(slice->ContainsPlacement(newLayer), L"the completed cell must move to the new virtual layer");
+    }
+
+    TEST_METHOD(KittyVirtualParentMoveAllocationFailureRollsBackRecursiveDescendants)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        auto& buffer = *_testGetSet->_textBuffer;
+        const til::point oldParent{ 10, 10 };
+        const til::point attemptedParent{ 3, 3 };
+        buffer.GetCursor().SetPosition(oldParent);
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,p=1,f=24,s=1,v=1;/wAA\x1b\\");
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m\x1b[58:2::0:0:1m");
+        _stateMachine->ProcessString(Placeholder());
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;0m");
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=2,p=1,P=1,Q=1,H=1,V=0,f=24,s=1,v=1,C=1;AP8A\x1b\\");
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=3,p=1,P=2,Q=1,H=1,V=1,f=24,s=1,v=1,C=1;AAD/\x1b\\");
+        const til::point oldChild{ oldParent.x + 1, oldParent.y };
+        const til::point oldGrandchild{ oldParent.x + 2, oldParent.y + 1 };
+
+        _kitty()._testMovePlacementFailureCountdown = 1;
+        buffer.GetCursor().SetPosition(attemptedParent);
+        const auto cursorBeforeAttempt = buffer.GetCursor().GetPosition();
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m\x1b[58:2::0:0:1m");
+        _stateMachine->ProcessString(Placeholder());
+
+        const auto anchor = _kitty()._deriveVirtualPlacementAnchor(1, 1);
+        VERIFY_IS_TRUE(anchor.has_value());
+        VERIFY_ARE_EQUAL(oldParent, *anchor, L"the failed transaction must not publish the new parent fragment");
+        const auto* oldSlice = DirectImageSlice(buffer, oldChild.y);
+        VERIFY_IS_NOT_NULL(oldSlice);
+        VERIFY_ARE_EQUAL(2u, oldSlice->ColumnOwner(oldChild.x), L"the child remains at its original anchor after rollback");
+        const auto* oldGrandchildSlice = DirectImageSlice(buffer, oldGrandchild.y);
+        VERIFY_IS_NOT_NULL(oldGrandchildSlice);
+        VERIFY_ARE_EQUAL(3u, oldGrandchildSlice->ColumnOwner(oldGrandchild.x), L"the grandchild remains at its original anchor after rollback");
+        VERIFY_IS_FALSE(_kitty()._testMovePlacementFailureCountdown.has_value(), L"the one-shot failure injection must disarm after the transaction");
+        const auto* attemptedMetadata = buffer.GetRowByOffset(attemptedParent.y).GetImageCellRef(attemptedParent.x);
+        VERIFY_IS_NULL(attemptedMetadata, L"rollback removes uncommitted placeholder metadata");
+        VERIFY_ARE_EQUAL(std::wstring{ L" " }, std::wstring{ buffer.GetRowByOffset(attemptedParent.y).GlyphAt(attemptedParent.x) });
+        VERIFY_ARE_EQUAL(cursorBeforeAttempt, buffer.GetCursor().GetPosition());
+    }
+
+    TEST_METHOD(KittyPlaceholderSplitMarksRollbackRestoresMetadataAndDescendants)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        auto& buffer = *_testGetSet->_textBuffer;
+        const til::point textPosition{ 1, 1 };
+        const til::point firstParent{ 10, 10 };
+        const til::point secondParent{ 20, 10 };
+        buffer.GetCursor().SetPosition(textPosition);
+        _stateMachine->ProcessString(L"K");
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,p=1,f=24,s=2,v=1,c=2,r=1;/wAAAP8A\x1b\\");
+
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m\x1b[58:2::0:0:1m");
+        buffer.GetCursor().SetPosition(firstParent);
+        _stateMachine->ProcessString(Placeholder());
+        const auto oldMetadata = *buffer.GetRowByOffset(firstParent.y).GetImageCellRef(firstParent.x);
+        buffer.GetCursor().SetPosition(secondParent);
+        _stateMachine->ProcessString(Placeholder());
+
+        _stateMachine->ProcessString(L"\x1b[0m");
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=2,p=1,P=1,Q=1,H=3,V=0,f=24,s=1,v=1,C=1;AP8A\x1b\\");
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=3,p=1,P=2,Q=1,H=1,V=1,f=24,s=1,v=1,C=1;AAD/\x1b\\");
+        const til::point oldChild{ firstParent.x + 3, firstParent.y };
+        const til::point oldGrandchild{ firstParent.x + 4, firstParent.y + 1 };
+        const auto oldChildSurface = _kitty()._images.at(2).surface;
+        const auto oldGrandchildSurface = _kitty()._images.at(3).surface;
+        const auto oldChildRendered = _kitty()._images.at(2).hasRenderedPlacements;
+        const auto oldGrandchildRendered = _kitty()._images.at(3).hasRenderedPlacements;
+
+        _kitty()._testMovePlacementFailureCountdown = 3;
+        buffer.GetCursor().SetPosition({ firstParent.x + 1, firstParent.y });
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m\x1b[58:2::0:0:1m");
+        _stateMachine->ProcessString(L"\x0305\x030E");
+
+        const auto* restoredMetadata = buffer.GetRowByOffset(firstParent.y).GetImageCellRef(firstParent.x);
+        VERIFY_IS_NOT_NULL(restoredMetadata);
+        VERIFY_ARE_EQUAL(oldMetadata.layerId, restoredMetadata->layerId);
+        VERIFY_ARE_EQUAL(oldMetadata.column, restoredMetadata->column);
+        VERIFY_ARE_EQUAL(oldMetadata.row, restoredMetadata->row);
+        VERIFY_ARE_EQUAL(oldMetadata.imageIdHighByte, restoredMetadata->imageIdHighByte);
+        VERIFY_IS_TRUE(restoredMetadata->valid);
+        VERIFY_ARE_EQUAL(1u, DirectImageSlice(buffer, firstParent.y)->ColumnOwner(firstParent.x));
+        VERIFY_ARE_EQUAL(2u, DirectImageSlice(buffer, oldChild.y)->ColumnOwner(oldChild.x));
+        VERIFY_ARE_EQUAL(3u, DirectImageSlice(buffer, oldGrandchild.y)->ColumnOwner(oldGrandchild.x));
+        const auto& child = _kitty()._placements.at({ 2u, 1u });
+        const auto& grandchild = _kitty()._placements.at({ 3u, 1u });
+        VERIFY_ARE_EQUAL(oldChild.x, child.anchorCol);
+        VERIFY_ARE_EQUAL(oldChild.y, child.anchorRow);
+        VERIFY_ARE_EQUAL(oldGrandchild.x, grandchild.anchorCol);
+        VERIFY_ARE_EQUAL(oldGrandchild.y, grandchild.anchorRow);
+        VERIFY_ARE_EQUAL(oldChildSurface.get(), _kitty()._images.at(2).surface.get());
+        VERIFY_ARE_EQUAL(oldGrandchildSurface.get(), _kitty()._images.at(3).surface.get());
+        VERIFY_ARE_EQUAL(oldChildRendered, _kitty()._images.at(2).hasRenderedPlacements);
+        VERIFY_ARE_EQUAL(oldGrandchildRendered, _kitty()._images.at(3).hasRenderedPlacements);
+
+        buffer.GetCursor().SetPosition({ firstParent.x + 1, firstParent.y });
+        _stateMachine->ProcessString(Placeholder());
+        const auto* inherited = buffer.GetRowByOffset(firstParent.y).GetImageCellRef(firstParent.x + 1);
+        VERIFY_IS_NOT_NULL(inherited);
+        VERIFY_ARE_EQUAL(oldMetadata.layerId, inherited->layerId);
+        VERIFY_ARE_EQUAL(oldMetadata.row, inherited->row);
+        VERIFY_ARE_EQUAL(oldMetadata.column + 1, inherited->column);
+        VERIFY_ARE_EQUAL(1u, DirectImageSlice(buffer, firstParent.y)->ColumnOwner(firstParent.x + 1));
+        VERIFY_ARE_EQUAL(L'K', buffer.GetRowByOffset(textPosition.y).GlyphAt(textPosition.x).front());
     }
 
     TEST_METHOD(NonKittyApcIgnored)

@@ -19,6 +19,7 @@ class AdapterTest;
 #endif
 
 class ROW;
+struct ImageCellRef;
 
 namespace Microsoft::Console::VirtualTerminal
 {
@@ -42,12 +43,23 @@ namespace Microsoft::Console::VirtualTerminal
         ITermDispatch::StringHandler DefineImage();
 
         // Resolves the placeholder cells in a run of text the writer just placed.
-        void RenderPlaceholders(const std::wstring_view segment, const til::CoordType screenRow, const til::CoordType startColumn);
+        bool RenderPlaceholders(const std::wstring_view segment,
+                                til::CoordType screenRow,
+                                til::CoordType startColumn,
+                                const ImageCellRef* leadingCellMetadataBeforeWrite = nullptr);
 
         // True when a run of text opens with kitty rowcolumn diacritics, i.e. it may be the tail
         // of a placeholder cell whose write was split before its marks. The writer has to notice
         // such a run even though it carries no U+10EEEE of its own.
         static bool StartsWithPlaceholderDiacritic(const std::wstring_view text) noexcept;
+
+        // Reconciles relative descendants after a text-buffer operation moved or erased
+        // placeholder fragments without routing through RenderPlaceholders.
+        bool SynchronizeVirtualPlacementChildren();
+        bool HasRelativeVirtualDescendants() const noexcept;
+        class MutationSnapshot;
+        std::shared_ptr<MutationSnapshot> CreateMutationSnapshot() const;
+        void RestoreMutationSnapshot(MutationSnapshot& snapshot) noexcept;
 
         // Drops every image, every placement, and any transfer in progress.
         void HardReset() noexcept;
@@ -64,6 +76,8 @@ namespace Microsoft::Console::VirtualTerminal
         void RestoreMainBufferState() noexcept;
 
     private:
+        class PlacementMutationGuard;
+
         struct Control
         {
             wchar_t action = L't';
@@ -192,6 +206,13 @@ namespace Microsoft::Console::VirtualTerminal
             std::vector<Placement> anonymousPlacements;
         };
 
+        struct ImageCacheState
+        {
+            uint32_t id = 0;
+            bool hasRenderedPlacements = false;
+            ::Image::Pointer surface;
+        };
+
         static Control _ParseControl(std::wstring_view control) noexcept;
         bool _localMediaAllowed() const noexcept;
         void _HandleSequence(std::wstring_view control, std::string_view payload, bool controlValid, bool payloadValid, bool payloadTooLarge);
@@ -212,11 +233,13 @@ namespace Microsoft::Console::VirtualTerminal
         void _restoreBufferState(BufferState&& state) noexcept;
         size_t _retainedPixelBytes() const noexcept;
         void _releaseImageSurface(Image& image) noexcept;
+        std::vector<ImageCacheState> _snapshotImageCacheStates() const;
+        void _restoreImageCacheStates(const std::vector<ImageCacheState>& states) noexcept;
         void _storeVirtualPlacement(const uint32_t id, uint32_t placementId, const Image& image, const uint32_t cols, const uint32_t rows, const uint32_t srcX, const uint32_t srcY, const uint32_t srcW, const uint32_t srcH, const int32_t zIndex, uint64_t layerId);
         static TargetSize _targetPixels(int64_t cropW, int64_t cropH, uint32_t cols, uint32_t rows, int64_t cellWidth, int64_t cellHeight) noexcept;
         til::size _placeImage(const Image& image, bool moveCursor, uint32_t imageId, uint64_t layerId, uint32_t cols = 0, uint32_t rows = 0, uint32_t srcX = 0, uint32_t srcY = 0, uint32_t srcW = 0, uint32_t srcH = 0, uint32_t cellOffsetX = 0, uint32_t cellOffsetY = 0, int32_t zIndex = 0, std::optional<til::point> anchor = std::nullopt);
         void _registerPlacement(const Placement& placement);
-        bool _movePlacementChildren(const std::pair<uint32_t, uint32_t>& parent, til::point parentAnchor, bool apply, std::wstring_view& code);
+        bool _movePlacementChildren(const std::pair<uint32_t, uint32_t>& parent, std::optional<til::point> parentAnchor, bool apply, std::wstring_view& code);
         void _erasePlacementCells(const Placement& placement);
         void _erasePlacementsForImage(uint32_t imageId);
         bool _imageHasPlacements(uint32_t id) const noexcept;
@@ -269,5 +292,11 @@ namespace Microsoft::Console::VirtualTerminal
 #ifdef UNIT_TESTING
         friend class ::AdapterTest;
 #endif
+        // Test seams. Each operation takes and clears its one-shot mutation
+        // checkpoint countdown before planning, so an armed failure cannot leak
+        // into another transaction.
+        std::optional<size_t> _testMovePlacementFailureCountdown;
+        std::optional<size_t> _testCascadeFailureAfterEraseCountdown;
+        bool _testPersistentMovePlacementFailure = false;
     };
 }
