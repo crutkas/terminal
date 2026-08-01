@@ -10849,10 +10849,10 @@ public:
         _stateMachine->ProcessString(L"\x1b[0m");
         _stateMachine->ProcessString(L"\x1b_Ga=T,i=2,p=1,P=1,Q=0,H=1,V=0,f=24,s=1,v=1,C=1;AP8A\x1b\\");
 
+        buffer.GetCursor().SetPosition({ 0, 0 });
         for (auto id = 3u; id <= KittyParser::MaxImages; ++id)
         {
-            _kitty()._images.emplace(id, KittyParser::Image{});
-            _kitty()._imageOrder.push_back(id);
+            _stateMachine->ProcessString(L"\x1b_Ga=T,i=" + std::to_wstring(id) + L",q=2,f=24,s=1,v=1,C=1;AAAA\x1b\\");
         }
         VERIFY_IS_TRUE(_kitty()._registerImage(KittyParser::MaxImages + 1, KittyParser::Image{}));
         VERIFY_IS_FALSE(_kitty()._images.contains(1u));
@@ -10921,10 +10921,10 @@ public:
         verify();
 
         setup();
+        _testGetSet->_textBuffer->GetCursor().SetPosition({ 0, 0 });
         for (auto id = 4u; id <= KittyParser::MaxImages; ++id)
         {
-            _kitty()._images.emplace(id, KittyParser::Image{});
-            _kitty()._imageOrder.push_back(id);
+            _stateMachine->ProcessString(L"\x1b_Ga=T,i=" + std::to_wstring(id) + L",q=2,f=24,s=1,v=1,C=1;AAAA\x1b\\");
         }
         _kitty()._testCascadeFailureAfterEraseCountdown = 0;
         VERIFY_THROWS(_kitty()._registerImage(KittyParser::MaxImages + 1, KittyParser::Image{}), std::bad_alloc);
