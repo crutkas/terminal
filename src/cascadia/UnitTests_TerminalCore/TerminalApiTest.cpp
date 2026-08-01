@@ -981,8 +981,9 @@ void TerminalApiTest::DirectImageRendererPreservesSharedSurfaceGeometryAndLifeti
     VERIFY_ARE_EQUAL(size_t{ 0 }, frame.surfaceUploads);
     VERIFY_ARE_EQUAL(size_t{ 1 }, frame.surfaceRefreshes, L"a new revision must refresh the existing cached surface");
     VERIFY_IS_TRUE(std::ranges::all_of(frame.images, [](const auto& image) {
-        return image.surfaceSize == til::size{ 5, 3 };
-    }), L"renderer frames must retain dimensions with their immutable pixel snapshot");
+                       return image.surfaceSize == til::size{ 5, 3 };
+                   }),
+                   L"renderer frames must retain dimensions with their immutable pixel snapshot");
 
     fixture.terminal.LockConsole();
     auto unlockAfterDelete = wil::scope_exit([&fixture]() {
