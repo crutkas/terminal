@@ -1957,16 +1957,6 @@ try
     {
         return false;
     }
-    if (command.compression == L'z')
-    {
-        std::vector<uint8_t> inflated;
-        if (!_inflateZlib(bytes, inflated, MaxPayload))
-        {
-            code = L"EINVAL:invalid compressed data";
-            return false;
-        }
-        bytes = std::move(inflated);
-    }
 
     uint32_t frameWidth = 0;
     uint32_t frameHeight = 0;
