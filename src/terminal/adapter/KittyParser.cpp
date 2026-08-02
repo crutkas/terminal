@@ -1808,9 +1808,14 @@ try
         code = L"ENOENT:image not found";
         return false;
     }
-    if (command.medium != L'd' || command.compression != 0)
+    if (command.medium != L'd')
     {
-        code = command.medium != L'd' ? L"EINVAL:unsupported transmission medium" : L"EINVAL:unsupported compression";
+        code = L"EINVAL:unsupported transmission medium";
+        return false;
+    }
+    if (command.compression != 0 && command.compression != L'z')
+    {
+        code = L"EINVAL:unsupported compression";
         return false;
     }
     if (command.format != 24 && command.format != 32 && command.format != 100)
@@ -1829,6 +1834,16 @@ try
     {
         code = payloadTooLarge ? L"EFBIG:payload exceeds maximum size" : L"EINVAL:bad payload";
         return false;
+    }
+    if (command.compression == L'z')
+    {
+        std::vector<uint8_t> inflated;
+        if (!_inflateZlib(bytes, inflated, MaxPayload))
+        {
+            code = L"EINVAL:invalid compressed data";
+            return false;
+        }
+        bytes = std::move(inflated);
     }
 
     uint32_t frameWidth = 0;
@@ -1923,6 +1938,8 @@ try
 
     if (editFrame != 0)
     {
+        std::vector<uint32_t> updatedImageIds;
+        updatedImageIds.reserve(2);
         auto& storedImage = imageIt->second;
         *_frameStorage(storedImage, editFrame) = std::make_shared<std::vector<RGBQUAD>>(std::move(canvas));
         if (command.haveZ && command.zIndex != 0)
@@ -1932,16 +1949,17 @@ try
 
         if (storedImage.presentedFrame == editFrame)
         {
-            _updateImageSurface(imageId);
+            updatedImageIds.push_back(imageId);
         }
         const auto now = std::chrono::steady_clock::now();
         if (storedImage.currentFrame == editFrame &&
             command.haveZ && command.zIndex != 0 &&
             (storedImage.animationState == 2 || storedImage.animationState == 3))
         {
-            _scheduleAnimation(imageId, storedImage, now);
+            _scheduleAnimation(imageId, storedImage, now, &updatedImageIds);
         }
         _scheduleAnimationTimer();
+        _updateImageSurfaces(updatedImageIds);
         return true;
     }
 
@@ -1962,7 +1980,7 @@ try
     }
 
     std::vector<uint32_t> updatedImageIds;
-    updatedImageIds.reserve(1);
+    updatedImageIds.reserve(2);
     if (stagedImage.presentedFrame == changedFrame)
     {
         updatedImageIds.push_back(imageId);
@@ -2024,25 +2042,30 @@ try
     std::vector<uint32_t> victims;
     if (requiredBytes != 0)
     {
-        for (const auto candidateId : _imageOrder)
-        {
-            if (std::find(protectedImageIds.begin(), protectedImageIds.end(), candidateId) != protectedImageIds.end())
+        const auto selectVictims = [&](const bool placed) {
+            for (const auto candidateId : _imageOrder)
             {
-                continue;
+                if (reclaimableBytes >= requiredBytes)
+                {
+                    break;
+                }
+                if (std::find(protectedImageIds.begin(), protectedImageIds.end(), candidateId) != protectedImageIds.end() ||
+                    _isImagePlaced(candidateId) != placed)
+                {
+                    continue;
+                }
+                const auto candidate = _images.find(candidateId);
+                if (candidate == _images.end())
+                {
+                    continue;
+                }
+                victims.push_back(candidateId);
+                const auto candidateBytes = candidate->second.RetainedBytes();
+                reclaimableBytes = candidateBytes > SIZE_MAX - reclaimableBytes ? SIZE_MAX : reclaimableBytes + candidateBytes;
             }
-            const auto candidate = _images.find(candidateId);
-            if (candidate == _images.end())
-            {
-                continue;
-            }
-            victims.push_back(candidateId);
-            const auto candidateBytes = candidate->second.RetainedBytes();
-            reclaimableBytes = candidateBytes > SIZE_MAX - reclaimableBytes ? SIZE_MAX : reclaimableBytes + candidateBytes;
-            if (reclaimableBytes >= requiredBytes)
-            {
-                break;
-            }
-        }
+        };
+        selectVictims(false);
+        selectVictims(true);
     }
     if (reclaimableBytes < requiredBytes)
     {
@@ -2412,6 +2435,7 @@ catch (const std::bad_alloc&)
 }
 
 bool KittyParser::_processAnimationControl(const Control& command, const uint32_t imageId, std::wstring_view& code)
+try
 {
     const auto imageIt = _images.find(imageId);
     if (imageIt == _images.end())
@@ -2436,12 +2460,14 @@ bool KittyParser::_processAnimationControl(const Control& command, const uint32_
         return false;
     }
 
+    std::vector<uint32_t> updatedImageIds;
+    updatedImageIds.reserve(2);
     auto reschedule = false;
     if (command.cols != 0)
     {
         image.currentFrame = command.cols;
         image.presentedFrame = image.currentFrame;
-        _updateImageSurface(imageId);
+        updatedImageIds.push_back(imageId);
         reschedule = true;
     }
     if (command.rows != 0 && command.haveZ && command.zIndex != 0)
@@ -2470,10 +2496,16 @@ bool KittyParser::_processAnimationControl(const Control& command, const uint32_
     }
     else if (reschedule)
     {
-        _scheduleAnimation(imageId, image, std::chrono::steady_clock::now());
+        _scheduleAnimation(imageId, image, std::chrono::steady_clock::now(), &updatedImageIds);
     }
     _scheduleAnimationTimer();
+    _updateImageSurfaces(updatedImageIds);
     return true;
+}
+catch (const std::bad_alloc&)
+{
+    code = L"ENOSPC:could not update animation";
+    return false;
 }
 
 bool KittyParser::_processFrameComposition(const Control& command, const uint32_t imageId, std::wstring_view& code)
@@ -2781,6 +2813,9 @@ void KittyParser::_deleteAnimationFrames(const uint32_t imageId, const uint32_t 
         _scheduleAnimationTimer();
         return;
     }
+    std::vector<uint32_t> updatedImageIds;
+    updatedImageIds.reserve(2);
+    updatedImageIds.push_back(imageId);
     const auto oldBytes = image.RetainedBytes();
     if (selectedFrame == 1)
     {
@@ -2819,13 +2854,12 @@ void KittyParser::_deleteAnimationFrames(const uint32_t imageId, const uint32_t 
         image.waitingForFrames = false;
         image.nextFrameTime = {};
     }
-    _updateImageSurface(imageId);
-
     if (image.animationState == 2 || image.animationState == 3)
     {
-        _scheduleAnimation(imageId, image, std::chrono::steady_clock::now());
+        _scheduleAnimation(imageId, image, std::chrono::steady_clock::now(), &updatedImageIds);
     }
     _scheduleAnimationTimer();
+    _updateImageSurfaces(updatedImageIds);
 }
 
 til::size KittyParser::_placeImage(const Image& image,

@@ -11274,6 +11274,33 @@ public:
         VERIFY_ARE_EQUAL(static_cast<BYTE>(0), pixel.rgbGreen);
     }
 
+    TEST_METHOD(KittyAnimationFrameEditTimerFailurePreservesPresentedSurface)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,f=24,s=1,v=1,C=1;/wAA\x1b\\");
+        _stateMachine->ProcessString(L"\x1b_Ga=f,i=1,f=24,s=1,v=1,z=100;AP8A\x1b\\");
+        _stateMachine->ProcessString(L"\x1b_Ga=a,i=1,c=1,r=1,z=100,s=3;\x1b\\");
+
+        const auto surface = _kitty()._images.at(1).surface;
+        const auto revision = surface->Revision();
+        const auto deadline = _testGetSet->_timedContentDeadline;
+        _testGetSet->_failTimedContentUpdate = true;
+        _testGetSet->_response.clear();
+        _stateMachine->ProcessString(L"\x1b_Ga=f,i=1,f=24,s=1,v=1,r=1,z=200,X=1;AAD/\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=1;ENOSPC:could not allocate frame\x1b\\");
+
+        const auto& restored = _kitty()._images.at(1);
+        VERIFY_ARE_EQUAL(3u, restored.animationState);
+        VERIFY_ARE_EQUAL(100, restored.rootGapMilliseconds);
+        VERIFY_IS_TRUE(deadline == _testGetSet->_timedContentDeadline);
+        VERIFY_ARE_EQUAL(surface.get(), restored.surface.get());
+        VERIFY_ARE_EQUAL(revision, surface->Revision());
+        VERIFY_ARE_EQUAL(static_cast<BYTE>(255), restored.pixels->front().rgbRed);
+        VERIFY_ARE_EQUAL(static_cast<BYTE>(255), surface->Pixels().front().rgbRed);
+        VERIFY_ARE_EQUAL(static_cast<BYTE>(0), surface->Pixels().front().rgbBlue);
+    }
+
     TEST_METHOD(KittyAnimationRefreshesPageWhenItBecomesActive)
     {
         _testGetSet->PrepData();
@@ -11485,6 +11512,19 @@ public:
         }));
     }
 
+    TEST_METHOD(KittyAnimationZlibFrameUsesInlineDecoder)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1b_Ga=t,i=1,f=24,s=1,v=1;AAAA\x1b\\");
+        _stateMachine->ProcessString(L"\x1b_Ga=f,i=1,f=24,s=1,v=1,o=z;eJxj+M8AAAIBAQA=\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=1;OK\x1b\\");
+
+        const auto& frame = *_kitty()._images.at(1).animationFrames.front().pixels;
+        VERIFY_ARE_EQUAL(static_cast<BYTE>(0), frame.front().rgbRed);
+        VERIFY_ARE_EQUAL(static_cast<BYTE>(255), frame.front().rgbGreen);
+        VERIFY_ARE_EQUAL(static_cast<BYTE>(0), frame.front().rgbBlue);
+    }
+
     TEST_METHOD(KittyAnimationCompositionUsesDocumentedCoordinateRoles)
     {
         _testGetSet->PrepData();
@@ -11529,6 +11569,33 @@ public:
         VERIFY_IS_NOT_NULL(slice);
         const auto pixel = SlicePixelAt(slice, ImageSlice::RenderPosition::AboveText, origin.x - slice->ColumnOffset(), 0);
         VERIFY_ARE_EQUAL(static_cast<BYTE>(255), pixel.rgbGreen);
+    }
+
+    TEST_METHOD(KittyAnimationControlTimerFailurePreservesPresentedSurface)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,f=24,s=1,v=1,C=1;/wAA\x1b\\");
+        _stateMachine->ProcessString(L"\x1b_Ga=f,i=1,f=24,s=1,v=1;AP8A\x1b\\");
+
+        const auto surface = _kitty()._images.at(1).surface;
+        const auto revision = surface->Revision();
+        const auto deadline = _testGetSet->_timedContentDeadline;
+        _testGetSet->_failTimedContentUpdate = true;
+        _testGetSet->_response.clear();
+        _stateMachine->ProcessString(L"\x1b_Ga=a,i=1,c=2,r=2,z=100,s=3;\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=1;ENOSPC:could not update animation\x1b\\");
+
+        const auto& restored = _kitty()._images.at(1);
+        VERIFY_ARE_EQUAL(1u, restored.currentFrame);
+        VERIFY_ARE_EQUAL(1u, restored.presentedFrame);
+        VERIFY_ARE_EQUAL(1u, restored.animationState);
+        VERIFY_ARE_EQUAL(40, restored.animationFrames.front().gapMilliseconds);
+        VERIFY_IS_TRUE(deadline == _testGetSet->_timedContentDeadline);
+        VERIFY_ARE_EQUAL(surface.get(), restored.surface.get());
+        VERIFY_ARE_EQUAL(revision, surface->Revision());
+        VERIFY_ARE_EQUAL(static_cast<BYTE>(255), surface->Pixels().front().rgbRed);
+        VERIFY_ARE_EQUAL(static_cast<BYTE>(0), surface->Pixels().front().rgbGreen);
     }
 
     TEST_METHOD(KittyAnimationEditingCurrentGapReschedulesDeadline)
@@ -11792,15 +11859,42 @@ public:
         _stateMachine->ProcessString(L"\x1b_Ga=f,i=1,f=24,s=1,v=1;AP8A\x1b\\");
         _testGetSet->ValidateInputEvent(L"\x1b_Gi=1;ENOSPC:frame count limit exceeded\x1b\\");
 
-        image.animationFrames.clear();
-        image.animationFrames.shrink_to_fit();
-        _kitty()._totalRetainedBytes = image.RetainedBytes();
+        auto& restoredImage = _kitty()._images.at(1);
+        restoredImage.animationFrames.clear();
+        restoredImage.animationFrames.shrink_to_fit();
+        _kitty()._totalRetainedBytes = restoredImage.RetainedBytes();
         const auto savedBytes = _kitty()._totalRetainedBytes;
         _kitty()._totalRetainedBytes = KittyParser::MaxTotalBytes - sizeof(RGBQUAD);
         _stateMachine->ProcessString(L"\x1b_Ga=f,i=1,f=24,s=1,v=1;AP8A\x1b\\");
         _testGetSet->ValidateInputEvent(L"\x1b_Gi=1;ENOSPC:image storage limit exceeded\x1b\\");
         VERIFY_IS_TRUE(KittyParser::AnimationFrame::RetainedAllocationOverhead > sizeof(RGBQUAD), L"the frame's retained metadata must be charged in addition to its tiny payload");
         _kitty()._totalRetainedBytes = savedBytes;
+    }
+
+    TEST_METHOD(KittyAnimationQuotaEvictsUnplacedBeforePlaced)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        auto& buffer = *_testGetSet->_textBuffer;
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,f=24,s=1,v=1,C=1;/wAA\x1b\\");
+        _stateMachine->ProcessString(L"\x1b_Ga=t,i=2,f=24,s=1,v=1;AP8A\x1b\\");
+        _stateMachine->ProcessString(L"\x1b_Ga=t,i=3,f=24,s=1,v=1;AAD/\x1b\\");
+
+        auto projected = _kitty()._images.at(3);
+        projected.animationFrames.reserve(1);
+        projected.animationFrames.push_back(KittyParser::AnimationFrame{
+            .pixels = std::make_shared<std::vector<RGBQUAD>>(1),
+            .gapMilliseconds = 40,
+        });
+        const auto addedBytes = projected.RetainedBytes() - _kitty()._images.at(3).RetainedBytes();
+        _kitty()._totalRetainedBytes = KittyParser::MaxTotalBytes - addedBytes + _kitty()._images.at(2).RetainedBytes();
+
+        _stateMachine->ProcessString(L"\x1b_Ga=f,i=3,f=24,s=1,v=1;AAAA\x1b\\");
+
+        VERIFY_IS_TRUE(_kitty()._images.contains(1), L"a placed image must survive while an unplaced victim can satisfy the quota");
+        VERIFY_IS_FALSE(_kitty()._images.contains(2), L"the least-recently used unplaced image should be evicted");
+        VERIFY_ARE_EQUAL(size_t{ 2 }, _kitty()._frameCount(_kitty()._images.at(3)));
+        VERIFY_ARE_EQUAL(size_t{ 1 }, buffer.GetImages().All().size());
     }
 
     TEST_METHOD(KittyAnimationAppendCanShrinkRetainedFrameCapacity)
@@ -11861,6 +11955,33 @@ public:
         VERIFY_ARE_EQUAL(static_cast<BYTE>(255), image.pixels->front().rgbGreen);
         VERIFY_ARE_EQUAL(63, image.rootGapMilliseconds, L"the promoted frame keeps its gap");
         VERIFY_ARE_EQUAL(static_cast<BYTE>(255), image.animationFrames.front().pixels->front().rgbBlue);
+    }
+
+    TEST_METHOD(KittyAnimationDeleteTimerFailurePreservesPresentedSurface)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,f=24,s=1,v=1,C=1;/wAA\x1b\\");
+        _stateMachine->ProcessString(L"\x1b_Ga=f,i=1,f=24,s=1,v=1,z=100;AP8A\x1b\\");
+        _stateMachine->ProcessString(L"\x1b_Ga=a,i=1,c=2,r=2,z=100,s=3;\x1b\\");
+
+        const auto surface = _kitty()._images.at(1).surface;
+        const auto revision = surface->Revision();
+        const auto deadline = _testGetSet->_timedContentDeadline;
+        _testGetSet->_failTimedContentUpdate = true;
+        _testGetSet->_response.clear();
+        _stateMachine->ProcessString(L"\x1b_Ga=d,d=F,i=1,r=2;\x1b\\");
+
+        const auto& restored = _kitty()._images.at(1);
+        VERIFY_ARE_EQUAL(size_t{ 2 }, _kitty()._frameCount(restored));
+        VERIFY_ARE_EQUAL(2u, restored.currentFrame);
+        VERIFY_ARE_EQUAL(2u, restored.presentedFrame);
+        VERIFY_ARE_EQUAL(3u, restored.animationState);
+        VERIFY_IS_TRUE(deadline == _testGetSet->_timedContentDeadline);
+        VERIFY_ARE_EQUAL(surface.get(), restored.surface.get());
+        VERIFY_ARE_EQUAL(revision, surface->Revision());
+        VERIFY_ARE_EQUAL(static_cast<BYTE>(255), surface->Pixels().front().rgbGreen);
+        VERIFY_ARE_EQUAL(static_cast<BYTE>(0), surface->Pixels().front().rgbRed);
     }
 
     TEST_METHOD(KittyAnimationUppercaseDeleteClampsAndOnlyFreesStaticEntry)
