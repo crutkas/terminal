@@ -7622,7 +7622,7 @@ public:
         _stateMachine->ProcessString(L"\x1b_Ga=t,i=1,f=24,s=1,v=1;/wAA\x1b\\");
         const auto imagesBefore = _kitty()._images.size();
         const auto orderBefore = _kitty()._imageOrder;
-        const auto bytesBefore = _kitty()._totalPixelBytes;
+        const auto bytesBefore = _kitty()._retainedBytes();
         const auto nextIdBefore = _kitty()._nextImageId;
 
         _testGetSet->_kittyFileBytes = { 255, 0, 0 };
@@ -7635,7 +7635,7 @@ public:
         VERIFY_IS_TRUE(_kitty()._images.contains(1));
         VERIFY_IS_FALSE(_kitty()._images.contains(11));
         VERIFY_IS_TRUE(orderBefore == _kitty()._imageOrder);
-        VERIFY_ARE_EQUAL(bytesBefore, _kitty()._totalPixelBytes);
+        VERIFY_ARE_EQUAL(bytesBefore, _kitty()._retainedBytes());
         VERIFY_ARE_EQUAL(nextIdBefore, _kitty()._nextImageId);
     }
 
@@ -7644,7 +7644,7 @@ public:
         _prepDataWithKittyLocalMedia();
         _stateMachine->ProcessString(L"\x1b_Ga=t,i=1,f=24,s=1,v=1;/wAA\x1b\\");
         const auto orderBefore = _kitty()._imageOrder;
-        const auto bytesBefore = _kitty()._totalPixelBytes;
+        const auto bytesBefore = _kitty()._retainedBytes();
         const auto nextIdBefore = _kitty()._nextImageId;
 
         _testGetSet->_readLocalFileSucceeds = false;
@@ -7655,7 +7655,7 @@ public:
         VERIFY_ARE_EQUAL(0, _testGetSet->_deleteLocalFileCallCount, L"a failed read must leave the temporary file intact.");
         VERIFY_ARE_EQUAL(static_cast<size_t>(1), _kitty()._images.size());
         VERIFY_IS_TRUE(orderBefore == _kitty()._imageOrder);
-        VERIFY_ARE_EQUAL(bytesBefore, _kitty()._totalPixelBytes);
+        VERIFY_ARE_EQUAL(bytesBefore, _kitty()._retainedBytes());
         VERIFY_ARE_EQUAL(nextIdBefore, _kitty()._nextImageId);
     }
 
@@ -11637,7 +11637,7 @@ public:
         _testGetSet->PrepData();
         _stateMachine->ProcessString(L"\x1b_Ga=t,i=80,f=24,s=1,v=1;AAAA\x1b\\");
         const auto orderBefore = _kitty()._imageOrder;
-        const auto bytesBefore = _kitty()._totalPixelBytes;
+        const auto bytesBefore = _kitty()._retainedBytes();
         const std::wstring_view cases[]{
             L"\x1b_Ga=f,i=80,f=24,s=1,v=1,t=f;L3RtcC94\x1b\\",
             L"\x1b_Ga=f,i=80,f=24,s=1,v=1,t=t;L3RtcC94\x1b\\",
@@ -11660,7 +11660,7 @@ public:
         VERIFY_ARE_EQUAL(0, _testGetSet->_decodeImageCallCount);
         VERIFY_ARE_EQUAL(static_cast<size_t>(1), _kitty()._frameCount(_kitty()._images.at(80)));
         VERIFY_IS_TRUE(orderBefore == _kitty()._imageOrder);
-        VERIFY_ARE_EQUAL(bytesBefore, _kitty()._totalPixelBytes);
+        VERIFY_ARE_EQUAL(bytesBefore, _kitty()._retainedBytes());
         VERIFY_IS_FALSE(_kitty()._chunkActive);
         VERIFY_IS_TRUE(_kitty()._chunkPayload.empty());
     }
@@ -11758,7 +11758,7 @@ public:
         _prepDataWithKittyLocalMedia();
         _stateMachine->ProcessString(L"\x1b_Ga=t,i=84,f=24,s=1,v=1;AAAA\x1b\\");
         const auto orderBefore = _kitty()._imageOrder;
-        const auto bytesBefore = _kitty()._totalPixelBytes;
+        const auto bytesBefore = _kitty()._retainedBytes();
 
         _testGetSet->_readLocalFileSucceeds = false;
         for (const auto result : { til::read_file_result::not_found,
@@ -11787,7 +11787,7 @@ public:
 
         VERIFY_ARE_EQUAL(static_cast<size_t>(1), _kitty()._frameCount(_kitty()._images.at(84)));
         VERIFY_IS_TRUE(orderBefore == _kitty()._imageOrder);
-        VERIFY_ARE_EQUAL(bytesBefore, _kitty()._totalPixelBytes);
+        VERIFY_ARE_EQUAL(bytesBefore, _kitty()._retainedBytes());
     }
 
     TEST_METHOD(KittyAnimationFrameTransferCreatesFullFrame)
