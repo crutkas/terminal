@@ -33,6 +33,9 @@
     <ClCompile Include="..\FontBuffer.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="..\Iterm2ImageParser.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="..\MacroBuffer.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
@@ -78,6 +81,9 @@
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="..\FontBuffer.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="..\Iterm2ImageParser.hpp">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="..\MacroBuffer.hpp">

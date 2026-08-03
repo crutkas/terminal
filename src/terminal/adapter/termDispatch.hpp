@@ -146,6 +146,7 @@ public:
     void DoConEmuAction(const std::wstring_view /*string*/) override {}
 
     void DoITerm2Action(const std::wstring_view /*string*/) override {}
+    IStateMachineEngine::OscStringHandler Iterm2Image() override { return nullptr; }
 
     void DoFinalTermAction(const std::wstring_view /*string*/) override {}
 

@@ -779,9 +779,9 @@ IStateMachineEngine::StringHandler OutputStateMachineEngine::ActionApcDispatch(c
 // - parameter - identifier of the OSC action to perform
 // Return Value:
 // - the payload handler function or nullptr when streaming is not supported
-IStateMachineEngine::OscStringHandler OutputStateMachineEngine::ActionOscDispatch(const size_t /*parameter*/)
+IStateMachineEngine::OscStringHandler OutputStateMachineEngine::ActionOscDispatch(const size_t parameter)
 {
-    return nullptr;
+    return parameter == OscActionCodes::ITerm2Action ? _dispatch->Iterm2Image() : nullptr;
 }
 
 // Routine Description:

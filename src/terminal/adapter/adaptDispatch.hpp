@@ -30,6 +30,7 @@ class AdapterTest;
 
 namespace Microsoft::Console::VirtualTerminal
 {
+    class Iterm2ImageParser;
     class KittyParser;
 
     class AdaptDispatch : public ITermDispatch
@@ -161,6 +162,7 @@ namespace Microsoft::Console::VirtualTerminal
         void DoConEmuAction(const std::wstring_view string) override;
 
         void DoITerm2Action(const std::wstring_view string) override;
+        IStateMachineEngine::OscStringHandler Iterm2Image() override;
 
         void DoFinalTermAction(const std::wstring_view string) override;
 
@@ -352,6 +354,7 @@ namespace Microsoft::Console::VirtualTerminal
         std::shared_ptr<SixelParser> _sixelParser;
         friend class KittyParser;
         std::unique_ptr<KittyParser> _kittyParser;
+        std::unique_ptr<Iterm2ImageParser> _iterm2ImageParser;
         size_t _imageMutationDepth = 0;
         bool _imageMutationNotificationsActive = false;
         std::vector<ImageMutationNotification> _pendingImageMutationNotifications;

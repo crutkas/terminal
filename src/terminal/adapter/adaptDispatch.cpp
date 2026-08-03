@@ -6,6 +6,7 @@
 #include "adaptDispatch.hpp"
 #include "SixelParser.hpp"
 #include "KittyParser.hpp"
+#include "Iterm2ImageParser.hpp"
 #include "../../inc/unicode.hpp"
 #include "../../renderer/base/renderer.hpp"
 #include "../../types/inc/CodepointWidthDetector.hpp"
@@ -3544,6 +3545,11 @@ void AdaptDispatch::HardReset(bool erase)
         _kittyParser->HardReset();
     }
 
+    if (_iterm2ImageParser)
+    {
+        _iterm2ImageParser->Reset();
+    }
+
     // Completely reset the TerminalOutput state.
     _termOutput = {};
     // Reset the code page to the default value.
@@ -4176,6 +4182,15 @@ void AdaptDispatch::DoITerm2Action(const std::wstring_view string)
     {
         _api.UnknownSequence();
     }
+}
+
+IStateMachineEngine::OscStringHandler AdaptDispatch::Iterm2Image()
+{
+    if (!_iterm2ImageParser)
+    {
+        _iterm2ImageParser = std::make_unique<Iterm2ImageParser>();
+    }
+    return _iterm2ImageParser->Handler();
 }
 
 // Method Description:
