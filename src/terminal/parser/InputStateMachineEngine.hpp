@@ -188,6 +188,8 @@ namespace Microsoft::Console::VirtualTerminal
 
         StringHandler ActionApcDispatch(const VTID id) noexcept override;
 
+        OscStringHandler ActionOscDispatch(const size_t parameter) noexcept override;
+
         bool ActionOscDispatch(const size_t parameter, const std::wstring_view string) noexcept override;
 
         bool ActionSs3Dispatch(const wchar_t wch, const VTParameters parameters) override;

@@ -600,6 +600,11 @@ bool InputStateMachineEngine::ActionSs3Dispatch(const wchar_t wch, const VTParam
     return true;
 }
 
+IStateMachineEngine::OscStringHandler InputStateMachineEngine::ActionOscDispatch(const size_t /*parameter*/) noexcept
+{
+    return nullptr;
+}
+
 // Method Description:
 // - Triggers the OscDispatch action to indicate that the listener should handle a control sequence.
 //   These sequences perform various API-type commands that can include many parameters.

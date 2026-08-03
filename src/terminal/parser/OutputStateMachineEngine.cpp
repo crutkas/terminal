@@ -772,6 +772,19 @@ IStateMachineEngine::StringHandler OutputStateMachineEngine::ActionApcDispatch(c
 }
 
 // Routine Description:
+// - Gives the listener an opportunity to stream an OSC payload instead of
+//   accumulating it in the state machine. A null handler selects the bounded
+//   completed-string path.
+// Arguments:
+// - parameter - identifier of the OSC action to perform
+// Return Value:
+// - the payload handler function or nullptr when streaming is not supported
+IStateMachineEngine::OscStringHandler OutputStateMachineEngine::ActionOscDispatch(const size_t /*parameter*/)
+{
+    return nullptr;
+}
+
+// Routine Description:
 // - Triggers the OscDispatch action to indicate that the listener should handle a control sequence.
 //   These sequences perform various API-type commands that can include many parameters.
 // Arguments:

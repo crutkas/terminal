@@ -23,6 +23,8 @@ StateMachine::StateMachine(std::unique_ptr<IStateMachineEngine> engine, const bo
     _subParameterLimitOverflowed(false),
     _subParameterCounter(0),
     _oscString{},
+    _oscStringHandlerAccepted(false),
+    _oscStringDiscarded(false),
     _cachedSequence{ std::nullopt }
 {
     // The state machine must always accept C1 controls for the input engine,
@@ -629,6 +631,9 @@ void StateMachine::_ActionClear() noexcept
 
     _oscString.clear();
     _oscParameter = 0;
+    _oscStringHandler = nullptr;
+    _oscStringHandlerAccepted = false;
+    _oscStringDiscarded = false;
 
     _dcsStringHandler = nullptr;
     _apcStringHandler = nullptr;
@@ -655,9 +660,11 @@ void StateMachine::_ActionIgnore() noexcept
 // - <none>
 void StateMachine::_ActionInterrupt(const bool terminated)
 {
-    // This is only applicable for DCS and APC strings. OSC strings require a
-    // full ST sequence to be received before they can be dispatched.
-    if (_state == VTStates::DcsPassThrough)
+    if (_state == VTStates::OscString || _state == VTStates::OscTermination)
+    {
+        _ActionOscCancel();
+    }
+    else if (_state == VTStates::DcsPassThrough)
     {
         // The ESC signals the end of the data string.
         _dcsStringHandler(AsciiChars::ESC);
@@ -687,6 +694,23 @@ void StateMachine::_ActionOscParam(const wchar_t wch) noexcept
 }
 
 // Routine Description:
+// - Requests an optional streaming handler for the OSC payload. Until a handler
+//   accepts the sequence, the bounded fallback buffer retains every character
+//   so completed-string dispatch remains lossless.
+void StateMachine::_ActionOscStart()
+{
+    const auto success = _SafeExecute([&]() {
+        _oscStringHandler = _engine->ActionOscDispatch(_oscParameter);
+        return true;
+    });
+
+    if (!success)
+    {
+        _oscStringHandler = nullptr;
+    }
+}
+
+// Routine Description:
 // - Stores this character as part of the OSC string
 // Arguments:
 // - wch - Character to dispatch.
@@ -696,7 +720,72 @@ void StateMachine::_ActionOscPut(const wchar_t wch)
 {
     _trace.TraceOnAction(L"OscPut");
 
-    _oscString.push_back(wch);
+    if (_oscStringDiscarded)
+    {
+        return;
+    }
+
+    if (!_oscStringHandlerAccepted)
+    {
+        if (_oscString.size() >= MaxOscStringLength)
+        {
+            _ActionOscCancel();
+            _oscString.clear();
+            _oscStringDiscarded = true;
+            _cachedSequence.reset();
+            return;
+        }
+
+        _oscString.push_back(wch);
+    }
+
+    if (!_oscStringHandler)
+    {
+        return;
+    }
+
+    auto result = IStateMachineEngine::OscStringHandlerResult::Abort;
+    try
+    {
+        result = _oscStringHandler(wch);
+    }
+    catch (...)
+    {
+        LOG_HR(wil::ResultFromCaughtException());
+    }
+
+    if (_oscStringHandlerAccepted)
+    {
+        if (result == IStateMachineEngine::OscStringHandlerResult::Fallback ||
+            result == IStateMachineEngine::OscStringHandlerResult::Abort)
+        {
+            _oscStringHandler = nullptr;
+            _oscString.clear();
+            _oscStringDiscarded = true;
+            _cachedSequence.reset();
+        }
+        return;
+    }
+
+    switch (result)
+    {
+    case IStateMachineEngine::OscStringHandlerResult::Pending:
+        break;
+    case IStateMachineEngine::OscStringHandlerResult::Accept:
+        _oscStringHandlerAccepted = true;
+        _oscString.clear();
+        _cachedSequence.reset();
+        break;
+    case IStateMachineEngine::OscStringHandlerResult::Fallback:
+        _oscStringHandler = nullptr;
+        break;
+    case IStateMachineEngine::OscStringHandlerResult::Abort:
+        _oscStringHandler = nullptr;
+        _oscString.clear();
+        _oscStringDiscarded = true;
+        _cachedSequence.reset();
+        break;
+    }
 }
 
 // Routine Description:
@@ -706,12 +795,58 @@ void StateMachine::_ActionOscPut(const wchar_t wch)
 // - <none>
 // Return Value:
 // - <none>
-void StateMachine::_ActionOscDispatch()
+void StateMachine::_ActionOscDispatch(const wchar_t terminator)
 {
     _trace.TraceOnAction(L"OscDispatch");
-    _trace.DispatchSequenceTrace(_SafeExecute([=]() {
-        return _engine->ActionOscDispatch(_oscParameter, _oscString);
-    }));
+
+    auto dispatchFallback = !_oscStringDiscarded;
+    if (_oscStringHandler)
+    {
+        const auto wasAccepted = _oscStringHandlerAccepted;
+        auto result = IStateMachineEngine::OscStringHandlerResult::Abort;
+        try
+        {
+            result = _oscStringHandler(terminator);
+        }
+        catch (...)
+        {
+            LOG_HR(wil::ResultFromCaughtException());
+        }
+
+        if (wasAccepted ||
+            result == IStateMachineEngine::OscStringHandlerResult::Accept ||
+            result == IStateMachineEngine::OscStringHandlerResult::Abort)
+        {
+            dispatchFallback = false;
+        }
+    }
+
+    _oscStringHandler = nullptr;
+    _oscStringHandlerAccepted = false;
+
+    if (dispatchFallback)
+    {
+        _trace.DispatchSequenceTrace(_SafeExecute([=]() {
+            return _engine->ActionOscDispatch(_oscParameter, _oscString);
+        }));
+    }
+}
+
+// Routine Description:
+// - Cancels an in-progress OSC streaming handler. Cancellation is normalized to
+//   CAN, matching the APC handler contract, and never dispatches fallback data.
+void StateMachine::_ActionOscCancel() noexcept
+{
+    auto handler = std::move(_oscStringHandler);
+    _oscStringHandlerAccepted = false;
+    if (handler)
+    {
+        try
+        {
+            handler(AsciiChars::CAN);
+        }
+        CATCH_LOG()
+    }
 }
 
 // Routine Description:
@@ -940,6 +1075,7 @@ void StateMachine::_EnterOscString() noexcept
 {
     _state = VTStates::OscString;
     _trace.TraceStateChange(L"OscString");
+    _ActionOscStart();
 }
 
 // Routine Description:
@@ -1542,7 +1678,7 @@ void StateMachine::_EventOscParam(const wchar_t wch)
     _trace.TraceOnEvent(L"OscParam");
     if (_isOscTerminator(wch))
     {
-        _ActionOscDispatch();
+        _ActionOscDispatch(wch);
         _EnterGround();
     }
     else if (_isEscape(wch))
@@ -1580,7 +1716,7 @@ void StateMachine::_EventOscString(const wchar_t wch)
     _trace.TraceOnEvent(L"OscString");
     if (_isOscTerminator(wch))
     {
-        _ActionOscDispatch();
+        _ActionOscDispatch(wch);
         _EnterGround();
     }
     else if (_isEscape(wch))
@@ -1612,11 +1748,12 @@ void StateMachine::_EventOscTermination(const wchar_t wch)
     _trace.TraceOnEvent(L"OscTermination");
     if (_isStringTerminatorIndicator(wch))
     {
-        _ActionOscDispatch();
+        _ActionOscDispatch(AsciiChars::ESC);
         _EnterGround();
     }
     else
     {
+        _ActionOscCancel();
         _EnterEscape();
         _EventEscape(wch);
     }
@@ -2254,7 +2391,14 @@ void StateMachine::ProcessString(const std::wstring_view string)
                 cacheUnusedRun = false;
             }
         }
-        else if (_state == VTStates::SosPmString || _state == VTStates::ApcEntry || _state == VTStates::ApcPassThrough || _state == VTStates::ApcIgnore || _state == VTStates::DcsPassThrough || _state == VTStates::DcsIgnore)
+        else if (_state == VTStates::SosPmString ||
+                 _state == VTStates::ApcEntry ||
+                 _state == VTStates::ApcPassThrough ||
+                 _state == VTStates::ApcIgnore ||
+                 _state == VTStates::DcsPassThrough ||
+                 _state == VTStates::DcsIgnore ||
+                 ((_state == VTStates::OscString || _state == VTStates::OscTermination) &&
+                  (_oscStringHandlerAccepted || _oscStringDiscarded)))
         {
             // There is no need to cache the run if we've reached one of the
             // string processing states in the output engine, since that data
@@ -2326,6 +2470,8 @@ void StateMachine::OnCsiComplete(const std::function<void()> callback)
 // - <none>
 void StateMachine::ResetState() noexcept
 {
+    _ActionInterrupt(false);
+    _ActionClear();
     _EnterGround();
 }
 

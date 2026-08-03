@@ -60,6 +60,7 @@ namespace Microsoft::Console::VirtualTerminal
 #ifdef UNIT_TESTING
         friend class OutputEngineTest;
         friend class InputEngineTest;
+        friend class StateMachineTest;
 #endif
 
     public:
@@ -105,8 +106,10 @@ namespace Microsoft::Console::VirtualTerminal
         void _ActionSubParam(const wchar_t wch);
         void _ActionCsiDispatch(const wchar_t wch);
         void _ActionOscParam(const wchar_t wch) noexcept;
+        void _ActionOscStart();
         void _ActionOscPut(const wchar_t wch);
-        void _ActionOscDispatch();
+        void _ActionOscDispatch(const wchar_t terminator);
+        void _ActionOscCancel() noexcept;
         void _ActionSs3Dispatch(const wchar_t wch);
         void _ActionDcsDispatch(const wchar_t wch);
         void _ActionApcDispatch(const wchar_t wch);
@@ -229,6 +232,9 @@ namespace Microsoft::Console::VirtualTerminal
 
         std::wstring _oscString;
         VTInt _oscParameter;
+        IStateMachineEngine::OscStringHandler _oscStringHandler;
+        bool _oscStringHandlerAccepted;
+        bool _oscStringDiscarded;
 
         IStateMachineEngine::StringHandler _dcsStringHandler;
         IStateMachineEngine::StringHandler _apcStringHandler;
@@ -241,5 +247,7 @@ namespace Microsoft::Console::VirtualTerminal
         bool _processingLastCharacter;
 
         std::function<void()> _onCsiCompleteCallback;
+
+        static constexpr size_t MaxOscStringLength = 2 * 1024 * 1024;
     };
 }

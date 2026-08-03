@@ -21,6 +21,14 @@ namespace Microsoft::Console::VirtualTerminal
     {
     public:
         using StringHandler = std::function<bool(const wchar_t)>;
+        enum class OscStringHandlerResult : uint8_t
+        {
+            Pending,
+            Accept,
+            Fallback,
+            Abort,
+        };
+        using OscStringHandler = std::function<OscStringHandlerResult(const wchar_t)>;
 
         virtual ~IStateMachineEngine() = 0;
         IStateMachineEngine(const IStateMachineEngine&) = default;
@@ -43,6 +51,7 @@ namespace Microsoft::Console::VirtualTerminal
         virtual bool ActionCsiDispatch(const VTID id, const VTParameters parameters) = 0;
         virtual StringHandler ActionDcsDispatch(const VTID id, const VTParameters parameters) = 0;
         virtual StringHandler ActionApcDispatch(const VTID id) = 0;
+        virtual OscStringHandler ActionOscDispatch(const size_t parameter) = 0;
         virtual bool ActionOscDispatch(const size_t parameter, const std::wstring_view string) = 0;
         virtual bool ActionSs3Dispatch(const wchar_t wch, const VTParameters parameters) = 0;
 
