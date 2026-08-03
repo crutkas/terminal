@@ -104,10 +104,40 @@ namespace Microsoft::Console::VirtualTerminal
 
         virtual void ShowNotification(const std::wstring_view title, const std::wstring_view body) = 0;
 
-        // Decodes an encoded image (e.g. PNG) into premultiplied BGRA pixels. Not every
-        // host has an image decoder; one that does not returns false and its caller goes
-        // without the image.
-        virtual bool DecodeImageToBgra(const std::span<const uint8_t> data, std::vector<RGBQUAD>& pixels, til::size& size) noexcept = 0;
+        enum class ImageDecodePolicy : uint8_t
+        {
+            KittyPng,
+            Iterm2SingleFrame,
+        };
+
+        struct ImageDecodeResult
+        {
+            enum class Status : uint8_t
+            {
+                Success,
+                Unavailable,
+                InvalidData,
+                UnsupportedContainer,
+                MultipleFrames,
+                TooLarge,
+            };
+
+            Status status = Status::InvalidData;
+            GUID containerFormat{};
+            uint32_t frameCount = 0;
+            til::size size{};
+            std::vector<RGBQUAD> pixels;
+
+            explicit operator bool() const noexcept
+            {
+                return status == Status::Success;
+            }
+        };
+
+        // Decodes an encoded raster image into premultiplied BGRA pixels under a
+        // protocol-specific container/frame policy. Hosts without a decoder return
+        // Unavailable; callers never infer success from partially populated output.
+        virtual ImageDecodeResult DecodeImageToBgra(std::span<const uint8_t> data, ImageDecodePolicy policy) noexcept = 0;
 
         // Some content changes on a clock rather than on input, so the adapter has work
         // to do when nothing is arriving to drive it. It hands the host a routine to run

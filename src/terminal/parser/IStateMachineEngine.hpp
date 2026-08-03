@@ -38,6 +38,7 @@ namespace Microsoft::Console::VirtualTerminal
 
         virtual void UnknownSequence() noexcept = 0;
         virtual bool EncounteredWin32InputModeSequence() const noexcept = 0;
+        virtual void ActionReset() noexcept = 0;
 
         virtual bool ActionExecute(const wchar_t wch) = 0;
         virtual bool ActionExecuteFromEscape(const wchar_t wch) = 0;

@@ -988,17 +988,15 @@ void KittyParser::_ProcessCommand(const Control& command, const std::string_view
                 }
             }
 
-            std::vector<RGBQUAD> decoded;
-            til::size decodedSize;
+            ITerminalApi::ImageDecodeResult decoded;
             if (!directPixels)
             {
-                const auto decodedSuccessfully =
-                    !bytes.empty() &&
-                    _dispatcher._api.DecodeImageToBgra(bytes, decoded, decodedSize) &&
-                    decodedSize.width > 0 && decodedSize.height > 0 &&
-                    decoded.size() == static_cast<size_t>(decodedSize.width) * decodedSize.height;
+                decoded = _dispatcher._api.DecodeImageToBgra(bytes, ITerminalApi::ImageDecodePolicy::KittyPng);
+                const auto decodedSuccessfully = decoded &&
+                                                 decoded.size.width > 0 && decoded.size.height > 0 &&
+                                                 decoded.pixels.size() == static_cast<size_t>(decoded.size.width) * decoded.size.height;
                 if (decodedSuccessfully &&
-                    (decodedSize.width > ::Image::MaximumDimension || decodedSize.height > ::Image::MaximumDimension))
+                    (decoded.size.width > ::Image::MaximumDimension || decoded.size.height > ::Image::MaximumDimension))
                 {
                     success = false;
                     code = L"EFBIG:image dimensions exceed renderer limit";
@@ -1024,9 +1022,9 @@ void KittyParser::_ProcessCommand(const Control& command, const std::string_view
                 }
                 else
                 {
-                    image.width = static_cast<uint32_t>(decodedSize.width);
-                    image.height = static_cast<uint32_t>(decodedSize.height);
-                    image.pixels = std::make_shared<std::vector<RGBQUAD>>(std::move(decoded));
+                    image.width = static_cast<uint32_t>(decoded.size.width);
+                    image.height = static_cast<uint32_t>(decoded.size.height);
+                    image.pixels = std::make_shared<std::vector<RGBQUAD>>(std::move(decoded.pixels));
                 }
 
                 assignedId = haveId ? imageId : _assignImageId();
@@ -1981,17 +1979,18 @@ try
     }
     else
     {
-        til::size decodedSize;
+        auto decoded = _dispatcher._api.DecodeImageToBgra(bytes, ITerminalApi::ImageDecodePolicy::KittyPng);
         if (bytes.empty() ||
-            !_dispatcher._api.DecodeImageToBgra(bytes, framePixels, decodedSize) ||
-            decodedSize.width <= 0 || decodedSize.height <= 0 ||
-            framePixels.size() != static_cast<size_t>(decodedSize.width) * decodedSize.height)
+            !decoded ||
+            decoded.size.width <= 0 || decoded.size.height <= 0 ||
+            decoded.pixels.size() != static_cast<size_t>(decoded.size.width) * decoded.size.height)
         {
             code = L"EBADPNG:could not decode frame";
             return false;
         }
-        frameWidth = static_cast<uint32_t>(decodedSize.width);
-        frameHeight = static_cast<uint32_t>(decodedSize.height);
+        frameWidth = static_cast<uint32_t>(decoded.size.width);
+        frameHeight = static_cast<uint32_t>(decoded.size.height);
+        framePixels = std::move(decoded.pixels);
     }
 
     auto& image = imageIt->second;

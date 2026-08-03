@@ -242,6 +242,8 @@ class Iterm2ImageParserTests final
         VERIFY_ARE_EQUAL(1u, transfers.size());
         VERIFY_IS_TRUE(Send(parser, L"File=size=4;inline=1:YWJj") == Result::Accept);
         VERIFY_ARE_EQUAL(1u, transfers.size());
+        VERIFY_IS_TRUE(Send(parser, L"File=inline=1:") == Result::Accept);
+        VERIFY_ARE_EQUAL(1u, transfers.size());
     }
 
     TEST_METHOD(MultipartFailuresAreAtomic)

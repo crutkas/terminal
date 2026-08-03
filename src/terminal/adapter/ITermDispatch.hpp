@@ -43,6 +43,7 @@ public:
     virtual ~ITermDispatch() = 0;
 
     virtual void UnknownSequence() noexcept = 0;
+    virtual void ResetParser() noexcept = 0;
     virtual void Print(const wchar_t wchPrintable) = 0;
     virtual void PrintString(const std::wstring_view string) = 0;
 

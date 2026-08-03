@@ -426,71 +426,183 @@ void Terminal::ShowNotification(const std::wstring_view title, const std::wstrin
     }
 }
 
-// Decodes an encoded image (PNG etc.) into premultiplied BGRA pixels using WIC.
-// Returns false on any failure; never throws.
-bool Terminal::DecodeImageToBgra(const std::span<const uint8_t> data, std::vector<RGBQUAD>& pixels, til::size& size) noexcept
-try
+namespace
 {
-    pixels.clear();
-    if (data.empty())
+    uint32_t readBigEndianUint32(const std::span<const uint8_t> data, const size_t offset) noexcept
     {
-        return false;
+        return (static_cast<uint32_t>(data[offset]) << 24) |
+               (static_cast<uint32_t>(data[offset + 1]) << 16) |
+               (static_cast<uint32_t>(data[offset + 2]) << 8) |
+               static_cast<uint32_t>(data[offset + 3]);
     }
 
-    // WIC requires COM. It may already be initialized on this thread (in either
-    // apartment, both fine for WIC); only balance the call we actually made.
-    const auto coInitHr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
-    const auto coUninit = wil::scope_exit([coInitHr]() noexcept {
-        if (SUCCEEDED(coInitHr))
+    bool pngAnimationFrameCount(const std::span<const uint8_t> data, uint32_t& frameCount) noexcept
+    {
+        static constexpr std::array signature{ uint8_t{ 0x89 }, uint8_t{ 0x50 }, uint8_t{ 0x4e }, uint8_t{ 0x47 }, uint8_t{ 0x0d }, uint8_t{ 0x0a }, uint8_t{ 0x1a }, uint8_t{ 0x0a } };
+        if (data.size() < signature.size() || !std::ranges::equal(data.first(signature.size()), signature))
         {
-            CoUninitialize();
+            return false;
         }
-    });
 
-    const auto factory = wil::CoCreateInstance<IWICImagingFactory2>(CLSID_WICImagingFactory2);
+        frameCount = 0;
+        auto sawAnimationControl = false;
+        auto sawImageEnd = false;
+        size_t offset = signature.size();
+        while (offset < data.size())
+        {
+            const auto remaining = data.size() - offset;
+            if (remaining < 12)
+            {
+                return false;
+            }
 
-    wil::com_ptr<IWICStream> stream;
-    THROW_IF_FAILED(factory->CreateStream(stream.addressof()));
-    THROW_IF_FAILED(stream->InitializeFromMemory(const_cast<WICInProcPointer>(data.data()), gsl::narrow<DWORD>(data.size())));
+            const auto length = static_cast<size_t>(readBigEndianUint32(data, offset));
+            if (length > remaining - 12)
+            {
+                return false;
+            }
 
-    wil::com_ptr<IWICBitmapDecoder> decoder;
-    THROW_IF_FAILED(factory->CreateDecoderFromStream(stream.get(), nullptr, WICDecodeMetadataCacheOnDemand, decoder.addressof()));
+            const auto type = data.subspan(offset + 4, 4);
+            if (std::ranges::equal(type, std::array{ uint8_t{ 'a' }, uint8_t{ 'c' }, uint8_t{ 'T' }, uint8_t{ 'L' } }))
+            {
+                if (sawAnimationControl || length != 8)
+                {
+                    return false;
+                }
+                frameCount = readBigEndianUint32(data, offset + 8);
+                if (frameCount == 0)
+                {
+                    return false;
+                }
+                sawAnimationControl = true;
+            }
 
-    // Kitty's f=100 means PNG specifically; reject any other container WIC accepts.
-    GUID container{};
-    THROW_IF_FAILED(decoder->GetContainerFormat(&container));
-    if (container != GUID_ContainerFormatPng)
-    {
-        return false;
+            offset += length + 12;
+            if (std::ranges::equal(type, std::array{ uint8_t{ 'I' }, uint8_t{ 'E' }, uint8_t{ 'N' }, uint8_t{ 'D' } }))
+            {
+                if (length != 0)
+                {
+                    return false;
+                }
+                sawImageEnd = true;
+                break;
+            }
+        }
+        return sawImageEnd && offset == data.size();
     }
-
-    wil::com_ptr<IWICBitmapFrameDecode> frame;
-    THROW_IF_FAILED(decoder->GetFrame(0, frame.addressof()));
-
-    UINT width = 0;
-    UINT height = 0;
-    THROW_IF_FAILED(frame->GetSize(&width, &height));
-    if (width == 0 || height == 0 || static_cast<uint64_t>(width) * height > 64ull * 1024 * 1024)
-    {
-        return false;
-    }
-
-    wil::com_ptr<IWICFormatConverter> converter;
-    THROW_IF_FAILED(factory->CreateFormatConverter(converter.addressof()));
-    THROW_IF_FAILED(converter->Initialize(frame.get(), GUID_WICPixelFormat32bppPBGRA, WICBitmapDitherTypeNone, nullptr, 0.0, WICBitmapPaletteTypeCustom));
-
-    pixels.resize(static_cast<size_t>(width) * height);
-    const auto stride = width * static_cast<UINT>(sizeof(RGBQUAD));
-    const auto bufferSize = gsl::narrow<UINT>(pixels.size() * sizeof(RGBQUAD));
-    THROW_IF_FAILED(converter->CopyPixels(nullptr, stride, bufferSize, reinterpret_cast<BYTE*>(pixels.data())));
-
-    size = { static_cast<til::CoordType>(width), static_cast<til::CoordType>(height) };
-    return true;
 }
-catch (...)
+
+// Decodes an encoded raster image into premultiplied BGRA pixels using WIC.
+// The caller's policy controls container and frame acceptance.
+ITerminalApi::ImageDecodeResult Terminal::DecodeImageToBgra(const std::span<const uint8_t> data, const ImageDecodePolicy policy) noexcept
 {
-    pixels.clear();
-    return false;
+    ImageDecodeResult result;
+    try
+    {
+        if (data.empty())
+        {
+            return result;
+        }
+
+        // WIC requires COM. It may already be initialized on this thread (in either
+        // apartment, both fine for WIC); only balance the call we actually made.
+        const auto coInitHr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+        const auto coUninit = wil::scope_exit([coInitHr]() noexcept {
+            if (SUCCEEDED(coInitHr))
+            {
+                CoUninitialize();
+            }
+        });
+
+        const auto factory = wil::CoCreateInstance<IWICImagingFactory2>(CLSID_WICImagingFactory2);
+
+        wil::com_ptr<IWICStream> stream;
+        THROW_IF_FAILED(factory->CreateStream(stream.addressof()));
+        THROW_IF_FAILED(stream->InitializeFromMemory(const_cast<WICInProcPointer>(data.data()), gsl::narrow<DWORD>(data.size())));
+
+        wil::com_ptr<IWICBitmapDecoder> decoder;
+        THROW_IF_FAILED(factory->CreateDecoderFromStream(stream.get(), nullptr, WICDecodeMetadataCacheOnDemand, decoder.addressof()));
+        THROW_IF_FAILED(decoder->GetContainerFormat(&result.containerFormat));
+
+        if (policy == ImageDecodePolicy::KittyPng && result.containerFormat != GUID_ContainerFormatPng)
+        {
+            result.status = ImageDecodeResult::Status::UnsupportedContainer;
+            return result;
+        }
+
+        UINT wicFrameCount = 0;
+        const auto frameCountHr = decoder->GetFrameCount(&wicFrameCount);
+        if (policy == ImageDecodePolicy::Iterm2SingleFrame)
+        {
+            THROW_IF_FAILED(frameCountHr);
+        }
+        if (SUCCEEDED(frameCountHr))
+        {
+            result.frameCount = wicFrameCount;
+        }
+
+        if (policy == ImageDecodePolicy::Iterm2SingleFrame && result.containerFormat == GUID_ContainerFormatPng)
+        {
+            uint32_t apngFrameCount = 0;
+            if (!pngAnimationFrameCount(data, apngFrameCount))
+            {
+                return result;
+            }
+            result.frameCount = std::max(result.frameCount, apngFrameCount);
+        }
+        if (policy == ImageDecodePolicy::Iterm2SingleFrame && result.frameCount != 1)
+        {
+            result.status = ImageDecodeResult::Status::MultipleFrames;
+            return result;
+        }
+
+        wil::com_ptr<IWICBitmapFrameDecode> frame;
+        THROW_IF_FAILED(decoder->GetFrame(0, frame.addressof()));
+
+        UINT width = 0;
+        UINT height = 0;
+        THROW_IF_FAILED(frame->GetSize(&width, &height));
+        if (width == 0 ||
+            height == 0 ||
+            width > static_cast<UINT>(til::CoordTypeMax) ||
+            height > static_cast<UINT>(til::CoordTypeMax) ||
+            static_cast<uint64_t>(width) * height > 64ull * 1024 * 1024)
+        {
+            result.status = ImageDecodeResult::Status::TooLarge;
+            return result;
+        }
+        result.size = { gsl::narrow_cast<til::CoordType>(width), gsl::narrow_cast<til::CoordType>(height) };
+
+        wil::com_ptr<IWICFormatConverter> converter;
+        THROW_IF_FAILED(factory->CreateFormatConverter(converter.addressof()));
+        THROW_IF_FAILED(converter->Initialize(frame.get(), GUID_WICPixelFormat32bppPBGRA, WICBitmapDitherTypeNone, nullptr, 0.0, WICBitmapPaletteTypeCustom));
+
+        result.pixels.resize(static_cast<size_t>(width) * height);
+        const auto stride = width * static_cast<UINT>(sizeof(RGBQUAD));
+        const auto bufferSize = gsl::narrow<UINT>(result.pixels.size() * sizeof(RGBQUAD));
+        THROW_IF_FAILED(converter->CopyPixels(nullptr, stride, bufferSize, reinterpret_cast<BYTE*>(result.pixels.data())));
+
+        result.status = ImageDecodeResult::Status::Success;
+    }
+    catch (const std::bad_alloc&)
+    {
+        LOG_HR(E_OUTOFMEMORY);
+        result.status = ImageDecodeResult::Status::TooLarge;
+        result.pixels.clear();
+    }
+    catch (const wil::ResultException& exception)
+    {
+        LOG_HR(exception.GetErrorCode());
+        result.status = ImageDecodeResult::Status::InvalidData;
+        result.pixels.clear();
+    }
+    catch (const std::exception&)
+    {
+        LOG_HR(E_FAIL);
+        result.status = ImageDecodeResult::Status::InvalidData;
+        result.pixels.clear();
+    }
+    return result;
 }
 
 til::size Terminal::GetCellSize() const noexcept

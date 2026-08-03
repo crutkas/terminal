@@ -23,6 +23,8 @@ class Microsoft::Console::VirtualTerminal::TermDispatch : public Microsoft::Cons
 {
 public:
     void UnknownSequence() noexcept override {}
+    void ResetParser() noexcept override {}
+
     void Print(const wchar_t wchPrintable) override = 0;
     void PrintString(const std::wstring_view string) override = 0;
 

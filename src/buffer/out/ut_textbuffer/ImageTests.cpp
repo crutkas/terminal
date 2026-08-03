@@ -485,25 +485,37 @@ void ImageTests::ProtocolIdentityPreventsCrossProtocolMutation()
 {
     constexpr ImagePlacement::Key kittyKey{ 7, 9, ImagePlacement::Key::Protocol::Kitty };
     constexpr ImagePlacement::Key sixelKey{ 7, 9, ImagePlacement::Key::Protocol::Sixel };
+    constexpr ImagePlacement::Key iterm2Key{ 7, 9, ImagePlacement::Key::Protocol::Iterm2 };
     VERIFY_IS_FALSE(kittyKey == sixelKey);
+    VERIFY_IS_FALSE(kittyKey == iterm2Key);
+    VERIFY_IS_FALSE(sixelKey == iterm2Key);
 
     ImageCollection images;
     auto kitty = MakePlacement(kittyKey, { 0, 0, 2, 1 });
     auto sixel = MakePlacement(sixelKey, { 0, 0, 2, 1 });
+    auto iterm2 = MakePlacement(iterm2Key, { 0, 0, 2, 1 });
     const auto sixelSurface = sixel.SurfacePointer();
+    const auto iterm2Surface = iterm2.SurfacePointer();
     images.Add(std::move(kitty));
     images.Add(std::move(sixel));
+    images.Add(std::move(iterm2));
 
-    VERIFY_ARE_EQUAL(size_t{ 2 }, images.Size());
+    VERIFY_ARE_EQUAL(size_t{ 3 }, images.Size());
     VERIFY_ARE_EQUAL(size_t{ 1 }, images.EraseImage(ImagePlacement::Key::Protocol::Kitty, kittyKey.imageId));
-    VERIFY_ARE_EQUAL(size_t{ 1 }, images.Size());
-    VERIFY_ARE_EQUAL(sixelKey, images.All()[0].Identity());
-    VERIFY_ARE_EQUAL(sixelSurface.get(), images.All()[0].SurfacePointer().get());
+    VERIFY_ARE_EQUAL(size_t{ 2 }, images.Size());
+    VERIFY_IS_TRUE(std::ranges::any_of(images.All(), [&](const auto& image) {
+        return image.Identity() == sixelKey && image.SurfacePointer().get() == sixelSurface.get();
+    }));
+    VERIFY_IS_TRUE(std::ranges::any_of(images.All(), [&](const auto& image) {
+        return image.Identity() == iterm2Key && image.SurfacePointer().get() == iterm2Surface.get();
+    }));
 
     images.Add(MakePlacement(kittyKey, { 0, 0, 2, 1 }));
     VERIFY_ARE_EQUAL(size_t{ 1 }, images.EraseProtocol(ImagePlacement::Key::Protocol::Kitty));
+    VERIFY_ARE_EQUAL(size_t{ 2 }, images.Size());
+    VERIFY_ARE_EQUAL(size_t{ 1 }, images.EraseProtocol(ImagePlacement::Key::Protocol::Iterm2));
     VERIFY_ARE_EQUAL(size_t{ 1 }, images.Size());
-    VERIFY_ARE_EQUAL(sixelKey, images.All()[0].Identity());
+    VERIFY_ARE_EQUAL(sixelKey, images.All().front().Identity());
 }
 
 void ImageTests::LogicalCacheReleasesSurfacesOnInvalidation()
@@ -668,7 +680,7 @@ void ImageTests::CircularAndRegionalScrollUseLogicalRows()
 {
     DummyRenderer renderer;
     TextBuffer buffer{ til::size{ 8, 4 }, TextAttribute{}, 0, false, &renderer };
-    auto placement = MakePlacement({ 1, 1 }, { 1, 0, 5, 3 });
+    auto placement = MakePlacement({ 1, 1, ImagePlacement::Key::Protocol::Iterm2 }, { 1, 0, 5, 3 });
     const auto surface = placement.SurfacePointer();
     AddPlacement(buffer, std::move(placement));
 
@@ -708,7 +720,7 @@ void ImageTests::RectangularCopyAndErasePreserveSampling()
 {
     DummyRenderer renderer;
     TextBuffer buffer{ til::size{ 10, 4 }, TextAttribute{}, 0, false, &renderer };
-    auto placement = MakePlacement({ 1, 1 }, { 1, 0, 6, 3 });
+    auto placement = MakePlacement({ 1, 1, ImagePlacement::Key::Protocol::Iterm2 }, { 1, 0, 6, 3 });
     const auto surface = placement.SurfacePointer();
     AddPlacement(buffer, std::move(placement));
 
@@ -767,7 +779,7 @@ void ImageTests::TraditionalResizeClipsAndRetainsImages()
 {
     DummyRenderer renderer;
     TextBuffer buffer{ til::size{ 8, 4 }, TextAttribute{}, 0, false, &renderer };
-    auto placement = MakePlacement({ 1, 1 }, { 4, 1, 8, 4 });
+    auto placement = MakePlacement({ 1, 1, ImagePlacement::Key::Protocol::Iterm2 }, { 4, 1, 8, 4 });
     const auto surface = placement.SurfacePointer();
     AddPlacement(buffer, std::move(placement));
 
@@ -830,10 +842,12 @@ void ImageTests::ReflowAppliesDirectPlacementPolicy()
     buffer.Replace(1, TextAttribute{}, secondRow);
     buffer.GetCursor().SetPosition({ 1, 1 });
 
-    auto wrappedPlacement = MakePlacement({ 1, 1 }, { 2, 0, 6, 2 });
+    constexpr ImagePlacement::Key wrappedKey{ 1, 1, ImagePlacement::Key::Protocol::Iterm2 };
+    constexpr ImagePlacement::Key imageOnlyKey{ 2, 2, ImagePlacement::Key::Protocol::Iterm2 };
+    auto wrappedPlacement = MakePlacement(wrappedKey, { 2, 0, 6, 2 });
     const auto wrappedSurface = wrappedPlacement.SurfacePointer();
     AddPlacement(buffer, std::move(wrappedPlacement));
-    auto imageOnlyPlacement = MakePlacement({ 2, 2 }, { 0, 4, 1, 5 });
+    auto imageOnlyPlacement = MakePlacement(imageOnlyKey, { 0, 4, 1, 5 });
     const auto imageOnlySurface = imageOnlyPlacement.SurfacePointer();
     AddPlacement(buffer, std::move(imageOnlyPlacement));
 
@@ -848,7 +862,7 @@ void ImageTests::ReflowAppliesDirectPlacementPolicy()
     auto foundImageOnlyRow = false;
     for (const auto& fragment : reflowed.GetImages().All())
     {
-        if (fragment.Identity() == ImagePlacement::Key{ 1, 1 })
+        if (fragment.Identity() == wrappedKey)
         {
             VERIFY_ARE_EQUAL(wrappedSurface.get(), fragment.SurfacePointer().get());
             foundFirstSegment |= fragment.CellBounds() == til::rect{ 2, 0, 4, 1 };
@@ -856,7 +870,7 @@ void ImageTests::ReflowAppliesDirectPlacementPolicy()
             foundSecondSegment |= fragment.CellBounds() == til::rect{ 2, 2, 4, 3 };
             foundSecondWrappedSegment |= fragment.CellBounds() == til::rect{ 0, 3, 2, 4 };
         }
-        else if (fragment.Identity() == ImagePlacement::Key{ 2, 2 })
+        else if (fragment.Identity() == imageOnlyKey)
         {
             VERIFY_ARE_EQUAL(imageOnlySurface.get(), fragment.SurfacePointer().get());
             foundImageOnlyRow |= fragment.CellBounds() == til::rect{ 0, 6, 1, 7 };
@@ -889,21 +903,26 @@ void ImageTests::ReflowDistinguishesPlaceholderProtocol()
 
     constexpr ImagePlacement::Key kittyKey{ 0, 9, ImagePlacement::Key::Protocol::Kitty };
     constexpr ImagePlacement::Key sixelKey{ 0, 9, ImagePlacement::Key::Protocol::Sixel };
+    constexpr ImagePlacement::Key iterm2Key{ 0, 9, ImagePlacement::Key::Protocol::Iterm2 };
     const auto kittySurface = MakeSurface({ 0, 0, 1, 1 });
     const auto sixelSurface = MakeSurface({ 1, 0, 2, 1 });
+    const auto iterm2Surface = MakeSurface({ 2, 0, 3, 1 });
     buffer.GetMutableImages().Add(ImagePlacement{ kittyKey, kittySurface, { 0, 0, 1, 1 }, 0 });
     buffer.GetMutableImages().Add(ImagePlacement{ sixelKey, sixelSurface, { 1, 0, 2, 1 }, 0 });
+    buffer.GetMutableImages().Add(ImagePlacement{ iterm2Key, iterm2Surface, { 2, 0, 3, 1 }, 0 });
     buffer.GetCursor().SetPosition({ 1, 0 });
 
     TextBuffer reflowed{ til::size{ 2, 4 }, TextAttribute{}, 0, false, &renderer };
     TextBuffer::Reflow(buffer, reflowed);
 
-    VERIFY_ARE_EQUAL(size_t{ 2 }, reflowed.GetImages().Size());
+    VERIFY_ARE_EQUAL(size_t{ 3 }, reflowed.GetImages().Size());
     const auto result = reflowed.GetImages().All();
     const auto kitty = std::ranges::find(result, kittyKey, &ImagePlacement::Identity);
     const auto sixel = std::ranges::find(result, sixelKey, &ImagePlacement::Identity);
+    const auto iterm2 = std::ranges::find(result, iterm2Key, &ImagePlacement::Identity);
     VERIFY_IS_TRUE(kitty != result.end());
     VERIFY_IS_TRUE(sixel != result.end(), L"a Sixel with the same numeric ids is not a Kitty placeholder fragment");
+    VERIFY_IS_TRUE(iterm2 != result.end(), L"an iTerm2 image follows the direct-placement reflow policy");
     if (kitty != result.end())
     {
         VERIFY_ARE_EQUAL(kittySurface.get(), kitty->SurfacePointer().get());
@@ -911,5 +930,9 @@ void ImageTests::ReflowDistinguishesPlaceholderProtocol()
     if (sixel != result.end())
     {
         VERIFY_ARE_EQUAL(sixelSurface.get(), sixel->SurfacePointer().get());
+    }
+    if (iterm2 != result.end())
+    {
+        VERIFY_ARE_EQUAL(iterm2Surface.get(), iterm2->SurfacePointer().get());
     }
 }

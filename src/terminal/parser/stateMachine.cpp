@@ -2472,6 +2472,7 @@ void StateMachine::ResetState() noexcept
 {
     _ActionInterrupt(false);
     _ActionClear();
+    _engine->ActionReset();
     _EnterGround();
 }
 

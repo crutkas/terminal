@@ -122,7 +122,7 @@ namespace Microsoft::Console::VirtualTerminal
 
         struct TransferState
         {
-            explicit TransferState(Metadata&& metadata);
+            TransferState(Metadata&& metadata, bool retainData);
 
             Metadata metadata;
             Base64Decoder decoder;
@@ -158,6 +158,7 @@ namespace Microsoft::Console::VirtualTerminal
         static bool _decodeName(std::wstring_view value, std::wstring& name);
 
         CompletionHandler _completionHandler;
+        bool _retainInlineData = false;
         std::optional<TransferState> _multipartTransfer;
 
 #ifdef UNIT_TESTING

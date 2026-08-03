@@ -193,14 +193,15 @@ bool Iterm2ImageParser::Base64Decoder::_emit(const std::span<const uint8_t> byte
     return true;
 }
 
-Iterm2ImageParser::TransferState::TransferState(Metadata&& metadata) :
+Iterm2ImageParser::TransferState::TransferState(Metadata&& metadata, const bool retainData) :
     metadata{ std::move(metadata) },
-    decoder{ this->metadata.inlineDisplay, MaxTransferEncodedSize, MaxTransferDecodedSize }
+    decoder{ this->metadata.inlineDisplay && retainData, MaxTransferEncodedSize, MaxTransferDecodedSize }
 {
 }
 
 Iterm2ImageParser::Iterm2ImageParser(CompletionHandler completionHandler) :
-    _completionHandler{ std::move(completionHandler) }
+    _completionHandler{ std::move(completionHandler) },
+    _retainInlineData{ static_cast<bool>(_completionHandler) }
 {
 }
 
@@ -220,6 +221,12 @@ IStateMachineEngine::OscStringHandler Iterm2ImageParser::Handler()
         catch (const wil::ResultException& exception)
         {
             LOG_HR(exception.GetErrorCode());
+            _multipartTransfer.reset();
+            return IStateMachineEngine::OscStringHandlerResult::Abort;
+        }
+        catch (const std::length_error&)
+        {
+            LOG_HR(E_INVALIDARG);
             _multipartTransfer.reset();
             return IStateMachineEngine::OscStringHandlerResult::Abort;
         }
@@ -257,7 +264,7 @@ IStateMachineEngine::OscStringHandlerResult Iterm2ImageParser::_process(Sequence
                 Metadata metadata;
                 if (sequence.valid && _parseMetadata(sequence.metadata, metadata))
                 {
-                    sequence.legacyTransfer.emplace(std::move(metadata));
+                    sequence.legacyTransfer.emplace(std::move(metadata), _retainInlineData);
                 }
                 else
                 {
@@ -346,7 +353,7 @@ IStateMachineEngine::OscStringHandlerResult Iterm2ImageParser::_finish(SequenceS
         Metadata metadata;
         if (sequence.valid && _parseMetadata(sequence.metadata, metadata))
         {
-            _multipartTransfer.emplace(std::move(metadata));
+            _multipartTransfer.emplace(std::move(metadata), _retainInlineData);
         }
         return IStateMachineEngine::OscStringHandlerResult::Accept;
     }
@@ -447,11 +454,19 @@ bool Iterm2ImageParser::_complete(TransferState&& transfer)
     }
 
     const auto decodedSize = transfer.decoder.DecodedSize();
+    if (transfer.decoder.EncodedSize() == 0 || decodedSize == 0)
+    {
+        return false;
+    }
     if (transfer.metadata.declaredSize && *transfer.metadata.declaredSize != decodedSize)
     {
         return false;
     }
     if (!transfer.metadata.inlineDisplay)
+    {
+        return true;
+    }
+    if (!_completionHandler)
     {
         return true;
     }
@@ -462,10 +477,7 @@ bool Iterm2ImageParser::_complete(TransferState&& transfer)
         transfer.decoder.EncodedSize(),
         decodedSize,
     };
-    if (_completionHandler)
-    {
-        _completionHandler(result);
-    }
+    _completionHandler(result);
     return true;
 }
 

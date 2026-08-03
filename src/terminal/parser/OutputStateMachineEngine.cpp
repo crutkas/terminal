@@ -34,6 +34,11 @@ bool OutputStateMachineEngine::EncounteredWin32InputModeSequence() const noexcep
     return false;
 }
 
+void OutputStateMachineEngine::ActionReset() noexcept
+{
+    _dispatch->ResetParser();
+}
+
 const ITermDispatch& OutputStateMachineEngine::Dispatch() const noexcept
 {
     return *_dispatch;

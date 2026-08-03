@@ -79,7 +79,7 @@ public:
 
     void ShowNotification(std::wstring_view title, std::wstring_view body) override;
 
-    bool DecodeImageToBgra(const std::span<const uint8_t> data, std::vector<RGBQUAD>& pixels, til::size& size) noexcept override;
+    ImageDecodeResult DecodeImageToBgra(std::span<const uint8_t> data, ImageDecodePolicy policy) noexcept override;
     til::size GetCellSize() const noexcept override;
     void SetTimedContentHandler(std::function<void()> handler) override;
     void RequestTimedContentUpdate(const std::optional<std::chrono::steady_clock::time_point> deadline) override;

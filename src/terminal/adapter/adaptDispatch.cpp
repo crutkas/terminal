@@ -20,6 +20,49 @@ using namespace Microsoft::Console::VirtualTerminal;
 
 static constexpr std::wstring_view whitespace{ L" " };
 
+namespace
+{
+    std::optional<uint64_t> checkedMultiply(const uint64_t lhs, const uint64_t rhs) noexcept
+    {
+        if (lhs != 0 && rhs > std::numeric_limits<uint64_t>::max() / lhs)
+        {
+            return std::nullopt;
+        }
+        return lhs * rhs;
+    }
+
+    std::optional<uint64_t> multiplyDivide(const uint64_t lhs, const uint64_t rhs, const uint64_t divisor, const bool roundUp, const bool roundNearest = false) noexcept
+    {
+        const auto product = checkedMultiply(lhs, rhs);
+        if (!product || divisor == 0)
+        {
+            return std::nullopt;
+        }
+
+        auto result = *product / divisor;
+        const auto remainder = *product % divisor;
+        if ((roundUp && remainder != 0) ||
+            (roundNearest && remainder >= divisor / 2 + divisor % 2))
+        {
+            if (result == std::numeric_limits<uint64_t>::max())
+            {
+                return std::nullopt;
+            }
+            result++;
+        }
+        return result;
+    }
+
+    std::optional<uint64_t> ceilingDivide(const uint64_t value, const uint64_t divisor) noexcept
+    {
+        if (divisor == 0)
+        {
+            return std::nullopt;
+        }
+        return value / divisor + (value % divisor != 0);
+    }
+}
+
 static ImageCellRef getImageCellRef(const TextBuffer& buffer, const til::point position) noexcept
 {
     if (const auto metadata = buffer.GetRowByOffset(position.y).GetImageCellRef(position.x))
@@ -72,6 +115,14 @@ AdaptDispatch::~AdaptDispatch()
     // _api is a reference, so it outlives us; withdraw before the captured pointer
     // back to this object goes stale.
     _api.SetTimedContentHandler(nullptr);
+}
+
+void AdaptDispatch::ResetParser() noexcept
+{
+    if (_iterm2ImageParser)
+    {
+        _iterm2ImageParser->Reset();
+    }
 }
 
 void AdaptDispatch::_SetViewportPosition(const til::point position)
@@ -177,12 +228,13 @@ void AdaptDispatch::_DiscardImageMutationNotifications() noexcept
 class AdaptDispatch::ImageMutationGuard final : public TextBuffer::MutationJournal
 {
 public:
-    explicit ImageMutationGuard(AdaptDispatch& dispatch) :
+    explicit ImageMutationGuard(AdaptDispatch& dispatch, const bool forceSnapshot = false) :
         _dispatch{ dispatch },
         _root{ dispatch._imageMutationDepth++ == 0 },
         _uncaughtExceptions{ std::uncaught_exceptions() }
     {
-        if (!_root || !dispatch._kittyParser || !dispatch._kittyParser->HasRelativeVirtualDescendants())
+        const auto needsKittySnapshot = dispatch._kittyParser && dispatch._kittyParser->HasRelativeVirtualDescendants();
+        if (!_root || (!forceSnapshot && !needsKittySnapshot))
         {
             return;
         }
@@ -198,7 +250,10 @@ public:
                 snapshot->state = page.Buffer().CreateMutationState();
                 _buffers.push_back(std::move(snapshot));
             });
-            _kittySnapshot = dispatch._kittyParser->CreateMutationSnapshot();
+            if (needsKittySnapshot)
+            {
+                _kittySnapshot = dispatch._kittyParser->CreateMutationSnapshot();
+            }
             for (const auto& buffer : _buffers)
             {
                 buffer->buffer->SetMutationJournal(this);
@@ -250,9 +305,13 @@ public:
                 synchronized = false;
             }
         }
-        if (_ready && _kittySnapshot && !synchronized)
+        const auto hasBufferSnapshots = !_buffers.empty();
+        if (_ready && hasBufferSnapshots && !synchronized)
         {
-            _dispatch._kittyParser->RestoreMutationSnapshot(*_kittySnapshot);
+            if (_kittySnapshot)
+            {
+                _dispatch._kittyParser->RestoreMutationSnapshot(*_kittySnapshot);
+            }
             for (auto& buffer : _buffers)
             {
                 for (auto& row : buffer->rows)
@@ -264,7 +323,7 @@ public:
             _dispatch._DiscardImageMutationNotifications();
             LOG_HR(E_FAIL);
         }
-        else if (_ready && _kittySnapshot)
+        else if (_ready && hasBufferSnapshots)
         {
             _dispatch._FlushImageMutationNotifications();
         }
@@ -3549,6 +3608,7 @@ void AdaptDispatch::HardReset(bool erase)
     {
         _iterm2ImageParser->Reset();
     }
+    _iterm2Surfaces.clear();
 
     // Completely reset the TerminalOutput state.
     _termOutput = {};
@@ -4188,9 +4248,408 @@ IStateMachineEngine::OscStringHandler AdaptDispatch::Iterm2Image()
 {
     if (!_iterm2ImageParser)
     {
-        _iterm2ImageParser = std::make_unique<Iterm2ImageParser>();
+        Iterm2ImageParser::CompletionHandler completionHandler;
+        if (!_api.IsConPTY())
+        {
+            completionHandler = [this](const Iterm2ImageParser::Transfer& transfer) {
+                _DisplayIterm2Image(transfer);
+            };
+        }
+        _iterm2ImageParser = std::make_unique<Iterm2ImageParser>(std::move(completionHandler));
     }
     return _iterm2ImageParser->Handler();
+}
+
+std::optional<AdaptDispatch::Iterm2PlacementGeometry> AdaptDispatch::_ResolveIterm2Placement(const Iterm2ImageParser::Metadata& metadata, const til::size imageSize, const Page& page) noexcept
+{
+    if (imageSize.width <= 0 || imageSize.height <= 0 || page.Width() <= 0 || page.Height() <= 0)
+    {
+        return std::nullopt;
+    }
+
+    const auto cursor = page.Cursor().GetPosition();
+    const auto rightmostColumn = page.Width() - 1;
+    const auto horizontalMarginsSet = _scrollMargins.left < _scrollMargins.right && _scrollMargins.left < rightmostColumn;
+    const auto configuredLeft = horizontalMarginsSet ? _scrollMargins.left : 0;
+    const auto configuredRight = horizontalMarginsSet ? std::min(_scrollMargins.right, rightmostColumn) : rightmostColumn;
+    const auto useHorizontalMargins = cursor.x >= configuredLeft && cursor.x <= configuredRight;
+    const auto left = useHorizontalMargins ? configuredLeft : 0;
+    const auto right = useHorizontalMargins ? configuredRight : page.Width() - 1;
+    if (cursor.x < left || cursor.x > right)
+    {
+        return std::nullopt;
+    }
+
+    const auto bottommostRow = page.Height() - 1;
+    const auto verticalMarginsSet = _scrollMargins.top < _scrollMargins.bottom && _scrollMargins.top < bottommostRow;
+    const auto configuredTop = page.Top() + (verticalMarginsSet ? _scrollMargins.top : 0);
+    const auto configuredBottom = page.Top() + (verticalMarginsSet ? std::min(_scrollMargins.bottom, bottommostRow) : bottommostRow);
+    const auto useVerticalMargins = cursor.y >= configuredTop && cursor.y <= configuredBottom;
+    const auto regionHeight = useVerticalMargins ?
+                                  configuredBottom - configuredTop + 1 :
+                                  page.Height();
+    const auto regionWidth = right - left + 1;
+    const auto availableWidth = right - cursor.x + 1;
+    if (regionWidth <= 0 || regionHeight <= 0 || availableWidth <= 0)
+    {
+        return std::nullopt;
+    }
+
+    const auto rawCellSize = _api.GetCellSize();
+    const auto cellWidth = static_cast<uint64_t>(std::max(1, rawCellSize.width));
+    const auto cellHeight = static_cast<uint64_t>(std::max(1, rawCellSize.height));
+
+    struct Axis
+    {
+        uint64_t cells = 0;
+        uint64_t points = 0;
+        bool automatic = false;
+    };
+
+    const auto resolveAxis = [](const Iterm2ImageParser::Dimension dimension, const uint64_t regionCells, const uint64_t cellPoints) -> std::optional<Axis> {
+        switch (dimension.unit)
+        {
+        case Iterm2ImageParser::DimensionUnit::Auto:
+            return Axis{ .automatic = true };
+        case Iterm2ImageParser::DimensionUnit::Cells:
+        {
+            const auto points = checkedMultiply(dimension.value, cellPoints);
+            return points ? std::optional{ Axis{ dimension.value, *points, false } } : std::nullopt;
+        }
+        case Iterm2ImageParser::DimensionUnit::Pixels:
+        {
+            const auto cells = ceilingDivide(dimension.value, cellPoints);
+            return cells ? std::optional{ Axis{ *cells, dimension.value, false } } : std::nullopt;
+        }
+        case Iterm2ImageParser::DimensionUnit::Percent:
+        {
+            const auto percentage = static_cast<uint64_t>(std::min(dimension.value, 100u));
+            const auto cells = multiplyDivide(regionCells, percentage, 100, true);
+            const auto regionPoints = checkedMultiply(regionCells, cellPoints);
+            const auto points = regionPoints ? multiplyDivide(*regionPoints, percentage, 100, true) : std::nullopt;
+            return cells && points ? std::optional{ Axis{ *cells, *points, false } } : std::nullopt;
+        }
+        default:
+            return std::nullopt;
+        }
+    };
+
+    auto width = resolveAxis(metadata.width, static_cast<uint64_t>(regionWidth), cellWidth);
+    auto height = resolveAxis(metadata.height, static_cast<uint64_t>(regionHeight), cellHeight);
+    if (!width || !height)
+    {
+        return std::nullopt;
+    }
+
+    const auto imageWidth = static_cast<uint64_t>(imageSize.width);
+    const auto imageHeight = static_cast<uint64_t>(imageSize.height);
+    if (width->automatic && height->automatic)
+    {
+        width->points = imageWidth;
+        height->points = imageHeight;
+        const auto widthCells = ceilingDivide(width->points, cellWidth);
+        const auto heightCells = ceilingDivide(height->points, cellHeight);
+        if (!widthCells || !heightCells)
+        {
+            return std::nullopt;
+        }
+        width->cells = *widthCells;
+        height->cells = *heightCells;
+    }
+    else if (width->automatic)
+    {
+        const auto widthPoints = multiplyDivide(height->points, imageWidth, imageHeight, false, true);
+        if (!widthPoints)
+        {
+            return std::nullopt;
+        }
+        width->points = *widthPoints;
+        const auto quotient = width->points / cellWidth;
+        const auto remainder = width->points % cellWidth;
+        width->cells = quotient + (remainder >= cellWidth / 2 + cellWidth % 2);
+    }
+    else if (height->automatic)
+    {
+        const auto heightPoints = multiplyDivide(width->points, imageHeight, imageWidth, true);
+        if (!heightPoints)
+        {
+            return std::nullopt;
+        }
+        height->points = *heightPoints;
+        const auto heightCells = ceilingDivide(height->points, cellHeight);
+        if (!heightCells)
+        {
+            return std::nullopt;
+        }
+        height->cells = *heightCells;
+    }
+
+    width->cells = std::max<uint64_t>(width->cells, 1);
+    height->cells = std::max<uint64_t>(height->cells, 1);
+    width->points = std::max<uint64_t>(width->points, 1);
+    height->points = std::max<uint64_t>(height->points, 1);
+
+    if (width->cells > static_cast<uint64_t>(availableWidth))
+    {
+        height->cells = std::max<uint64_t>(1, height->cells * static_cast<uint64_t>(availableWidth) / width->cells);
+        width->cells = static_cast<uint64_t>(availableWidth);
+        const auto widthPoints = checkedMultiply(width->cells, cellWidth);
+        const auto heightPoints = checkedMultiply(height->cells, cellHeight);
+        if (!widthPoints || !heightPoints)
+        {
+            return std::nullopt;
+        }
+        width->points = *widthPoints;
+        height->points = *heightPoints;
+    }
+
+    constexpr uint64_t maximumRows = 255;
+    if (height->cells > maximumRows)
+    {
+        width->cells = std::max<uint64_t>(1, width->cells * maximumRows / height->cells);
+        height->cells = maximumRows;
+        const auto widthPoints = checkedMultiply(width->cells, cellWidth);
+        const auto heightPoints = checkedMultiply(height->cells, cellHeight);
+        if (!widthPoints || !heightPoints)
+        {
+            return std::nullopt;
+        }
+        width->points = *widthPoints;
+        height->points = *heightPoints;
+    }
+
+    uint64_t targetWidth = width->points;
+    uint64_t targetHeight = height->points;
+    if (metadata.preserveAspectRatio)
+    {
+        const auto imageAcrossHeight = checkedMultiply(imageWidth, height->points);
+        const auto imageAcrossWidth = checkedMultiply(imageHeight, width->points);
+        if (!imageAcrossHeight || !imageAcrossWidth)
+        {
+            return std::nullopt;
+        }
+        if (*imageAcrossHeight > *imageAcrossWidth)
+        {
+            targetHeight = multiplyDivide(width->points, imageHeight, imageWidth, false).value_or(0);
+        }
+        else
+        {
+            targetWidth = multiplyDivide(height->points, imageWidth, imageHeight, false).value_or(0);
+        }
+        targetWidth = std::max<uint64_t>(targetWidth, 1);
+        targetHeight = std::max<uint64_t>(targetHeight, 1);
+    }
+
+    if (width->cells > static_cast<uint64_t>(til::CoordTypeMax) ||
+        height->cells > static_cast<uint64_t>(til::CoordTypeMax) ||
+        targetWidth > static_cast<uint64_t>(INT64_MAX) ||
+        targetHeight > static_cast<uint64_t>(INT64_MAX))
+    {
+        return std::nullopt;
+    }
+
+    return Iterm2PlacementGeometry{
+        .cells = {
+            gsl::narrow_cast<til::CoordType>(width->cells),
+            gsl::narrow_cast<til::CoordType>(height->cells),
+        },
+        .cellSize = {
+            gsl::narrow_cast<til::CoordType>(cellWidth),
+            gsl::narrow_cast<til::CoordType>(cellHeight),
+        },
+        .targetWidth = targetWidth,
+        .targetHeight = targetHeight,
+        .rightExclusive = right + 1,
+    };
+}
+
+bool AdaptDispatch::_PrepareIterm2Admission(const size_t newBytes)
+{
+    if (newBytes > MaxIterm2RetainedBytes)
+    {
+        return false;
+    }
+
+    std::vector<std::weak_ptr<const std::vector<RGBQUAD>>> live;
+    live.reserve(_iterm2Surfaces.size() + 1);
+    size_t retainedBytes = 0;
+    for (const auto& weak : _iterm2Surfaces)
+    {
+        if (const auto storage = weak.lock())
+        {
+            if (storage->size() > SIZE_MAX / sizeof(RGBQUAD))
+            {
+                return false;
+            }
+            const auto bytes = storage->size() * sizeof(RGBQUAD);
+            if (bytes > MaxIterm2RetainedBytes - std::min(retainedBytes, MaxIterm2RetainedBytes))
+            {
+                return false;
+            }
+            retainedBytes += bytes;
+            live.emplace_back(storage);
+        }
+    }
+    if (newBytes > MaxIterm2RetainedBytes - retainedBytes)
+    {
+        return false;
+    }
+
+    _iterm2Surfaces = std::move(live);
+    return true;
+}
+
+void AdaptDispatch::_DisplayIterm2Image(const Iterm2ImageParser::Transfer& transfer)
+{
+    auto decoded = _api.DecodeImageToBgra(transfer.Data(), ITerminalApi::ImageDecodePolicy::Iterm2SingleFrame);
+    if (!decoded ||
+        decoded.frameCount != 1 ||
+        decoded.size.width <= 0 ||
+        decoded.size.height <= 0 ||
+        decoded.size.width > ::Image::MaximumDimension ||
+        decoded.size.height > ::Image::MaximumDimension)
+    {
+        return;
+    }
+
+    const auto width = static_cast<size_t>(decoded.size.width);
+    const auto height = static_cast<size_t>(decoded.size.height);
+    if (height == 0 ||
+        width > SIZE_MAX / height ||
+        width * height > 64ull * 1024 * 1024 ||
+        decoded.pixels.size() != width * height ||
+        decoded.pixels.size() > SIZE_MAX / sizeof(RGBQUAD))
+    {
+        return;
+    }
+
+    const auto page = _pages.ActivePage();
+    const auto geometry = _ResolveIterm2Placement(transfer.GetMetadata(), decoded.size, page);
+    if (!geometry)
+    {
+        return;
+    }
+
+    const auto retainedBytes = decoded.pixels.size() * sizeof(RGBQUAD);
+    auto surface = std::make_shared<::Image>(decoded.size, std::move(decoded.pixels));
+    if (!_PrepareIterm2Admission(retainedBytes))
+    {
+        return;
+    }
+    _iterm2Surfaces.emplace_back(surface->Storage());
+
+    const auto start = page.Cursor().GetPosition();
+    if (geometry->cells.height <= 0 ||
+        start.x > til::CoordTypeMax - geometry->cells.width)
+    {
+        return;
+    }
+
+    ImageMutationGuard mutation{ *this, true };
+    if (!mutation)
+    {
+        return;
+    }
+
+    const ImagePlacement::Key key{ 0, _nextIterm2LayerId, ImagePlacement::Key::Protocol::Iterm2 };
+    const ImagePlacement::PixelGeometry pixelGeometry{
+        .cellSize = geometry->cellSize,
+        .targetWidth = geometry->targetWidth,
+        .targetHeight = geometry->targetHeight,
+    };
+    const auto addImageRow = [&](const til::CoordType imageRow) {
+        const auto position = page.Cursor().GetPosition();
+        const auto originalTop = position.y - imageRow;
+        page.Buffer().GetMutableImages().Add(ImagePlacement::FromFragment(
+            key,
+            surface,
+            {
+                start.x,
+                position.y,
+                start.x + geometry->cells.width,
+                position.y + 1,
+            },
+            {
+                start.x,
+                originalTop,
+                start.x + geometry->cells.width,
+                originalTop + geometry->cells.height,
+            },
+            0,
+            {},
+            pixelGeometry));
+    };
+
+    addImageRow(0);
+    for (til::CoordType row = 1; row < geometry->cells.height; ++row)
+    {
+        LineFeed(DispatchTypes::LineFeedType::WithoutReturn);
+        addImageRow(row);
+    }
+
+    auto& cursor = page.Cursor();
+    const auto finalPosition = cursor.GetPosition();
+    if (finalPosition.y == til::CoordTypeMax)
+    {
+        mutation.Fail();
+        return;
+    }
+
+    const auto currentPlacements = page.Buffer().GetImages().All();
+    std::optional<til::rect> cellBounds;
+    std::optional<til::rect> originalBounds;
+    const auto include = [](const std::optional<til::rect> current, const til::rect next) {
+        return current ?
+                   til::rect{
+                       std::min(current->left, next.left),
+                       std::min(current->top, next.top),
+                       std::max(current->right, next.right),
+                       std::max(current->bottom, next.bottom),
+                   } :
+                   next;
+    };
+    for (const auto& fragment : currentPlacements)
+    {
+        if (fragment.Identity() != key)
+        {
+            continue;
+        }
+        cellBounds = include(cellBounds, fragment.CellBounds());
+        originalBounds = include(originalBounds, fragment.OriginalCellBounds());
+    }
+    if (!cellBounds || !originalBounds || cellBounds->empty() || originalBounds->empty())
+    {
+        mutation.Fail();
+        return;
+    }
+    page.Buffer().GetMutableImages().Erase(key);
+    page.Buffer().GetMutableImages().Add(ImagePlacement::FromFragment(
+        key,
+        surface,
+        *cellBounds,
+        *originalBounds,
+        0,
+        {},
+        pixelGeometry));
+
+    const auto finalX = start.x + geometry->cells.width;
+    if (finalX >= geometry->rightExclusive)
+    {
+        cursor.SetXPosition(geometry->rightExclusive - 1);
+        cursor.DelayEOLWrap();
+    }
+    else
+    {
+        cursor.SetXPosition(finalX);
+    }
+
+    const auto finalPage = _pages.ActivePage();
+    finalPage.Buffer().TriggerRedraw(Viewport::FromExclusive({ 0, finalPage.Top(), finalPage.Width(), finalPage.Bottom() }));
+    _nextIterm2LayerId++;
+    if (_nextIterm2LayerId == 0)
+    {
+        _nextIterm2LayerId = 1;
+    }
 }
 
 // Method Description:

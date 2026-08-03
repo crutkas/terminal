@@ -62,6 +62,10 @@ public:
         return false;
     }
 
+    void ActionReset() noexcept override
+    {
+    }
+
     bool ActionExecute(const wchar_t wch) override
     {
         executed += wch;
