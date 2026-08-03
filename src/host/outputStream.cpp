@@ -542,12 +542,11 @@ void ConhostInternalGetSet::RequestTimedContentUpdate(
     pRender->StartTimerAt(_timedContentTimer, *deadline);
 }
 
-bool ConhostInternalGetSet::DecodeImageToBgra(const std::span<const uint8_t> /*data*/, std::vector<RGBQUAD>& pixels, til::size& /*size*/) noexcept
+ITerminalApi::ImageDecodeResult ConhostInternalGetSet::DecodeImageToBgra(const std::span<const uint8_t> /*data*/, const ImageDecodePolicy /*policy*/) noexcept
 {
     // conhost has no image decoder. Under ConPTY the connected terminal decodes; standalone,
     // an encoded image simply isn't displayed.
-    pixels.clear();
-    return false;
+    return { .status = ImageDecodeResult::Status::Unavailable };
 }
 
 til::size ConhostInternalGetSet::GetCellSize() const noexcept

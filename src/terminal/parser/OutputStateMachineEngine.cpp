@@ -34,6 +34,11 @@ bool OutputStateMachineEngine::EncounteredWin32InputModeSequence() const noexcep
     return false;
 }
 
+void OutputStateMachineEngine::ActionReset() noexcept
+{
+    _dispatch->ResetParser();
+}
+
 const ITermDispatch& OutputStateMachineEngine::Dispatch() const noexcept
 {
     return *_dispatch;
@@ -769,6 +774,19 @@ IStateMachineEngine::StringHandler OutputStateMachineEngine::ActionApcDispatch(c
     default:
         return nullptr;
     }
+}
+
+// Routine Description:
+// - Gives the listener an opportunity to stream an OSC payload instead of
+//   accumulating it in the state machine. A null handler selects the bounded
+//   completed-string path.
+// Arguments:
+// - parameter - identifier of the OSC action to perform
+// Return Value:
+// - the payload handler function or nullptr when streaming is not supported
+IStateMachineEngine::OscStringHandler OutputStateMachineEngine::ActionOscDispatch(const size_t parameter)
+{
+    return parameter == OscActionCodes::ITerm2Action ? _dispatch->Iterm2Image() : nullptr;
 }
 
 // Routine Description:

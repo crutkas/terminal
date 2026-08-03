@@ -12,6 +12,7 @@
   <Import Project="$(SolutionDir)src\common.nugetversions.props" />
   <ItemGroup>
     <ClCompile Include="adapterTest.cpp" />
+    <ClCompile Include="Iterm2ImageParserTests.cpp" />
     <ClCompile Include="inputTest.cpp" />
     <ClCompile Include="kittyKeyboardProtocol.cpp" />
     <ClCompile Include="MouseInputTest.cpp" />

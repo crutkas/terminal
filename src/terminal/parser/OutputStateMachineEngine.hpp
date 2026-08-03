@@ -26,6 +26,7 @@ namespace Microsoft::Console::VirtualTerminal
 
         void UnknownSequence() noexcept override;
         bool EncounteredWin32InputModeSequence() const noexcept override;
+        void ActionReset() noexcept override;
 
         bool ActionExecute(const wchar_t wch) override;
         bool ActionExecuteFromEscape(const wchar_t wch) override;
@@ -45,6 +46,8 @@ namespace Microsoft::Console::VirtualTerminal
         StringHandler ActionDcsDispatch(const VTID id, const VTParameters parameters) override;
 
         StringHandler ActionApcDispatch(const VTID id) override;
+
+        OscStringHandler ActionOscDispatch(const size_t parameter) override;
 
         bool ActionOscDispatch(const size_t parameter, const std::wstring_view string) override;
 

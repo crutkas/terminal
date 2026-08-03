@@ -25,6 +25,7 @@ C_DEFINES               = $(C_DEFINES) -DINLINE_TEST_METHOD_MARKUP -DUNIT_TESTIN
 SOURCES = \
     $(SOURCES) \
     adapterTest.cpp \
+    Iterm2ImageParserTests.cpp \
     inputTest.cpp \
     kittyKeyboardProtocol.cpp \
     MouseInputTest.cpp \

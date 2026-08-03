@@ -56,6 +56,7 @@ public:
         {
             Sixel,
             Kitty,
+            Iterm2,
         };
 
         uint32_t imageId = 0;

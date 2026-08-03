@@ -169,7 +169,7 @@ public:
     void SearchMissingCommand(const std::wstring_view command) override;
 
     void ShowNotification(const std::wstring_view title, const std::wstring_view body) override;
-    bool DecodeImageToBgra(const std::span<const uint8_t> data, std::vector<RGBQUAD>& pixels, til::size& size) noexcept override;
+    ImageDecodeResult DecodeImageToBgra(std::span<const uint8_t> data, ImageDecodePolicy policy) noexcept override;
     til::size GetCellSize() const noexcept override;
     til::read_file_result ReadLocalFile(const std::wstring_view path, uint64_t offset, uint64_t size, bool deleteAfter, const std::wstring_view deleteNameMarker, std::vector<uint8_t>& out) noexcept override;
     Microsoft::Console::Utils::ReadSharedMemoryResult ReadSharedMemory(const std::wstring_view name, uint64_t offset, uint64_t size, std::vector<uint8_t>& out) noexcept override;

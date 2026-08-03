@@ -11,16 +11,30 @@
 #include "consoletaeftemplates.hpp"
 
 #include <wil/resource.h>
+#include <wincrypt.h>
+#include <wincodec.h>
 
 using namespace winrt::Microsoft::Terminal::Core;
 using namespace Microsoft::Terminal::Core;
 using namespace Microsoft::Console::Render;
+using namespace Microsoft::Console::VirtualTerminal;
 
 using namespace WEX::Logging;
 using namespace WEX::TestExecution;
+using namespace std::string_view_literals;
 
 namespace
 {
+    std::vector<uint8_t> DecodeFixture(const std::string_view encoded)
+    {
+        DWORD size = 0;
+        THROW_IF_WIN32_BOOL_FALSE(CryptStringToBinaryA(encoded.data(), gsl::narrow<DWORD>(encoded.size()), CRYPT_STRING_BASE64, nullptr, &size, nullptr, nullptr));
+        std::vector<uint8_t> decoded(size);
+        THROW_IF_WIN32_BOOL_FALSE(CryptStringToBinaryA(encoded.data(), gsl::narrow<DWORD>(encoded.size()), CRYPT_STRING_BASE64, decoded.data(), &size, nullptr, nullptr));
+        decoded.resize(size);
+        return decoded;
+    }
+
     struct PaintedCluster
     {
         til::point position;
@@ -503,6 +517,9 @@ namespace TerminalCoreUnitTests
         TEST_METHOD(SetWorkingDirectory);
 
         TEST_METHOD(GetCellSizeFallsBackWhenFontUnset);
+        TEST_METHOD(ImageDecodePolicyEnforcesContainerAndFrameCount);
+        TEST_METHOD(ImageDecodeRejectsMalformedAndTruncatedData);
+        TEST_METHOD(Iterm2ImgcatLegacyMultipartAndDividerRender);
 
         TEST_METHOD(DirectImageRendererPreservesSharedSurfaceGeometryAndLifetime);
         TEST_METHOD(KittyAnimationSurvivesFontAndRendererRefresh);
@@ -900,6 +917,121 @@ void TerminalApiTest::GetCellSizeFallsBackWhenFontUnset()
     const auto cellSize = term.GetCellSize();
     VERIFY_IS_GREATER_THAN(cellSize.width, 1, L"cell width must not be a degenerate 1px");
     VERIFY_IS_GREATER_THAN(cellSize.height, 1, L"cell height must not be a degenerate 1px");
+}
+
+void TerminalApiTest::ImageDecodePolicyEnforcesContainerAndFrameCount()
+{
+    struct Fixture
+    {
+        std::string_view encoded;
+        GUID container;
+    };
+    const std::array staticFixtures{
+        Fixture{ "iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAYAAABytg0kAAAAFUlEQVR4nGP8z8Dwn4GBgYEJRIAwAB8XAgICR7MUAAAAAElFTkSuQmCC", GUID_ContainerFormatPng },
+        Fixture{ "/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAgGBgcGBQgHBwcJCQgKDBQNDAsLDBkSEw8UHRofHh0aHBwgJC4nICIsIxwcKDcpLDAxNDQ0Hyc5PTgyPC4zNDL/2wBDAQkJCQwLDBgNDRgyIRwhMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjL/wAARCAACAAIDASIAAhEBAxEB/8QAHwAAAQUBAQEBAQEAAAAAAAAAAAECAwQFBgcICQoL/8QAtRAAAgEDAwIEAwUFBAQAAAF9AQIDAAQRBRIhMUEGE1FhByJxFDKBkaEII0KxwRVS0fAkM2JyggkKFhcYGRolJicoKSo0NTY3ODk6Q0RFRkdISUpTVFVWV1hZWmNkZWZnaGlqc3R1dnd4eXqDhIWGh4iJipKTlJWWl5iZmqKjpKWmp6ipqrKztLW2t7i5usLDxMXGx8jJytLT1NXW19jZ2uHi4+Tl5ufo6erx8vP09fb3+Pn6/8QAHwEAAwEBAQEBAQEBAQAAAAAAAAECAwQFBgcICQoL/8QAtREAAgECBAQDBAcFBAQAAQJ3AAECAxEEBSExBhJBUQdhcRMiMoEIFEKRobHBCSMzUvAVYnLRChYkNOEl8RcYGRomJygpKjU2Nzg5OkNERUZHSElKU1RVVldYWVpjZGVmZ2hpanN0dXZ3eHl6goOEhYaHiImKkpOUlZaXmJmaoqOkpaanqKmqsrO0tba3uLm6wsPExcbHyMnK0tPU1dbX2Nna4uPk5ebn6Onq8vP09fb3+Pn6/9oADAMBAAIRAxEAPwDi6KKK+ZP3E//Z", GUID_ContainerFormatJpeg },
+        Fixture{ "Qk1GAAAAAAAAADYAAAAoAAAAAgAAAAIAAAABACAAAAAAABAAAADEDgAAxA4AAAAAAAAAAAAAAAD//wAA//8AAP//AAD//w==", GUID_ContainerFormatBmp },
+        Fixture{ "R0lGODdhAgACAIEAAP8AAAAAAAAAAAAAACwAAAAAAgACAAAIBgABCAQQEAA7", GUID_ContainerFormatGif },
+        Fixture{ "SUkqAAgAAAALAAABBAABAAAAAgAAAAEBBAABAAAAAgAAAAIBAwAEAAAAkgAAAAMBAwABAAAAAQAAAAYBAwABAAAAAgAAABEBBAABAAAAmgAAABUBAwABAAAABAAAABYBBAABAAAAAgAAABcBBAABAAAAEAAAABwBAwABAAAAAQAAAFIBAwABAAAAAgAAAAAAAAAIAAgACAAIAP8AAP//AAD//wAA//8AAP8=", GUID_ContainerFormatTiff },
+    };
+
+    Terminal terminal{ Terminal::TestDummyMarker{} };
+    for (const auto& fixture : staticFixtures)
+    {
+        const auto data = DecodeFixture(fixture.encoded);
+        const auto iterm2 = terminal.DecodeImageToBgra(data, ITerminalApi::ImageDecodePolicy::Iterm2SingleFrame);
+        VERIFY_IS_TRUE(static_cast<bool>(iterm2));
+        VERIFY_ARE_EQUAL(uint32_t{ 1 }, iterm2.frameCount);
+        VERIFY_IS_TRUE(iterm2.containerFormat == fixture.container);
+        VERIFY_ARE_EQUAL((til::size{ 2, 2 }), iterm2.size);
+        VERIFY_ARE_EQUAL(size_t{ 4 }, iterm2.pixels.size());
+
+        const auto kitty = terminal.DecodeImageToBgra(data, ITerminalApi::ImageDecodePolicy::KittyPng);
+        VERIFY_ARE_EQUAL(fixture.container == GUID_ContainerFormatPng, static_cast<bool>(kitty));
+    }
+
+    static constexpr std::array animatedFixtures{
+        "R0lGODlhAgACAIEAAP8AAAAAAAAAAAAAACH/C05FVFNDQVBFMi4wAwEAAAAh+QQACgAAACwAAAAAAgACAAAIBgABCAQQEAAh+QQBCgABACwAAAAAAgACAIEA/wAAAAAAAAAAAAAIBgABCAQQEAA7"sv,
+        "SUkqAAgAAAALAAABBAABAAAAAgAAAAEBBAABAAAAAgAAAAIBAwAEAAAAkgAAAAMBAwABAAAAAQAAAAYBAwABAAAAAgAAABEBBAABAAAAmgAAABUBAwABAAAABAAAABYBBAABAAAAAgAAABcBBAABAAAAEAAAABwBAwABAAAAAQAAAFIBAwABAAAAAgAAALgAAAAIAAgACAAIAP8AAP//AAD//wAA//8AAP8AAAAAAABJSSoACAAAAAsAAAEEAAEAAAACAAAAAQEEAAEAAAACAAAAAgEDAAQAAABCAQAAAwEDAAEAAAABAAAABgEDAAEAAAACAAAAEQEEAAEAAABKAQAAFQEDAAEAAAAEAAAAFgEEAAEAAAACAAAAFwEEAAEAAAAQAAAAHAEDAAEAAAABAAAAUgEDAAEAAAACAAAAAAAAAAgACAAIAAgAAP8A/wD/AP8A/wD/AP8A/wAAAAAAAA=="sv,
+        "iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAYAAABytg0kAAAACGFjVEwAAAACAAAAAPONk3AAAAAaZmNUTAAAAAAAAAACAAAAAgAAAAAAAAAAAAEACgAA6FTcAAAAABVJREFUeJxj/M/A8J+BgYGBCUSAMAAfFwICAkezFAAAABpmY1RMAAAAAQAAAAIAAAACAAAAAAAAAAAAAQAKAABzJzbUAAAAGWZkQVQAAAACeJxjZPjP8J+BgYGBCUSAMAAeGAICRb04jgAAAABJRU5ErkJggg=="sv,
+    };
+    for (const auto encoded : animatedFixtures)
+    {
+        const auto result = terminal.DecodeImageToBgra(DecodeFixture(encoded), ITerminalApi::ImageDecodePolicy::Iterm2SingleFrame);
+        VERIFY_IS_TRUE(result.status == ITerminalApi::ImageDecodeResult::Status::MultipleFrames);
+        VERIFY_IS_TRUE(result.frameCount > 1);
+        VERIFY_IS_TRUE(result.pixels.empty());
+    }
+}
+
+void TerminalApiTest::ImageDecodeRejectsMalformedAndTruncatedData()
+{
+    Terminal terminal{ Terminal::TestDummyMarker{} };
+    const std::array malformed{
+        std::vector<uint8_t>{ 0, 1, 2, 3 },
+        DecodeFixture("iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAYAAABytg0kAAAAFUlEQVR4nGP8z8Dwn4GBgYEJRIAwAB8XAgICR7MUAAAAAElFTkSuQmCC"),
+    };
+    auto truncated = malformed[1];
+    truncated.resize(truncated.size() / 2);
+
+    for (const auto& data : std::array{ malformed[0], truncated })
+    {
+        const auto result = terminal.DecodeImageToBgra(data, ITerminalApi::ImageDecodePolicy::Iterm2SingleFrame);
+        VERIFY_IS_FALSE(static_cast<bool>(result));
+        VERIFY_IS_TRUE(result.pixels.empty());
+    }
+
+    auto oversized = DecodeFixture("SUkqAAgAAAALAAABBAABAAAAAgAAAAEBBAABAAAAAgAAAAIBAwAEAAAAkgAAAAMBAwABAAAAAQAAAAYBAwABAAAAAgAAABEBBAABAAAAmgAAABUBAwABAAAABAAAABYBBAABAAAAAgAAABcBBAABAAAAEAAAABwBAwABAAAAAQAAAFIBAwABAAAAAgAAAAAAAAAIAAgACAAIAP8AAP//AAD//wAA//8AAP8=");
+    const std::array oversizedDimension{ uint8_t{ 0x01 }, uint8_t{ 0x20 }, uint8_t{ 0x00 }, uint8_t{ 0x00 } };
+    std::copy(oversizedDimension.begin(), oversizedDimension.end(), oversized.begin() + 18);
+    std::copy(oversizedDimension.begin(), oversizedDimension.end(), oversized.begin() + 30);
+    const auto oversizedResult = terminal.DecodeImageToBgra(oversized, ITerminalApi::ImageDecodePolicy::Iterm2SingleFrame);
+    VERIFY_IS_FALSE(static_cast<bool>(oversizedResult));
+    VERIFY_IS_TRUE(oversizedResult.pixels.empty());
+}
+
+void TerminalApiTest::Iterm2ImgcatLegacyMultipartAndDividerRender()
+{
+    static constexpr std::wstring_view image{ L"iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAYAAABytg0kAAAAFUlEQVR4nGP8z8Dwn4GBgYEJRIAwAB8XAgICR7MUAAAAAElFTkSuQmCC" };
+    KittyRenderFixture fixture{ { 20, 10 }, 0 };
+    auto& stateMachine = *fixture.terminal._stateMachine;
+
+    // Current official imgcat --legacy framing.
+    stateMachine.ProcessString(L"\x1b]1337;File=inline=1;width=2;height=2:" + std::wstring{ image } + L"\x1b\\\r\n");
+
+    // Current official imgcat multipart framing (one FilePart here because the
+    // fixture is smaller than imgcat's 200-character chunk size).
+    stateMachine.ProcessString(L"\x1b]1337;MultipartFile=inline=1;width=2;height=2\x1b\\");
+    stateMachine.ProcessString(L"\x1b]1337;FilePart=" + std::wstring{ image } + L"\x1b\\");
+    stateMachine.ProcessString(L"\x1b]1337;FileEnd\x1b\\\r\n");
+
+    // The official divider example stretches one image row across the grid.
+    stateMachine.ProcessString(L"\x1b]1337;File=inline=1;width=100%;height=1;preserveAspectRatio=0:" + std::wstring{ image } + L"\a\r\n");
+
+    fixture.StartPainting();
+    const auto frame = fixture.engine.Snapshot();
+    VERIFY_ARE_EQUAL(size_t{ 5 }, frame.images.size());
+    VERIFY_IS_TRUE(std::ranges::all_of(frame.images, [](const auto& painted) {
+        return painted.key.protocol == ImagePlacement::Key::Protocol::Iterm2 &&
+               painted.containsRed;
+    }));
+
+    std::unordered_set<uint64_t> layers;
+    for (const auto& painted : frame.images)
+    {
+        layers.emplace(painted.key.layerId);
+    }
+    VERIFY_ARE_EQUAL(size_t{ 3 }, layers.size());
+
+    const auto divider = std::ranges::find_if(frame.images, [](const auto& painted) {
+        return painted.bounds.width() == 20;
+    });
+    VERIFY_IS_TRUE(divider != frame.images.end());
+    if (divider != frame.images.end())
+    {
+        VERIFY_ARE_EQUAL(til::CoordType{ 1 }, divider->bounds.height());
+        VERIFY_ARE_EQUAL(uint64_t{ 200 }, divider->geometry.targetWidth);
+        VERIFY_ARE_EQUAL(uint64_t{ 20 }, divider->geometry.targetHeight);
+    }
 }
 
 void TerminalApiTest::DirectImageRendererPreservesSharedSurfaceGeometryAndLifetime()

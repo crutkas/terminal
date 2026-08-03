@@ -5,6 +5,7 @@
 #include "WexTestClass.h"
 #include "../../inc/consoletaeftemplates.hpp"
 
+#include "ascii.hpp"
 #include "stateMachine.hpp"
 
 using namespace WEX::Common;
@@ -43,6 +44,11 @@ public:
         apcDispatchCount = 0;
         apcId = 0;
         apcDataString.clear();
+        oscHandler = nullptr;
+        oscHandlerParameter = 0;
+        oscDispatchCount = 0;
+        oscDispatchParameter = 0;
+        oscDispatchedString.clear();
         unknownSequenceCount = 0;
     }
 
@@ -54,6 +60,10 @@ public:
     bool EncounteredWin32InputModeSequence() const noexcept override
     {
         return false;
+    }
+
+    void ActionReset() noexcept override
+    {
     }
 
     bool ActionExecute(const wchar_t wch) override
@@ -80,8 +90,17 @@ public:
 
     bool ActionVt52EscDispatch(const VTID /*id*/, const VTParameters /*parameters*/) override { return true; };
 
-    bool ActionOscDispatch(const size_t /* parameter */, const std::wstring_view /* string */) override
+    IStateMachineEngine::OscStringHandler ActionOscDispatch(const size_t parameter) override
     {
+        oscHandlerParameter = parameter;
+        return oscHandler;
+    }
+
+    bool ActionOscDispatch(const size_t parameter, const std::wstring_view string) override
+    {
+        oscDispatchCount++;
+        oscDispatchParameter = parameter;
+        oscDispatchedString = string;
         if (pfnFlushToTerminal)
         {
             pfnFlushToTerminal();
@@ -166,6 +185,12 @@ public:
     uint64_t apcId = 0;
     std::wstring apcDataString;
 
+    IStateMachineEngine::OscStringHandler oscHandler;
+    size_t oscHandlerParameter = 0;
+    size_t oscDispatchCount = 0;
+    size_t oscDispatchParameter = 0;
+    std::wstring oscDispatchedString;
+
     size_t unknownSequenceCount = 0;
 };
 
@@ -198,6 +223,11 @@ class Microsoft::Console::VirtualTerminal::StateMachineTest
     TEST_METHOD(ApcEntryRoutingBehavior);
     TEST_METHOD(ApcDataStringSplitAcrossWrites);
     TEST_METHOD(ApcDataStringIsOpaqueToTheParser);
+
+    TEST_METHOD(OscCompletedStringCompatibility);
+    TEST_METHOD(OscStreamingHandlerAndFallback);
+    TEST_METHOD(OscStreamingCancellation);
+    TEST_METHOD(OscFallbackBufferIsBounded);
 
     TEST_METHOD(VtParameterSubspanTest);
 };
@@ -447,6 +477,128 @@ void StateMachineTest::ApcDataStringsReceivedByHandler()
 
     // Verify the control characters were executed (if expected).
     VERIFY_ARE_EQUAL(expectedExecuted, engine.executed);
+}
+
+void StateMachineTest::OscCompletedStringCompatibility()
+{
+    auto enginePtr{ std::make_unique<TestStateMachineEngine>() };
+    auto& engine{ *enginePtr.get() };
+    StateMachine machine{ std::move(enginePtr) };
+
+    machine.ProcessString(L"\x1b]42;ordinary payload\a");
+    VERIFY_ARE_EQUAL(1u, engine.oscDispatchCount);
+    VERIFY_ARE_EQUAL(42u, engine.oscDispatchParameter);
+    VERIFY_ARE_EQUAL(L"ordinary payload", engine.oscDispatchedString);
+
+    engine.ResetTestState();
+    machine.ProcessString(L"\x1b]1337;SetMark\x1b");
+    VERIFY_ARE_EQUAL(0u, engine.oscDispatchCount);
+    machine.ProcessString(L"\\");
+    VERIFY_ARE_EQUAL(1u, engine.oscDispatchCount);
+    VERIFY_ARE_EQUAL(1337u, engine.oscDispatchParameter);
+    VERIFY_ARE_EQUAL(L"SetMark", engine.oscDispatchedString);
+}
+
+void StateMachineTest::OscStreamingHandlerAndFallback()
+{
+    auto enginePtr{ std::make_unique<TestStateMachineEngine>() };
+    auto& engine{ *enginePtr.get() };
+    StateMachine machine{ std::move(enginePtr) };
+
+    std::wstring streamed;
+    engine.oscHandler = [&](const wchar_t ch) {
+        streamed += ch;
+        return streamed.size() >= 5 ?
+                   IStateMachineEngine::OscStringHandlerResult::Accept :
+                   IStateMachineEngine::OscStringHandlerResult::Pending;
+    };
+
+    machine.ProcessString(L"\x1b]1337;Fi");
+    VERIFY_ARE_EQUAL(1337u, engine.oscHandlerParameter);
+    VERIFY_ARE_EQUAL(L"Fi", machine._oscString);
+    VERIFY_IS_TRUE(machine._cachedSequence.has_value());
+
+    machine.ProcessString(L"le=payload");
+    VERIFY_IS_TRUE(machine._oscString.empty());
+    VERIFY_IS_FALSE(machine._cachedSequence.has_value());
+
+    machine.ProcessString(L"\x1b\\");
+    VERIFY_ARE_EQUAL(L"File=payload\x1b", streamed);
+    VERIFY_ARE_EQUAL(0u, engine.oscDispatchCount);
+
+    engine.ResetTestState();
+    std::wstring probed;
+    engine.oscHandler = [&](const wchar_t ch) {
+        probed += ch;
+        return probed.size() == 3 ?
+                   IStateMachineEngine::OscStringHandlerResult::Fallback :
+                   IStateMachineEngine::OscStringHandlerResult::Pending;
+    };
+
+    machine.ProcessString(L"\x1b]1337;Set");
+    machine.ProcessString(L"Mark\a");
+    VERIFY_ARE_EQUAL(L"Set", probed);
+    VERIFY_ARE_EQUAL(1u, engine.oscDispatchCount);
+    VERIFY_ARE_EQUAL(L"SetMark", engine.oscDispatchedString);
+}
+
+void StateMachineTest::OscStreamingCancellation()
+{
+    auto enginePtr{ std::make_unique<TestStateMachineEngine>() };
+    auto& engine{ *enginePtr.get() };
+    StateMachine machine{ std::move(enginePtr) };
+
+    std::wstring streamed;
+    engine.oscHandler = [&](const wchar_t ch) {
+        streamed += ch;
+        return IStateMachineEngine::OscStringHandlerResult::Accept;
+    };
+
+    machine.ProcessString(L"\x1b]1337;x\x18");
+    VERIFY_ARE_EQUAL(L"x\x18", streamed);
+    VERIFY_ARE_EQUAL(0u, engine.oscDispatchCount);
+
+    streamed.clear();
+    machine.ProcessString(L"\x1b]1337;x\x1b[31m");
+    VERIFY_ARE_EQUAL(L"x\x18", streamed);
+    VERIFY_ARE_EQUAL(0u, engine.oscDispatchCount);
+
+    streamed.clear();
+    machine.ProcessString(L"\x1b]1337;x");
+    machine.ResetState();
+    VERIFY_ARE_EQUAL(L"x\x18", streamed);
+    VERIFY_ARE_EQUAL(0u, engine.oscDispatchCount);
+}
+
+void StateMachineTest::OscFallbackBufferIsBounded()
+{
+    auto enginePtr{ std::make_unique<TestStateMachineEngine>() };
+    auto& engine{ *enginePtr.get() };
+    StateMachine machine{ std::move(enginePtr) };
+
+    std::wstring streamed;
+    engine.oscHandler = [&](const wchar_t ch) {
+        streamed += ch;
+        return IStateMachineEngine::OscStringHandlerResult::Pending;
+    };
+
+    machine.ProcessString(L"\x1b]1337;");
+    machine._oscString.assign(StateMachine::MaxOscStringLength, L'x');
+    machine._cachedSequence.emplace(L"bounded prefix");
+    machine.ProcessCharacter(L'x');
+
+    VERIFY_IS_TRUE(machine._oscStringDiscarded);
+    VERIFY_IS_TRUE(machine._oscString.empty());
+    VERIFY_IS_FALSE(machine._cachedSequence.has_value());
+    VERIFY_ARE_EQUAL(std::wstring(1, AsciiChars::CAN), streamed);
+
+    machine.ProcessCharacter(AsciiChars::BEL);
+    VERIFY_ARE_EQUAL(0u, engine.oscDispatchCount);
+
+    engine.ResetTestState();
+    machine.ProcessString(L"\x1b]42;ok\a");
+    VERIFY_ARE_EQUAL(1u, engine.oscDispatchCount);
+    VERIFY_ARE_EQUAL(L"ok", engine.oscDispatchedString);
 }
 
 void StateMachineTest::ApcIdentifiersAreRoutedToTheEngine()

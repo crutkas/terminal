@@ -23,6 +23,8 @@ class Microsoft::Console::VirtualTerminal::TermDispatch : public Microsoft::Cons
 {
 public:
     void UnknownSequence() noexcept override {}
+    void ResetParser() noexcept override {}
+
     void Print(const wchar_t wchPrintable) override = 0;
     void PrintString(const std::wstring_view string) override = 0;
 
@@ -146,6 +148,7 @@ public:
     void DoConEmuAction(const std::wstring_view /*string*/) override {}
 
     void DoITerm2Action(const std::wstring_view /*string*/) override {}
+    IStateMachineEngine::OscStringHandler Iterm2Image() override { return nullptr; }
 
     void DoFinalTermAction(const std::wstring_view /*string*/) override {}
 

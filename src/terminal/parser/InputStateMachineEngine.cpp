@@ -138,6 +138,10 @@ bool InputStateMachineEngine::EncounteredWin32InputModeSequence() const noexcept
     return _encounteredWin32InputModeSequence;
 }
 
+void InputStateMachineEngine::ActionReset() noexcept
+{
+}
+
 // Method Description:
 // - Triggers the Execute action to indicate that the listener should
 //      immediately respond to a C0 control character.
@@ -598,6 +602,11 @@ bool InputStateMachineEngine::ActionSs3Dispatch(const wchar_t wch, const VTParam
     }
 
     return true;
+}
+
+IStateMachineEngine::OscStringHandler InputStateMachineEngine::ActionOscDispatch(const size_t /*parameter*/) noexcept
+{
+    return nullptr;
 }
 
 // Method Description:

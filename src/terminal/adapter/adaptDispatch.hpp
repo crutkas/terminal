@@ -17,6 +17,7 @@ Author(s):
 #include "termDispatch.hpp"
 #include "ITerminalApi.hpp"
 #include "FontBuffer.hpp"
+#include "Iterm2ImageParser.hpp"
 #include "MacroBuffer.hpp"
 #include "PageManager.hpp"
 #include "terminalOutput.hpp"
@@ -44,6 +45,7 @@ namespace Microsoft::Console::VirtualTerminal
         void NotifyFontChanged();
 
         void UnknownSequence() noexcept override;
+        void ResetParser() noexcept override;
         void Print(const wchar_t wchPrintable) override;
         void PrintString(const std::wstring_view string) override;
 
@@ -161,6 +163,7 @@ namespace Microsoft::Console::VirtualTerminal
         void DoConEmuAction(const std::wstring_view string) override;
 
         void DoITerm2Action(const std::wstring_view string) override;
+        IStateMachineEngine::OscStringHandler Iterm2Image() override;
 
         void DoFinalTermAction(const std::wstring_view string) override;
 
@@ -269,6 +272,14 @@ namespace Microsoft::Console::VirtualTerminal
             TextBuffer* textBuffer = nullptr;
             std::wstring text;
         };
+        struct Iterm2PlacementGeometry
+        {
+            til::size cells;
+            til::size cellSize;
+            uint64_t targetWidth = 0;
+            uint64_t targetHeight = 0;
+            til::CoordType rightExclusive = 0;
+        };
 
         void _WriteToBuffer(const std::wstring_view string);
         std::pair<int, int> _GetVerticalMargins(const Page& page, const bool absolute) noexcept;
@@ -337,6 +348,9 @@ namespace Microsoft::Console::VirtualTerminal
         void _ReturnDcsResponse(const std::wstring_view response) const;
         void _ReturnApcResponse(const std::wstring_view response) const;
         void _ReturnOscResponse(const std::wstring_view response) const;
+        void _DisplayIterm2Image(const Iterm2ImageParser::Transfer& transfer);
+        std::optional<Iterm2PlacementGeometry> _ResolveIterm2Placement(const Iterm2ImageParser::Metadata& metadata, til::size imageSize, const Page& page) noexcept;
+        bool _PrepareIterm2Admission(size_t newBytes);
 
         std::vector<uint8_t> _tabStopColumns;
         bool _initDefaultTabStops = true;
@@ -352,6 +366,10 @@ namespace Microsoft::Console::VirtualTerminal
         std::shared_ptr<SixelParser> _sixelParser;
         friend class KittyParser;
         std::unique_ptr<KittyParser> _kittyParser;
+        std::unique_ptr<Iterm2ImageParser> _iterm2ImageParser;
+        uint64_t _nextIterm2LayerId = 1;
+        std::vector<std::weak_ptr<const std::vector<RGBQUAD>>> _iterm2Surfaces;
+        static constexpr size_t MaxIterm2RetainedBytes = 320 * 1024 * 1024;
         size_t _imageMutationDepth = 0;
         bool _imageMutationNotificationsActive = false;
         std::vector<ImageMutationNotification> _pendingImageMutationNotifications;

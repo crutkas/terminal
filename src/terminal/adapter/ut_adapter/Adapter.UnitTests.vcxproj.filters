@@ -18,6 +18,9 @@
     <ClCompile Include="adapterTest.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="Iterm2ImageParserTests.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="inputTest.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>

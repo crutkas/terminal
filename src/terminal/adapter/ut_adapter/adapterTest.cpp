@@ -3,6 +3,7 @@
 
 #include "precomp.h"
 #include <wextestclass.h>
+#include <wincodec.h>
 #include "../../inc/consoletaeftemplates.hpp"
 #include "../../parser/OutputStateMachineEngine.hpp"
 #include "../../../renderer/inc/DummyRenderer.hpp"
@@ -10,6 +11,7 @@
 #include "adaptDispatch.hpp"
 #include "KittyParser.hpp"
 #include "SixelParser.hpp"
+#include "../../parser/ascii.hpp"
 #include "../../../buffer/out/Image.hpp"
 
 using namespace WEX::Common;
@@ -471,20 +473,27 @@ public:
         _timedContentDeadline = deadline;
     }
 
-    bool DecodeImageToBgra(const std::span<const uint8_t> data, std::vector<RGBQUAD>& pixels, til::size& size) noexcept override
+    ImageDecodeResult DecodeImageToBgra(const std::span<const uint8_t> data, const ImageDecodePolicy policy) noexcept override
     {
         Log::Comment(L"DecodeImageToBgra MOCK called...");
         _decodeImageCallCount++;
+        _lastDecodeImagePolicy = policy;
         if (!_decodeImageSucceeds || data.empty())
         {
-            return false;
+            return { .status = ImageDecodeResult::Status::InvalidData };
         }
         // Return a fixed 2x2 opaque blue image so tests can verify the PNG path.
-        size = { 2, 2 };
+        ImageDecodeResult result{
+            .status = ImageDecodeResult::Status::Success,
+            .containerFormat = _decodeImageContainer,
+            .frameCount = _decodeImageFrameCount,
+            .size = _decodeImageSize,
+        };
         // When asked, return an inconsistent pixel count (3 != 2*2) to exercise the
         // adapter's host-contract guard.
-        pixels.assign(_decodeImageMismatched ? 3 : 4, RGBQUAD{ 255, 0, 0, 255 });
-        return true;
+        const auto pixelCount = static_cast<size_t>(std::max(0, result.size.width)) * static_cast<size_t>(std::max(0, result.size.height));
+        result.pixels.assign(_decodeImageMismatched && pixelCount > 0 ? pixelCount - 1 : pixelCount, RGBQUAD{ 255, 0, 0, 255 });
+        return result;
     }
 
     til::size GetCellSize() const noexcept override
@@ -711,6 +720,10 @@ public:
     bool _decodeImageSucceeds = true;
     bool _decodeImageMismatched = false;
     int _decodeImageCallCount = 0;
+    ImageDecodePolicy _lastDecodeImagePolicy = ImageDecodePolicy::KittyPng;
+    GUID _decodeImageContainer = GUID_ContainerFormatPng;
+    uint32_t _decodeImageFrameCount = 1;
+    til::size _decodeImageSize{ 2, 2 };
     til::size _cellSize{ 10, 20 };
 
     // Kitty file-transmission (t=f / t=t) mock state. The mock returns synthetic bytes
@@ -12742,6 +12755,240 @@ public:
         _kitty()._totalRetainedBytes = savedBytes;
     }
 
+    TEST_METHOD(Iterm2InlineImageGeometryAndIdentity)
+    {
+        _prepIterm2({ 100, 40 });
+        _sendIterm2(L"inline=1");
+
+        auto& buffer = *_testGetSet->_textBuffer;
+        VERIFY_ARE_EQUAL(size_t{ 1 }, buffer.GetImages().Size());
+        const auto first = buffer.GetImages().All().front();
+        VERIFY_ARE_EQUAL(uint32_t{ 0 }, first.Identity().imageId);
+        VERIFY_ARE_EQUAL(uint64_t{ 1 }, first.Identity().layerId);
+        VERIFY_IS_TRUE(first.Identity().protocol == ImagePlacement::Key::Protocol::Iterm2);
+        VERIFY_ARE_EQUAL((til::rect{ 0, 20, 10, 22 }), first.CellBounds());
+        VERIFY_ARE_EQUAL((til::size{ 10, 20 }), first.Geometry().cellSize);
+        VERIFY_ARE_EQUAL(uint64_t{ 100 }, first.Geometry().targetWidth);
+        VERIFY_ARE_EQUAL(uint64_t{ 40 }, first.Geometry().targetHeight);
+        VERIFY_ARE_EQUAL((til::point{ 10, 21 }), buffer.GetCursor().GetPosition());
+        VERIFY_IS_FALSE(buffer.GetCursor().GetDelayEOLWrap().has_value());
+        VERIFY_IS_TRUE(_testGetSet->_lastDecodeImagePolicy == ITerminalApi::ImageDecodePolicy::Iterm2SingleFrame);
+        VERIFY_IS_TRUE(_pDispatch->_kittyParser == nullptr);
+        VERIFY_IS_TRUE(_testGetSet->_response.empty());
+
+        _sendIterm2(L"inline=1;width=2;height=1;preserveAspectRatio=0");
+        VERIFY_ARE_EQUAL(size_t{ 2 }, buffer.GetImages().Size());
+        const auto placements = buffer.GetImages().All();
+        VERIFY_ARE_NOT_EQUAL(placements[0].Identity().layerId, placements[1].Identity().layerId);
+        VERIFY_ARE_EQUAL((til::rect{ 10, 21, 12, 22 }), placements[1].CellBounds());
+        VERIFY_ARE_EQUAL(uint64_t{ 20 }, placements[1].Geometry().targetWidth);
+        VERIFY_ARE_EQUAL(uint64_t{ 20 }, placements[1].Geometry().targetHeight);
+        VERIFY_ARE_EQUAL((til::point{ 12, 21 }), buffer.GetCursor().GetPosition());
+    }
+
+    TEST_METHOD(Iterm2InlineImageDimensionModes)
+    {
+        const auto verify = [&](const std::wstring_view arguments,
+                                const til::size decodedSize,
+                                const til::rect expectedBounds,
+                                const uint64_t expectedTargetWidth,
+                                const uint64_t expectedTargetHeight) {
+            _prepIterm2(decodedSize);
+            _sendIterm2(arguments);
+            const auto images = _testGetSet->_textBuffer->GetImages().All();
+            VERIFY_ARE_EQUAL(size_t{ 1 }, images.size());
+            if (!images.empty())
+            {
+                VERIFY_ARE_EQUAL(expectedBounds, images.front().CellBounds());
+                VERIFY_ARE_EQUAL(expectedTargetWidth, images.front().Geometry().targetWidth);
+                VERIFY_ARE_EQUAL(expectedTargetHeight, images.front().Geometry().targetHeight);
+            }
+        };
+
+        verify(L"inline=1;width=25px;height=41px;preserveAspectRatio=0",
+               { 100, 40 },
+               { 0, 20, 3, 23 },
+               25,
+               41);
+        verify(L"inline=1;width=4;height=2",
+               { 100, 50 },
+               { 0, 20, 4, 22 },
+               40,
+               20);
+        verify(L"inline=1;width=4;height=2;preserveAspectRatio=0",
+               { 100, 50 },
+               { 0, 20, 4, 22 },
+               40,
+               40);
+        verify(L"inline=1;width=4;height=auto",
+               { 100, 50 },
+               { 0, 20, 4, 21 },
+               40,
+               20);
+        verify(L"inline=1;width=auto;height=2",
+               { 100, 50 },
+               { 0, 20, 8, 22 },
+               80,
+               40);
+        verify(L"inline=1;width=50%;height=10%;preserveAspectRatio=0",
+               { 100, 50 },
+               { 0, 20, 50, 23 },
+               500,
+               58);
+        verify(L"inline=1;width=150%;height=1;preserveAspectRatio=0",
+               { 100, 50 },
+               { 0, 20, 100, 21 },
+               1000,
+               20);
+        verify(L"inline=1;width=0%;height=1;preserveAspectRatio=0",
+               { 100, 50 },
+               { 0, 20, 1, 21 },
+               1,
+               20);
+    }
+
+    TEST_METHOD(Iterm2InlineImageCursorFlowAndMargins)
+    {
+        _prepIterm2({ 20, 20 });
+        auto& buffer = *_testGetSet->_textBuffer;
+        buffer.GetCursor().SetPosition({ 98, 20 });
+        _sendIterm2(L"inline=1;width=5;height=3;preserveAspectRatio=0");
+        VERIFY_ARE_EQUAL((til::point{ 99, 20 }), buffer.GetCursor().GetPosition());
+        const std::optional<til::point> expectedDelayedWrap{ til::point{ 99, 20 } };
+        VERIFY_IS_TRUE(buffer.GetCursor().GetDelayEOLWrap() == expectedDelayedWrap);
+        VERIFY_ARE_EQUAL((til::rect{ 98, 20, 100, 21 }), buffer.GetImages().All().front().CellBounds());
+
+        _prepIterm2({ 20, 20 }, CursorX::LEFT, CursorY::BOTTOM);
+        auto& bottomBuffer = *_testGetSet->_textBuffer;
+        _sendIterm2(L"inline=1;width=2;height=3;preserveAspectRatio=0");
+        VERIFY_ARE_EQUAL(_testGetSet->_viewport.bottom - 1, bottomBuffer.GetCursor().GetPosition().y);
+        VERIFY_ARE_EQUAL(til::CoordType{ 2 }, bottomBuffer.GetCursor().GetPosition().x);
+        const auto bottomPlacement = bottomBuffer.GetImages().All().front();
+        VERIFY_ARE_EQUAL(bottomBuffer.GetCursor().GetPosition().y + 1, bottomPlacement.CellBounds().bottom);
+        VERIFY_ARE_EQUAL(til::CoordType{ 3 }, bottomPlacement.CellBounds().height());
+
+        _prepIterm2({ 20, 20 });
+        auto& marginBuffer = *_testGetSet->_textBuffer;
+        marginBuffer.GetCursor().SetPosition({ 10, 24 });
+        _pDispatch->_scrollMargins = { 10, 2, 19, 6 };
+        _sendIterm2(L"inline=1;width=100%;height=100%;preserveAspectRatio=0");
+        VERIFY_ARE_EQUAL((til::point{ 19, 26 }), marginBuffer.GetCursor().GetPosition());
+        VERIFY_IS_TRUE(marginBuffer.GetCursor().GetDelayEOLWrap().has_value());
+        const auto marginPlacement = marginBuffer.GetImages().All().front();
+        VERIFY_ARE_EQUAL(til::CoordType{ 10 }, marginPlacement.CellBounds().width());
+        VERIFY_ARE_EQUAL(til::CoordType{ 5 }, marginPlacement.CellBounds().height());
+        VERIFY_ARE_EQUAL(uint64_t{ 100 }, marginPlacement.Geometry().targetWidth);
+        VERIFY_ARE_EQUAL(uint64_t{ 100 }, marginPlacement.Geometry().targetHeight);
+    }
+
+    TEST_METHOD(Iterm2InlineImageFailuresAndBudgetAreAtomic)
+    {
+        const auto verifyFailure = [&](const std::function<void()>& configure) {
+            _prepIterm2({ 2, 2 });
+            configure();
+            auto& buffer = *_testGetSet->_textBuffer;
+            const auto cursor = buffer.GetCursor().GetState();
+            _sendIterm2(L"inline=1;width=2;height=2");
+            VERIFY_IS_TRUE(buffer.GetImages().Empty());
+            VERIFY_ARE_EQUAL(cursor.position, buffer.GetCursor().GetPosition());
+            VERIFY_IS_TRUE(cursor.delayedAt == buffer.GetCursor().GetDelayEOLWrap());
+            VERIFY_ARE_EQUAL(uint64_t{ 1 }, _pDispatch->_nextIterm2LayerId);
+        };
+
+        verifyFailure([&]() { _testGetSet->_decodeImageSucceeds = false; });
+        verifyFailure([&]() { _testGetSet->_decodeImageMismatched = true; });
+        verifyFailure([&]() { _testGetSet->_decodeImageFrameCount = 2; });
+        verifyFailure([&]() { _testGetSet->_decodeImageSize = { Image::MaximumDimension + 1, 1 }; });
+
+        _prepIterm2({ 2, 2 });
+        _sendIterm2(L"inline=1");
+        VERIFY_ARE_EQUAL(size_t{ 1 }, _testGetSet->_textBuffer->GetImages().Size());
+        VERIFY_IS_FALSE(_pDispatch->_PrepareIterm2Admission(AdaptDispatch::MaxIterm2RetainedBytes));
+        VERIFY_IS_FALSE(_pDispatch->_PrepareIterm2Admission(AdaptDispatch::MaxIterm2RetainedBytes + 1));
+        _testGetSet->_textBuffer->GetMutableImages().Clear();
+        VERIFY_IS_TRUE(_pDispatch->_PrepareIterm2Admission(AdaptDispatch::MaxIterm2RetainedBytes));
+    }
+
+    TEST_METHOD(Iterm2InlineImageConptyClaimsWithoutDecode)
+    {
+        _prepIterm2({ 2, 2 });
+        _testGetSet->_isPty = true;
+        _sendIterm2(L"inline=1;width=2;height=2");
+
+        VERIFY_ARE_EQUAL(0, _testGetSet->_decodeImageCallCount);
+        VERIFY_IS_TRUE(_testGetSet->_textBuffer->GetImages().Empty());
+        VERIFY_IS_TRUE(_pDispatch->_kittyParser == nullptr);
+        VERIFY_IS_TRUE(_testGetSet->_response.empty());
+    }
+
+    TEST_METHOD(Iterm2MultipartIsCancelledByParserReset)
+    {
+        _prepIterm2({ 2, 2 });
+        _stateMachine->ProcessString(L"\x1b]1337;MultipartFile=inline=1\a");
+        _stateMachine->ProcessString(L"\x1b]1337;FilePart=AA==\a");
+
+        _stateMachine->ResetState();
+        _stateMachine->ProcessString(L"\x1b]1337;FileEnd\a");
+
+        VERIFY_ARE_EQUAL(0, _testGetSet->_decodeImageCallCount);
+        VERIFY_IS_TRUE(_testGetSet->_textBuffer->GetImages().Empty());
+    }
+
+    TEST_METHOD(Iterm2InlineImageDoesNotMutateKittyState)
+    {
+        _prepIterm2({ 2, 2 });
+        _stateMachine->ProcessString(L"\x1b_Ga=t,i=7,q=2,f=24,s=1,v=1;/wAA\x1b\\");
+        const auto nextImageId = _kitty()._nextImageId;
+        const auto nextLayerId = _kitty()._nextLayerId;
+        const auto totalRetainedBytes = _kitty()._totalRetainedBytes;
+        const auto imageOrder = _kitty()._imageOrder;
+        const auto placementCount = _kitty()._placements.size();
+
+        _sendIterm2(L"inline=1;width=1;height=1");
+
+        VERIFY_ARE_EQUAL(nextImageId, _kitty()._nextImageId);
+        VERIFY_ARE_EQUAL(nextLayerId, _kitty()._nextLayerId);
+        VERIFY_ARE_EQUAL(totalRetainedBytes, _kitty()._totalRetainedBytes);
+        VERIFY_IS_TRUE(imageOrder == _kitty()._imageOrder);
+        VERIFY_ARE_EQUAL(placementCount, _kitty()._placements.size());
+        VERIFY_ARE_EQUAL(size_t{ 1 }, _kitty()._images.size());
+        VERIFY_ARE_EQUAL(size_t{ 1 }, _testGetSet->_textBuffer->GetImages().Size());
+        VERIFY_IS_TRUE(_testGetSet->_textBuffer->GetImages().All().front().Identity().protocol == ImagePlacement::Key::Protocol::Iterm2);
+        VERIFY_IS_TRUE(_testGetSet->_response.empty());
+    }
+
+    TEST_METHOD(Iterm2InlineImageUsesTextBufferLifecycle)
+    {
+        _prepIterm2({ 40, 40 });
+        _sendIterm2(L"inline=1;width=4;height=2;preserveAspectRatio=0");
+        auto& buffer = *_testGetSet->_textBuffer;
+        const auto mainKey = buffer.GetImages().All().front().Identity();
+
+        buffer.GetCursor().SetPosition({ 1, 20 });
+        _pDispatch->Print(L'X');
+        VERIFY_IS_FALSE(std::ranges::any_of(buffer.GetImages().All(), [](const auto& placement) {
+            return placement.CellBounds().contains({ 1, 20 });
+        }));
+
+        auto mainImages = buffer.GetImages().Snapshot();
+        _pDispatch->_SetAlternateScreenBufferMode(true);
+        buffer.GetMutableImages().Clear();
+        buffer.GetCursor().SetPosition({ 0, 20 });
+        _sendIterm2(L"inline=1;width=1;height=1");
+        VERIFY_ARE_EQUAL(size_t{ 1 }, buffer.GetImages().Size());
+        VERIFY_ARE_NOT_EQUAL(mainKey.layerId, buffer.GetImages().All().front().Identity().layerId);
+
+        _testGetSet->_mainImagesOnUseMain = std::make_unique<ImageCollection>(std::move(mainImages));
+        _pDispatch->_SetAlternateScreenBufferMode(false);
+        VERIFY_IS_TRUE(std::ranges::any_of(buffer.GetImages().All(), [&](const auto& placement) {
+            return placement.Identity() == mainKey;
+        }));
+        VERIFY_IS_FALSE(std::ranges::any_of(buffer.GetImages().All(), [&](const auto& placement) {
+            return placement.Identity().protocol == ImagePlacement::Key::Protocol::Iterm2 &&
+                   placement.Identity().layerId != mainKey.layerId;
+        }));
+    }
+
     TEST_METHOD(NonKittyApcIgnored)
     {
         _testGetSet->PrepData();
@@ -12776,6 +13023,32 @@ private:
         _testGetSet->PrepData();
         _pDispatch->SetOptionalFeatures({ ITermDispatch::OptionalFeature::ClipboardWrite, ITermDispatch::OptionalFeature::KittyLocalMedia });
     }
+
+    void _prepIterm2(const til::size decodedSize, const CursorX cursorX = CursorX::LEFT, const CursorY cursorY = CursorY::TOP)
+    {
+        _testGetSet->PrepData(cursorX, cursorY);
+        _testGetSet->_isPty = false;
+        _testGetSet->_decodeImageSucceeds = true;
+        _testGetSet->_decodeImageMismatched = false;
+        _testGetSet->_decodeImageCallCount = 0;
+        _testGetSet->_decodeImageFrameCount = 1;
+        _testGetSet->_decodeImageSize = decodedSize;
+        _pDispatch->_iterm2ImageParser.reset();
+        _pDispatch->_iterm2Surfaces.clear();
+        _pDispatch->_nextIterm2LayerId = 1;
+        _pDispatch->_scrollMargins = {};
+    }
+
+    void _sendIterm2(const std::wstring_view arguments, const std::wstring_view encoded = L"AA==")
+    {
+        std::wstring sequence{ L"\x1b]1337;File=" };
+        sequence.append(arguments);
+        sequence.push_back(L':');
+        sequence.append(encoded);
+        sequence.push_back(AsciiChars::BEL);
+        _stateMachine->ProcessString(sequence);
+    }
+
     AdaptDispatch* _pDispatch; // non-ownership pointer
     std::unique_ptr<StateMachine> _stateMachine;
 };
