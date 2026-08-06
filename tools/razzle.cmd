@@ -24,18 +24,31 @@ rem Run nuget restore so you can use vswhere
 nuget restore %OPENCON%\OpenConsole.slnx -Verbosity quiet
 nuget restore %OPENCON%\dep\nuget\packages.config -Verbosity quiet
 
+rem Determine the native OS architecture even when this script is launched from
+rem an emulated x86 or x64 process.
+set "_NATIVE_HOST_ARCH=x86"
+if /I "%PROCESSOR_ARCHITECTURE%" == "AMD64" set "_NATIVE_HOST_ARCH=x64"
+if /I "%PROCESSOR_ARCHITECTURE%" == "ARM64" set "_NATIVE_HOST_ARCH=arm64"
+if /I "%PROCESSOR_ARCHITEW6432%" == "AMD64" set "_NATIVE_HOST_ARCH=x64"
+if /I "%PROCESSOR_ARCHITEW6432%" == "ARM64" set "_NATIVE_HOST_ARCH=arm64"
+
 :FIND_MSBUILD
 set MSBUILD=
 
 rem GH#1313: If msbuild is already on the path, we don't need to look for it.
+rem On ARM64, resolve the native MSBuild explicitly because an emulated developer
+rem prompt may have placed an x86 or x64 MSBuild on PATH.
+if /I "%_NATIVE_HOST_ARCH%" == "arm64" goto :FIND_MSBUILD_WITH_VSWHERE
 for %%X in (msbuild.exe) do (set MSBUILD=%%~$PATH:X)
 if defined MSBUILD (
     echo Using MSBuild at %MSBUILD% which was already on the path.
     goto :FOUND_MSBUILD
 )
 
+:FIND_MSBUILD_WITH_VSWHERE
 rem Find vswhere
 rem from https://github.com/microsoft/vs-setup-samples/blob/master/tools/vswhere.cmd
+set VSWHERE=
 for /f "usebackq delims=" %%I in (`dir /b /aD /o-N /s "%~dp0..\packages\vswhere*" 2^>nul`) do (
     for /f "usebackq delims=" %%J in (`where /r "%%I" vswhere.exe 2^>nul`) do (
         set VSWHERE=%%J
@@ -55,7 +68,9 @@ rem but not a still-newer major whose toolset may be incompatible. VS 18 uses ou
 rem v145 PlatformToolset (see src\common.build.pre.props); older VS versions default
 rem to v143.
 rem
-for /f "usebackq tokens=*" %%B in (`"%VSWHERE%" -latest -prerelease -products * -requires Microsoft.Component.MSBuild -version "[17.0,19.0)" -find MSBuild\**\Bin\MSBuild.exe 2^>nul`) do (
+set "_MSBUILD_FIND_PATTERN=MSBuild\**\Bin\MSBuild.exe"
+if /I "%_NATIVE_HOST_ARCH%" == "arm64" set "_MSBUILD_FIND_PATTERN=MSBuild\**\Bin\arm64\MSBuild.exe"
+for /f "usebackq tokens=*" %%B in (`"%VSWHERE%" -latest -prerelease -products * -requires Microsoft.Component.MSBuild -version [17.0^,19.0^) -find %_MSBUILD_FIND_PATTERN% 2^>nul`) do (
     set MSBUILD=%%B
 )
 
@@ -81,7 +96,10 @@ rem Add MSBuild's own directory to PATH, with a proper ; separator.
 for %%F in ("%MSBUILD%") do set "MSBUILD_BIN=%%~dpF"
 set "PATH=%PATH%;%MSBUILD_BIN%"
 
-if "%PROCESSOR_ARCHITECTURE%" == "AMD64" (
+if /I "%_NATIVE_HOST_ARCH%" == "arm64" (
+    set ARCH=arm64
+    set PLATFORM=ARM64
+) else if /I "%_NATIVE_HOST_ARCH%" == "x64" (
     set ARCH=x64
     set PLATFORM=x64
 ) else (
@@ -118,6 +136,18 @@ if (%1) == (rel) (
 if (%1) == (x86) (
     set ARCH=x86
     set PLATFORM=Win32
+    shift
+    goto :ARGS_LOOP
+)
+if (%1) == (x64) (
+    set ARCH=x64
+    set PLATFORM=x64
+    shift
+    goto :ARGS_LOOP
+)
+if (%1) == (arm64) (
+    set ARCH=arm64
+    set PLATFORM=ARM64
     shift
     goto :ARGS_LOOP
 )

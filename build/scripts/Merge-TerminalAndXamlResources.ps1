@@ -23,8 +23,7 @@ Param(
 $ErrorActionPreference = 'Stop'
 
 If (-not $MakePriPath) {
-  $winSdk10Root = $(Get-ItemPropertyValue -Path "HKLM:\Software\Microsoft\Windows Kits\Installed Roots" -Name "KitsRoot10")
-  $MakePriPath = "$winSdk10Root\bin\10.0.26100.0\x64\MakePri.exe"
+  $MakePriPath = & "$PSScriptRoot\Resolve-WindowsSdkTool.ps1" -Tool MakePri.exe
 }
 
 If ($null -Eq (Get-Item $MakePriPath -EA:SilentlyContinue)) {

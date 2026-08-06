@@ -25,6 +25,8 @@ Set-MsBuildDevEnvironment
 Invoke-OpenConsoleBuild
 ```
 
+On ARM64, the setup uses native ARM64 MSBuild, compiler, linker, and Windows SDK tools. The Windows SDK remains installed under `C:\Program Files (x86)\Windows Kits`, but tools executed by the build should come from its `arm64` subdirectory.
+
 There are a few additional exported functions (look at their documentation for further details):
 
 - `Invoke-OpenConsoleBuild` - builds the solution. Can be passed msbuild arguments.

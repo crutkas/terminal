@@ -69,22 +69,29 @@ function Set-MsbuildDevEnvironment
 
     $ErrorActionPreference = 'Stop'
 
+    $arch = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString().ToLowerInvariant()
+    if ($arch -notin @('arm64', 'x64', 'x86')) {
+        throw "Unknown OS architecture: $arch"
+    }
+
     Import-LocalModule -Name 'VSSetup'
 
     Write-Verbose 'Searching for VC++ instances'
+    $requiredComponents = @('Microsoft.VisualStudio.Component.VC.Tools.x86.x64')
+    if ($arch -eq 'arm64') {
+        $requiredComponents += 'Microsoft.VisualStudio.Component.VC.Tools.ARM64'
+    }
+
     $vsinfo = `
         Get-VSSetupInstance  -All -Prerelease:$Prerelease `
         | Select-VSSetupInstance `
             -Latest -Product * `
-            -Require 'Microsoft.VisualStudio.Component.VC.Tools.x86.x64'
+            -Require $requiredComponents
 
     $vspath = $vsinfo.InstallationPath
 
-    switch ($env:PROCESSOR_ARCHITECTURE) {
-        "amd64" { $arch = "x64" }
-        "x86" { $arch = "x86" }
-        "arm64" { $arch = "arm64" }
-        default { throw "Unknown architecture: $switch" }
+    if (-not $vspath) {
+        throw "Could not find a Visual Studio installation with the required $arch C++ tools."
     }
 
     $devShellModule = "$vspath\Common7\Tools\Microsoft.VisualStudio.DevShell.dll"
@@ -93,7 +100,7 @@ function Set-MsbuildDevEnvironment
 
     Write-Verbose 'Setting up environment variables'
     Enter-VsDevShell -VsInstallPath $vspath -SkipAutomaticLocation `
-        -devCmdArguments "-arch=$arch" | Out-Null
+        -devCmdArguments "-arch=$arch -host_arch=$arch" | Out-Null
 
     Set-Item -Force -path "Env:\Platform" -Value $arch
 

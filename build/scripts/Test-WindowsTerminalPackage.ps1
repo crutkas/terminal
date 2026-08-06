@@ -13,18 +13,8 @@ Param(
 
 $ErrorActionPreference = "Stop"
 
-If (-not $WindowsKitPath) {
-  $winSdk10Root = $(Get-ItemPropertyValue -Path "HKLM:\Software\Microsoft\Windows Kits\Installed Roots" -Name "KitsRoot10")
-  $WindowsKitPath = "$winSdk10Root\bin\10.0.26100.0"
-}
-
-If ($null -Eq (Get-Item $WindowsKitPath -EA:SilentlyContinue)) {
-    Write-Error "Could not find a windows SDK at at `"$WindowsKitPath`".`nMake sure that WindowsKitPath points to a valid SDK."
-    Exit 1
-}
-
-$makeAppx = "$WindowsKitPath\x86\MakeAppx.exe"
-$makePri = "$WindowsKitPath\x86\MakePri.exe"
+$makeAppx = & "$PSScriptRoot\Resolve-WindowsSdkTool.ps1" -Tool MakeAppx.exe -WindowsKitPath $WindowsKitPath
+$makePri = & "$PSScriptRoot\Resolve-WindowsSdkTool.ps1" -Tool MakePri.exe -WindowsKitPath $WindowsKitPath
 
 Function Expand-ApplicationPackage {
     Param(

@@ -97,7 +97,6 @@ jobs:
             ${{ else }}:
               OutputBuildPlatform: ${{ platform }}
   variables:
-    MakeAppxPath: 'C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x86\MakeAppx.exe'
     Terminal.BinDir: $(Build.SourcesDirectory)/bin/$(OutputBuildPlatform)/$(BuildConfiguration)
     # Azure DevOps abhors a vacuum
     # If these are blank, expansion will fail later on... which will result in direct substitution of the variable *names*
@@ -273,7 +272,8 @@ jobs:
       
     - ${{ if eq(parameters.codeSign, true) }}:
       - pwsh: |-
-          & "$(MakeAppxPath)" unpack /p "$(WindowsTerminalPackagePath)" /d "$(Terminal.BinDir)/PackageContents"
+          $makeAppxPath = & .\build\scripts\Resolve-WindowsSdkTool.ps1 -Tool MakeAppx.exe
+          & $makeAppxPath unpack /p "$(WindowsTerminalPackagePath)" /d "$(Terminal.BinDir)/PackageContents"
         displayName: Unpack the MSIX for signing
 
   - ${{ if eq(parameters.codeSign, true) }}:
@@ -299,7 +299,8 @@ jobs:
       - pwsh: |-
           $outDir = New-Item -Type Directory "$(Terminal.BinDir)/_appx" -ErrorAction:Ignore
           $PackageFilename = Join-Path $outDir.FullName (Split-Path -Leaf "$(WindowsTerminalPackagePath)")
-          & "$(MakeAppxPath)" pack /h SHA256 /o /p $PackageFilename /d "$(Terminal.BinDir)/PackageContents"
+          $makeAppxPath = & .\build\scripts\Resolve-WindowsSdkTool.ps1 -Tool MakeAppx.exe
+          & $makeAppxPath pack /h SHA256 /o /p $PackageFilename /d "$(Terminal.BinDir)/PackageContents"
           Write-Host "##vso[task.setvariable variable=WindowsTerminalPackagePath]${PackageFilename}"
         displayName: Re-pack the new Terminal package after signing
 

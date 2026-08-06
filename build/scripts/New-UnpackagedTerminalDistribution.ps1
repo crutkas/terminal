@@ -40,8 +40,7 @@ $filesToCopyFromXaml = @("Microsoft.UI.Xaml.dll", "Microsoft.UI.Xaml") # We don'
 $ErrorActionPreference = 'Stop'
 
 If (-not $MakeAppxPath) {
-  $winSdk10Root = $(Get-ItemPropertyValue -Path "HKLM:\Software\Microsoft\Windows Kits\Installed Roots" -Name "KitsRoot10")
-  $MakeAppxPath = "$winSdk10Root\bin\10.0.26100.0\x64\MakeAppx.exe"
+  $MakeAppxPath = & "$PSScriptRoot\Resolve-WindowsSdkTool.ps1" -Tool MakeAppx.exe
 }
 
 If ($null -Eq (Get-Item $MakeAppxPath -EA:SilentlyContinue)) {
