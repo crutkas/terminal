@@ -544,3 +544,61 @@ void Terminal::NotifyShellIntegrationMark()
     // Notify the scrollbar that marks have been added so it can refresh the mark indicators
     _NotifyScrollEvent();
 }
+
+// Stores the handler the adapter wants called when timed content advances.
+// A null handler clears any prior registration and stops the outstanding timer.
+void Terminal::SetTimedContentHandler(std::function<void()> handler)
+{
+    const auto stop = !handler;
+    {
+        std::lock_guard lock(_timedContentMutex);
+        _timedContentHandler = std::move(handler);
+    }
+    if (stop && _renderer && _timedContentTimer)
+    {
+        _renderer->StopTimer(_timedContentTimer);
+    }
+}
+
+// Arms the render-thread timer so the adapter is woken at `deadline`.
+// No value means the adapter no longer needs a wakeup; stop the timer.
+void Terminal::RequestTimedContentUpdate(
+    const std::optional<std::chrono::steady_clock::time_point> deadline)
+{
+    if (!_renderer)
+    {
+        return;
+    }
+
+    if (!deadline)
+    {
+        if (_timedContentTimer)
+        {
+            _renderer->StopTimer(_timedContentTimer);
+        }
+        return;
+    }
+
+    if (!_timedContentTimer)
+    {
+        // Registered lazily, so a session that never shows timed content never
+        // takes a timer slot. Binding the callback to _timedContentLifetime lets
+        // the renderer retire the slot on its own once this object is gone.
+        _timedContentTimer = _renderer->RegisterTimer(
+            "timed content",
+            [this](Renderer&, TimerHandle) {
+                std::function<void()> handler;
+                {
+                    std::lock_guard lock(_timedContentMutex);
+                    handler = _timedContentHandler;
+                }
+                if (handler)
+                {
+                    handler();
+                }
+            },
+            _timedContentLifetime);
+    }
+
+    _renderer->StartTimerAt(_timedContentTimer, *deadline);
+}

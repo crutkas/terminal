@@ -20,8 +20,11 @@ Author(s):
 #include "../../buffer/out/textBuffer.hpp"
 #include "../../renderer/inc/RenderSettings.hpp"
 
+#include <chrono>
 #include <deque>
+#include <functional>
 #include <memory>
+#include <optional>
 #include <span>
 
 namespace Microsoft::Console::VirtualTerminal
@@ -102,6 +105,14 @@ namespace Microsoft::Console::VirtualTerminal
         // host has an image decoder; one that does not returns false and its caller goes
         // without the image.
         virtual bool DecodeImageToBgra(const std::span<const uint8_t> data, std::vector<RGBQUAD>& pixels, til::size& size) noexcept = 0;
+
+        // Some content changes on a clock rather than on input, so the adapter has work
+        // to do when nothing is arriving to drive it. It hands the host a routine to run
+        // and then reports the deadline it next wants that routine run at; no deadline
+        // withdraws the request. Arranging the wakeup is the host's business, because the
+        // host owns the render thread: the adapter says when it has work, not when to run.
+        virtual void SetTimedContentHandler(std::function<void()> handler) = 0;
+        virtual void RequestTimedContentUpdate(const std::optional<std::chrono::steady_clock::time_point> deadline) = 0;
 
         // The pixel size of a text cell, for anything that has to lay pixels out against
         // the grid.

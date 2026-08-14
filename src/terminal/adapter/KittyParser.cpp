@@ -38,7 +38,7 @@ public:
         {
             _state.nextImageId = parser._nextImageId;
             _state.nextLayerId = parser._nextLayerId;
-            _state.totalPixelBytes = parser._totalPixelBytes;
+            _state.totalRetainedBytes = parser._totalRetainedBytes;
             _state.images = parser._images;
             _state.imageNumbers = parser._imageNumbers;
             _state.imageOrder = parser._imageOrder;
@@ -97,7 +97,7 @@ private:
     {
         _parser._nextImageId = _state.nextImageId;
         _parser._nextLayerId = _state.nextLayerId;
-        _parser._totalPixelBytes = _state.totalPixelBytes;
+        _parser._totalRetainedBytes = _state.totalRetainedBytes;
         _parser._images.swap(_state.images);
         _parser._imageNumbers.swap(_state.imageNumbers);
         _parser._imageOrder.swap(_state.imageOrder);
@@ -130,7 +130,7 @@ std::shared_ptr<KittyParser::MutationSnapshot> KittyParser::CreateMutationSnapsh
     auto snapshot = std::make_shared<MutationSnapshot>();
     snapshot->state.nextImageId = _nextImageId;
     snapshot->state.nextLayerId = _nextLayerId;
-    snapshot->state.totalPixelBytes = _totalPixelBytes;
+    snapshot->state.totalRetainedBytes = _totalRetainedBytes;
     snapshot->state.images = _images;
     snapshot->state.imageNumbers = _imageNumbers;
     snapshot->state.imageOrder = _imageOrder;
@@ -144,7 +144,7 @@ void KittyParser::RestoreMutationSnapshot(MutationSnapshot& snapshot) noexcept
 {
     _nextImageId = snapshot.state.nextImageId;
     _nextLayerId = snapshot.state.nextLayerId;
-    _totalPixelBytes = snapshot.state.totalPixelBytes;
+    _totalRetainedBytes = snapshot.state.totalRetainedBytes;
     _images.swap(snapshot.state.images);
     _imageNumbers.swap(snapshot.state.imageNumbers);
     _imageOrder.swap(snapshot.state.imageOrder);
@@ -176,6 +176,7 @@ void KittyParser::SaveMainBufferState() noexcept
 {
     _mainBufferState.emplace(_takeBufferState());
     _clearChunk();
+    _scheduleAnimationTimer();
 }
 
 void KittyParser::DiscardBufferState() noexcept
@@ -184,7 +185,7 @@ void KittyParser::DiscardBufferState() noexcept
     _clearChunk();
 }
 
-void KittyParser::RestoreMainBufferState() noexcept
+void KittyParser::RestoreMainBufferState()
 {
     if (_mainBufferState)
     {
@@ -192,6 +193,7 @@ void KittyParser::RestoreMainBufferState() noexcept
         _mainBufferState.reset();
         _restoreBufferState(std::move(state));
     }
+    RefreshImageSurfaces();
 }
 
 // Handles the Kitty graphics protocol (APC G <control>;<payload> ST). The parser
@@ -324,9 +326,11 @@ KittyParser::Control KittyParser::_ParseControl(const std::wstring_view control)
                 break;
             case L'X':
                 c.cellOffsetX = _ParseUint(value);
+                c.upperX = c.cellOffsetX;
                 break;
             case L'Y':
                 c.cellOffsetY = _ParseUint(value);
+                c.upperY = c.cellOffsetY;
                 break;
             case L'o':
                 c.compression = value.front();
@@ -1008,6 +1012,42 @@ void KittyParser::_ProcessCommand(const Control& command, const std::string_view
             }
             break;
         }
+        case L'f':
+        case L'a':
+        case L'c':
+        {
+            uint32_t targetId = 0;
+            if (haveId)
+            {
+                targetId = imageId;
+            }
+            else if (haveNumber)
+            {
+                const auto it = _imageNumbers.find(imageNumber);
+                if (it != _imageNumbers.end() && !it->second.empty())
+                {
+                    targetId = it->second.back();
+                }
+            }
+            if (targetId == 0)
+            {
+                success = false;
+                code = L"ENOENT:image not found";
+            }
+            else if (action == L'f')
+            {
+                success = _processAnimationFrame(command, payload, payloadValid, payloadTooLarge, targetId, code);
+            }
+            else if (action == L'a')
+            {
+                success = _processAnimationControl(command, targetId, code);
+            }
+            else
+            {
+                success = _processFrameComposition(command, targetId, code);
+            }
+            break;
+        }
         case L'd':
         {
             const auto freeData = deleteTarget >= L'A' && deleteTarget <= L'Z';
@@ -1133,6 +1173,28 @@ void KittyParser::_ProcessCommand(const Control& command, const std::string_view
                     _deletePlacementsByZ(command.zIndex, freeData, til::point{ x, y });
                 }
                 break;
+            case L'f':
+            case L'F':
+            {
+                uint32_t targetId = 0;
+                if (haveId)
+                {
+                    targetId = imageId;
+                }
+                else if (haveNumber)
+                {
+                    const auto it = _imageNumbers.find(imageNumber);
+                    if (it != _imageNumbers.end() && !it->second.empty())
+                    {
+                        targetId = it->second.back();
+                    }
+                }
+                if (targetId != 0)
+                {
+                    _deleteAnimationFrames(targetId, command.rows == 0 ? 1 : command.rows, freeData);
+                }
+                break;
+            }
             default:
                 success = false;
                 code = L"EINVAL:unsupported delete target";
@@ -1243,11 +1305,11 @@ bool KittyParser::_registerImage(const uint32_t id, Image&& image)
         return false;
     }
     const auto number = image.number;
-    const auto newBytes = image.PixelBytes();
+    const auto newBytes = image.RetainedBytes();
     const auto existing = _images.find(id);
-    const auto existingBytes = existing != _images.end() ? existing->second.PixelBytes() : size_t{ 0 };
-    const auto retainedBytes = _mainBufferState ? _mainBufferState->totalPixelBytes : size_t{ 0 };
-    auto projectedBytes = retainedBytes + (_totalPixelBytes - existingBytes) + newBytes;
+    const auto existingBytes = existing != _images.end() ? existing->second.RetainedBytes() : size_t{ 0 };
+    const auto retainedBytes = _mainBufferState ? _mainBufferState->totalRetainedBytes : size_t{ 0 };
+    auto projectedBytes = retainedBytes + (_totalRetainedBytes - existingBytes) + newBytes;
     auto projectedCount = _images.size() - (existing != _images.end() ? 1 : 0) + 1;
     std::vector<uint32_t> victims;
     const auto selectVictims = [&](const bool placed) {
@@ -1264,7 +1326,7 @@ bool KittyParser::_registerImage(const uint32_t id, Image&& image)
             const auto candidate = _images.find(candidateId);
             if (candidate != _images.end())
             {
-                projectedBytes -= candidate->second.PixelBytes();
+                projectedBytes -= candidate->second.RetainedBytes();
                 --projectedCount;
                 victims.push_back(candidateId);
             }
@@ -1289,7 +1351,7 @@ bool KittyParser::_registerImage(const uint32_t id, Image&& image)
     _eraseImage(id);
     _imageOrder.push_back(id);
     _images[id] = std::move(image);
-    _totalPixelBytes += newBytes;
+    _totalRetainedBytes += newBytes;
     if (number != 0)
     {
         _imageNumbers[number].push_back(id);
@@ -1305,7 +1367,47 @@ void KittyParser::_eraseImage(const uint32_t id)
     {
         return;
     }
-    _totalPixelBytes -= it->second.PixelBytes();
+    const auto wasAnimating = it->second.animationState == 2 || it->second.animationState == 3;
+    _eraseImageRegistryEntry(id);
+    std::erase_if(_virtualIds, [&](const auto& entry) {
+        return entry.first.first == id;
+    });
+    for (auto placement = _placements.begin(); placement != _placements.end();)
+    {
+        placement = placement->first.first == id ? _placements.erase(placement) : std::next(placement);
+    }
+    std::deque<std::pair<uint32_t, uint32_t>> removed;
+    for (auto placement = _anonymousPlacements.begin(); placement != _anonymousPlacements.end();)
+    {
+        if (placement->imageId == id)
+        {
+            removed.push_back({ placement->imageId, placement->placementId });
+            placement = _anonymousPlacements.erase(placement);
+        }
+        else
+        {
+            ++placement;
+        }
+    }
+    if (!removed.empty())
+    {
+        _cascadePlacementChildren(removed, 0);
+    }
+    if (wasAnimating)
+    {
+        _scheduleAnimationTimer();
+    }
+}
+
+void KittyParser::_eraseImageRegistryEntry(const uint32_t id) noexcept
+{
+    const auto it = _images.find(id);
+    if (it == _images.end())
+    {
+        return;
+    }
+
+    _totalRetainedBytes -= it->second.RetainedBytes();
     if (it->second.number != 0)
     {
         const auto reverse = _imageNumbers.find(it->second.number);
@@ -1320,33 +1422,6 @@ void KittyParser::_eraseImage(const uint32_t id)
         }
     }
     _images.erase(it);
-    std::erase_if(_virtualIds, [&](const auto& entry) {
-        return entry.first.first == id;
-    });
-    for (auto placement = _placements.begin(); placement != _placements.end();)
-    {
-        placement = placement->first.first == id ? _placements.erase(placement) : std::next(placement);
-    }
-    std::deque<std::pair<uint32_t, uint32_t>> removed;
-    for (auto placement = _anonymousPlacements.begin(); placement != _anonymousPlacements.end();)
-    {
-        if (placement->imageId == id)
-        {
-            if (placement->isVirtual)
-            {
-                removed.push_back({ placement->imageId, 0 });
-            }
-            placement = _anonymousPlacements.erase(placement);
-        }
-        else
-        {
-            ++placement;
-        }
-    }
-    if (!removed.empty())
-    {
-        _cascadePlacementChildren(removed, 0);
-    }
     if (!_imageOrder.empty() && _imageOrder.front() == id)
     {
         _imageOrder.pop_front();
@@ -1396,7 +1471,8 @@ try
     _virtualIds.clear();
     _placements.clear();
     _anonymousPlacements.clear();
-    _totalPixelBytes = 0;
+    _totalRetainedBytes = 0;
+    _scheduleAnimationTimer();
     const auto visiblePageNumber = _dispatcher._pages.VisiblePage().Number();
     _dispatcher._pages.ForEachPage([&](const Page page) {
         auto& buffer = page.Buffer();
@@ -1416,7 +1492,7 @@ KittyParser::BufferState KittyParser::_takeBufferState() noexcept
     BufferState state;
     state.nextImageId = std::exchange(_nextImageId, 1);
     state.nextLayerId = std::exchange(_nextLayerId, 1);
-    state.totalPixelBytes = std::exchange(_totalPixelBytes, 0);
+    state.totalRetainedBytes = std::exchange(_totalRetainedBytes, 0);
     state.images = std::move(_images);
     state.imageNumbers = std::move(_imageNumbers);
     state.imageOrder = std::move(_imageOrder);
@@ -1436,7 +1512,7 @@ void KittyParser::_restoreBufferState(BufferState&& state) noexcept
 {
     _nextImageId = state.nextImageId;
     _nextLayerId = state.nextLayerId;
-    _totalPixelBytes = state.totalPixelBytes;
+    _totalRetainedBytes = state.totalRetainedBytes;
     _images = std::move(state.images);
     _imageNumbers = std::move(state.imageNumbers);
     _imageOrder = std::move(state.imageOrder);
@@ -1445,10 +1521,10 @@ void KittyParser::_restoreBufferState(BufferState&& state) noexcept
     _anonymousPlacements = std::move(state.anonymousPlacements);
 }
 
-size_t KittyParser::_retainedPixelBytes() const noexcept
+size_t KittyParser::_retainedBytes() const noexcept
 {
-    const auto retained = _mainBufferState ? _mainBufferState->totalPixelBytes : size_t{ 0 };
-    return _totalPixelBytes > SIZE_MAX - retained ? SIZE_MAX : _totalPixelBytes + retained;
+    const auto retained = _mainBufferState ? _mainBufferState->totalRetainedBytes : size_t{ 0 };
+    return _totalRetainedBytes > SIZE_MAX - retained ? SIZE_MAX : _totalRetainedBytes + retained;
 }
 
 void KittyParser::_releaseImageSurface(Image& image) noexcept
@@ -1526,6 +1602,1266 @@ std::vector<RGBQUAD> KittyParser::_decodePixels(const uint32_t format, const std
     return pixels;
 }
 
+RGBQUAD KittyParser::_rgbaColor(const uint32_t rgba) noexcept
+{
+    const auto alpha = rgba & 0xffu;
+    RGBQUAD pixel{};
+    pixel.rgbRed = static_cast<BYTE>(((rgba >> 24) & 0xffu) * alpha / 255u);
+    pixel.rgbGreen = static_cast<BYTE>(((rgba >> 16) & 0xffu) * alpha / 255u);
+    pixel.rgbBlue = static_cast<BYTE>(((rgba >> 8) & 0xffu) * alpha / 255u);
+    pixel.rgbReserved = static_cast<BYTE>(alpha);
+    return pixel;
+}
+
+void KittyParser::_compositePixels(const std::span<RGBQUAD> destination, const std::span<const RGBQUAD> source, const bool replace) noexcept
+{
+    const auto count = std::min(destination.size(), source.size());
+    for (size_t i = 0; i < count; ++i)
+    {
+        const auto& src = source[i];
+        auto& dst = destination[i];
+        if (replace)
+        {
+            dst = src;
+            continue;
+        }
+        const auto inverseAlpha = 255u - src.rgbReserved;
+        dst.rgbRed = static_cast<BYTE>(std::min(255u, static_cast<uint32_t>(src.rgbRed) + (static_cast<uint32_t>(dst.rgbRed) * inverseAlpha + 127u) / 255u));
+        dst.rgbGreen = static_cast<BYTE>(std::min(255u, static_cast<uint32_t>(src.rgbGreen) + (static_cast<uint32_t>(dst.rgbGreen) * inverseAlpha + 127u) / 255u));
+        dst.rgbBlue = static_cast<BYTE>(std::min(255u, static_cast<uint32_t>(src.rgbBlue) + (static_cast<uint32_t>(dst.rgbBlue) * inverseAlpha + 127u) / 255u));
+        dst.rgbReserved = static_cast<BYTE>(std::min(255u, static_cast<uint32_t>(src.rgbReserved) + (static_cast<uint32_t>(dst.rgbReserved) * inverseAlpha + 127u) / 255u));
+    }
+}
+
+size_t KittyParser::_frameCount(const Image& image) noexcept
+{
+    return !image.pixels || image.pixels->empty() ? 0 : image.animationFrames.size() + 1;
+}
+
+const std::vector<RGBQUAD>* KittyParser::_framePixels(const Image& image, const uint32_t frameNumber) noexcept
+{
+    if (frameNumber == 1)
+    {
+        return image.pixels.get();
+    }
+    const auto index = static_cast<size_t>(frameNumber) - 2;
+    return index < image.animationFrames.size() ? image.animationFrames[index].pixels.get() : nullptr;
+}
+
+KittyParser::FramePixelStorage* KittyParser::_frameStorage(Image& image, const uint32_t frameNumber) noexcept
+{
+    if (frameNumber == 1)
+    {
+        return image.pixels ? &image.pixels : nullptr;
+    }
+    const auto index = static_cast<size_t>(frameNumber) - 2;
+    return index < image.animationFrames.size() && image.animationFrames[index].pixels ?
+               &image.animationFrames[index].pixels :
+               nullptr;
+}
+
+const KittyParser::FramePixelStorage* KittyParser::_frameStorage(const Image& image, const uint32_t frameNumber) noexcept
+{
+    if (frameNumber == 1)
+    {
+        return image.pixels ? &image.pixels : nullptr;
+    }
+    const auto index = static_cast<size_t>(frameNumber) - 2;
+    return index < image.animationFrames.size() && image.animationFrames[index].pixels ?
+               &image.animationFrames[index].pixels :
+               nullptr;
+}
+
+int32_t* KittyParser::_frameGap(Image& image, const uint32_t frameNumber) noexcept
+{
+    if (frameNumber == 1)
+    {
+        return &image.rootGapMilliseconds;
+    }
+    const auto index = static_cast<size_t>(frameNumber) - 2;
+    return index < image.animationFrames.size() ? &image.animationFrames[index].gapMilliseconds : nullptr;
+}
+
+void KittyParser::_updateImageSurface(const uint32_t imageId)
+{
+    const std::array imageIds{ imageId };
+    _updateImageSurfaces(imageIds);
+}
+
+void KittyParser::_updateImageSurfaces(const std::span<const uint32_t> imageIds)
+{
+    struct Update
+    {
+        uint32_t imageId = 0;
+        FramePixelStorage storage;
+        ::Image::Pointer surface;
+        bool foundPlacement = false;
+    };
+
+    std::vector<Update> updates;
+    updates.reserve(imageIds.size());
+    for (const auto imageId : imageIds)
+    {
+        const auto image = _images.find(imageId);
+        if (image == _images.end())
+        {
+            continue;
+        }
+        const auto storage = _frameStorage(image->second, image->second.presentedFrame);
+        if (storage && *storage)
+        {
+            updates.push_back(Update{
+                .imageId = imageId,
+                .storage = *storage,
+                .surface = image->second.surface,
+            });
+        }
+    }
+
+    std::sort(updates.begin(), updates.end(), [](const auto& lhs, const auto& rhs) {
+        return lhs.imageId < rhs.imageId;
+    });
+    updates.erase(std::unique(updates.begin(), updates.end(), [](const auto& lhs, const auto& rhs) {
+                      return lhs.imageId == rhs.imageId;
+                  }),
+                  updates.end());
+    if (updates.empty())
+    {
+        return;
+    }
+
+    const auto visiblePageNumber = _dispatcher._pages.VisiblePage().Number();
+    _dispatcher._pages.ForEachPage([&](const Page page) {
+        auto& buffer = page.Buffer();
+        auto firstRow = page.Bottom();
+        auto lastRow = 0;
+        for (const auto& placement : buffer.GetImages().All())
+        {
+            const auto key = placement.Identity();
+            if (key.protocol != ImagePlacement::Key::Protocol::Kitty)
+            {
+                continue;
+            }
+            const auto update = std::lower_bound(updates.begin(), updates.end(), key.imageId, [](const auto& candidate, const uint32_t id) {
+                return candidate.imageId < id;
+            });
+            if (update == updates.end() || update->imageId != key.imageId)
+            {
+                continue;
+            }
+
+            update->foundPlacement = true;
+            update->surface = update->surface ? update->surface : placement.SurfacePointer();
+            const auto bounds = placement.CellBounds();
+            firstRow = std::min(firstRow, bounds.top);
+            lastRow = std::max(lastRow, bounds.bottom - 1);
+        }
+        if (page.Number() == visiblePageNumber && firstRow <= lastRow)
+        {
+            buffer.TriggerRedraw(Viewport::FromExclusive({ 0, firstRow, page.Width(), lastRow + 1 }));
+        }
+    });
+
+    for (auto& update : updates)
+    {
+        const auto image = _images.find(update.imageId);
+        if (image == _images.end())
+        {
+            continue;
+        }
+        image->second.hasRenderedPlacements = update.foundPlacement;
+        if (update.foundPlacement && update.surface)
+        {
+            image->second.surface = update.surface;
+            update.surface->UpdatePixels(std::move(update.storage));
+        }
+        else
+        {
+            _releaseImageSurface(image->second);
+        }
+    }
+}
+
+void KittyParser::RefreshImageSurfaces()
+{
+    // Rearm first so an allocation failure while rebuilding a page's logical image
+    // view cannot consume the only wakeup for a restored or currently running animation.
+    _scheduleAnimationTimer();
+    std::vector<uint32_t> imageIds;
+    imageIds.reserve(_images.size());
+    for (const auto& [imageId, image] : _images)
+    {
+        if (!image.animationFrames.empty())
+        {
+            imageIds.push_back(imageId);
+        }
+    }
+    _updateImageSurfaces(imageIds);
+}
+
+bool KittyParser::_processAnimationFrame(const Control& command, const std::string_view payload, const bool payloadValid, const bool payloadTooLarge, const uint32_t imageId, std::wstring_view& code)
+try
+{
+    auto imageIt = _images.find(imageId);
+    if (imageIt == _images.end())
+    {
+        code = L"ENOENT:image not found";
+        return false;
+    }
+    if (command.medium != L'd')
+    {
+        code = L"EINVAL:unsupported transmission medium";
+        return false;
+    }
+    if (command.compression != 0 && command.compression != L'z')
+    {
+        code = L"EINVAL:unsupported compression";
+        return false;
+    }
+    if (command.format != 24 && command.format != 32 && command.format != 100)
+    {
+        code = L"EINVAL:unsupported format";
+        return false;
+    }
+    if (command.upperX > 1)
+    {
+        code = L"EINVAL:invalid frame composition mode";
+        return false;
+    }
+
+    std::vector<uint8_t> bytes;
+    if (!payloadValid || !_DecodeBase64(payload, bytes))
+    {
+        code = payloadTooLarge ? L"EFBIG:payload exceeds maximum size" : L"EINVAL:bad payload";
+        return false;
+    }
+    if (command.compression == L'z')
+    {
+        std::vector<uint8_t> inflated;
+        if (!_inflateZlib(bytes, inflated, MaxPayload))
+        {
+            code = L"EINVAL:invalid compressed data";
+            return false;
+        }
+        bytes = std::move(inflated);
+    }
+
+    uint32_t frameWidth = 0;
+    uint32_t frameHeight = 0;
+    std::vector<RGBQUAD> framePixels;
+    if (command.format == 24 || command.format == 32)
+    {
+        const auto depth = command.format == 24 ? 3u : 4u;
+        if (command.width == 0 || command.height == 0)
+        {
+            code = L"EINVAL:missing frame dimensions";
+            return false;
+        }
+        const auto area = static_cast<uint64_t>(command.width) * command.height;
+        if (area > bytes.size() / depth || area * depth != bytes.size())
+        {
+            code = L"EINVAL:payload size mismatch";
+            return false;
+        }
+        frameWidth = command.width;
+        frameHeight = command.height;
+        framePixels = _decodePixels(command.format, bytes);
+    }
+    else
+    {
+        til::size decodedSize;
+        if (bytes.empty() ||
+            !_dispatcher._api.DecodeImageToBgra(bytes, framePixels, decodedSize) ||
+            decodedSize.width <= 0 || decodedSize.height <= 0 ||
+            framePixels.size() != static_cast<size_t>(decodedSize.width) * decodedSize.height)
+        {
+            code = L"EBADPNG:could not decode frame";
+            return false;
+        }
+        frameWidth = static_cast<uint32_t>(decodedSize.width);
+        frameHeight = static_cast<uint32_t>(decodedSize.height);
+    }
+
+    auto& image = imageIt->second;
+    if (command.srcX > image.width || command.srcY > image.height ||
+        frameWidth > image.width - command.srcX || frameHeight > image.height - command.srcY)
+    {
+        code = L"EINVAL:frame rectangle out of bounds";
+        return false;
+    }
+
+    const auto editFrame = command.rows;
+    const auto backgroundFrame = command.cols;
+    if (editFrame != 0 && backgroundFrame != 0)
+    {
+        code = L"EINVAL:cannot edit and create a frame simultaneously";
+        return false;
+    }
+    if (editFrame == 0 && _frameCount(image) >= MaxFramesPerImage)
+    {
+        code = L"ENOSPC:frame count limit exceeded";
+        return false;
+    }
+    if (editFrame != 0 && !_framePixels(image, editFrame))
+    {
+        code = L"ENOENT:frame not found";
+        return false;
+    }
+    if (editFrame == 0 && backgroundFrame != 0 && !_framePixels(image, backgroundFrame))
+    {
+        code = L"ENOENT:background frame not found";
+        return false;
+    }
+
+    auto canvas = std::vector<RGBQUAD>{};
+    if (editFrame != 0)
+    {
+        canvas = *_framePixels(imageIt->second, editFrame);
+    }
+    else if (backgroundFrame != 0)
+    {
+        canvas = *_framePixels(imageIt->second, backgroundFrame);
+    }
+    else
+    {
+        canvas.assign(imageIt->second.pixels->size(), _rgbaColor(command.upperY));
+    }
+
+    for (uint32_t row = 0; row < frameHeight; ++row)
+    {
+        const auto srcOffset = static_cast<size_t>(row) * frameWidth;
+        const auto dstOffset = static_cast<size_t>(command.srcY + row) * imageIt->second.width + command.srcX;
+        _compositePixels(std::span{ canvas }.subspan(dstOffset, frameWidth),
+                         std::span{ framePixels }.subspan(srcOffset, frameWidth),
+                         command.upperX == 1);
+    }
+
+    if (editFrame != 0)
+    {
+        std::vector<uint32_t> updatedImageIds;
+        updatedImageIds.reserve(2);
+        auto& storedImage = imageIt->second;
+        *_frameStorage(storedImage, editFrame) = std::make_shared<std::vector<RGBQUAD>>(std::move(canvas));
+        if (command.haveZ && command.zIndex != 0)
+        {
+            *_frameGap(storedImage, editFrame) = command.zIndex;
+        }
+
+        if (storedImage.presentedFrame == editFrame)
+        {
+            updatedImageIds.push_back(imageId);
+        }
+        const auto now = std::chrono::steady_clock::now();
+        if (storedImage.currentFrame == editFrame &&
+            command.haveZ && command.zIndex != 0 &&
+            (storedImage.animationState == 2 || storedImage.animationState == 3))
+        {
+            _scheduleAnimation(imageId, storedImage, now, &updatedImageIds);
+        }
+        _scheduleAnimationTimer();
+        _updateImageSurfaces(updatedImageIds);
+        return true;
+    }
+
+    Image stagedImage = image;
+    stagedImage.animationFrames.reserve(stagedImage.animationFrames.size() + 1);
+    stagedImage.animationFrames.push_back(AnimationFrame{
+        .pixels = std::make_shared<std::vector<RGBQUAD>>(std::move(canvas)),
+        .gapMilliseconds = command.haveZ && command.zIndex != 0 ? command.zIndex : 40,
+    });
+    const auto changedFrame = gsl::narrow_cast<uint32_t>(_frameCount(stagedImage));
+    const auto oldTargetBytes = image.RetainedBytes();
+    const auto newTargetBytes = stagedImage.RetainedBytes();
+    const auto addedBytes = newTargetBytes > oldTargetBytes ? newTargetBytes - oldTargetBytes : size_t{ 0 };
+    if (addedBytes > MaxTotalBytes)
+    {
+        code = L"ENOSPC:image storage limit exceeded";
+        return false;
+    }
+
+    std::vector<uint32_t> updatedImageIds;
+    updatedImageIds.reserve(2);
+    if (stagedImage.presentedFrame == changedFrame)
+    {
+        updatedImageIds.push_back(imageId);
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (stagedImage.animationState == 2 && stagedImage.waitingForFrames)
+    {
+        stagedImage.waitingForFrames = false;
+        _advanceImage(imageId, stagedImage, now, &updatedImageIds);
+    }
+    else if (stagedImage.currentFrame == changedFrame &&
+             command.haveZ && command.zIndex != 0 &&
+             (stagedImage.animationState == 2 || stagedImage.animationState == 3))
+    {
+        _scheduleAnimation(imageId, stagedImage, now, &updatedImageIds);
+    }
+    const auto updateTargetSurface = !updatedImageIds.empty();
+
+    // A victim whose placement is an ancestor of the target would cascade-delete
+    // the image we are extending. Build the target's bounded parent ancestry once,
+    // then exclude those image ids from the eviction plan.
+    std::vector<uint32_t> protectedImageIds{ imageId };
+    const auto protectAncestors = [&](std::pair<uint32_t, uint32_t> parent) {
+        for (auto depth = 0; depth < MaxPlacementDepth; ++depth)
+        {
+            if (std::find(protectedImageIds.begin(), protectedImageIds.end(), parent.first) == protectedImageIds.end())
+            {
+                protectedImageIds.push_back(parent.first);
+            }
+            const auto placement = _placements.find(parent);
+            if (placement == _placements.end() || !placement->second.hasParent)
+            {
+                break;
+            }
+            parent = { placement->second.parentImageId, placement->second.parentPlacementId };
+        }
+    };
+    for (const auto& [key, placement] : _placements)
+    {
+        static_cast<void>(key);
+        if (placement.imageId == imageId && placement.hasParent)
+        {
+            protectAncestors({ placement.parentImageId, placement.parentPlacementId });
+        }
+    }
+    for (const auto& placement : _anonymousPlacements)
+    {
+        if (placement.imageId == imageId && placement.hasParent)
+        {
+            protectAncestors({ placement.parentImageId, placement.parentPlacementId });
+        }
+    }
+
+    const auto retainedBytes = _retainedBytes();
+    const auto requiredBytes = retainedBytes > MaxTotalBytes - addedBytes ?
+                                   retainedBytes - (MaxTotalBytes - addedBytes) :
+                                   size_t{ 0 };
+    auto reclaimableBytes = size_t{ 0 };
+    std::vector<uint32_t> victims;
+    if (requiredBytes != 0)
+    {
+        const auto selectVictims = [&](const bool placed) {
+            for (const auto candidateId : _imageOrder)
+            {
+                if (reclaimableBytes >= requiredBytes)
+                {
+                    break;
+                }
+                if (std::find(protectedImageIds.begin(), protectedImageIds.end(), candidateId) != protectedImageIds.end() ||
+                    _isImagePlaced(candidateId) != placed)
+                {
+                    continue;
+                }
+                const auto candidate = _images.find(candidateId);
+                if (candidate == _images.end())
+                {
+                    continue;
+                }
+                victims.push_back(candidateId);
+                const auto candidateBytes = candidate->second.RetainedBytes();
+                reclaimableBytes = candidateBytes > SIZE_MAX - reclaimableBytes ? SIZE_MAX : reclaimableBytes + candidateBytes;
+            }
+        };
+        selectVictims(false);
+        selectVictims(true);
+    }
+    if (reclaimableBytes < requiredBytes)
+    {
+        code = L"ENOSPC:image storage limit exceeded";
+        return false;
+    }
+
+    struct EvictionPlan
+    {
+        std::map<std::pair<uint32_t, uint32_t>, VirtualPlacement> virtualIds;
+        std::map<std::pair<uint32_t, uint32_t>, Placement> placements;
+        std::vector<Placement> anonymousPlacements;
+        std::vector<uint32_t> deletedImageIds;
+        std::vector<ImagePlacement::Key> removedPlacementKeys;
+    };
+
+    std::optional<EvictionPlan> eviction;
+    if (!victims.empty())
+    {
+        eviction.emplace();
+        eviction->virtualIds = _virtualIds;
+        eviction->anonymousPlacements.reserve(_anonymousPlacements.size());
+        eviction->deletedImageIds.reserve(victims.size() + _placements.size() + _anonymousPlacements.size());
+        eviction->removedPlacementKeys.reserve(_placements.size() + _anonymousPlacements.size());
+
+        struct PlacementNode
+        {
+            std::pair<uint32_t, uint32_t> key;
+            Placement placement;
+            bool named = false;
+            bool removed = false;
+        };
+        struct ParentEdge
+        {
+            std::pair<uint32_t, uint32_t> parent;
+            size_t child = 0;
+        };
+
+        std::vector<PlacementNode> nodes;
+        nodes.reserve(_placements.size() + _anonymousPlacements.size());
+        for (const auto& [key, placement] : _placements)
+        {
+            nodes.push_back(PlacementNode{
+                .key = key,
+                .placement = placement,
+                .named = true,
+            });
+        }
+        for (const auto& placement : _anonymousPlacements)
+        {
+            nodes.push_back(PlacementNode{
+                .key = { placement.imageId, placement.placementId },
+                .placement = placement,
+            });
+        }
+
+        std::vector<ParentEdge> edges;
+        edges.reserve(nodes.size());
+        for (size_t i = 0; i < nodes.size(); ++i)
+        {
+            if (const auto& placement = nodes[i].placement; placement.hasParent)
+            {
+                edges.push_back(ParentEdge{
+                    .parent = { placement.parentImageId, placement.parentPlacementId },
+                    .child = i,
+                });
+            }
+        }
+        std::sort(edges.begin(), edges.end(), [](const auto& lhs, const auto& rhs) {
+            return lhs.parent < rhs.parent;
+        });
+
+        std::vector<uint32_t> victimImageIds = victims;
+        std::sort(victimImageIds.begin(), victimImageIds.end());
+        victimImageIds.erase(std::unique(victimImageIds.begin(), victimImageIds.end()), victimImageIds.end());
+
+        std::deque<std::pair<uint32_t, uint32_t>> removedParents;
+        std::set<std::pair<uint32_t, uint32_t>> queuedParents;
+        std::vector<std::pair<uint32_t, uint32_t>> removedVirtualIds;
+        removedVirtualIds.reserve(_virtualIds.size());
+        std::vector<uint32_t> affectedImageIds;
+        affectedImageIds.reserve(nodes.size());
+        const auto removeNode = [&](PlacementNode& node) {
+            if (node.removed)
+            {
+                return;
+            }
+            node.removed = true;
+            affectedImageIds.push_back(node.placement.imageId);
+            if (node.placement.isVirtual)
+            {
+                removedVirtualIds.push_back(node.key);
+            }
+            if (node.placement.layerId != 0)
+            {
+                eviction->removedPlacementKeys.push_back({
+                    node.placement.imageId,
+                    node.placement.layerId,
+                    ImagePlacement::Key::Protocol::Kitty,
+                });
+            }
+            if (queuedParents.insert(node.key).second)
+            {
+                removedParents.push_back(node.key);
+            }
+        };
+
+        for (auto& node : nodes)
+        {
+            if (std::binary_search(victimImageIds.begin(), victimImageIds.end(), node.placement.imageId))
+            {
+                removeNode(node);
+            }
+        }
+
+        while (!removedParents.empty())
+        {
+            const auto parent = removedParents.front();
+            removedParents.pop_front();
+            const auto begin = std::lower_bound(edges.begin(), edges.end(), parent, [](const auto& edge, const auto& key) {
+                return edge.parent < key;
+            });
+            const auto end = std::upper_bound(begin, edges.end(), parent, [](const auto& key, const auto& edge) {
+                return key < edge.parent;
+            });
+            for (auto edge = begin; edge != end; ++edge)
+            {
+                removeNode(nodes[edge->child]);
+            }
+        }
+
+        std::vector<uint32_t> remainingImageIds;
+        remainingImageIds.reserve(nodes.size());
+        for (const auto& node : nodes)
+        {
+            if (node.removed)
+            {
+                continue;
+            }
+            remainingImageIds.push_back(node.placement.imageId);
+            if (node.named)
+            {
+                eviction->placements.emplace(node.key, node.placement);
+            }
+            else
+            {
+                eviction->anonymousPlacements.push_back(node.placement);
+            }
+        }
+        std::sort(remainingImageIds.begin(), remainingImageIds.end());
+        remainingImageIds.erase(std::unique(remainingImageIds.begin(), remainingImageIds.end()), remainingImageIds.end());
+        std::sort(affectedImageIds.begin(), affectedImageIds.end());
+        affectedImageIds.erase(std::unique(affectedImageIds.begin(), affectedImageIds.end()), affectedImageIds.end());
+        std::sort(removedVirtualIds.begin(), removedVirtualIds.end());
+        removedVirtualIds.erase(std::unique(removedVirtualIds.begin(), removedVirtualIds.end()), removedVirtualIds.end());
+
+        eviction->deletedImageIds = victimImageIds;
+        for (const auto affectedImageId : affectedImageIds)
+        {
+            if (_images.contains(affectedImageId) &&
+                !std::binary_search(remainingImageIds.begin(), remainingImageIds.end(), affectedImageId))
+            {
+                eviction->deletedImageIds.push_back(affectedImageId);
+            }
+        }
+        std::sort(eviction->deletedImageIds.begin(), eviction->deletedImageIds.end());
+        eviction->deletedImageIds.erase(std::unique(eviction->deletedImageIds.begin(), eviction->deletedImageIds.end()), eviction->deletedImageIds.end());
+        std::sort(eviction->removedPlacementKeys.begin(), eviction->removedPlacementKeys.end());
+        eviction->removedPlacementKeys.erase(std::unique(eviction->removedPlacementKeys.begin(), eviction->removedPlacementKeys.end()), eviction->removedPlacementKeys.end());
+        std::erase_if(eviction->virtualIds, [&](const auto& entry) {
+            return std::binary_search(eviction->deletedImageIds.begin(), eviction->deletedImageIds.end(), entry.first.first) ||
+                   std::binary_search(removedVirtualIds.begin(), removedVirtualIds.end(), entry.first);
+        });
+    }
+
+    const auto deletedImageIds = eviction ?
+                                     std::span<const uint32_t>{ eviction->deletedImageIds } :
+                                     std::span<const uint32_t>{};
+    const auto removedPlacementKeys = eviction ?
+                                          std::span<const ImagePlacement::Key>{ eviction->removedPlacementKeys } :
+                                          std::span<const ImagePlacement::Key>{};
+    WI_ASSERT(!std::binary_search(deletedImageIds.begin(), deletedImageIds.end(), imageId));
+
+    auto committedBytes = _totalRetainedBytes;
+    for (const auto deletedImageId : deletedImageIds)
+    {
+        if (const auto deleted = _images.find(deletedImageId); deleted != _images.end())
+        {
+            committedBytes -= deleted->second.RetainedBytes();
+        }
+    }
+    committedBytes -= oldTargetBytes;
+    committedBytes += newTargetBytes;
+    const auto inactiveBytes = _mainBufferState ? _mainBufferState->totalRetainedBytes : size_t{ 0 };
+    if (inactiveBytes > MaxTotalBytes || committedBytes > MaxTotalBytes - inactiveBytes)
+    {
+        code = L"ENOSPC:image storage limit exceeded";
+        return false;
+    }
+
+    struct RenderedState
+    {
+        uint32_t imageId = 0;
+        bool foundPlacement = false;
+        ::Image::Pointer surface;
+    };
+    std::vector<uint32_t> trackedImageIds;
+    trackedImageIds.reserve(removedPlacementKeys.size() + (updateTargetSurface ? 1 : 0));
+    for (const auto key : removedPlacementKeys)
+    {
+        if (!std::binary_search(deletedImageIds.begin(), deletedImageIds.end(), key.imageId))
+        {
+            trackedImageIds.push_back(key.imageId);
+        }
+    }
+    if (updateTargetSurface)
+    {
+        trackedImageIds.push_back(imageId);
+    }
+    std::sort(trackedImageIds.begin(), trackedImageIds.end());
+    trackedImageIds.erase(std::unique(trackedImageIds.begin(), trackedImageIds.end()), trackedImageIds.end());
+
+    std::vector<RenderedState> renderedStates;
+    renderedStates.reserve(trackedImageIds.size());
+    for (const auto trackedImageId : trackedImageIds)
+    {
+        const auto tracked = trackedImageId == imageId ? stagedImage.surface : _images.at(trackedImageId).surface;
+        renderedStates.push_back(RenderedState{ .imageId = trackedImageId, .surface = tracked });
+    }
+
+    struct PageCommit
+    {
+        TextBuffer* buffer = nullptr;
+        til::CoordType width = 0;
+        til::CoordType firstRow = 0;
+        til::CoordType lastRow = -1;
+        bool visible = false;
+    };
+    std::vector<PageCommit> pages;
+    if (eviction || updateTargetSurface)
+    {
+        pages.reserve(6);
+        const auto visiblePageNumber = _dispatcher._pages.VisiblePage().Number();
+        _dispatcher._pages.ForEachPage([&](const Page page) {
+            auto& buffer = page.Buffer();
+            auto firstRow = page.Bottom();
+            auto lastRow = 0;
+            for (const auto& placement : buffer.GetImages().All())
+            {
+                const auto key = placement.Identity();
+                if (key.protocol != ImagePlacement::Key::Protocol::Kitty)
+                {
+                    continue;
+                }
+                const auto remove = std::binary_search(deletedImageIds.begin(), deletedImageIds.end(), key.imageId) ||
+                                    std::binary_search(removedPlacementKeys.begin(), removedPlacementKeys.end(), key);
+                const auto rendered = std::lower_bound(renderedStates.begin(), renderedStates.end(), key.imageId, [](const auto& candidate, const uint32_t id) {
+                    return candidate.imageId < id;
+                });
+                if (!remove && rendered != renderedStates.end() && rendered->imageId == key.imageId)
+                {
+                    rendered->foundPlacement = true;
+                    rendered->surface = rendered->surface ? rendered->surface : placement.SurfacePointer();
+                }
+                if (page.Number() == visiblePageNumber &&
+                    (remove || (updateTargetSurface && key.imageId == imageId)))
+                {
+                    const auto bounds = placement.CellBounds();
+                    firstRow = std::min(firstRow, bounds.top);
+                    lastRow = std::max(lastRow, bounds.bottom - 1);
+                }
+            }
+            pages.push_back(PageCommit{
+                .buffer = &buffer,
+                .width = page.Width(),
+                .firstRow = firstRow,
+                .lastRow = lastRow,
+                .visible = page.Number() == visiblePageNumber,
+            });
+        });
+    }
+
+    FramePixelStorage presentedStorage;
+    ::Image::Pointer presentedSurface;
+    if (updateTargetSurface)
+    {
+        const auto targetState = std::lower_bound(renderedStates.begin(), renderedStates.end(), imageId, [](const auto& candidate, const uint32_t id) {
+            return candidate.imageId < id;
+        });
+        WI_ASSERT(targetState != renderedStates.end() && targetState->imageId == imageId);
+        stagedImage.hasRenderedPlacements = targetState->foundPlacement;
+        if (targetState->foundPlacement && targetState->surface)
+        {
+            stagedImage.surface = targetState->surface;
+            presentedSurface = targetState->surface;
+            presentedStorage = *_frameStorage(stagedImage, stagedImage.presentedFrame);
+        }
+        else
+        {
+            _releaseImageSurface(stagedImage);
+        }
+    }
+
+    // No mutation has happened yet. Renderer invalidation and timer registration are
+    // the last potentially throwing operations; everything after them is a no-throw commit.
+    for (const auto& page : pages)
+    {
+        if (page.visible && page.firstRow <= page.lastRow)
+        {
+            page.buffer->TriggerRedraw(Viewport::FromExclusive({ 0, page.firstRow, page.width, page.lastRow + 1 }));
+        }
+    }
+    _dispatcher._api.RequestTimedContentUpdate(_nextAnimationDeadline(imageId, &stagedImage, deletedImageIds));
+
+    if (eviction)
+    {
+        _virtualIds.swap(eviction->virtualIds);
+        _placements.swap(eviction->placements);
+        _anonymousPlacements.swap(eviction->anonymousPlacements);
+        for (const auto& page : pages)
+        {
+            page.buffer->GetMutableImages().EraseImagesAndPlacements(
+                ImagePlacement::Key::Protocol::Kitty,
+                deletedImageIds,
+                removedPlacementKeys);
+        }
+        for (const auto deletedImageId : deletedImageIds)
+        {
+            _eraseImageRegistryEntry(deletedImageId);
+        }
+    }
+
+    imageIt = _images.find(imageId);
+    WI_ASSERT(imageIt != _images.end());
+    imageIt->second = std::move(stagedImage);
+    _totalRetainedBytes = committedBytes;
+    for (const auto& rendered : renderedStates)
+    {
+        if (rendered.imageId == imageId)
+        {
+            continue;
+        }
+        if (const auto stored = _images.find(rendered.imageId); stored != _images.end())
+        {
+            stored->second.hasRenderedPlacements = rendered.foundPlacement;
+            if (rendered.foundPlacement && rendered.surface)
+            {
+                stored->second.surface = rendered.surface;
+            }
+            else
+            {
+                _releaseImageSurface(stored->second);
+            }
+        }
+    }
+    if (presentedSurface && presentedStorage)
+    {
+        WI_ASSERT(presentedStorage->size() == imageIt->second.pixels->size());
+        presentedSurface->UpdatePixels(std::move(presentedStorage));
+    }
+    return true;
+}
+catch (const std::bad_alloc&)
+{
+    code = L"ENOSPC:could not allocate frame";
+    return false;
+}
+
+bool KittyParser::_processAnimationControl(const Control& command, const uint32_t imageId, std::wstring_view& code)
+try
+{
+    const auto imageIt = _images.find(imageId);
+    if (imageIt == _images.end())
+    {
+        code = L"ENOENT:image not found";
+        return false;
+    }
+    auto& image = imageIt->second;
+    if (command.width > 3)
+    {
+        code = L"EINVAL:invalid animation state";
+        return false;
+    }
+    if (command.cols != 0 && !_framePixels(image, command.cols))
+    {
+        code = L"ENOENT:frame not found";
+        return false;
+    }
+    if (command.rows != 0 && !_frameGap(image, command.rows))
+    {
+        code = L"ENOENT:frame not found";
+        return false;
+    }
+
+    std::vector<uint32_t> updatedImageIds;
+    updatedImageIds.reserve(2);
+    auto reschedule = false;
+    if (command.cols != 0)
+    {
+        image.currentFrame = command.cols;
+        image.presentedFrame = image.currentFrame;
+        updatedImageIds.push_back(imageId);
+        reschedule = true;
+    }
+    if (command.rows != 0 && command.haveZ && command.zIndex != 0)
+    {
+        *_frameGap(image, command.rows) = command.zIndex;
+        reschedule |= command.rows == image.currentFrame;
+    }
+    if (command.height != 0)
+    {
+        image.loopCount = command.height;
+        image.loopsRemaining = command.height == 1 ? UINT32_MAX : command.height - 1;
+    }
+    if (command.width != 0)
+    {
+        image.animationState = command.width;
+        image.waitingForFrames = false;
+        image.nextFrameTime = {};
+        image.loopsRemaining = image.loopCount == 1 ? UINT32_MAX : image.loopCount - 1;
+        reschedule = true;
+    }
+
+    if (image.animationState == 1)
+    {
+        image.nextFrameTime = {};
+        image.waitingForFrames = false;
+    }
+    else if (reschedule)
+    {
+        _scheduleAnimation(imageId, image, std::chrono::steady_clock::now(), &updatedImageIds);
+    }
+    _scheduleAnimationTimer();
+    _updateImageSurfaces(updatedImageIds);
+    return true;
+}
+catch (const std::bad_alloc&)
+{
+    code = L"ENOSPC:could not update animation";
+    return false;
+}
+
+bool KittyParser::_processFrameComposition(const Control& command, const uint32_t imageId, std::wstring_view& code)
+try
+{
+    const auto imageIt = _images.find(imageId);
+    if (imageIt == _images.end())
+    {
+        code = L"ENOENT:image not found";
+        return false;
+    }
+    auto& image = imageIt->second;
+    const auto sourceFrame = command.rows;
+    const auto destinationFrame = command.cols;
+    const auto* source = _framePixels(image, sourceFrame);
+    const auto* destination = _framePixels(image, destinationFrame);
+    if (sourceFrame == 0 || destinationFrame == 0 || !source || !destination)
+    {
+        code = L"ENOENT:frame not found";
+        return false;
+    }
+
+    const auto width = command.srcW == 0 ? image.width : command.srcW;
+    const auto height = command.srcH == 0 ? image.height : command.srcH;
+    if (width == 0 || height == 0 ||
+        command.srcX > image.width || command.srcY > image.height ||
+        command.upperX > image.width || command.upperY > image.height ||
+        width > image.width - command.srcX || height > image.height - command.srcY ||
+        width > image.width - command.upperX || height > image.height - command.upperY)
+    {
+        code = L"EINVAL:composition rectangle out of bounds";
+        return false;
+    }
+
+    const til::rect sourceRect{
+        gsl::narrow_cast<til::CoordType>(command.upperX),
+        gsl::narrow_cast<til::CoordType>(command.upperY),
+        gsl::narrow_cast<til::CoordType>(command.upperX + width),
+        gsl::narrow_cast<til::CoordType>(command.upperY + height),
+    };
+    const til::rect destinationRect{
+        gsl::narrow_cast<til::CoordType>(command.srcX),
+        gsl::narrow_cast<til::CoordType>(command.srcY),
+        gsl::narrow_cast<til::CoordType>(command.srcX + width),
+        gsl::narrow_cast<til::CoordType>(command.srcY + height),
+    };
+    const auto rectanglesOverlap = sourceRect.left < destinationRect.right &&
+                                   destinationRect.left < sourceRect.right &&
+                                   sourceRect.top < destinationRect.bottom &&
+                                   destinationRect.top < sourceRect.bottom;
+    if (sourceFrame == destinationFrame && rectanglesOverlap)
+    {
+        code = L"EINVAL:overlapping self-composition";
+        return false;
+    }
+
+    std::vector<RGBQUAD> sourcePixels(static_cast<size_t>(width) * height);
+    for (uint32_t row = 0; row < height; ++row)
+    {
+        const auto srcOffset = static_cast<size_t>(command.upperY + row) * image.width + command.upperX;
+        std::copy_n(source->begin() + srcOffset, width, sourcePixels.begin() + static_cast<size_t>(row) * width);
+    }
+    auto composed = *destination;
+    for (uint32_t row = 0; row < height; ++row)
+    {
+        const auto dstOffset = static_cast<size_t>(command.srcY + row) * image.width + command.srcX;
+        _compositePixels(std::span{ composed }.subspan(dstOffset, width),
+                         std::span{ sourcePixels }.subspan(static_cast<size_t>(row) * width, width),
+                         command.noCursorMovement);
+    }
+    *_frameStorage(image, destinationFrame) = std::make_shared<std::vector<RGBQUAD>>(std::move(composed));
+    if (image.presentedFrame == destinationFrame)
+    {
+        _updateImageSurface(imageId);
+    }
+    return true;
+}
+catch (const std::bad_alloc&)
+{
+    code = L"ENOSPC:could not compose frame";
+    return false;
+}
+
+void KittyParser::_scheduleAnimation(const uint32_t imageId, Image& image, const std::chrono::steady_clock::time_point now, std::vector<uint32_t>* const updatedImageIds)
+{
+    if (image.animationState != 2 && image.animationState != 3)
+    {
+        image.nextFrameTime = {};
+        return;
+    }
+    const auto* gap = _frameGap(image, image.currentFrame);
+    if (!gap)
+    {
+        image.animationState = 1;
+        image.nextFrameTime = {};
+        return;
+    }
+    if (*gap > 0)
+    {
+        image.waitingForFrames = false;
+        if (image.presentedFrame != image.currentFrame)
+        {
+            image.presentedFrame = image.currentFrame;
+            if (updatedImageIds)
+            {
+                updatedImageIds->push_back(imageId);
+            }
+            else
+            {
+                _updateImageSurface(imageId);
+            }
+        }
+        image.nextFrameTime = now + std::chrono::milliseconds(*gap);
+    }
+    else
+    {
+        image.nextFrameTime = now;
+        _advanceImage(imageId, image, now, updatedImageIds);
+    }
+}
+
+bool KittyParser::_advanceImage(const uint32_t imageId, Image& image, const std::chrono::steady_clock::time_point now, std::vector<uint32_t>* const updatedImageIds)
+{
+    if (image.animationState != 2 && image.animationState != 3)
+    {
+        image.nextFrameTime = {};
+        return false;
+    }
+
+    const auto frameCount = gsl::narrow_cast<uint32_t>(_frameCount(image));
+    if (frameCount < 2)
+    {
+        image.waitingForFrames = image.animationState == 2;
+        image.nextFrameTime = {};
+        return false;
+    }
+
+    // A full pass is enough to prove that every frame is gapless. Stop rather
+    // than spin forever on an animation that can never present a frame.
+    for (uint32_t skipped = 0; skipped <= frameCount; ++skipped)
+    {
+        if (image.currentFrame < frameCount)
+        {
+            ++image.currentFrame;
+        }
+        else if (image.animationState == 2)
+        {
+            image.waitingForFrames = true;
+            image.nextFrameTime = {};
+            return false;
+        }
+        else
+        {
+            if (image.loopsRemaining != UINT32_MAX)
+            {
+                if (image.loopsRemaining == 0)
+                {
+                    image.animationState = 1;
+                    image.nextFrameTime = {};
+                    return false;
+                }
+                --image.loopsRemaining;
+            }
+            image.currentFrame = 1;
+        }
+
+        const auto* gap = _frameGap(image, image.currentFrame);
+        if (gap && *gap > 0)
+        {
+            image.waitingForFrames = false;
+            image.presentedFrame = image.currentFrame;
+            if (updatedImageIds)
+            {
+                updatedImageIds->push_back(imageId);
+            }
+            else
+            {
+                _updateImageSurface(imageId);
+            }
+            image.nextFrameTime = now + std::chrono::milliseconds(*gap);
+            return true;
+        }
+    }
+
+    image.animationState = 1;
+    image.nextFrameTime = {};
+    return false;
+}
+
+void KittyParser::AdvanceAnimations(const std::chrono::steady_clock::time_point now)
+{
+    struct PreviousState
+    {
+        uint32_t imageId = 0;
+        uint32_t currentFrame = 1;
+        uint32_t animationState = 1;
+        uint32_t loopsRemaining = UINT32_MAX;
+        uint32_t presentedFrame = 1;
+        bool waitingForFrames = false;
+        std::chrono::steady_clock::time_point nextFrameTime{};
+    };
+
+    std::vector<PreviousState> previousStates;
+    previousStates.reserve(_images.size());
+    std::vector<uint32_t> updatedImageIds;
+    updatedImageIds.reserve(_images.size());
+    for (auto& [imageId, image] : _images)
+    {
+        if ((image.animationState == 2 || image.animationState == 3) &&
+            image.nextFrameTime != std::chrono::steady_clock::time_point{} &&
+            image.nextFrameTime <= now)
+        {
+            previousStates.push_back(PreviousState{
+                .imageId = imageId,
+                .currentFrame = image.currentFrame,
+                .animationState = image.animationState,
+                .loopsRemaining = image.loopsRemaining,
+                .presentedFrame = image.presentedFrame,
+                .waitingForFrames = image.waitingForFrames,
+                .nextFrameTime = image.nextFrameTime,
+            });
+            _advanceImage(imageId, image, now, &updatedImageIds);
+        }
+    }
+    try
+    {
+        _updateImageSurfaces(updatedImageIds);
+    }
+    catch (const std::bad_alloc&)
+    {
+        for (const auto& previous : previousStates)
+        {
+            if (const auto image = _images.find(previous.imageId); image != _images.end())
+            {
+                image->second.currentFrame = previous.currentFrame;
+                image->second.animationState = previous.animationState;
+                image->second.loopsRemaining = previous.loopsRemaining;
+                image->second.presentedFrame = previous.presentedFrame;
+                image->second.waitingForFrames = previous.waitingForFrames;
+                image->second.nextFrameTime = previous.nextFrameTime;
+            }
+        }
+        _scheduleAnimationTimer();
+        throw;
+    }
+    _scheduleAnimationTimer();
+}
+
+std::optional<std::chrono::steady_clock::time_point> KittyParser::_nextAnimationDeadline(
+    const uint32_t replacementImageId,
+    const Image* const replacement,
+    const std::span<const uint32_t> omittedImageIds) const noexcept
+{
+    auto earliest = std::chrono::steady_clock::time_point::max();
+    for (const auto& [id, storedImage] : _images)
+    {
+        if (std::find(omittedImageIds.begin(), omittedImageIds.end(), id) != omittedImageIds.end())
+        {
+            continue;
+        }
+        const auto& image = replacement && id == replacementImageId ? *replacement : storedImage;
+        if ((image.animationState == 2 || image.animationState == 3) &&
+            image.nextFrameTime != std::chrono::steady_clock::time_point{})
+        {
+            earliest = std::min(earliest, image.nextFrameTime);
+        }
+    }
+    return earliest == std::chrono::steady_clock::time_point::max() ?
+               std::nullopt :
+               std::optional{ earliest };
+}
+
+// Animated images advance on their own schedule, with nothing arriving in the
+// stream to drive them. Work out when the soonest one is due and tell the host,
+// which owns the render thread and decides how to arrange the wakeup. Whether
+// that deadline is honoured early, late, or coalesced with other work is the
+// host's business; this only reports when there is something to do.
+void KittyParser::_scheduleAnimationTimer()
+{
+    _dispatcher._api.RequestTimedContentUpdate(_nextAnimationDeadline());
+}
+
+void KittyParser::_deleteAnimationFrames(const uint32_t imageId, const uint32_t frameNumber, const bool freeData)
+{
+    const auto imageIt = _images.find(imageId);
+    if (imageIt == _images.end())
+    {
+        return;
+    }
+    auto& image = imageIt->second;
+    const auto frameCount = gsl::narrow_cast<uint32_t>(_frameCount(image));
+    if (frameCount == 0)
+    {
+        return;
+    }
+    const auto selectedFrame = std::clamp(frameNumber, 1u, frameCount);
+    if (frameCount <= 1)
+    {
+        if (freeData)
+        {
+            _erasePlacementsForImage(imageId);
+            _eraseImagePlacements(imageId);
+            _eraseImage(imageId);
+        }
+        _scheduleAnimationTimer();
+        return;
+    }
+    std::vector<uint32_t> updatedImageIds;
+    updatedImageIds.reserve(2);
+    updatedImageIds.push_back(imageId);
+    const auto oldBytes = image.RetainedBytes();
+    if (selectedFrame == 1)
+    {
+        auto promoted = std::move(image.animationFrames.front());
+        image.animationFrames.erase(image.animationFrames.begin());
+        image.pixels = std::move(promoted.pixels);
+        image.rootGapMilliseconds = promoted.gapMilliseconds;
+    }
+    else
+    {
+        image.animationFrames.erase(image.animationFrames.begin() + (selectedFrame - 2));
+    }
+    _totalRetainedBytes -= oldBytes - image.RetainedBytes();
+
+    const auto remaining = gsl::narrow_cast<uint32_t>(_frameCount(image));
+    if (image.currentFrame > selectedFrame)
+    {
+        --image.currentFrame;
+    }
+    else if (image.currentFrame == selectedFrame)
+    {
+        image.currentFrame = std::min(selectedFrame, remaining);
+    }
+    if (image.presentedFrame > selectedFrame)
+    {
+        --image.presentedFrame;
+    }
+    else if (image.presentedFrame == selectedFrame)
+    {
+        image.presentedFrame = std::min(selectedFrame, remaining);
+    }
+
+    if (remaining == 1)
+    {
+        image.animationState = 1;
+        image.waitingForFrames = false;
+        image.nextFrameTime = {};
+    }
+    if (image.animationState == 2 || image.animationState == 3)
+    {
+        _scheduleAnimation(imageId, image, std::chrono::steady_clock::now(), &updatedImageIds);
+    }
+    _scheduleAnimationTimer();
+    _updateImageSurfaces(updatedImageIds);
+}
+
 til::size KittyParser::_placeImage(const Image& image,
                                    const bool moveCursor,
                                    const uint32_t imageId,
@@ -1541,7 +2877,9 @@ til::size KittyParser::_placeImage(const Image& image,
                                    const int32_t zIndex,
                                    const std::optional<til::point> anchor)
 {
-    if (!image.pixels || image.pixels->empty() || image.width == 0 || image.height == 0)
+    const auto frameStorage = _frameStorage(image, image.presentedFrame);
+    const auto framePixels = frameStorage ? frameStorage->get() : nullptr;
+    if (!framePixels || framePixels->empty() || image.width == 0 || image.height == 0)
     {
         return {};
     }
@@ -1586,16 +2924,16 @@ til::size KittyParser::_placeImage(const Image& image,
     if (drawnColumns > 0 && drawnRows > 0)
     {
         auto surface = image.surface;
-        if (!surface)
+        const auto newSurface = !surface;
+        if (newSurface)
         {
-            surface = std::make_shared<::Image>(til::size{ imageWidth, imageHeight }, image.pixels);
-            image.surface = surface;
+            surface = std::make_shared<::Image>(til::size{ imageWidth, imageHeight }, *frameStorage);
         }
 
         const ImagePlacement::Key key{ imageId, layerId, ImagePlacement::Key::Protocol::Kitty };
         buffer.GetMutableImages().AddOrReplace(ImagePlacement{
             key,
-            std::move(surface),
+            surface,
             { columnBegin, origin.y, columnEnd, redrawBottom },
             zIndex,
             { cropX, cropY, cropX + cropW, cropY + cropH },
@@ -1609,6 +2947,10 @@ til::size KittyParser::_placeImage(const Image& image,
         if (const auto entry = _images.find(imageId); entry != _images.end())
         {
             entry->second.hasRenderedPlacements = true;
+        }
+        if (newSurface)
+        {
+            image.surface = std::move(surface);
         }
     }
     buffer.TriggerRedraw(Viewport::FromExclusive({ 0, redrawTop, page.Width(), redrawBottom }));
@@ -2131,10 +3473,7 @@ void KittyParser::_erasePlacementsForImage(const uint32_t imageId)
     {
         if (placement->imageId == imageId)
         {
-            if (placement->isVirtual)
-            {
-                removed.push_back({ placement->imageId, 0 });
-            }
+            removed.push_back({ placement->imageId, placement->placementId });
             _erasePlacementCells(*placement);
             placement = _anonymousPlacements.erase(placement);
         }
@@ -2230,6 +3569,7 @@ void KittyParser::_cascadePlacementChildren(std::deque<std::pair<uint32_t, uint3
             if (placement->hasParent && placement->parentImageId == parent.first && placement->parentPlacementId == parent.second)
             {
                 const auto anonymousImageId = placement->imageId;
+                removed.push_back({ placement->imageId, placement->placementId });
                 _erasePlacementCells(*placement);
                 failAfterErase();
                 placement = _anonymousPlacements.erase(placement);
@@ -2369,6 +3709,7 @@ void KittyParser::_deleteAllPlacements(const bool freeData)
             }
         }
     }
+    _scheduleAnimationTimer();
 }
 
 void KittyParser::_deleteImagesIntersecting(const til::CoordType left,
@@ -3131,7 +4472,8 @@ int KittyParser::_PlaceholderDiacriticIndex(const char32_t ch) noexcept
 // the complete scaled placement, so adjacent fragments share one source surface.
 bool KittyParser::_placeImageCellRef(const Image& image, const uint32_t imageId, const til::CoordType column, const til::CoordType row, const uint32_t cellRow, const uint32_t cellCol, const VirtualPlacement& place, std::vector<ImagePlacement>& fragments)
 {
-    if (!image.pixels || image.pixels->empty() || image.width == 0 || image.height == 0)
+    const auto frameStorage = _frameStorage(image, image.presentedFrame);
+    if (!frameStorage || !*frameStorage || (*frameStorage)->empty() || image.width == 0 || image.height == 0)
     {
         return false;
     }
@@ -3166,7 +4508,7 @@ bool KittyParser::_placeImageCellRef(const Image& image, const uint32_t imageId,
     {
         surface = std::make_shared<::Image>(
             til::size{ gsl::narrow_cast<til::CoordType>(image.width), gsl::narrow_cast<til::CoordType>(image.height) },
-            image.pixels);
+            *frameStorage);
     }
 
     const auto originalLeft = gsl::narrow<til::CoordType>(static_cast<int64_t>(column) - cellCol);

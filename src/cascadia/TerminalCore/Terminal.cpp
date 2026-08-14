@@ -48,6 +48,7 @@ void Terminal::Create(til::size viewportSize, til::CoordType scrollbackLines, Re
                                 Utils::ClampToShortMax(viewportSize.height + scrollbackLines, 1) };
     const TextAttribute attr{};
     const UINT cursorSize = 12;
+    _renderer = &renderer;
     _mainBuffer = std::make_unique<TextBuffer>(bufferSize, attr, cursorSize, true, &renderer);
 
     auto dispatch = std::make_unique<AdaptDispatch>(*this, &renderer, _renderSettings, _terminalInput);
@@ -259,6 +260,15 @@ void Terminal::SetCursorStyle(const DispatchTypes::CursorStyle cursorStyle)
 {
     auto& engine = reinterpret_cast<OutputStateMachineEngine&>(_stateMachine->Engine());
     engine.Dispatch().SetCursorStyle(cursorStyle);
+}
+
+void Terminal::_notifyFontChanged()
+{
+    if (_stateMachine)
+    {
+        auto& engine = reinterpret_cast<OutputStateMachineEngine&>(_stateMachine->Engine());
+        static_cast<AdaptDispatch&>(engine.Dispatch()).NotifyFontChanged();
+    }
 }
 
 void Terminal::SetOptionalFeatures(winrt::Microsoft::Terminal::Core::ICoreSettings settings)

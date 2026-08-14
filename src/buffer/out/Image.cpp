@@ -656,7 +656,7 @@ size_t ImageCollection::EraseProtocol(const ImagePlacement::Key::Protocol protoc
     return removed;
 }
 
-bool ImageCollection::Erase(const ImagePlacement::Key key)
+bool ImageCollection::Erase(const ImagePlacement::Key key) noexcept
 {
     const auto oldSize = _images.size();
     std::erase_if(_images, [&](const auto& image) {
@@ -670,7 +670,7 @@ bool ImageCollection::Erase(const ImagePlacement::Key key)
     return erased;
 }
 
-size_t ImageCollection::EraseImage(const ImagePlacement::Key::Protocol protocol, const uint32_t imageId)
+size_t ImageCollection::EraseImage(const ImagePlacement::Key::Protocol protocol, const uint32_t imageId) noexcept
 {
     const auto oldSize = _images.size();
     std::erase_if(_images, [&](const auto& image) {
@@ -720,6 +720,25 @@ void ImageCollection::EraseArea(const ImagePlacement::Key key, const til::rect a
         }
     }
     _replace(std::move(remaining));
+}
+
+size_t ImageCollection::EraseImagesAndPlacements(const ImagePlacement::Key::Protocol protocol,
+                                                 const std::span<const uint32_t> imageIds,
+                                                 const std::span<const ImagePlacement::Key> placements) noexcept
+{
+    const auto oldSize = _images.size();
+    std::erase_if(_images, [&](const auto& image) {
+        const auto key = image.Identity();
+        return key.protocol == protocol &&
+               (std::binary_search(imageIds.begin(), imageIds.end(), key.imageId) ||
+                std::binary_search(placements.begin(), placements.end(), key));
+    });
+    const auto erased = oldSize - _images.size();
+    if (erased != 0)
+    {
+        _markIndexDirty();
+    }
+    return erased;
 }
 
 void ImageCollection::EraseArea(const til::rect area)

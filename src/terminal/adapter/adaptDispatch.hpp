@@ -39,6 +39,9 @@ namespace Microsoft::Console::VirtualTerminal
 
     public:
         AdaptDispatch(ITerminalApi& api, Renderer* renderer, RenderSettings& renderSettings, TerminalInput& terminalInput) noexcept;
+        ~AdaptDispatch() override;
+
+        void NotifyFontChanged();
 
         void UnknownSequence() noexcept override;
         void Print(const wchar_t wchPrintable) override;
