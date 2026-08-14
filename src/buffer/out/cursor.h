@@ -24,6 +24,18 @@ class TextBuffer;
 class Cursor final
 {
 public:
+    struct State
+    {
+        uint64_t mutationId = 0;
+        til::point position;
+        std::optional<til::point> delayedAt;
+        ULONG size = 0;
+        CursorType type = CursorType::Legacy;
+        bool visible = true;
+        bool blinking = true;
+        bool doubled = false;
+    };
+
     // the following values are used to create the textmode cursor.
     static constexpr unsigned int CURSOR_SMALL_SIZE = 25; // large enough to be one pixel on a six pixel font
 
@@ -59,6 +71,8 @@ public:
     void DecrementYPosition(const til::CoordType DeltaY) noexcept;
 
     void CopyProperties(const Cursor& other) noexcept;
+    State GetState() const noexcept;
+    void RestoreState(const State& state) noexcept;
 
     void DelayEOLWrap() noexcept;
     void ResetDelayEOLWrap() noexcept;

@@ -242,6 +242,7 @@ class ScreenBufferTests
     TEST_METHOD(UpdateVirtualBottomWithSetConsoleCursorPosition);
     TEST_METHOD(UpdateVirtualBottomAfterInternalSetViewportSize);
     TEST_METHOD(UpdateVirtualBottomAfterResizeWithReflow);
+    TEST_METHOD(KittyRelativePlacementSurvivesHostReflow);
     TEST_METHOD(DontShrinkVirtualBottomDuringResizeWithReflowAtTop);
     TEST_METHOD(DontChangeVirtualBottomWithOffscreenLinefeed);
     TEST_METHOD(DontChangeVirtualBottomAfterResizeWindow);
@@ -7399,6 +7400,44 @@ void ScreenBufferTests::UpdateVirtualBottomAfterResizeWithReflow()
 
     Log::Comment(L"Confirm cursor distance to the virtual bottom is unchanged");
     VERIFY_ARE_EQUAL(cursorDistanceFromBottom, si._virtualBottom - si.GetTextBuffer().GetCursor().GetPosition().y);
+}
+
+void ScreenBufferTests::KittyRelativePlacementSurvivesHostReflow()
+{
+    auto& gci = ServiceLocator::LocateGlobals().getConsoleInformation();
+    auto& si = gci.GetActiveOutputBuffer();
+    auto& stateMachine = si.GetStateMachine();
+    auto& buffer = si.GetTextBuffer();
+
+    stateMachine.ProcessString(std::wstring(20, L'.'));
+    stateMachine.ProcessString(L"\x1b_Ga=T,U=1,i=1,p=1,f=24,s=1,v=1;/wAA\x1b\\");
+    stateMachine.ProcessString(L"\x1b[38;2;0;0;1m\x1b[58:2::0:0:1m");
+    stateMachine.ProcessString(L"\xDBFB\xDEEE");
+    stateMachine.ProcessString(L"\x1b[0m");
+    stateMachine.ProcessString(L"\x1b_Ga=T,i=2,p=1,P=1,Q=1,H=1,V=0,f=24,s=1,v=1,C=1;AP8A\x1b\\");
+
+    auto reflowedSize = buffer.GetSize().Dimensions();
+    reflowedSize.width = std::max<til::CoordType>(10, reflowedSize.width / 2);
+    VERIFY_NT_SUCCESS(si.ResizeWithReflow(reflowedSize));
+
+    const auto& reflowed = si.GetTextBuffer();
+    const auto parent = std::ranges::find_if(reflowed.GetImages().All(), [](const auto& placement) {
+        const auto key = placement.Identity();
+        return key.protocol == ImagePlacement::Key::Protocol::Kitty && key.imageId == 1;
+    });
+    const auto child = std::ranges::find_if(reflowed.GetImages().All(), [](const auto& placement) {
+        const auto key = placement.Identity();
+        return key.protocol == ImagePlacement::Key::Protocol::Kitty && key.imageId == 2;
+    });
+    VERIFY_IS_TRUE(parent != reflowed.GetImages().All().end());
+    VERIFY_IS_TRUE(child != reflowed.GetImages().All().end());
+    if (parent != reflowed.GetImages().All().end() && child != reflowed.GetImages().All().end())
+    {
+        const auto parentBounds = parent->CellBounds();
+        const auto childBounds = child->CellBounds();
+        VERIFY_ARE_EQUAL(parentBounds.left + 1, childBounds.left);
+        VERIFY_ARE_EQUAL(parentBounds.top, childBounds.top);
+    }
 }
 
 void ScreenBufferTests::DontShrinkVirtualBottomDuringResizeWithReflowAtTop()

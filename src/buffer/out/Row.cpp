@@ -230,6 +230,7 @@ void ROW::Reset(const TextAttribute& attr) noexcept
     // Constructing and then moving objects into place isn't free.
     // Modifying the existing object is _much_ faster.
     *_attr.runs().unsafe_shrink_to_size(1) = til::rle_pair{ attr, _columnCount };
+    _imageCellRefs.reset();
     _lineRendition = LineRendition::SingleWidth;
     _wrapForced = false;
     _doubleBytePadded = false;
@@ -356,6 +357,9 @@ void ROW::CopyFrom(const ROW& source)
 {
     _lineRendition = source._lineRendition;
     _wrapForced = source._wrapForced;
+    _doubleBytePadded = source._doubleBytePadded;
+    _promptData = source._promptData;
+    _imageCellRefs.reset();
 
     RowCopyTextFromState state{
         .source = source,
@@ -365,6 +369,60 @@ void ROW::CopyFrom(const ROW& source)
 
     _attr = source.Attributes();
     _attr.resize_trailing_extent(_columnCount);
+}
+
+class ROW::Snapshot final
+{
+public:
+    std::vector<wchar_t> chars;
+    std::vector<uint16_t> charOffsets;
+    std::unique_ptr<wchar_t[]> charsHeap;
+    size_t charsCapacity = 0;
+    RowAttributes attributes;
+    std::unique_ptr<ImageCellRef[]> imageCellRefs;
+    LineRendition lineRendition = LineRendition::SingleWidth;
+    bool wrapForced = false;
+    bool doubleBytePadded = false;
+    std::optional<ScrollbarData> promptData;
+};
+
+std::shared_ptr<ROW::Snapshot> ROW::CreateSnapshot() const
+{
+    auto snapshot = std::make_shared<Snapshot>();
+    snapshot->chars.assign(_charsBuffer, _charsBuffer + _columnCount);
+    snapshot->charOffsets.assign(_charOffsets.begin(), _charOffsets.end());
+    snapshot->charsCapacity = _chars.size();
+    if (_charsHeap)
+    {
+        snapshot->charsHeap = std::make_unique<wchar_t[]>(snapshot->charsCapacity);
+        std::copy_n(_charsHeap.get(), snapshot->charsCapacity, snapshot->charsHeap.get());
+    }
+    snapshot->attributes = _attr;
+    if (_imageCellRefs)
+    {
+        snapshot->imageCellRefs = std::make_unique<ImageCellRef[]>(_columnCount);
+        std::copy_n(_imageCellRefs.get(), _columnCount, snapshot->imageCellRefs.get());
+    }
+    snapshot->lineRendition = _lineRendition;
+    snapshot->wrapForced = _wrapForced;
+    snapshot->doubleBytePadded = _doubleBytePadded;
+    snapshot->promptData = _promptData;
+    return snapshot;
+}
+
+void ROW::RestoreSnapshot(Snapshot& snapshot) noexcept
+{
+    std::copy_n(snapshot.chars.data(), _columnCount, _charsBuffer);
+    std::copy_n(snapshot.charOffsets.data(), _charOffsets.size(), _charOffsets.data());
+    std::swap(_charsHeap, snapshot.charsHeap);
+    _chars = _charsHeap ? std::span<wchar_t>{ _charsHeap.get(), snapshot.charsCapacity } :
+                          std::span<wchar_t>{ _charsBuffer, _columnCount };
+    std::swap(_attr, snapshot.attributes);
+    std::swap(_imageCellRefs, snapshot.imageCellRefs);
+    _lineRendition = snapshot.lineRendition;
+    _wrapForced = snapshot.wrapForced;
+    _doubleBytePadded = snapshot.doubleBytePadded;
+    std::swap(_promptData, snapshot.promptData);
 }
 
 // Returns the previous possible cursor position, preceding the given column.
@@ -621,6 +679,7 @@ try
     }
     h.ReplaceCharacters(width);
     h.Finish();
+    _clearImageCellRefs(h.colBegDirty, h.colEndDirty);
     if (columnBeginDirty)
     {
         *columnBeginDirty = h.colBegDirty;
@@ -672,6 +731,7 @@ try
     }
     h.ReplaceText();
     h.Finish();
+    _clearImageCellRefs(h.colBegDirty, h.colEndDirty);
 
     state.text = state.text.substr(h.charsConsumed);
     // Here's why we set `state.columnEnd` to `colLimit` if there's remaining text:
@@ -851,6 +911,8 @@ try
 
     h.CopyTextFrom(charOffsets);
     h.Finish();
+    _clearImageCellRefs(h.colBegDirty, h.colEndDirty);
+    CopyImageCellRefs(source, sourceColBeg, h.colBeg, h.colEnd);
 
     // state.columnEnd is computed identical to ROW::ReplaceText. Check it out for more information.
     state.columnEnd = h.charsConsumed == chars.size() ? h.colEnd : h.colLimit;
@@ -1158,6 +1220,89 @@ std::wstring_view ROW::GetText(til::CoordType columnBegin, til::CoordType column
     const size_t chEnd = _uncheckedCharOffset(gsl::narrow_cast<size_t>(colEnd));
 #pragma warning(suppress : 26481) // Don't use pointer arithmetic. Use span instead (bounds.1).
     return { _chars.data() + chBeg, chEnd - chBeg };
+}
+
+const ImageCellRef* ROW::GetImageCellRef(const til::CoordType column) const noexcept
+{
+    if (!_imageCellRefs || column < 0 || column >= _columnCount)
+    {
+        return nullptr;
+    }
+
+    const auto& metadata = til::at(_imageCellRefs, column);
+    return metadata.valid ? &metadata : nullptr;
+}
+
+void ROW::SetImageCellRef(const til::CoordType column, const ImageCellRef& metadata)
+{
+    if (column < 0 || column >= _columnCount)
+    {
+        return;
+    }
+
+    if (!_imageCellRefs)
+    {
+        if (!metadata.valid)
+        {
+            return;
+        }
+        _imageCellRefs = std::make_unique<ImageCellRef[]>(_columnCount);
+    }
+    til::at(_imageCellRefs, column) = metadata;
+}
+
+void ROW::RestoreImageCellRefNoAlloc(const til::CoordType column, const ImageCellRef& metadata) noexcept
+{
+    if (column < 0 || column >= _columnCount || !_imageCellRefs)
+    {
+        // A valid snapshot necessarily came from existing storage. Invalid
+        // metadata is deliberately ignored when no storage was allocated.
+        return;
+    }
+
+    til::at(_imageCellRefs, column) = metadata;
+}
+
+void ROW::_clearImageCellRefs(const til::CoordType columnBegin, const til::CoordType columnEnd) noexcept
+{
+    if (!_imageCellRefs)
+    {
+        return;
+    }
+
+    const auto begin = std::clamp<til::CoordType>(columnBegin, 0, _columnCount);
+    const auto end = std::clamp<til::CoordType>(columnEnd, begin, _columnCount);
+    std::fill_n(_imageCellRefs.get() + begin, end - begin, ImageCellRef{});
+}
+
+void ROW::CopyImageCellRefs(const ROW& source, const til::CoordType sourceColumnBegin, const til::CoordType columnBegin, const til::CoordType columnEnd)
+{
+    const auto destinationBegin = std::clamp<til::CoordType>(columnBegin, 0, _columnCount);
+    const auto destinationEnd = std::clamp<til::CoordType>(columnEnd, destinationBegin, _columnCount);
+    const auto sourceBegin = std::clamp<til::CoordType>(sourceColumnBegin, 0, source._columnCount);
+    const auto count = std::min(destinationEnd - destinationBegin, source._columnCount - sourceBegin);
+
+    std::vector<ImageCellRef> copied;
+    if (count > 0 && source._imageCellRefs)
+    {
+        copied.reserve(count);
+        for (auto i = 0; i < count; ++i)
+        {
+            copied.emplace_back(til::at(source._imageCellRefs, sourceBegin + i));
+        }
+    }
+
+    _clearImageCellRefs(destinationBegin, destinationEnd);
+    if (copied.empty() || std::none_of(copied.begin(), copied.end(), [](const auto& metadata) { return metadata.valid; }))
+    {
+        return;
+    }
+
+    if (!_imageCellRefs)
+    {
+        _imageCellRefs = std::make_unique<ImageCellRef[]>(_columnCount);
+    }
+    std::copy(copied.begin(), copied.end(), _imageCellRefs.get() + destinationBegin);
 }
 
 til::CoordType ROW::GetLeadingColumnAtCharOffset(const ptrdiff_t offset) const noexcept

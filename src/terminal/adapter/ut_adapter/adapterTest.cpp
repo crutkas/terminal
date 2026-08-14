@@ -295,9 +295,22 @@ public:
         return { *_textBuffer.get(), viewport, true };
     }
 
-    void SetViewportPosition(const til::point /*position*/) override
+    void SetViewportPosition(const til::point position) override
     {
         Log::Comment(L"SetViewportPosition MOCK called...");
+        _viewportPositions.push_back(position);
+    }
+
+    void SetViewportPositionInternal(const til::point position) override
+    {
+        const auto width = _viewport.right - _viewport.left;
+        const auto height = _viewport.bottom - _viewport.top;
+        _viewport = { position.x, position.y, position.x + width, position.y + height };
+    }
+
+    void RestoreViewportPositionInternal(const til::point position) override
+    {
+        SetViewportPositionInternal(position);
     }
 
     bool IsVtInputEnabled() const override
@@ -347,6 +360,11 @@ public:
     void UseMainScreenBuffer() override
     {
         Log::Comment(L"UseMainScreenBuffer MOCK called...");
+        if (_mainImagesOnUseMain)
+        {
+            _textBuffer->GetMutableImages() = std::move(*_mainImagesOnUseMain);
+            _mainImagesOnUseMain.reset();
+        }
     }
 
     CursorType GetUserDefaultCursorStyle() const override
@@ -410,9 +428,10 @@ public:
         Log::Comment(L"PlayMidiNote MOCK called...");
     }
 
-    void NotifyBufferRotation(const int /*delta*/) override
+    void NotifyBufferRotation(const int delta) override
     {
         Log::Comment(L"NotifyBufferRotation MOCK called...");
+        _bufferRotations.push_back(delta);
     }
 
     void NotifyShellIntegrationMark() override
@@ -506,6 +525,9 @@ public:
 
         _response.clear();
         _retainResponse = false;
+        _viewportPositions.clear();
+        _bufferRotations.clear();
+        _mainImagesOnUseMain.reset();
     }
 
     void PrepCursor(CursorX xact, CursorY yact)
@@ -594,6 +616,9 @@ public:
 
     std::wstring _response;
     bool _retainResponse{ false };
+    std::vector<til::point> _viewportPositions;
+    std::vector<int> _bufferRotations;
+    std::unique_ptr<ImageCollection> _mainImagesOnUseMain;
 
     auto EnableInputRetentionInScope()
     {
@@ -4519,6 +4544,14 @@ public:
         return p.rgbRed == r && p.rgbGreen == g && p.rgbBlue == b;
     }
 
+    // ---- Kitty Unicode placeholders (U=1 virtual placement) -------------------
+    // A single U+10EEEE placeholder cell (one UTF-16 surrogate pair).
+    static const std::wstring& Placeholder()
+    {
+        static const std::wstring p = L"\xDBFB\xDEEE";
+        return p;
+    }
+
     // Baseline smoke test: the simplest valid sixel (one color, one full column) must produce a
     // rendered image slice whose pixels contain the declared color. The other tests assume this
     // fundamental path works, so this is the canary if the Sixel pipeline breaks entirely.
@@ -5085,6 +5118,2509 @@ public:
         VERIFY_IS_TRUE(cursor.IsVisible(), L"a completed long Sixel sequence must restore cursor visibility");
     }
 
+    // Lowercase d=i on a VIRTUAL (U=1) image deletes the virtual placement -- a later placeholder is
+    // inert -- but keeps the image DATA so a=p still displays it. (Virtual placements are deleted by
+    // i/I/n/N/r/R regardless of case; only the data free is case-gated.)
+    TEST_METHOD(KittyGraphicsDeleteLowercaseVirtualDropsPlacementKeepsData)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,f=24,s=1,v=1;/wAA\x1b\\"); // virtual red
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m"); // fg = image id 1
+        _stateMachine->ProcessString(Placeholder());
+        VERIFY_IS_TRUE(BufferContainsColor(*_testGetSet->_textBuffer, 255, 0, 0), L"placeholder overlays the virtual image");
+
+        _stateMachine->ProcessString(L"\x1b_Ga=d,d=i,i=1;\x1b\\"); // lowercase: drop virtual placement, keep data
+        _stateMachine->ProcessString(Placeholder()); // a new placeholder must be inert now
+        VERIFY_ARE_EQUAL(0, CountImageRows(*_testGetSet->_textBuffer), L"the virtual placement is gone; a re-printed placeholder is inert");
+
+        _testGetSet->_response.clear();
+        _stateMachine->ProcessString(L"\x1b_Ga=p,i=1;\x1b\\"); // image DATA survived
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=1;OK\x1b\\");
+    }
+
+    // Lowercase single-placement delete (d=i,i=1,p=1) of a VIRTUAL placement drops the per-image
+    // virtual grid (a re-printed placeholder is inert) and keeps the image DATA. A virtual placement
+    // draws no cells of its own, so d=i,p exercises _deletePlacement's virtual-grid teardown
+    // rather than a per-placement cell erase -- without it the grid (and pixels) would survive and
+    // the lowercase p= delete would be a no-op.
+    TEST_METHOD(KittyGraphicsDeleteLowercaseVirtualPlacementByIdKeepsData)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,p=1,f=24,s=1,v=1;/wAA\x1b\\"); // virtual red, placement id 1
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m"); // fg = image id 1
+        _stateMachine->ProcessString(L"\x1b[58:2::0:0:1m"); // underline = placement id 1
+        _stateMachine->ProcessString(Placeholder());
+        VERIFY_IS_TRUE(BufferContainsColor(*_testGetSet->_textBuffer, 255, 0, 0), L"placeholder overlays the virtual image");
+
+        _stateMachine->ProcessString(L"\x1b_Ga=d,d=i,i=1,p=1;\x1b\\"); // lowercase: drop just this virtual placement, keep data
+        _stateMachine->ProcessString(Placeholder()); // a new placeholder must be inert now
+        VERIFY_ARE_EQUAL(0, CountImageRows(*_testGetSet->_textBuffer), L"the virtual placement is gone; a re-printed placeholder is inert");
+
+        _testGetSet->_response.clear();
+        _stateMachine->ProcessString(L"\x1b_Ga=p,i=1;\x1b\\"); // image DATA survived
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=1;OK\x1b\\");
+    }
+
+    // Uppercase single-placement delete (d=I,i=1,p=1) of a VIRTUAL placement drops the grid AND
+    // frees the image data (the image has no placements left) -- the case-gated other half of the
+    // lowercase test above, proving _deletePlacement's freeData path reaches virtual images.
+    TEST_METHOD(KittyGraphicsDeleteUppercaseVirtualPlacementByIdFreesData)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,p=1,f=24,s=1,v=1;/wAA\x1b\\"); // virtual red, placement id 1
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m"); // fg = image id 1
+        _stateMachine->ProcessString(L"\x1b[58:2::0:0:1m"); // underline = placement id 1
+        _stateMachine->ProcessString(Placeholder());
+        VERIFY_IS_TRUE(BufferContainsColor(*_testGetSet->_textBuffer, 255, 0, 0), L"placeholder overlays the virtual image");
+
+        _stateMachine->ProcessString(L"\x1b_Ga=d,d=I,i=1,p=1;\x1b\\"); // uppercase: drop placement AND free data
+        _testGetSet->_response.clear();
+        _stateMachine->ProcessString(L"\x1b_Ga=p,i=1;\x1b\\"); // image DATA freed
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=1;ENOENT:image not found\x1b\\");
+    }
+
+    // Deleting a VIRTUAL placement of an image that ALSO has a NORMAL placement erases only the
+    // virtual placement's retained layer, leaving the sibling normal placement intact.
+    TEST_METHOD(KittyGraphicsDeleteVirtualPlacementKeepsSiblingNormalPlacement)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        auto& buf = *_testGetSet->_textBuffer;
+
+        // A NORMAL placement (1,1) drawn at a known cell (C=1 keeps the cursor put).
+        _pDispatch->CursorPosition(3, 3);
+        const auto normalPos = buf.GetCursor().GetPosition();
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,p=1,f=24,s=1,v=1,C=1;/wAA\x1b\\"); // red, non-virtual
+        const auto* normalSlice = DirectImageSlice(buf, normalPos.y);
+        VERIFY_IS_NOT_NULL(normalSlice);
+        VERIFY_ARE_EQUAL(1u, normalSlice->ColumnOwner(normalPos.x), L"the normal placement (1,1) owns its cell");
+
+        // A VIRTUAL placement (1,2) of the SAME image, shown by a placeholder on a different row.
+        _stateMachine->ProcessString(L"\x1b_Ga=p,U=1,i=1,p=2,c=1,r=1;\x1b\\"); // register the virtual grid + placement (1,2)
+        _pDispatch->CursorPosition(12, 12);
+        const auto phPos = buf.GetCursor().GetPosition();
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m"); // fg = image id 1
+        _stateMachine->ProcessString(L"\x1b[58:2::0:0:2m"); // underline = placement id 2
+        _stateMachine->ProcessString(L"\xDBFB\xDEEE"); // one U+10EEEE placeholder
+        const auto* phSlice = DirectImageSlice(buf, phPos.y);
+        VERIFY_IS_NOT_NULL(phSlice);
+        VERIFY_ARE_EQUAL(1u, phSlice->ColumnOwner(phPos.x), L"the virtual placement's placeholder owns its cell");
+
+        _stateMachine->ProcessString(L"\x1b_Ga=d,d=i,i=1,p=2;\x1b\\"); // lowercase: delete just the virtual placement
+
+        VERIFY_ARE_EQUAL(static_cast<size_t>(0), _kitty()._placements.count({ 1u, 2u }), L"the virtual placement (1,2) is gone");
+        VERIFY_ARE_EQUAL(static_cast<size_t>(1), _kitty()._placements.count({ 1u, 1u }), L"the normal placement (1,1) survives");
+        VERIFY_ARE_EQUAL(static_cast<size_t>(1), _kitty()._images.count(1u), L"lowercase kept the image data");
+        // The invariant we guarantee: the surviving normal placement (1,1) keeps its pixels.
+        const auto* normalAfter = DirectImageSlice(buf, normalPos.y);
+        VERIFY_IS_NOT_NULL(normalAfter);
+        VERIFY_ARE_EQUAL(1u, normalAfter->ColumnOwner(normalPos.x), L"the surviving normal placement (1,1) keeps its pixels");
+        const auto* phAfter = DirectImageSlice(buf, phPos.y);
+        VERIFY_IS_TRUE(phAfter == nullptr || phAfter->ColumnOwner(phPos.x) != 1u, L"only the deleted virtual placement's layer is erased");
+    }
+
+    // Deleting the ONLY (virtual) placement of an image still erases its placeholder pixels even
+    // after the buffer scrolls -- the erase is owner-tag-based (scroll-safe), not anchor-based.
+    TEST_METHOD(KittyGraphicsDeleteVirtualPlacementErasesAfterScroll)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,p=1,f=24,s=1,v=1;/wAA\x1b\\"); // virtual red, placement id 1
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m"); // fg = image id 1
+        _stateMachine->ProcessString(L"\x1b[58:2::0:0:1m"); // underline = placement id 1
+        _stateMachine->ProcessString(Placeholder());
+        VERIFY_IS_TRUE(BufferContainsColor(*_testGetSet->_textBuffer, 255, 0, 0), L"placeholder overlays the virtual image");
+
+        _stateMachine->ProcessString(L"\r\n\r\n"); // scroll the placeholder up a couple rows
+        _stateMachine->ProcessString(L"\x1b_Ga=d,d=i,i=1,p=1;\x1b\\"); // lowercase single-placement delete
+        VERIFY_IS_FALSE(BufferContainsColor(*_testGetSet->_textBuffer, 255, 0, 0), L"the scroll-safe erase clears the placeholder pixels wherever they scrolled");
+    }
+
+    TEST_METHOD(KittyAnonymousVirtualEvictionDropsPlaceholderGrid)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,f=24,s=1,v=1;/wAA\x1b\\");
+        VERIFY_ARE_EQUAL(static_cast<size_t>(1), _kitty()._virtualIds.count({ 1u, 0u }));
+        _kitty()._anonymousPlacements.resize(KittyParser::MaxPlacements);
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=2,f=24,s=1,v=1,C=1;AP8A\x1b\\");
+        VERIFY_ARE_EQUAL(static_cast<size_t>(0), _kitty()._virtualIds.count({ 1u, 0u }), L"physical insertion evicts the anonymous virtual grid with its placement");
+
+        _kitty()._clearImages();
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,f=24,s=1,v=1;/wAA\x1b\\");
+        _kitty()._anonymousPlacements.resize(KittyParser::MaxPlacements);
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=2,f=24,s=1,v=1;AP8A\x1b\\");
+        VERIFY_ARE_EQUAL(static_cast<size_t>(0), _kitty()._virtualIds.count({ 1u, 0u }), L"virtual insertion evicts the anonymous virtual grid with its placement");
+        VERIFY_ARE_EQUAL(static_cast<size_t>(1), _kitty()._virtualIds.count({ 2u, 0u }));
+    }
+
+    TEST_METHOD(KittyAnonymousPhysicalPlacementKeepsVirtualPrototype)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,f=24,s=1,v=1;/wAA\x1b\\");
+        VERIFY_ARE_EQUAL(static_cast<size_t>(1), _kitty()._anonymousPlacements.size());
+        VERIFY_IS_TRUE(_kitty()._anonymousPlacements.front().isVirtual);
+        VERIFY_ARE_EQUAL(static_cast<size_t>(1), _kitty()._virtualIds.count({ 1u, 0u }));
+
+        _stateMachine->ProcessString(L"\x1b_Ga=p,i=1,C=1;\x1b\\");
+        VERIFY_ARE_EQUAL(static_cast<size_t>(2), _kitty()._anonymousPlacements.size());
+        VERIFY_ARE_EQUAL(static_cast<size_t>(1), static_cast<size_t>(std::count_if(_kitty()._anonymousPlacements.begin(), _kitty()._anonymousPlacements.end(), [](const auto& placement) {
+                             return placement.isVirtual;
+                         })));
+        VERIFY_ARE_EQUAL(static_cast<size_t>(1), _kitty()._virtualIds.count({ 1u, 0u }), L"an anonymous physical put must not replace the image's anonymous virtual prototype");
+    }
+
+    // a=T,U=1 stores the image but must NOT draw it at the cursor (virtual placement).
+    TEST_METHOD(KittyVirtualPlacementStoresWithoutDrawing)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,f=24,s=1,v=1;/wAA\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=1;OK\x1b\\");
+        VERIFY_ARE_EQUAL(0, CountImageRows(*_testGetSet->_textBuffer), L"U=1 must store only, not draw at the cursor");
+    }
+
+    // a=p,U=1 against a stored image is also virtual: still no cursor-anchored draw.
+    TEST_METHOD(KittyVirtualPutStoresWithoutDrawing)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1b_Ga=t,i=1,f=24,s=1,v=1;/wAA\x1b\\");
+        _stateMachine->ProcessString(L"\x1b_Ga=p,U=1,i=1;\x1b\\");
+        VERIFY_ARE_EQUAL(0, CountImageRows(*_testGetSet->_textBuffer), L"a=p,U=1 must not draw at the cursor");
+    }
+
+    // A placeholder cell whose fg = image id renders that image's pixel.
+    TEST_METHOD(KittyPlaceholderRendersImage)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,f=24,s=1,v=1;/wAA\x1b\\"); // red, virtual
+        VERIFY_ARE_EQUAL(0, CountImageRows(*_testGetSet->_textBuffer));
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m"); // fg id 1
+        _stateMachine->ProcessString(Placeholder());
+        VERIFY_IS_TRUE(BufferContainsColor(*_testGetSet->_textBuffer, 255, 0, 0), L"placeholder cell must overlay the image pixel");
+        VERIFY_IS_TRUE(CountImageRows(*_testGetSet->_textBuffer) >= 1);
+    }
+
+    // The fg id selects WHICH image: id 2 (green), so red (id 1) must not appear.
+    TEST_METHOD(KittyPlaceholderForegroundSelectsImage)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,f=24,s=1,v=1;/wAA\x1b\\"); // id1 red
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=2,f=24,s=1,v=1;AP8A\x1b\\"); // id2 green
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;2m"); // fg id 2
+        _stateMachine->ProcessString(Placeholder());
+        VERIFY_IS_TRUE(BufferContainsColor(*_testGetSet->_textBuffer, 0, 255, 0), L"id 2 selects the green image");
+        VERIFY_IS_FALSE(BufferContainsColor(*_testGetSet->_textBuffer, 255, 0, 0), L"id 1 must not be drawn");
+    }
+
+    // The image id may also be carried by a 256-color foreground (38;5;N), not just a
+    // 24-bit RGB color. A virtual image stored as id N then renders via a placeholder
+    // whose foreground is the 256-color index N.
+    TEST_METHOD(KittyPlaceholder256ColorForegroundSelectsImage)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=200,f=24,s=1,v=1;AP8A\x1b\\"); // id 200 green
+        _stateMachine->ProcessString(L"\x1b[38;5;200m"); // 256-color fg index 200 = image id 200
+        _stateMachine->ProcessString(Placeholder());
+        VERIFY_IS_TRUE(BufferContainsColor(*_testGetSet->_textBuffer, 0, 255, 0), L"256-color fg index selects image id 200");
+    }
+
+    // A run of placeholders forms a grid; a 2px-wide red|green image with a host cell size of
+    // 1px spans a 2x1 grid, so the left cell is red ONLY and the right cell is green ONLY.
+    // Positional pixel checks (not a whole-row color scan) prove the two tiles are distinct.
+    TEST_METHOD(KittyPlaceholderBlockFormsGrid)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        const auto origin = _testGetSet->_textBuffer->GetCursor().GetPosition();
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,f=24,s=2,v=1;/wAAAP8A\x1b\\"); // 2px: red,green
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m");
+        _stateMachine->ProcessString(Placeholder() + Placeholder());
+        const auto* slice = DirectImageSlice(*_testGetSet->_textBuffer, origin.y);
+        VERIFY_IS_NOT_NULL(slice);
+        VERIFY_IS_TRUE(SlicePixelIs(slice, 0, 0, 255, 0, 0), L"grid col 0 (left cell) = red only");
+        VERIFY_IS_TRUE(SlicePixelIs(slice, 1, 0, 0, 255, 0), L"grid col 1 (right cell) = green only");
+    }
+
+    // Equivalence: the placeholder render must produce the SAME pixels as a direct
+    // a=T,c,r placement of the same image, proving the two independent code paths agree
+    // (this is the basis for the side-by-side screenshot's 0-pixel diff).
+    TEST_METHOD(KittyPlaceholderMatchesDirectRender)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 4, 4 };
+        auto& buf = *_testGetSet->_textBuffer;
+        const auto cell = _testGetSet->_cellSize;
+        const std::wstring payload = L"/wAAAP8AAAD/////"; // 2x2: TL red, TR green, BL blue, BR white
+        const til::CoordType directRow = buf.GetCursor().GetPosition().y;
+        const til::CoordType phRow = directRow + 6;
+
+        // Direct placement (geometry path) at column 0, C=1 so the cursor stays put.
+        buf.GetCursor().SetPosition({ 0, directRow });
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,f=24,s=2,v=2,c=2,r=2,C=1;" + payload + L"\x1b\\");
+
+        // The same image via U=1 + a 2x2 placeholder grid at column 0.
+        _stateMachine->ProcessString(L"\x1b_Ga=t,i=2,U=1,f=24,s=2,v=2,c=2,r=2;" + payload + L"\x1b\\");
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;2m"); // fg = image id 2
+        buf.GetCursor().SetPosition({ 0, phRow });
+        _stateMachine->ProcessString(Placeholder() + L"\x0305" + Placeholder()); // explicit grid row 0, then inherit
+        buf.GetCursor().SetPosition({ 0, phRow + 1 });
+        _stateMachine->ProcessString(Placeholder() + L"\x030D" + Placeholder()); // explicit grid row 1, then inherit
+        _stateMachine->ProcessString(L"\x1b[0m");
+
+        // Every pixel of the 2-cell x 2-row footprint must be identical between the renders.
+        for (til::CoordType r = 0; r < 2; ++r)
+        {
+            const auto* sd = DirectImageSlice(buf, directRow + r);
+            const auto* sp = DirectImageSlice(buf, phRow + r);
+            VERIFY_IS_NOT_NULL(sd, L"direct render produced an image slice");
+            VERIFY_IS_NOT_NULL(sp, L"placeholder render produced an image slice");
+            for (til::CoordType py = 0; py < cell.height; ++py)
+            {
+                for (til::CoordType px = 0; px < 2 * cell.width; ++px)
+                {
+                    const auto a = SlicePixelAt(sd, px, py);
+                    const auto b = SlicePixelAt(sp, px, py);
+                    VERIFY_IS_TRUE(a.rgbRed == b.rgbRed && a.rgbGreen == b.rgbGreen && a.rgbBlue == b.rgbBlue,
+                                   L"placeholder pixel must equal the direct-render pixel");
+                }
+            }
+        }
+    }
+
+    // A relative placement MAY refer to a virtual parent; that parent's position is derived from
+    // the on-screen Unicode-placeholder cells referring to it (min x / min y).
+    TEST_METHOD(KittyRelativeVirtualParentDerivesFromPlaceholders)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        // Virtual parent (id 1, placement 1).
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,p=1,f=24,s=1,v=1;/wAA\x1b\\"); // red, virtual
+        // Give it on-screen presence via a placeholder cell at the cursor.
+        _pDispatch->CursorPosition(5, 5);
+        auto& buf = *_testGetSet->_textBuffer;
+        const auto phPos = buf.GetCursor().GetPosition();
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m"); // fg id 1
+        _stateMachine->ProcessString(L"\x1b[58:2::0:0:1m"); // underline = placement id 1
+        _stateMachine->ProcessString(L"\xDBFB\xDEEE"); // one U+10EEEE placeholder
+        const auto* phSlice = DirectImageSlice(buf, phPos.y);
+        VERIFY_IS_NOT_NULL(phSlice);
+        VERIFY_ARE_EQUAL(1u, phSlice->ColumnOwner(phPos.x), L"virtual parent placeholder owns its cell");
+        // Child relative to the virtual parent, +H=1,+V=1.
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;0m"); // reset fg so the child isn't a placeholder
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=2,p=1,P=1,Q=1,H=1,V=1,f=24,s=1,v=1;AP8A\x1b\\"); // green
+        const auto* childSlice = DirectImageSlice(buf, phPos.y + 1);
+        VERIFY_IS_NOT_NULL(childSlice);
+        VERIFY_ARE_EQUAL(2u, childSlice->ColumnOwner(phPos.x + 1), L"child anchored at virtual-parent min(x,y)+(1,1)");
+    }
+
+    TEST_METHOD(KittyVirtualParentRepaintMovesRelativeChild)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        auto& buffer = *_testGetSet->_textBuffer;
+        const til::point oldParent{ 5, 5 };
+        const til::point newParent{ 12, 9 };
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,p=1,f=24,s=1,v=1;/wAA\x1b\\");
+
+        buffer.GetCursor().SetPosition(oldParent);
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m\x1b[58:2::0:0:1m");
+        _stateMachine->ProcessString(Placeholder());
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;0m");
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=2,p=1,P=1,Q=1,H=1,V=0,f=24,s=1,v=1,C=1;AP8A\x1b\\");
+
+        const til::point oldChild{ oldParent.x + 1, oldParent.y };
+        VERIFY_ARE_EQUAL(2u, DirectImageSlice(buffer, oldChild.y)->ColumnOwner(oldChild.x));
+
+        buffer.GetCursor().SetPosition(oldParent);
+        _stateMachine->ProcessString(L"\x1b[0mX");
+        const auto* removedSlice = DirectImageSlice(buffer, oldChild.y);
+        VERIFY_IS_TRUE(removedSlice == nullptr || removedSlice->ColumnOwner(oldChild.x) != 2u);
+        buffer.GetCursor().SetPosition(newParent);
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m\x1b[58:2::0:0:1m");
+        _stateMachine->ProcessString(Placeholder());
+
+        const auto* oldSlice = DirectImageSlice(buffer, oldChild.y);
+        VERIFY_IS_TRUE(oldSlice == nullptr || oldSlice->ColumnOwner(oldChild.x) != 2u);
+        const til::point newChild{ newParent.x + 1, newParent.y };
+        const auto* newSlice = DirectImageSlice(buffer, newChild.y);
+        VERIFY_IS_NOT_NULL(newSlice);
+        VERIFY_ARE_EQUAL(2u, newSlice->ColumnOwner(newChild.x));
+        const auto& child = _kitty()._placements.at({ 2u, 1u });
+        VERIFY_ARE_EQUAL(newChild.x, child.anchorCol);
+        VERIFY_ARE_EQUAL(newChild.y, child.anchorRow);
+    }
+
+    TEST_METHOD(KittyParentDeletionFailureRestoresNoOrphan)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        auto& buffer = *_testGetSet->_textBuffer;
+        const til::point parent{ 10, 10 };
+        const til::point child{ parent.x + 1, parent.y };
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,p=1,f=24,s=1,v=1;/wAA\x1b\\");
+        buffer.GetCursor().SetPosition(parent);
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m\x1b[58:2::0:0:1m");
+        _stateMachine->ProcessString(Placeholder());
+        const auto parentMetadata = *buffer.GetRowByOffset(parent.y).GetImageCellRef(parent.x);
+        _stateMachine->ProcessString(L"\x1b[0m");
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=2,p=1,P=1,Q=1,H=1,V=0,f=24,s=1,v=1,C=1;AP8A\x1b\\");
+
+        _kitty()._testMovePlacementFailureCountdown = 0;
+        buffer.GetCursor().SetPosition(parent);
+        _stateMachine->ProcessString(L"X");
+
+        const auto* restoredMetadata = buffer.GetRowByOffset(parent.y).GetImageCellRef(parent.x);
+        VERIFY_IS_NOT_NULL(restoredMetadata);
+        VERIFY_ARE_EQUAL(parentMetadata.layerId, restoredMetadata->layerId);
+        VERIFY_ARE_EQUAL(std::wstring{ Placeholder() }, std::wstring{ buffer.GetRowByOffset(parent.y).GlyphAt(parent.x) });
+        VERIFY_ARE_EQUAL(1u, DirectImageSlice(buffer, parent.y)->ColumnOwner(parent.x));
+        VERIFY_ARE_EQUAL(2u, DirectImageSlice(buffer, child.y)->ColumnOwner(child.x));
+        const auto& placement = _kitty()._placements.at({ 2u, 1u });
+        VERIFY_ARE_EQUAL(child.x, placement.anchorCol);
+        VERIFY_ARE_EQUAL(child.y, placement.anchorRow);
+        VERIFY_IS_FALSE(_kitty()._testMovePlacementFailureCountdown.has_value());
+    }
+
+    TEST_METHOD(KittyNewTextNotificationCommitsOnlyAfterImageTransaction)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        auto& buffer = *_testGetSet->_textBuffer;
+        const til::point parent{ 10, 10 };
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,p=1,f=24,s=1,v=1;/wAA\x1b\\");
+        buffer.GetCursor().SetPosition(parent);
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m\x1b[58:2::0:0:1m");
+        _stateMachine->ProcessString(Placeholder());
+        _stateMachine->ProcessString(L"\x1b[0m");
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=2,p=1,P=1,Q=1,H=1,V=0,f=24,s=1,v=1,C=1;AP8A\x1b\\");
+
+        std::vector<std::wstring> notifications;
+        _pDispatch->_testOnNewTextNotification = [&](const std::wstring_view text) {
+            notifications.emplace_back(text);
+        };
+        const auto clearCallback = wil::scope_exit([&] {
+            _pDispatch->_testOnNewTextNotification = {};
+        });
+
+        _kitty()._testMovePlacementFailureCountdown = 0;
+        buffer.GetCursor().SetPosition(parent);
+        _stateMachine->ProcessString(L"X");
+        VERIFY_IS_TRUE(notifications.empty());
+        VERIFY_IS_NOT_NULL(buffer.GetRowByOffset(parent.y).GetImageCellRef(parent.x));
+
+        _stateMachine->ProcessString(L"Y");
+        VERIFY_ARE_EQUAL(size_t{ 1 }, notifications.size());
+        VERIFY_ARE_EQUAL(std::wstring{ L"Y" }, notifications.front());
+    }
+
+    TEST_METHOD(KittyFillAndCopyFailureRestoreRelativePlacement)
+    {
+        const til::point parent{ 10, 10 };
+        const til::point child{ parent.x + 1, parent.y };
+        const auto setup = [&]() {
+            _testGetSet->PrepData();
+            _testGetSet->_cellSize = { 1, 1 };
+            auto& buffer = *_testGetSet->_textBuffer;
+            _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,p=1,f=24,s=1,v=1;/wAA\x1b\\");
+            buffer.GetCursor().SetPosition(parent);
+            _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m\x1b[58:2::0:0:1m");
+            _stateMachine->ProcessString(Placeholder());
+            _stateMachine->ProcessString(L"\x1b[0m");
+            _stateMachine->ProcessString(L"\x1b_Ga=T,i=2,p=1,P=1,Q=1,H=1,V=0,f=24,s=1,v=1,C=1;AP8A\x1b\\");
+        };
+        const auto verify = [&]() {
+            const auto& buffer = *_testGetSet->_textBuffer;
+            VERIFY_ARE_EQUAL(1u, DirectImageSlice(buffer, parent.y)->ColumnOwner(parent.x));
+            VERIFY_ARE_EQUAL(2u, DirectImageSlice(buffer, child.y)->ColumnOwner(child.x));
+            VERIFY_IS_NOT_NULL(buffer.GetRowByOffset(parent.y).GetImageCellRef(parent.x));
+            const auto& placement = _kitty()._placements.at({ 2u, 1u });
+            VERIFY_ARE_EQUAL(child.x, placement.anchorCol);
+            VERIFY_ARE_EQUAL(child.y, placement.anchorRow);
+            VERIFY_IS_FALSE(_kitty()._testMovePlacementFailureCountdown.has_value());
+        };
+
+        setup();
+        const auto page = _pDispatch->_pages.ActivePage();
+        const auto vtRow = parent.y - page.Top() + 1;
+        const auto vtColumn = parent.x + 1;
+        _kitty()._testMovePlacementFailureCountdown = 0;
+        _pDispatch->EraseRectangularArea(vtRow, vtColumn, vtRow, vtColumn);
+        verify();
+
+        setup();
+        const auto destination = til::point{ parent.x - 3, parent.y };
+        _kitty()._testMovePlacementFailureCountdown = 0;
+        _pDispatch->CopyRectangularArea(vtRow, vtColumn, vtRow, vtColumn, 1, vtRow, destination.x + 1, 1);
+        verify();
+        const auto& buffer = *_testGetSet->_textBuffer;
+        VERIFY_IS_NULL(buffer.GetRowByOffset(destination.y).GetImageCellRef(destination.x));
+    }
+
+    TEST_METHOD(KittyVirtualParentInsertMovesRelativeChild)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        auto& buffer = *_testGetSet->_textBuffer;
+        const til::point parent{ 5, 5 };
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,p=1,f=24,s=1,v=1;/wAA\x1b\\");
+
+        buffer.GetCursor().SetPosition(parent);
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m\x1b[58:2::0:0:1m");
+        _stateMachine->ProcessString(Placeholder());
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;0m");
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=2,p=1,P=1,Q=1,H=1,V=0,f=24,s=1,v=1,C=1;AP8A\x1b\\");
+
+        buffer.GetCursor().SetPosition(parent);
+        _stateMachine->ProcessString(L"\x1b[@");
+
+        const til::point movedParent{ parent.x + 1, parent.y };
+        const til::point movedChild{ movedParent.x + 1, movedParent.y };
+        const auto* slice = DirectImageSlice(buffer, movedChild.y);
+        VERIFY_IS_NOT_NULL(slice);
+        VERIFY_ARE_EQUAL(2u, slice->ColumnOwner(movedChild.x));
+        const auto& child = _kitty()._placements.at({ 2u, 1u });
+        VERIFY_ARE_EQUAL(movedChild.x, child.anchorCol);
+        VERIFY_ARE_EQUAL(movedChild.y, child.anchorRow);
+    }
+
+    TEST_METHOD(KittyInsertFailureRestoresVirtualParentAndNegativeChild)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        auto& buffer = *_testGetSet->_textBuffer;
+        const til::point textPosition{ 1, 1 };
+        const til::point parent{ 5, 5 };
+        const til::point child{ parent.x - 1, parent.y };
+        buffer.GetCursor().SetPosition(textPosition);
+        _stateMachine->ProcessString(L"K");
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,p=1,f=24,s=1,v=1;/wAA\x1b\\");
+        buffer.GetCursor().SetPosition(parent);
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m\x1b[58:2::0:0:1m");
+        _stateMachine->ProcessString(Placeholder());
+        const auto parentMetadata = *buffer.GetRowByOffset(parent.y).GetImageCellRef(parent.x);
+        _stateMachine->ProcessString(L"\x1b[0m");
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=2,p=1,P=1,Q=1,H=-1,V=0,f=24,s=1,v=1,C=1;AP8A\x1b\\");
+        VERIFY_ARE_EQUAL(2u, DirectImageSlice(buffer, child.y)->ColumnOwner(child.x));
+
+        _kitty()._testMovePlacementFailureCountdown = 0;
+        buffer.GetCursor().SetPosition(parent);
+        _stateMachine->ProcessString(L"\x1b[@");
+
+        const auto* restoredMetadata = buffer.GetRowByOffset(parent.y).GetImageCellRef(parent.x);
+        VERIFY_IS_NOT_NULL(restoredMetadata);
+        VERIFY_ARE_EQUAL(parentMetadata.layerId, restoredMetadata->layerId);
+        VERIFY_ARE_EQUAL(1u, DirectImageSlice(buffer, parent.y)->ColumnOwner(parent.x));
+        VERIFY_ARE_EQUAL(2u, DirectImageSlice(buffer, child.y)->ColumnOwner(child.x));
+        VERIFY_IS_NULL(buffer.GetRowByOffset(parent.y).GetImageCellRef(parent.x + 1));
+        VERIFY_ARE_EQUAL(std::wstring{ Placeholder() }, std::wstring{ buffer.GetRowByOffset(parent.y).GlyphAt(parent.x) });
+        VERIFY_ARE_EQUAL(L'K', buffer.GetRowByOffset(textPosition.y).GlyphAt(textPosition.x).front());
+        const auto& placement = _kitty()._placements.at({ 2u, 1u });
+        VERIFY_ARE_EQUAL(child.x, placement.anchorCol);
+        VERIFY_ARE_EQUAL(child.y, placement.anchorRow);
+        VERIFY_IS_FALSE(_kitty()._testMovePlacementFailureCountdown.has_value());
+    }
+
+    TEST_METHOD(KittyMutationJournalKeepsUntouchedRowsLazy)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        auto& buffer = *_testGetSet->_textBuffer;
+        const til::point parent{ 5, 5 };
+        const til::point child{ parent.x - 1, parent.y };
+        constexpr auto untouchedRow = til::CoordType{ 500 };
+        VERIFY_IS_FALSE(buffer._isRowCommitted(untouchedRow));
+
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,p=1,f=24,s=1,v=1;/wAA\x1b\\");
+        buffer.GetCursor().SetPosition(parent);
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m\x1b[58:2::0:0:1m");
+        _stateMachine->ProcessString(Placeholder());
+        _stateMachine->ProcessString(L"\x1b[0m");
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=2,p=1,P=1,Q=1,H=-1,V=0,f=24,s=1,v=1,C=1;AP8A\x1b\\");
+
+        _kitty()._testMovePlacementFailureCountdown = 0;
+        buffer.GetCursor().SetPosition(parent);
+        _stateMachine->ProcessString(L"\x1b[@");
+
+        VERIFY_ARE_EQUAL(2u, DirectImageSlice(buffer, child.y)->ColumnOwner(child.x));
+        VERIFY_IS_FALSE(buffer._isRowCommitted(untouchedRow));
+    }
+
+    TEST_METHOD(KittyWrappedWriteExceptionRestoresRowsAndCursor)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        auto& buffer = *_testGetSet->_textBuffer;
+        const til::point parent{ 10, 5 };
+        const til::point child{ parent.x + 1, parent.y };
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,p=1,f=24,s=1,v=1;/wAA\x1b\\");
+        buffer.GetCursor().SetPosition(parent);
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m\x1b[58:2::0:0:1m");
+        _stateMachine->ProcessString(Placeholder());
+        _stateMachine->ProcessString(L"\x1b[0m");
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=2,p=1,P=1,Q=1,H=1,V=0,f=24,s=1,v=1,C=1;AP8A\x1b\\");
+
+        const til::point writeStart{ buffer.GetSize().Width() - 2, parent.y };
+        buffer.GetCursor().SetPosition(writeStart);
+        const auto cursorBefore = buffer.GetCursor().GetPosition();
+        _pDispatch->_testThrowAfterRowMutationCountdown = 1;
+        VERIFY_THROWS(_pDispatch->PrintString(L"ABC"), std::bad_alloc);
+
+        VERIFY_ARE_EQUAL(cursorBefore, buffer.GetCursor().GetPosition());
+        VERIFY_IS_NOT_NULL(buffer.GetRowByOffset(parent.y).GetImageCellRef(parent.x));
+        VERIFY_ARE_EQUAL(1u, DirectImageSlice(buffer, parent.y)->ColumnOwner(parent.x));
+        VERIFY_ARE_EQUAL(2u, DirectImageSlice(buffer, child.y)->ColumnOwner(child.x));
+        VERIFY_ARE_EQUAL(L' ', buffer.GetRowByOffset(writeStart.y).GlyphAt(writeStart.x).front());
+        VERIFY_ARE_EQUAL(L' ', buffer.GetRowByOffset(writeStart.y + 1).GlyphAt(0).front());
+        VERIFY_IS_FALSE(_pDispatch->_testThrowAfterRowMutationCountdown.has_value());
+    }
+
+    TEST_METHOD(KittyStandaloneCircularLineFeedTransactionsDescendantsAndNotifications)
+    {
+        const til::point parent{ 0, 0 };
+        const til::point child{ 1, 5 };
+        const til::point cursorAtBottom{ 0, 9 };
+        const auto setup = [&]() {
+            _testGetSet->PrepData();
+            _testGetSet->_cellSize = { 1, 1 };
+            _testGetSet->_textBuffer = std::make_unique<TextBuffer>(
+                til::size{ 4, 10 },
+                TextAttribute{},
+                0,
+                false,
+                &_testGetSet->_renderer);
+            _testGetSet->_viewport = { 0, 0, 4, 10 };
+            auto& buffer = *_testGetSet->_textBuffer;
+            _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,p=1,f=24,s=1,v=1;/wAA\x1b\\");
+            buffer.GetCursor().SetPosition(parent);
+            _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m\x1b[58:2::0:0:1m");
+            _stateMachine->ProcessString(Placeholder());
+            _stateMachine->ProcessString(L"\x1b[0m");
+            _stateMachine->ProcessString(L"\x1b_Ga=T,i=2,p=1,P=1,Q=1,H=1,V=5,f=24,s=1,v=1,C=1;AP8A\x1b\\");
+            buffer.GetCursor().SetPosition(cursorAtBottom);
+        };
+        const auto childVisible = [&]() {
+            const auto& buffer = *_testGetSet->_textBuffer;
+            for (auto row = 0; row < buffer.GetSize().Height(); ++row)
+            {
+                if (const auto* slice = DirectImageSlice(buffer, row); slice && slice->Contains(2))
+                {
+                    return true;
+                }
+            }
+            return false;
+        };
+
+        setup();
+        _pDispatch->LineFeed(DispatchTypes::LineFeedType::WithoutReturn);
+        VERIFY_ARE_EQUAL(size_t{ 1 }, _testGetSet->_bufferRotations.size());
+        VERIFY_ARE_EQUAL(1, _testGetSet->_bufferRotations.front());
+        VERIFY_IS_TRUE(_testGetSet->_viewportPositions.empty());
+        VERIFY_IS_FALSE(childVisible());
+
+        setup();
+        auto& buffer = *_testGetSet->_textBuffer;
+        const auto firstRow = buffer.GetFirstRowIndex();
+        _kitty()._testMovePlacementFailureCountdown = 0;
+        _pDispatch->LineFeed(DispatchTypes::LineFeedType::WithoutReturn);
+        VERIFY_ARE_EQUAL(firstRow, buffer.GetFirstRowIndex());
+        VERIFY_ARE_EQUAL(cursorAtBottom, buffer.GetCursor().GetPosition());
+        VERIFY_IS_NOT_NULL(buffer.GetRowByOffset(parent.y).GetImageCellRef(parent.x));
+        VERIFY_ARE_EQUAL(1u, DirectImageSlice(buffer, parent.y)->ColumnOwner(parent.x));
+        VERIFY_ARE_EQUAL(2u, DirectImageSlice(buffer, child.y)->ColumnOwner(child.x));
+        VERIFY_IS_TRUE(_testGetSet->_bufferRotations.empty());
+        VERIFY_IS_TRUE(_testGetSet->_viewportPositions.empty());
+    }
+
+    TEST_METHOD(KittyStandaloneLineFeedCommitsViewportNotificationOnce)
+    {
+        const auto setup = [&]() {
+            _testGetSet->PrepData();
+            _testGetSet->_cellSize = { 1, 1 };
+            auto& buffer = *_testGetSet->_textBuffer;
+            const auto page = _pDispatch->_pages.ActivePage();
+            const til::point parent{ 20, page.Bottom() - 1 };
+            const til::point child{ parent.x + 1, parent.y };
+            _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,p=1,f=24,s=1,v=1;/wAA\x1b\\");
+            buffer.GetCursor().SetPosition(parent);
+            _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m\x1b[58:2::0:0:1m");
+            _stateMachine->ProcessString(Placeholder());
+            _stateMachine->ProcessString(L"\x1b[0m");
+            _stateMachine->ProcessString(L"\x1b_Ga=T,i=2,p=1,P=1,Q=1,H=1,V=0,f=24,s=1,v=1,C=1;AP8A\x1b\\");
+            const til::point wrapStart{ page.Width() - 1, page.Bottom() - 1 };
+            buffer.GetCursor().SetPosition(wrapStart);
+            _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m\x1b[58:2::0:0:1m");
+            return std::tuple{ page, parent, child, wrapStart };
+        };
+
+        {
+            auto [page, parent, child, wrapStart] = setup();
+            auto& buffer = *_testGetSet->_textBuffer;
+            const auto newRow = page.Bottom();
+            VERIFY_IS_NULL(buffer.GetRowByOffset(newRow).GetImageCellRef(0));
+            const auto* before = DirectImageSlice(buffer, newRow);
+            VERIFY_IS_TRUE(before == nullptr || before->ColumnOwner(0) != 1u);
+
+            _stateMachine->ProcessString(std::wstring{ L"X" } + Placeholder());
+
+            VERIFY_ARE_EQUAL(size_t{ 1 }, _testGetSet->_viewportPositions.size());
+            const til::point expectedViewportPosition{ page.XPanOffset(), page.Top() + 1 };
+            VERIFY_ARE_EQUAL(expectedViewportPosition, _testGetSet->_viewportPositions.front());
+            VERIFY_IS_TRUE(_testGetSet->_bufferRotations.empty());
+            VERIFY_IS_NOT_NULL(buffer.GetRowByOffset(newRow).GetImageCellRef(0));
+            VERIFY_ARE_EQUAL(1u, DirectImageSlice(buffer, newRow)->ColumnOwner(0));
+            const auto& placement = _kitty()._placements.at({ 2u, 1u });
+            VERIFY_ARE_EQUAL(1, placement.anchorCol);
+            VERIFY_ARE_EQUAL(parent.y, placement.anchorRow);
+            VERIFY_ARE_EQUAL(2u, DirectImageSlice(buffer, child.y)->ColumnOwner(1));
+        }
+
+        {
+            auto [page, parent, child, wrapStart] = setup();
+            auto& buffer = *_testGetSet->_textBuffer;
+            const auto oldViewport = _testGetSet->_viewport;
+            const auto newRow = page.Bottom();
+            _kitty()._testPersistentMovePlacementFailure = true;
+            _stateMachine->ProcessString(std::wstring{ L"X" } + Placeholder());
+            _kitty()._testPersistentMovePlacementFailure = false;
+
+            VERIFY_ARE_EQUAL(oldViewport, _testGetSet->_viewport);
+            VERIFY_ARE_EQUAL(wrapStart, buffer.GetCursor().GetPosition());
+            VERIFY_IS_NULL(buffer.GetRowByOffset(newRow).GetImageCellRef(0));
+            VERIFY_ARE_EQUAL(1u, DirectImageSlice(buffer, parent.y)->ColumnOwner(parent.x));
+            VERIFY_ARE_EQUAL(2u, DirectImageSlice(buffer, child.y)->ColumnOwner(child.x));
+            const auto& placement = _kitty()._placements.at({ 2u, 1u });
+            VERIFY_ARE_EQUAL(child.x, placement.anchorCol);
+            VERIFY_ARE_EQUAL(child.y, placement.anchorRow);
+            VERIFY_IS_TRUE(_testGetSet->_viewportPositions.empty());
+            VERIFY_IS_TRUE(_testGetSet->_bufferRotations.empty());
+        }
+    }
+
+    TEST_METHOD(KittyVirtualParentMovesAnonymousSiblingChildrenWithSharedImageId)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        auto& buffer = *_testGetSet->_textBuffer;
+        const til::point textPosition{ 1, 1 };
+        const til::point oldParent{ 10, 10 };
+        const til::point newParent{ 20, 15 };
+        buffer.GetCursor().SetPosition(textPosition);
+        _stateMachine->ProcessString(L"K");
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,p=1,f=24,s=1,v=1;/wAA\x1b\\");
+
+        buffer.GetCursor().SetPosition(oldParent);
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m\x1b[58:2::0:0:1m");
+        _stateMachine->ProcessString(Placeholder());
+        _stateMachine->ProcessString(L"\x1b[0m");
+        _stateMachine->ProcessString(L"\x1b_Ga=t,i=2,f=24,s=1,v=1;AP8A\x1b\\");
+        _stateMachine->ProcessString(L"\x1b_Ga=p,i=2,P=1,Q=1,H=1,V=0,c=1,r=1,C=1;\x1b\\");
+        _stateMachine->ProcessString(L"\x1b_Ga=p,i=2,P=1,Q=1,H=3,V=1,c=1,r=1,C=1;\x1b\\");
+
+        VERIFY_ARE_EQUAL(size_t{ 2 }, _kitty()._anonymousPlacements.size());
+        const auto firstLayer = _kitty()._anonymousPlacements[0].layerId;
+        const auto secondLayer = _kitty()._anonymousPlacements[1].layerId;
+        VERIFY_ARE_NOT_EQUAL(firstLayer, secondLayer);
+
+        const til::point prototype{ 50, 5 };
+        _stateMachine->ProcessString(L"\x1b_Ga=p,U=1,i=2,c=1,r=1;\x1b\\");
+        buffer.GetCursor().SetPosition(prototype);
+        _stateMachine->ProcessString(L"\x1b[0m\x1b[38;2;0;0;2m");
+        _stateMachine->ProcessString(Placeholder());
+        _stateMachine->ProcessString(L"\x1b[0m");
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=3,p=1,P=2,Q=0,H=1,V=0,f=24,s=1,v=1,C=1;AAD/\x1b\\");
+        const til::point prototypeChild{ prototype.x + 1, prototype.y };
+        VERIFY_ARE_EQUAL(3u, DirectImageSlice(buffer, prototypeChild.y)->ColumnOwner(prototypeChild.x));
+
+        buffer.GetCursor().SetPosition(oldParent);
+        _stateMachine->ProcessString(L"X");
+        buffer.GetCursor().SetPosition(newParent);
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m\x1b[58:2::0:0:1m");
+        _stateMachine->ProcessString(Placeholder());
+
+        const til::point firstChild{ newParent.x + 1, newParent.y };
+        const til::point secondChild{ newParent.x + 3, newParent.y + 1 };
+        const auto* firstSlice = DirectImageSlice(buffer, firstChild.y);
+        const auto* secondSlice = DirectImageSlice(buffer, secondChild.y);
+        VERIFY_IS_NOT_NULL(firstSlice);
+        VERIFY_IS_NOT_NULL(secondSlice);
+        VERIFY_IS_TRUE(firstSlice->PlacementCoversColumn(firstLayer, firstChild.x));
+        VERIFY_IS_TRUE(secondSlice->PlacementCoversColumn(secondLayer, secondChild.x));
+        const auto& firstPlacement = _kitty()._anonymousPlacements[0];
+        const auto& secondPlacement = _kitty()._anonymousPlacements[1];
+        VERIFY_ARE_EQUAL(firstChild.x, firstPlacement.anchorCol);
+        VERIFY_ARE_EQUAL(firstChild.y, firstPlacement.anchorRow);
+        VERIFY_ARE_EQUAL(secondChild.x, secondPlacement.anchorCol);
+        VERIFY_ARE_EQUAL(secondChild.y, secondPlacement.anchorRow);
+        VERIFY_ARE_EQUAL(1, firstPlacement.cols);
+        VERIFY_ARE_EQUAL(1, firstPlacement.rows);
+        VERIFY_ARE_EQUAL(1, secondPlacement.cols);
+        VERIFY_ARE_EQUAL(1, secondPlacement.rows);
+        VERIFY_IS_TRUE(_testGetSet->_response.find(L"ECYCLE") == std::wstring::npos);
+        VERIFY_ARE_EQUAL(3u, DirectImageSlice(buffer, prototypeChild.y)->ColumnOwner(prototypeChild.x));
+        const auto& prototypePlacement = _kitty()._placements.at({ 3u, 1u });
+        VERIFY_ARE_EQUAL(prototypeChild.x, prototypePlacement.anchorCol);
+        VERIFY_ARE_EQUAL(prototypeChild.y, prototypePlacement.anchorRow);
+        VERIFY_ARE_EQUAL(L'K', buffer.GetRowByOffset(textPosition.y).GlyphAt(textPosition.x).front());
+    }
+
+    TEST_METHOD(KittyVirtualParentRepaintMovesRecursiveNamedDescendants)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        auto& buffer = *_testGetSet->_textBuffer;
+        const til::point textPosition{ 1, 1 };
+        const til::point oldParent{ 10, 10 };
+        const til::point newParent{ 20, 15 };
+        buffer.GetCursor().SetPosition(textPosition);
+        _stateMachine->ProcessString(L"K");
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,p=1,f=24,s=1,v=1;/wAA\x1b\\");
+
+        buffer.GetCursor().SetPosition(oldParent);
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m\x1b[58:2::0:0:1m");
+        _stateMachine->ProcessString(Placeholder());
+        _stateMachine->ProcessString(L"\x1b[0m");
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=2,p=1,P=1,Q=1,H=1,V=0,f=24,s=1,v=1,C=1;AP8A\x1b\\");
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=3,p=1,P=2,Q=1,H=1,V=1,f=24,s=1,v=1,C=1;AAD/\x1b\\");
+
+        const til::point oldChild{ oldParent.x + 1, oldParent.y };
+        const til::point oldGrandchild{ oldParent.x + 2, oldParent.y + 1 };
+        VERIFY_ARE_EQUAL(2u, DirectImageSlice(buffer, oldChild.y)->ColumnOwner(oldChild.x));
+        VERIFY_ARE_EQUAL(3u, DirectImageSlice(buffer, oldGrandchild.y)->ColumnOwner(oldGrandchild.x));
+
+        buffer.GetCursor().SetPosition(oldParent);
+        _stateMachine->ProcessString(L"\x1b[0mX");
+        const auto* oldChildSlice = DirectImageSlice(buffer, oldChild.y);
+        const auto* oldGrandchildSlice = DirectImageSlice(buffer, oldGrandchild.y);
+        VERIFY_IS_TRUE(oldChildSlice == nullptr || oldChildSlice->ColumnOwner(oldChild.x) != 2u);
+        VERIFY_IS_TRUE(oldGrandchildSlice == nullptr || oldGrandchildSlice->ColumnOwner(oldGrandchild.x) != 3u);
+
+        buffer.GetCursor().SetPosition(newParent);
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m\x1b[58:2::0:0:1m");
+        _stateMachine->ProcessString(Placeholder());
+
+        const til::point newChild{ newParent.x + 1, newParent.y };
+        const til::point newGrandchild{ newParent.x + 2, newParent.y + 1 };
+        VERIFY_ARE_EQUAL(2u, DirectImageSlice(buffer, newChild.y)->ColumnOwner(newChild.x));
+        VERIFY_ARE_EQUAL(3u, DirectImageSlice(buffer, newGrandchild.y)->ColumnOwner(newGrandchild.x));
+        const auto& child = _kitty()._placements.at({ 2u, 1u });
+        const auto& grandchild = _kitty()._placements.at({ 3u, 1u });
+        VERIFY_ARE_EQUAL(newChild.x, child.anchorCol);
+        VERIFY_ARE_EQUAL(newChild.y, child.anchorRow);
+        VERIFY_ARE_EQUAL(newGrandchild.x, grandchild.anchorCol);
+        VERIFY_ARE_EQUAL(newGrandchild.y, grandchild.anchorRow);
+        VERIFY_ARE_EQUAL(L'K', buffer.GetRowByOffset(textPosition.y).GlyphAt(textPosition.x).front());
+    }
+
+    TEST_METHOD(KittyVirtualParentReflowMovesRelativeChild)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        auto& buffer = *_testGetSet->_textBuffer;
+        const auto origin = buffer.GetCursor().GetPosition();
+        const til::point parent{ origin.x + 10, origin.y };
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,p=1,f=24,s=1,v=1;/wAA\x1b\\");
+
+        buffer.GetCursor().SetPosition(parent);
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m\x1b[58:2::0:0:1m");
+        _stateMachine->ProcessString(Placeholder());
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;0m");
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=2,p=1,P=1,Q=1,H=1,V=0,f=24,s=1,v=1,C=1;AP8A\x1b\\");
+
+        auto reflowed = std::make_unique<TextBuffer>(til::size{ 5, 600 }, TextAttribute{}, 0, false, &_testGetSet->_renderer);
+        TextBuffer::Reflow(buffer, *reflowed);
+        _testGetSet->_textBuffer = std::move(reflowed);
+
+        const auto parentLayer = _kitty()._virtualIds.at({ 1u, 1u }).layerId;
+        auto foundParent = false;
+        til::point reflowedParent;
+        for (auto y = 0; y < _testGetSet->_textBuffer->GetSize().Height() && !foundParent; ++y)
+        {
+            const auto& row = _testGetSet->_textBuffer->GetRowByOffset(y);
+            for (auto x = 0; x < _testGetSet->_textBuffer->GetSize().Width(); ++x)
+            {
+                if (const auto metadata = row.GetImageCellRef(x);
+                    metadata && metadata->layerId == parentLayer)
+                {
+                    reflowedParent = { x, y };
+                    foundParent = true;
+                    break;
+                }
+            }
+        }
+
+        VERIFY_IS_TRUE(foundParent);
+        const auto* copiedChild = DirectImageSlice(*_testGetSet->_textBuffer, reflowedParent.y);
+        VERIFY_IS_NOT_NULL(copiedChild);
+        VERIFY_ARE_EQUAL(2u, copiedChild->ColumnOwner(reflowedParent.x + 1), L"reflow keeps the child contiguous with its parent");
+        VERIFY_IS_TRUE(_pDispatch->SynchronizeImagePlacements());
+        const auto parentAnchor = _kitty()._deriveVirtualPlacementAnchor(1, 1);
+        VERIFY_IS_TRUE(parentAnchor.has_value());
+        const auto& child = _kitty()._placements.at({ 2u, 1u });
+        VERIFY_ARE_EQUAL(parentAnchor->x + 1, child.anchorCol);
+        VERIFY_ARE_EQUAL(parentAnchor->y, child.anchorRow);
+        const auto* slice = DirectImageSlice(*_testGetSet->_textBuffer, child.anchorRow);
+        VERIFY_IS_NOT_NULL(slice);
+        VERIFY_ARE_EQUAL(2u, slice->ColumnOwner(child.anchorCol));
+    }
+
+    TEST_METHOD(KittyVirtualParentWrappedReflowMovesRelativeChild)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        auto& buffer = *_testGetSet->_textBuffer;
+        const auto origin = buffer.GetCursor().GetPosition();
+        const til::point parent{ origin.x + 1, origin.y + 1 };
+        buffer.GetCursor().SetPosition(origin);
+        _stateMachine->ProcessString(L"A");
+        buffer.GetMutableRowByOffset(origin.y).SetWrapForced(true);
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,p=1,f=24,s=1,v=1;/wAA\x1b\\");
+
+        buffer.GetCursor().SetPosition(parent);
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m\x1b[58:2::0:0:1m");
+        _stateMachine->ProcessString(Placeholder());
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;0m");
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=2,p=1,P=1,Q=1,H=1,V=0,f=24,s=1,v=1,C=1;AP8A\x1b\\");
+
+        auto reflowed = std::make_unique<TextBuffer>(
+            til::size{ buffer.GetSize().Width() * 2, buffer.GetSize().Height() },
+            TextAttribute{},
+            0,
+            false,
+            &_testGetSet->_renderer);
+        TextBuffer::Reflow(buffer, *reflowed);
+        _testGetSet->_textBuffer = std::move(reflowed);
+
+        const auto parentLayer = _kitty()._virtualIds.at({ 1u, 1u }).layerId;
+        auto foundParent = false;
+        til::point reflowedParent;
+        for (auto y = 0; y < _testGetSet->_textBuffer->GetSize().Height() && !foundParent; ++y)
+        {
+            const auto& row = _testGetSet->_textBuffer->GetRowByOffset(y);
+            for (auto x = 0; x < _testGetSet->_textBuffer->GetSize().Width(); ++x)
+            {
+                if (const auto metadata = row.GetImageCellRef(x);
+                    metadata && metadata->layerId == parentLayer)
+                {
+                    reflowedParent = { x, y };
+                    foundParent = true;
+                    break;
+                }
+            }
+        }
+
+        VERIFY_IS_TRUE(foundParent);
+        const auto* copiedChild = DirectImageSlice(*_testGetSet->_textBuffer, reflowedParent.y);
+        VERIFY_IS_NOT_NULL(copiedChild);
+        VERIFY_ARE_EQUAL(2u, copiedChild->ColumnOwner(reflowedParent.x + 1), L"wrapped reflow keeps the child contiguous with its parent");
+        VERIFY_IS_TRUE(_pDispatch->SynchronizeImagePlacements());
+        const auto parentAnchor = _kitty()._deriveVirtualPlacementAnchor(1, 1);
+        VERIFY_IS_TRUE(parentAnchor.has_value());
+        const auto& child = _kitty()._placements.at({ 2u, 1u });
+        VERIFY_ARE_EQUAL(parentAnchor->x + 1, child.anchorCol);
+        VERIFY_ARE_EQUAL(parentAnchor->y, child.anchorRow);
+        const auto* slice = DirectImageSlice(*_testGetSet->_textBuffer, child.anchorRow);
+        VERIFY_IS_NOT_NULL(slice);
+        VERIFY_ARE_EQUAL(2u, slice->ColumnOwner(child.anchorCol));
+    }
+
+    TEST_METHOD(KittyMainBufferRestoreSynchronizesRelativeDescendants)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        auto& buffer = *_testGetSet->_textBuffer;
+        const til::point parent{ 10, 10 };
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,p=1,f=24,s=1,v=1;/wAA\x1b\\");
+        buffer.GetCursor().SetPosition(parent);
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m\x1b[58:2::0:0:1m");
+        _stateMachine->ProcessString(Placeholder());
+        _stateMachine->ProcessString(L"\x1b[0m");
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=2,p=1,P=1,Q=1,H=1,V=0,f=24,s=1,v=1,C=1;AP8A\x1b\\");
+
+        auto mainImages = buffer.GetImages().Snapshot();
+        _kitty().SaveMainBufferState();
+        _kitty().DiscardBufferState();
+        buffer.GetMutableImages() = std::move(mainImages);
+        buffer.GetMutableImages().Translate({ 2, 0 });
+        _kitty().RestoreMainBufferState();
+
+        VERIFY_IS_TRUE(_pDispatch->SynchronizeImagePlacements());
+        const til::point restoredParent{ parent.x + 2, parent.y };
+        const til::point restoredChild{ restoredParent.x + 1, restoredParent.y };
+        const auto& child = _kitty()._placements.at({ 2u, 1u });
+        VERIFY_ARE_EQUAL(restoredChild.x, child.anchorCol);
+        VERIFY_ARE_EQUAL(restoredChild.y, child.anchorRow);
+        const auto* slice = DirectImageSlice(buffer, restoredChild.y);
+        VERIFY_IS_NOT_NULL(slice);
+        VERIFY_ARE_EQUAL(2u, slice->ColumnOwner(restoredChild.x));
+    }
+
+    TEST_METHOD(KittyPersistentMainRestoreFailureRestoresCursorAndFailsClosed)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        auto& buffer = *_testGetSet->_textBuffer;
+        const til::point mainCursor{ 2, 22 };
+        const til::point parent{ 10, 10 };
+        buffer.GetCursor().SetPosition(mainCursor);
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,p=1,f=24,s=1,v=1;/wAA\x1b\\");
+        buffer.GetCursor().SetPosition(parent);
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m\x1b[58:2::0:0:1m");
+        _stateMachine->ProcessString(Placeholder());
+        _stateMachine->ProcessString(L"\x1b[0m");
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=2,p=1,P=1,Q=1,H=1,V=0,f=24,s=1,v=1,C=1;AP8A\x1b\\");
+        buffer.GetCursor().SetPosition(mainCursor);
+
+        const auto parentLayer = _kitty()._virtualIds.at({ 1u, 1u }).layerId;
+        const ImagePlacement::Key parentKey{ 1u, parentLayer, ImagePlacement::Key::Protocol::Kitty };
+        auto mainImages = buffer.GetImages().Snapshot();
+        const auto parentFragment = *std::ranges::find_if(mainImages.All(), [&](const auto& placement) {
+            return placement.Identity() == parentKey;
+        });
+
+        _pDispatch->_SetAlternateScreenBufferMode(true);
+        mainImages.Erase(parentKey);
+        mainImages.Add(parentFragment.Translated({ 3, 0 }));
+        _testGetSet->_mainImagesOnUseMain = std::make_unique<ImageCollection>(std::move(mainImages));
+        buffer.GetCursor().SetPosition({ 20, 20 });
+        _kitty()._testPersistentMovePlacementFailure = true;
+
+        VERIFY_THROWS(_pDispatch->_SetAlternateScreenBufferMode(false), wil::ResultException);
+        VERIFY_IS_FALSE(_pDispatch->_usingAltBuffer);
+        VERIFY_ARE_EQUAL(mainCursor, buffer.GetCursor().GetPosition());
+        VERIFY_IS_TRUE(_kitty()._images.empty());
+        VERIFY_IS_TRUE(buffer.GetImages().Empty());
+
+        _kitty()._testPersistentMovePlacementFailure = false;
+        VERIFY_NO_THROW(_pDispatch->_SetAlternateScreenBufferMode(false));
+        VERIFY_ARE_EQUAL(mainCursor, buffer.GetCursor().GetPosition());
+    }
+
+    TEST_METHOD(KittySynchronizeReportsAndRollsBackDescendantFailure)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        auto& buffer = *_testGetSet->_textBuffer;
+        const til::point parent{ 10, 10 };
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,p=1,f=24,s=1,v=1;/wAA\x1b\\");
+        buffer.GetCursor().SetPosition(parent);
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m\x1b[58:2::0:0:1m");
+        _stateMachine->ProcessString(Placeholder());
+        _stateMachine->ProcessString(L"\x1b[0m");
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=2,p=1,P=1,Q=1,H=1,V=0,f=24,s=1,v=1,C=1;AP8A\x1b\\");
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=3,p=1,P=2,Q=1,H=1,V=1,f=24,s=1,v=1,C=1;AAD/\x1b\\");
+        const til::point oldChild{ parent.x + 1, parent.y };
+        const til::point oldGrandchild{ parent.x + 2, parent.y + 1 };
+
+        const auto parentLayer = _kitty()._virtualIds.at({ 1u, 1u }).layerId;
+        const ImagePlacement::Key parentKey{ 1u, parentLayer, ImagePlacement::Key::Protocol::Kitty };
+        const auto parentFragment = *std::ranges::find_if(buffer.GetImages().All(), [&](const auto& placement) {
+            return placement.Identity() == parentKey;
+        });
+        buffer.GetMutableImages().Erase(parentKey);
+        buffer.GetMutableImages().Add(parentFragment.Translated({ 5, 0 }));
+
+        _kitty()._testMovePlacementFailureCountdown = 1;
+        VERIFY_IS_FALSE(_pDispatch->SynchronizeImagePlacements());
+        VERIFY_IS_FALSE(_kitty()._testMovePlacementFailureCountdown.has_value());
+        VERIFY_ARE_EQUAL(2u, DirectImageSlice(buffer, oldChild.y)->ColumnOwner(oldChild.x));
+        VERIFY_ARE_EQUAL(3u, DirectImageSlice(buffer, oldGrandchild.y)->ColumnOwner(oldGrandchild.x));
+        const auto& child = _kitty()._placements.at({ 2u, 1u });
+        const auto& grandchild = _kitty()._placements.at({ 3u, 1u });
+        VERIFY_ARE_EQUAL(oldChild.x, child.anchorCol);
+        VERIFY_ARE_EQUAL(oldChild.y, child.anchorRow);
+        VERIFY_ARE_EQUAL(oldGrandchild.x, grandchild.anchorCol);
+        VERIFY_ARE_EQUAL(oldGrandchild.y, grandchild.anchorRow);
+    }
+
+    TEST_METHOD(KittyVirtualParentMultiFragmentRepaintMovesRelativeChild)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        auto& buffer = *_testGetSet->_textBuffer;
+        const til::point firstParent{ 12, 5 };
+        const til::point secondParent{ 3, 8 };
+        const til::point replacementParent{ 14, 10 };
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,p=1,f=24,s=1,v=1;/wAA\x1b\\");
+
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m\x1b[58:2::0:0:1m");
+        buffer.GetCursor().SetPosition(firstParent);
+        _stateMachine->ProcessString(Placeholder());
+        buffer.GetCursor().SetPosition(secondParent);
+        _stateMachine->ProcessString(Placeholder());
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;0m");
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=2,p=1,P=1,Q=1,H=1,V=0,f=24,s=1,v=1,C=1;AP8A\x1b\\");
+
+        const til::point oldChild{ secondParent.x + 1, firstParent.y };
+        VERIFY_ARE_EQUAL(2u, DirectImageSlice(buffer, oldChild.y)->ColumnOwner(oldChild.x));
+
+        buffer.GetCursor().SetPosition(secondParent);
+        _stateMachine->ProcessString(L"\x1b[0mX");
+        buffer.GetCursor().SetPosition(replacementParent);
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m\x1b[58:2::0:0:1m");
+        _stateMachine->ProcessString(Placeholder());
+
+        const til::point newChild{ firstParent.x + 1, firstParent.y };
+        const auto* oldSlice = DirectImageSlice(buffer, oldChild.y);
+        VERIFY_IS_TRUE(oldSlice == nullptr || oldSlice->ColumnOwner(oldChild.x) != 2u);
+        const auto* newSlice = DirectImageSlice(buffer, newChild.y);
+        VERIFY_IS_NOT_NULL(newSlice);
+        VERIFY_ARE_EQUAL(2u, newSlice->ColumnOwner(newChild.x));
+    }
+
+    // Non-divisible geometry: a 3px-wide image scaled across a 2-cell grid at a 3px cell size
+    // (target width 6) has tile boundaries that DON'T fall on source-pixel edges. The placeholder
+    // render must STILL equal the direct c/r placement pixel-for-pixel (#35 item 2) -- the old
+    // per-cell source split diverged here (cell 0's rightmost pixel sampled the wrong source column).
+    TEST_METHOD(KittyPlaceholderMatchesDirectRenderNonDivisible)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 3, 3 };
+        auto& buf = *_testGetSet->_textBuffer;
+        const auto cell = _testGetSet->_cellSize;
+        const std::wstring payload = L"/wAAAP8AAAD//wAAAP8AAAD//wAAAP8AAAD/"; // 3x3: columns red|green|blue
+        const til::CoordType directRow = buf.GetCursor().GetPosition().y;
+        const til::CoordType phRow = directRow + 6;
+
+        // Direct placement (geometry path) at column 0, C=1 so the cursor stays put.
+        buf.GetCursor().SetPosition({ 0, directRow });
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,f=24,s=3,v=3,c=2,r=2,C=1;" + payload + L"\x1b\\");
+
+        // The same image via U=1 + a 2x2 placeholder grid at column 0.
+        _stateMachine->ProcessString(L"\x1b_Ga=t,i=2,U=1,f=24,s=3,v=3,c=2,r=2;" + payload + L"\x1b\\");
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;2m"); // fg = image id 2
+        buf.GetCursor().SetPosition({ 0, phRow });
+        _stateMachine->ProcessString(Placeholder() + L"\x0305" + Placeholder()); // explicit grid row 0, then inherit
+        buf.GetCursor().SetPosition({ 0, phRow + 1 });
+        _stateMachine->ProcessString(Placeholder() + L"\x030D" + Placeholder()); // explicit grid row 1, then inherit
+        _stateMachine->ProcessString(L"\x1b[0m");
+
+        for (til::CoordType r = 0; r < 2; ++r)
+        {
+            const auto* sd = DirectImageSlice(buf, directRow + r);
+            const auto* sp = DirectImageSlice(buf, phRow + r);
+            VERIFY_IS_NOT_NULL(sd, L"direct render produced an image slice");
+            VERIFY_IS_NOT_NULL(sp, L"placeholder render produced an image slice");
+            for (til::CoordType py = 0; py < cell.height; ++py)
+            {
+                for (til::CoordType px = 0; px < 2 * cell.width; ++px)
+                {
+                    const auto a = SlicePixelAt(sd, px, py);
+                    const auto b = SlicePixelAt(sp, px, py);
+                    VERIFY_IS_TRUE(a.rgbRed == b.rgbRed && a.rgbGreen == b.rgbGreen && a.rgbBlue == b.rgbBlue,
+                                   L"non-divisible placeholder pixel must equal the direct-render pixel");
+                }
+            }
+        }
+    }
+
+    // A virtual placement requesting an enormous c/r must clamp its grid to maxCells (8192) so a
+    // hostile geometry can't blow up memory or the auto-counter (#35 test gap).
+    TEST_METHOD(KittyPlaceholderGridClampsToMaxCells)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,f=24,s=1,v=1,c=100000,r=100000;/wAA\x1b\\");
+        const auto it = _kitty()._virtualIds.find({ 1u, 0u });
+        VERIFY_IS_TRUE(it != _kitty()._virtualIds.end(), L"the virtual grid is registered");
+        VERIFY_ARE_EQUAL(8192u, it->second.cols, L"grid columns clamp to maxCells");
+        VERIFY_ARE_EQUAL(8192u, it->second.rows, L"grid rows clamp to maxCells");
+    }
+
+    // Aspect-preserving (r-only) scaling makes the exact target WIDTH exceed 2^32 for a wide image;
+    // caching it in a 32-bit field truncated it (even to 0 -> wrong "legacy" fallback), diverging the
+    // placeholder render from the direct one. The stored target size must keep full 64-bit width
+    // (#35 item 2 review finding).
+    TEST_METHOD(KittyPlaceholderLargeTargetNotTruncated)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1000 };
+        std::wstring payload;
+        for (auto i = 0; i < 525; ++i)
+        {
+            payload += L"/wAA"; // one red pixel (FF0000); 525 px total => a 525x1 f=24 image
+        }
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,f=24,s=525,v=1,r=8192;" + payload + L"\x1b\\");
+        const auto it = _kitty()._virtualIds.find({ 1u, 0u });
+        VERIFY_IS_TRUE(it != _kitty()._virtualIds.end(), L"the virtual grid is registered");
+        // r-only: targetW = cropW * (r*cellHeight) / cropH = 525 * (8192*1000) / 1 = 4,300,800,000.
+        const uint64_t expectedTargetW = 525ull * 8192ull * 1000ull;
+        VERIFY_IS_TRUE(expectedTargetW > (1ull << 32), L"sanity: this target width genuinely exceeds 32 bits");
+        VERIFY_ARE_EQUAL(expectedTargetW, static_cast<uint64_t>(it->second.targetW), L"the exact target width must not be truncated to 32 bits");
+    }
+
+    // A very long run of placeholders must render without error, bounded to the buffer: each
+    // screen row resolves left-to-right and the per-segment redraw stays bounded (#35 test gap;
+    // also exercises the batched-redraw path that replaced the per-cell TriggerRedraw).
+    TEST_METHOD(KittyPlaceholderHugeRunIsBounded)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,f=24,s=2,v=1,c=2,r=1;/wAAAP8A\x1b\\"); // 2x1 grid: red|green
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m"); // fg = image id 1
+        std::wstring run;
+        for (auto n = 0; n < 2000; ++n)
+        {
+            run += Placeholder();
+        }
+        _stateMachine->ProcessString(run);
+        _stateMachine->ProcessString(L"\x1b[0m");
+        VERIFY_IS_TRUE(CountImageRows(*_testGetSet->_textBuffer) >= 1, L"the huge placeholder run renders");
+        VERIFY_IS_TRUE(BufferContainsColor(*_testGetSet->_textBuffer, 255, 0, 0), L"the red tile (grid col 0) appears");
+        VERIFY_IS_TRUE(BufferContainsColor(*_testGetSet->_textBuffer, 0, 255, 0), L"the green tile (grid col 1) appears");
+    }
+
+    // A virtual (U=1) placement created WITH a crop rect (x/y/w/h) must render the cropped
+    // sub-image, not the whole image. The 4x4 source has four distinct 2x2 quadrants (TL red,
+    // TR green, BL blue, BR white); cropping to the bottom-right (x=2,y=2,w=2,h=2) and scaling
+    // to a 2x2 grid at 1px cells must show WHITE in every placeholder cell and NONE of the
+    // other quadrants' colours. Before the crop was captured for virtual placements this drew
+    // the full image, so red/green/blue leaked in.
+    TEST_METHOD(KittyPlaceholderCropSelectsSubImage)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        const auto origin = _testGetSet->_textBuffer->GetCursor().GetPosition();
+        const std::wstring payload = L"/wAA/wAAAP8AAP8A/wAA/wAAAP8AAP8AAAD/AAD/////////AAD/AAD/////////"; // 4x4 quadrants
+        _stateMachine->ProcessString(L"\x1b_Ga=t,i=1,U=1,f=24,s=4,v=4,x=2,y=2,w=2,h=2,c=2,r=2;" + payload + L"\x1b\\");
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m"); // fg = image id 1
+        _stateMachine->ProcessString(Placeholder() + L"\x0305" + Placeholder()); // explicit grid row 0, then inherit
+        _testGetSet->_textBuffer->GetCursor().SetPosition({ origin.x, origin.y + 1 });
+        _stateMachine->ProcessString(Placeholder() + L"\x030D" + Placeholder()); // explicit grid row 1, then inherit
+        _stateMachine->ProcessString(L"\x1b[0m");
+
+        const auto* r0 = DirectImageSlice(*_testGetSet->_textBuffer, origin.y);
+        const auto* r1 = DirectImageSlice(*_testGetSet->_textBuffer, origin.y + 1);
+        VERIFY_IS_NOT_NULL(r0);
+        VERIFY_IS_NOT_NULL(r1);
+        VERIFY_IS_TRUE(SlicePixelIs(r0, 0, 0, 255, 255, 255), L"crop=BR: grid (0,0) must be white");
+        VERIFY_IS_TRUE(SlicePixelIs(r0, 1, 0, 255, 255, 255), L"crop=BR: grid (0,1) must be white");
+        VERIFY_IS_TRUE(SlicePixelIs(r1, 0, 0, 255, 255, 255), L"crop=BR: grid (1,0) must be white");
+        VERIFY_IS_TRUE(SlicePixelIs(r1, 1, 0, 255, 255, 255), L"crop=BR: grid (1,1) must be white");
+        VERIFY_IS_FALSE(BufferContainsColor(*_testGetSet->_textBuffer, 255, 0, 0), L"cropped-out red must not appear");
+        VERIFY_IS_FALSE(BufferContainsColor(*_testGetSet->_textBuffer, 0, 255, 0), L"cropped-out green must not appear");
+        VERIFY_IS_FALSE(BufferContainsColor(*_testGetSet->_textBuffer, 0, 0, 255), L"cropped-out blue must not appear");
+    }
+
+    // A virtual placement whose crop is entirely OUTSIDE the image (x past the right edge) must
+    // display nothing -- matching a direct a=T with an empty crop -- rather than storing a 1px
+    // edge crop that samples past the crop into the adjacent pixel row. Regression for the
+    // degenerate-crop leak (the crop was forced to a minimum of 1px).
+    TEST_METHOD(KittyPlaceholderCropOutsideImageDrawsNothing)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        // 2x2 image (TL red, TR green, BL blue, BR white); x=5 is past the 2px width -> empty crop.
+        _stateMachine->ProcessString(L"\x1b_Ga=t,i=1,U=1,f=24,s=2,v=2,x=5,c=2,r=2;/wAAAP8AAAD/////\x1b\\");
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m"); // fg = image id 1
+        _stateMachine->ProcessString(Placeholder() + Placeholder());
+        VERIFY_ARE_EQUAL(0, CountImageRows(*_testGetSet->_textBuffer), L"an empty crop must draw no placeholder cells");
+        VERIFY_IS_FALSE(BufferContainsColor(*_testGetSet->_textBuffer, 255, 0, 0), L"no image pixel may leak from an empty crop (red)");
+        VERIFY_IS_FALSE(BufferContainsColor(*_testGetSet->_textBuffer, 0, 0, 255), L"no adjacent-row pixel may leak from an empty crop (blue)");
+    }
+
+    // A 4th combining diacritic must be IGNORED (spec: only the first three are used). Regression:
+    // idHighByte started at 0, so a 4th diacritic overwrote an explicit 3rd diacritic of index 0
+    // and wrongly skipped the cell. With row 0 + col 0 + 3rd=0 (U+0305) + a non-zero 4th (U+030D),
+    // the cell must still render the plain 24-bit image.
+    TEST_METHOD(KittyPlaceholderFourthDiacriticIgnored)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,f=24,s=1,v=1;/wAA\x1b\\"); // id 1 red
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m"); // fg = image id 1
+        _stateMachine->ProcessString(Placeholder() + L"\x0305" + L"\x0305" + L"\x0305" + L"\x030D"); // row0,col0,3rd=0,4th=1
+        VERIFY_IS_TRUE(BufferContainsColor(*_testGetSet->_textBuffer, 255, 0, 0), L"a 4th diacritic must be ignored; the cell still renders (3rd byte = 0)");
+    }
+
+    // Deleting the image by id erases placeholder-rendered cells too.
+    TEST_METHOD(KittyPlaceholderDeleteErases)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,f=24,s=1,v=1;/wAA\x1b\\");
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m");
+        _stateMachine->ProcessString(Placeholder());
+        VERIFY_IS_TRUE(BufferContainsColor(*_testGetSet->_textBuffer, 255, 0, 0));
+        _stateMachine->ProcessString(L"\x1b_Ga=d,d=i,i=1;\x1b\\");
+        VERIFY_IS_FALSE(BufferContainsColor(*_testGetSet->_textBuffer, 255, 0, 0), L"delete by id must erase placeholder pixels");
+        VERIFY_ARE_EQUAL(0, CountImageRows(*_testGetSet->_textBuffer));
+    }
+
+    // Non-placeholder text must never produce an image slice.
+    TEST_METHOD(KittyPlaceholderTextUnaffected)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,f=24,s=1,v=1;/wAA\x1b\\");
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m");
+        _stateMachine->ProcessString(L"hello");
+        VERIFY_ARE_EQUAL(0, CountImageRows(*_testGetSet->_textBuffer), L"plain text must not render the image");
+    }
+
+    // A placeholder fg with no matching stored image renders nothing (and no crash).
+    TEST_METHOD(KittyPlaceholderUnknownIdRendersNothing)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;9m"); // id 9: never transmitted
+        _stateMachine->ProcessString(Placeholder());
+        VERIFY_ARE_EQUAL(0, CountImageRows(*_testGetSet->_textBuffer));
+    }
+
+    // A multi-row grid splits vertically: a 1x2 (red-over-green) image with a 1px host cell
+    // spans a 1x2 grid. Two cells on one line tagged row 0 and row 1 show the top tile (red)
+    // in the first cell and the bottom tile (green) in the second. Positional checks confirm
+    // each cell holds ONLY its tile (the old default 1x1 grid let both cells show the whole
+    // image, so this passed without actually splitting).
+    TEST_METHOD(KittyPlaceholderMultiRowSplitsVertically)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        const auto origin = _testGetSet->_textBuffer->GetCursor().GetPosition();
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,f=24,s=1,v=2;/wAAAP8A\x1b\\"); // top red, bottom green
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m");
+        _stateMachine->ProcessString(Placeholder() + L"\x0305" + Placeholder() + L"\x030D"); // row 0, row 1
+        const auto* slice = DirectImageSlice(*_testGetSet->_textBuffer, origin.y);
+        VERIFY_IS_NOT_NULL(slice);
+        VERIFY_IS_TRUE(SlicePixelIs(slice, 0, 0, 255, 0, 0), L"row-0 cell = top tile (red) only");
+        VERIFY_IS_TRUE(SlicePixelIs(slice, 1, 0, 0, 255, 0), L"row-1 cell = bottom tile (green) only");
+    }
+
+    // A line mixing text and a placeholder keeps the glyphs and overlays the image.
+    TEST_METHOD(KittyPlaceholderMixedTextKeepsGlyphs)
+    {
+        _testGetSet->PrepData();
+        const auto origin = _testGetSet->_textBuffer->GetCursor().GetPosition();
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,f=24,s=1,v=1;/wAA\x1b\\");
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m");
+        _stateMachine->ProcessString(L"ab" + Placeholder() + L"cd");
+        VERIFY_IS_TRUE(BufferContainsColor(*_testGetSet->_textBuffer, 255, 0, 0), L"placeholder still overlays");
+        const auto& row = _testGetSet->_textBuffer->GetRowByOffset(origin.y);
+        VERIFY_ARE_EQUAL(L'a', row.GlyphAt(origin.x).front());
+        VERIFY_ARE_EQUAL(L'b', row.GlyphAt(origin.x + 1).front());
+        VERIFY_ARE_EQUAL(L'c', row.GlyphAt(origin.x + 3).front(), L"text after the placeholder cell survives");
+        VERIFY_ARE_EQUAL(L'd', row.GlyphAt(origin.x + 4).front());
+    }
+
+    // A non-RGB (legacy/default) foreground is not an image id: no overlay.
+    TEST_METHOD(KittyPlaceholderNonRgbFgNoOp)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,f=24,s=1,v=1;/wAA\x1b\\");
+        _stateMachine->ProcessString(Placeholder()); // default legacy fg, never set to RGB
+        VERIFY_ARE_EQUAL(0, CountImageRows(*_testGetSet->_textBuffer), L"legacy fg must not select an image");
+    }
+
+    // A 256-palette foreground (38;5;n) is indexed, not 24-bit RGB, so it must not trigger.
+    // A 256-color foreground whose index does NOT match a stored virtual id must not
+    // overlay — the U=1 gate still applies to indexed ids just like RGB ids.
+    TEST_METHOD(KittyPlaceholder256ColorUnknownIdNoOp)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,f=24,s=1,v=1;/wAA\x1b\\"); // only id 1 is virtual
+        _stateMachine->ProcessString(L"\x1b[38;5;7m"); // 256-color index 7, no such image
+        _stateMachine->ProcessString(Placeholder());
+        VERIFY_ARE_EQUAL(0, CountImageRows(*_testGetSet->_textBuffer), L"a 256-color id with no virtual image must not overlay");
+    }
+
+    // Placeholders honor a non-default host cell size (sub-rect sampling still fills the cell).
+    TEST_METHOD(KittyPlaceholderScaledCell)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 5, 10 };
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,f=24,s=1,v=1;/wAA\x1b\\");
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m");
+        _stateMachine->ProcessString(Placeholder());
+        const auto& buffer = *_testGetSet->_textBuffer;
+        til::CoordType imageRow = -1;
+        const auto slice = FindFirstImageSlice(buffer, imageRow);
+        VERIFY_IS_NOT_NULL(slice);
+        VERIFY_ARE_EQUAL(5, slice->CellSize().width);
+        VERIFY_ARE_EQUAL(10, slice->CellSize().height);
+        VERIFY_IS_TRUE(SliceContainsColor(slice, 255, 0, 0));
+    }
+
+    // A placeholder fg pointing at a NON-virtual (ordinary) stored image must not
+    // overlay it: only U=1 images are placeholder-eligible.
+    TEST_METHOD(KittyPlaceholderNonVirtualIdRendersNothing)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1b_Ga=t,i=1,f=24,s=1,v=1;/wAA\x1b\\"); // stored, NOT virtual
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m");
+        _stateMachine->ProcessString(Placeholder());
+        VERIFY_ARE_EQUAL(0, CountImageRows(*_testGetSet->_textBuffer), L"plain colored placeholder must not overlay a non-virtual image");
+    }
+
+    // Non-divisible split keeps edge pixels: a 3px red/green/blue image forced to a 2-col grid
+    // (c=2) splits 1px | 2px, so the second tile keeps the rightmost (blue) pixel with no drop.
+    // Positional checks prove col 0 is red and the slice's rightmost pixel is blue.
+    TEST_METHOD(KittyPlaceholderNonDivisibleKeepsRightPixel)
+    {
+        _testGetSet->PrepData();
+        const auto origin = _testGetSet->_textBuffer->GetCursor().GetPosition();
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,f=24,s=3,v=1,c=2,r=1;/wAAAP8AAAD/\x1b\\"); // red,green,blue; grid 2x1
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m");
+        _stateMachine->ProcessString(Placeholder() + Placeholder());
+        const auto* slice = DirectImageSlice(*_testGetSet->_textBuffer, origin.y);
+        VERIFY_IS_NOT_NULL(slice);
+        VERIFY_IS_TRUE(SlicePixelIs(slice, 0, 0, 255, 0, 0), L"grid col 0 starts at the red pixel");
+        VERIFY_IS_TRUE(SlicePixelIs(slice, slice->PixelWidth() - 1, 0, 0, 0, 255), L"rightmost pixel (blue) must survive the 3px/2col split");
+    }
+
+    // The grid comes from the STORED geometry, so a multi-row placement printed one line
+    // per write (as the StateMachine splits output on newlines) slices correctly. A 1x2px
+    // image (top red, bottom green) stored as a 1col x 2row grid: writing grid row 0 then
+    // grid row 1 in TWO separate calls must show ONLY the top tile on the first screen row
+    // and ONLY the bottom tile on the next. The old per-run inference made the first write
+    // see rows=1 and draw the whole image (green leaking into the top row).
+    TEST_METHOD(KittyPlaceholderMultiRowAcrossWritesUsesStoredRows)
+    {
+        _testGetSet->PrepData();
+        const auto origin = _testGetSet->_textBuffer->GetCursor().GetPosition();
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,f=24,s=1,v=2,c=1,r=2;/wAAAP8A\x1b\\"); // 1x2: top red, bottom green
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m");
+
+        // Write 1: grid row 0 on the origin screen row -> top tile (red), no green.
+        _stateMachine->ProcessString(Placeholder() + L"\x0305");
+        const auto* row0 = DirectImageSlice(*_testGetSet->_textBuffer, origin.y);
+        VERIFY_IS_TRUE(SliceContainsColor(row0, 255, 0, 0), L"grid row 0 = top tile (red)");
+        VERIFY_IS_FALSE(SliceContainsColor(row0, 0, 255, 0), L"stored rows=2 must keep the bottom tile (green) out of grid row 0");
+
+        // Write 2: a SEPARATE call on the next screen row, grid row 1 -> bottom tile (green).
+        _testGetSet->_textBuffer->GetCursor().SetPosition({ origin.x, origin.y + 1 });
+        _stateMachine->ProcessString(Placeholder() + L"\x030D");
+        const auto* row1 = DirectImageSlice(*_testGetSet->_textBuffer, origin.y + 1);
+        VERIFY_IS_TRUE(SliceContainsColor(row1, 0, 255, 0), L"grid row 1 = bottom tile (green)");
+        VERIFY_IS_FALSE(SliceContainsColor(row1, 255, 0, 0), L"grid row 1 must not contain the top tile (red)");
+    }
+
+    // The screen column is tracked by real glyph width, so a wide (CJK = 2 cells) glyph
+    // before a placeholder doesn't shift it: the placeholder must land at origin.x+2, not
+    // origin.x+1 (the old one-column-per-grapheme walk).
+    TEST_METHOD(KittyPlaceholderWideGlyphKeepsColumn)
+    {
+        _testGetSet->PrepData();
+        const auto origin = _testGetSet->_textBuffer->GetCursor().GetPosition();
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,f=24,s=1,v=1;/wAA\x1b\\"); // red
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m");
+        _stateMachine->ProcessString(std::wstring{ L'\x4E00' } + Placeholder()); // U+4E00 is East Asian Wide
+        const auto& buffer = *_testGetSet->_textBuffer;
+        til::CoordType imageRow = -1;
+        const auto slice = FindFirstImageSlice(buffer, imageRow);
+        VERIFY_IS_NOT_NULL(slice);
+        VERIFY_ARE_EQUAL(origin.x + 2, slice->ColumnOffset(), L"a wide glyph before the placeholder must not shift its column");
+        VERIFY_ARE_EQUAL(1u, slice->ColumnOwner(origin.x + 2), L"the placeholder cell at origin.x+2 is owned by image id 1");
+    }
+
+    // The grid dimensions come from the stored c=/r=, NOT the number of placeholder cells
+    // printed: a 2px red|green image stored as a 2col x 1row grid, then ONE placeholder, is
+    // grid column 0 (left tile = red only). The old run-length inference made cols=1 and
+    // drew the whole image, so green appeared too.
+    TEST_METHOD(KittyPlaceholderGridUsesStoredColsNotRunLength)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,f=24,s=2,v=1,c=2,r=1;/wAAAP8A\x1b\\"); // 2px: red|green, grid 2x1
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m");
+        _stateMachine->ProcessString(Placeholder()); // ONE cell -> grid col 0 only
+        VERIFY_IS_TRUE(BufferContainsColor(*_testGetSet->_textBuffer, 255, 0, 0), L"grid col 0 = left tile (red)");
+        VERIFY_IS_FALSE(BufferContainsColor(*_testGetSet->_textBuffer, 0, 255, 0), L"stored cols=2 must keep the right tile (green) out of grid col 0");
+    }
+
+    TEST_METHOD(KittyPlaceholderLargeGridPublishesOneBatch)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        auto& buffer = *_testGetSet->_textBuffer;
+        const auto origin = buffer.GetCursor().GetPosition();
+        constexpr auto columns = 16;
+        constexpr auto rows = 8;
+        VERIFY_IS_TRUE(origin.x + columns <= buffer.GetSize().Width());
+        VERIFY_IS_TRUE(origin.y + rows <= buffer.GetSize().Height());
+
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,f=24,s=1,v=1,c=16,r=8;/wAA\x1b\\");
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m");
+        constexpr std::array rowDiacritics{ L'\x0305', L'\x030d', L'\x030e', L'\x0310', L'\x0312', L'\x033d', L'\x033e', L'\x033f' };
+
+        const auto revision = buffer.GetImages().Revision();
+        for (auto row = 0; row < rows; ++row)
+        {
+            buffer.GetCursor().SetPosition({ origin.x, origin.y + row });
+            auto placeholders = Placeholder() + rowDiacritics[row] + rowDiacritics[0];
+            for (auto column = 1; column < columns; ++column)
+            {
+                placeholders += Placeholder();
+            }
+            _stateMachine->ProcessString(placeholders);
+        }
+
+        VERIFY_ARE_EQUAL(revision + rows, buffer.GetImages().Revision(), L"commit growth is bounded by row segments, not placeholder cells");
+        VERIFY_ARE_EQUAL(size_t{ columns * rows }, buffer.GetImages().Size(), L"placement growth is bounded to one fragment per visible grid cell");
+        const til::rect expectedOriginal{ origin.x, origin.y, origin.x + columns, origin.y + rows };
+        std::vector<bool> covered(columns * rows);
+        const ::Image* surface = nullptr;
+        for (const auto& placement : buffer.GetImages().All())
+        {
+            VERIFY_ARE_EQUAL(ImagePlacement::Key::Protocol::Kitty, placement.Identity().protocol);
+            VERIFY_ARE_EQUAL(expectedOriginal, placement.OriginalCellBounds());
+            VERIFY_ARE_EQUAL(uint64_t{ columns }, placement.Geometry().targetWidth);
+            VERIFY_ARE_EQUAL(uint64_t{ rows }, placement.Geometry().targetHeight);
+            VERIFY_ARE_EQUAL(1, placement.CellBounds().width());
+            VERIFY_ARE_EQUAL(1, placement.CellBounds().height());
+            const auto column = placement.CellBounds().left - origin.x;
+            const auto row = placement.CellBounds().top - origin.y;
+            VERIFY_IS_TRUE(column >= 0 && column < columns);
+            VERIFY_IS_TRUE(row >= 0 && row < rows);
+            covered[row * columns + column] = true;
+            if (!surface)
+            {
+                surface = &placement.Surface();
+            }
+            else
+            {
+                VERIFY_ARE_EQUAL(surface, &placement.Surface());
+            }
+        }
+        VERIFY_IS_TRUE(std::ranges::all_of(covered, std::identity{}));
+        VERIFY_IS_TRUE(BufferContainsColor(buffer, 255, 0, 0), L"the batched grid still renders its image pixels");
+    }
+
+    // An explicit COLUMN diacritic (the 2nd recognized diacritic) selects the grid column
+    // independently of the row: a 2px red|green image in a 2-col grid addressed (row 0, col 1)
+    // shows ONLY green; the left tile (red) must be absent.
+    TEST_METHOD(KittyPlaceholderColDiacriticSelectsColumn)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,f=24,s=2,v=1,c=2,r=1;/wAAAP8A\x1b\\"); // red|green, grid 2x1
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m");
+        _stateMachine->ProcessString(Placeholder() + L"\x0305" + L"\x030D"); // row 0, col 1
+        VERIFY_IS_TRUE(BufferContainsColor(*_testGetSet->_textBuffer, 0, 255, 0), L"col diacritic 1 selects the right tile (green)");
+        VERIFY_IS_FALSE(BufferContainsColor(*_testGetSet->_textBuffer, 255, 0, 0), L"col 1 must not show the left tile (red)");
+    }
+
+    // The rowcolumn-diacritic table now covers all 297 kitty entries (was 16), resolved by binary
+    // search including astral (surrogate-pair) combining marks. Direct checks of the private lookup
+    // (AdapterTest is a friend) at the boundaries the old 16-entry table missed.
+    TEST_METHOD(KittyPlaceholderDiacriticTableIsComplete)
+    {
+        VERIFY_ARE_EQUAL(0, KittyParser::_PlaceholderDiacriticIndex(0x0305)); // first entry
+        VERIFY_ARE_EQUAL(15, KittyParser::_PlaceholderDiacriticIndex(0x0357)); // last of the old 16
+        VERIFY_ARE_EQUAL(16, KittyParser::_PlaceholderDiacriticIndex(0x035B)); // first newly-covered entry
+        VERIFY_ARE_EQUAL(282, KittyParser::_PlaceholderDiacriticIndex(0xFE26)); // last BMP entry
+        VERIFY_ARE_EQUAL(283, KittyParser::_PlaceholderDiacriticIndex(0x10A0F)); // first astral entry
+        VERIFY_ARE_EQUAL(296, KittyParser::_PlaceholderDiacriticIndex(0x1D244)); // last entry (index 296)
+        VERIFY_ARE_EQUAL(-1, KittyParser::_PlaceholderDiacriticIndex(0x0041)); // 'A' is not a diacritic
+        VERIFY_ARE_EQUAL(-1, KittyParser::_PlaceholderDiacriticIndex(0x0306)); // a gap between entries
+    }
+
+    // Regression (why): a 3rd rowcolumn diacritic encodes the high byte of a >24-bit image id,
+    // which isn't supported yet (#24). The old code IGNORED the 3rd diacritic and rendered the
+    // low-24-bit image -- the WRONG image (an id collision). This guards that a NON-ZERO 3rd
+    // diacritic skips the cell (draws nothing) rather than mis-rendering, while a plain 24-bit
+    // id (3rd diacritic absent or 0) still renders.
+    // #38: a 3rd rowcolumn diacritic supplies the HIGH byte of a >24-bit image id. The fg gives
+    // the low 24 bits, so a 3rd diacritic of index N selects id (N<<24)|low -- a DIFFERENT image
+    // than the low-24-bit one. Transmit id=1 (red) and id=0x01000001 (green) with the same low
+    // bits; the 3rd diacritic picks between them.
+    TEST_METHOD(KittyPlaceholderThirdDiacriticSelectsHighByteImage)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,f=24,s=1,v=1;/wAA\x1b\\"); // id 0x000001 red
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=16777217,f=24,s=1,v=1;AP8A\x1b\\"); // id 0x01000001 green
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m"); // fg low bits = 1
+        _stateMachine->ProcessString(Placeholder() + L"\x0305" + L"\x0305"); // no 3rd -> id 1 -> red
+        _stateMachine->ProcessString(Placeholder() + L"\x0305" + L"\x0305" + L"\x030D"); // 3rd=1 -> id 0x01000001 -> green
+        VERIFY_IS_TRUE(BufferContainsColor(*_testGetSet->_textBuffer, 255, 0, 0), L"no 3rd diacritic selects the low-24-bit image (red)");
+        VERIFY_IS_TRUE(BufferContainsColor(*_testGetSet->_textBuffer, 0, 255, 0), L"a 3rd diacritic of index 1 selects the >24-bit image (green)");
+    }
+
+    // End-to-end: a COLUMN diacritic for index 16 (U+035B) -- the first entry the old 16-entry table
+    // missed -- must resolve to grid column 16, not fall through to the auto-increment counter. A
+    // 20-wide image whose only red pixel is column 16 (all others green) shows red when addressed
+    // (row 0, col 16); the old table drew column 0 (green).
+    TEST_METHOD(KittyPlaceholderHighColumnDiacriticResolves)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,f=24,s=20,v=1,c=20,r=1;AP8AAP8AAP8AAP8AAP8AAP8AAP8AAP8AAP8AAP8AAP8AAP8AAP8AAP8AAP8AAP8A/wAAAP8AAP8AAP8A\x1b\\");
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m"); // fg = image id 1
+        _stateMachine->ProcessString(Placeholder() + L"\x0305" + L"\x035B"); // row 0 (index 0), col 16 (index 16)
+        VERIFY_IS_TRUE(BufferContainsColor(*_testGetSet->_textBuffer, 255, 0, 0), L"col diacritic index 16 (U+035B) must select grid column 16 (red)");
+        VERIFY_IS_FALSE(BufferContainsColor(*_testGetSet->_textBuffer, 0, 255, 0), L"column 16 is red only; the auto-increment fallback (col 0 = green) must not be used");
+    }
+
+    // A 3rd diacritic composing an id with no transmitted image draws nothing -- it is NOT
+    // mis-rendered as the low-24-bit image (the original id-collision hazard).
+    TEST_METHOD(KittyPlaceholderUnknownHighByteIdSkips)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,f=24,s=1,v=1;/wAA\x1b\\"); // only id 1 (red) exists
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m"); // fg low bits = 1
+        _stateMachine->ProcessString(Placeholder() + L"\x0305" + L"\x0305" + L"\x030D"); // 3rd=1 -> id 0x01000001 (absent)
+        VERIFY_IS_FALSE(BufferContainsColor(*_testGetSet->_textBuffer, 255, 0, 0), L"a >24-bit id with no image must skip, not render the low-24-bit image");
+    }
+
+    // A 3rd diacritic whose index exceeds 255 cannot be an image-id high byte (a byte is 0-255).
+    // Without a guard, index 285 (astral U+1D185) shift-wraps to high byte 0x1D and would compose
+    // id 0x1D000001 with fg low bits 1; an image at that id must NOT render -- the cell is skipped.
+    TEST_METHOD(KittyPlaceholderThirdDiacriticAboveByteRangeSkips)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=486539265,f=24,s=1,v=1;AP8A\x1b\\"); // id 0x1D000001 green
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m"); // fg low bits = 1
+        _stateMachine->ProcessString(Placeholder() + L"\x0305" + L"\x0305" + L"\xD834\xDD85"); // 3rd = U+1D185 (index 285 > 255)
+        VERIFY_IS_FALSE(BufferContainsColor(*_testGetSet->_textBuffer, 0, 255, 0), L"a 3rd diacritic index > 255 must not shift-wrap into a valid id (green must not render)");
+    }
+
+    // Regression (why): an explicit column/row diacritic OUTSIDE the placement grid used to be
+    // CLAMPED to the edge tile (std::min(cellCol, gridCols-1)), duplicating that tile. This
+    // guards that an out-of-grid cell draws NOTHING instead. A 2x1 grid (red|green) addressed at
+    // col index 2 (>= the 2 columns) must render neither tile.
+    TEST_METHOD(KittyPlaceholderOutOfGridDrawsNothing)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,f=24,s=2,v=1,c=2,r=1;/wAAAP8A\x1b\\"); // red|green, 2x1 grid
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m");
+        _stateMachine->ProcessString(Placeholder() + L"\x0305" + L"\x030E"); // row 0, col 2 (out of a 2-col grid)
+        VERIFY_IS_FALSE(BufferContainsColor(*_testGetSet->_textBuffer, 255, 0, 0), L"out-of-grid col must not clamp to the left tile");
+        VERIFY_IS_FALSE(BufferContainsColor(*_testGetSet->_textBuffer, 0, 255, 0), L"out-of-grid col must not clamp to the right (edge) tile");
+    }
+
+    // Row + column diacritics address a 2D tile: a 2x2 image (red,green / blue,white) in a
+    // 2x2 grid addressed (row 1, col 1) shows ONLY white; the other three tiles are absent.
+    TEST_METHOD(KittyPlaceholderRowColAddressesTile)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,f=24,s=2,v=2,c=2,r=2;/wAAAP8AAAD/////\x1b\\"); // red,green / blue,white
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m");
+        _stateMachine->ProcessString(Placeholder() + L"\x030D" + L"\x030D"); // row 1, col 1
+        VERIFY_IS_TRUE(BufferContainsColor(*_testGetSet->_textBuffer, 255, 255, 255), L"(row 1, col 1) selects the bottom-right tile (white)");
+        VERIFY_IS_FALSE(BufferContainsColor(*_testGetSet->_textBuffer, 255, 0, 0), L"the red (0,0) tile must be absent");
+        VERIFY_IS_FALSE(BufferContainsColor(*_testGetSet->_textBuffer, 0, 255, 0), L"the green (1,0) tile must be absent");
+        VERIFY_IS_FALSE(BufferContainsColor(*_testGetSet->_textBuffer, 0, 0, 255), L"the blue (0,1) tile must be absent");
+    }
+
+    // With no c=/r=, the grid is inferred from the image's pixel size vs the host cell size:
+    // a 2px-wide image with a 1px cell gives a 2-col grid, so ONE placeholder shows only the
+    // left (red) tile. The old default 1x1 grid drew the whole image, leaking green.
+    TEST_METHOD(KittyPlaceholderDefaultGridFromPixels)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,f=24,s=2,v=1;/wAAAP8A\x1b\\"); // red|green, no c/r
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m");
+        _stateMachine->ProcessString(Placeholder()); // ONE cell -> grid col 0
+        VERIFY_IS_TRUE(BufferContainsColor(*_testGetSet->_textBuffer, 255, 0, 0), L"inferred grid col 0 = red");
+        VERIFY_IS_FALSE(BufferContainsColor(*_testGetSet->_textBuffer, 0, 255, 0), L"inferred 2-col grid keeps green out of col 0");
+    }
+
+    // An explicit left cell establishes the resolved column inherited by a row-only cell
+    // immediately to its right. This documents the #17 spec rule in one write; the old
+    // placement-global counter happened to pass common sequential layouts but was not cell-based.
+    TEST_METHOD(KittyPlaceholderExplicitLeftInheritsSameWrite)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        const auto origin = _testGetSet->_textBuffer->GetCursor().GetPosition();
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,f=24,s=2,v=2,c=2,r=2;/wAAAP8AAAD/////\x1b\\");
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m");
+        _stateMachine->ProcessString(Placeholder() + L"\x030D" + L"\x0305" + Placeholder() + L"\x030D"); // (1,0), then row-only (1,1)
+
+        const auto* slice = DirectImageSlice(*_testGetSet->_textBuffer, origin.y);
+        VERIFY_IS_TRUE(SlicePixelIs(slice, 0, 0, 0, 0, 255), L"explicit (row 1, col 0) selects blue");
+        VERIFY_IS_TRUE(SlicePixelIs(slice, 1, 0, 255, 255, 255), L"the row-only cell inherits col 1 from the matching left row (white)");
+    }
+
+    // The left cell can have been written by an earlier ProcessString call. This requires
+    // persistent cell metadata; transient per-segment state cannot resolve the second write.
+    TEST_METHOD(KittyPlaceholderExplicitLeftInheritsAcrossWrites)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        const auto origin = _testGetSet->_textBuffer->GetCursor().GetPosition();
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,f=24,s=2,v=2,c=2,r=2;/wAAAP8AAAD/////\x1b\\");
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m");
+        _stateMachine->ProcessString(Placeholder() + L"\x030D" + L"\x0305"); // explicit (1,0)
+        _stateMachine->ProcessString(Placeholder()); // separate call, inherited (1,1)
+
+        const auto* slice = DirectImageSlice(*_testGetSet->_textBuffer, origin.y);
+        VERIFY_IS_TRUE(SlicePixelIs(slice, 0, 0, 0, 0, 255), L"the earlier explicit cell remains blue");
+        VERIFY_IS_TRUE(SlicePixelIs(slice, 1, 0, 255, 255, 255), L"the later write inherits from the stored left cell");
+    }
+
+    // Writing another tile elsewhere must not advance global state used by a later omission.
+    // Old failure: explicit (0,2) reset the per-image counter, so the cell at x=1 repeated col 0
+    // instead of inheriting col 1 from its actual left neighbour.
+    TEST_METHOD(KittyPlaceholderInterleavedWriteUsesLeftNeighbor)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        auto& buffer = *_testGetSet->_textBuffer;
+        const auto origin = buffer.GetCursor().GetPosition();
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,f=24,s=3,v=1,c=3,r=1;/wAAAP8AAAD/\x1b\\");
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m");
+        _stateMachine->ProcessString(Placeholder() + L"\x0305" + L"\x0305"); // x=0, explicit col 0 (red)
+        buffer.GetCursor().SetPosition({ 10, origin.y });
+        _stateMachine->ProcessString(Placeholder() + L"\x0305" + L"\x030E"); // elsewhere, explicit col 2 (blue)
+        buffer.GetCursor().SetPosition({ 1, origin.y });
+        _stateMachine->ProcessString(Placeholder()); // must inherit col 1 from x=0
+
+        const auto* slice = DirectImageSlice(buffer, origin.y);
+        VERIFY_IS_TRUE(SlicePixelIs(slice, 1, 0, 0, 255, 0), L"interleaving cannot corrupt immediate-left inheritance (col 1 = green)");
+    }
+
+    // Foreground is part of Kitty's inheritance gate. Even though the left glyph has resolved
+    // col 1, a different foreground image id cannot inherit it and therefore defaults to col 0.
+    TEST_METHOD(KittyPlaceholderForegroundMismatchUsesDefaults)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        const auto origin = _testGetSet->_textBuffer->GetCursor().GetPosition();
+        const std::wstring payload = L"/wAAAP8AAAD/"; // red|green|blue
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,f=24,s=3,v=1,c=3,r=1;" + payload + L"\x1b\\");
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=2,f=24,s=3,v=1,c=3,r=1;" + payload + L"\x1b\\");
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m");
+        _stateMachine->ProcessString(Placeholder() + L"\x0305" + L"\x030D"); // image 1, explicit col 1 (green)
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;2m");
+        _stateMachine->ProcessString(Placeholder());
+
+        const auto* slice = DirectImageSlice(*_testGetSet->_textBuffer, origin.y);
+        VERIFY_IS_TRUE(SlicePixelIs(slice, 0, 0, 0, 255, 0), L"the explicit image-1 cell is col 1 (green)");
+        VERIFY_IS_TRUE(SlicePixelIs(slice, 1, 0, 255, 0, 0), L"foreground mismatch rejects inheritance and defaults image 2 to col 0 (red)");
+    }
+
+    // Underline color carries the placement id and is also an exact inheritance gate.
+    TEST_METHOD(KittyPlaceholderUnderlineMismatchUsesDefaults)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        const auto origin = _testGetSet->_textBuffer->GetCursor().GetPosition();
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,p=1,f=24,s=3,v=1,c=3,r=1;/wAAAP8AAAD/\x1b\\");
+        _stateMachine->ProcessString(L"\x1b_Ga=p,U=1,i=1,p=2,c=3,r=1;\x1b\\");
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m");
+        _stateMachine->ProcessString(L"\x1b[58:2::0:0:1m");
+        _stateMachine->ProcessString(Placeholder() + L"\x0305" + L"\x030D"); // placement color 1, col 1
+        _stateMachine->ProcessString(L"\x1b[58:2::0:0:2m");
+        _stateMachine->ProcessString(Placeholder()); // placement color 2: no inheritance
+
+        const auto* slice = DirectImageSlice(*_testGetSet->_textBuffer, origin.y);
+        VERIFY_IS_TRUE(SlicePixelIs(slice, 0, 0, 0, 255, 0), L"the explicit left cell is col 1 (green)");
+        VERIFY_IS_TRUE(SlicePixelIs(slice, 1, 0, 255, 0, 0), L"underline mismatch defaults to col 0 (red), not stale col 2");
+    }
+
+    // At buffer column 0 there is no left cell, so all omitted values default to zero regardless
+    // of earlier writes for the same image. The old global counter selected col 2 (blue).
+    TEST_METHOD(KittyPlaceholderColumnZeroUsesDefaults)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        auto& buffer = *_testGetSet->_textBuffer;
+        const auto origin = buffer.GetCursor().GetPosition();
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,f=24,s=3,v=1,c=3,r=1;/wAAAP8AAAD/\x1b\\");
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m");
+        buffer.GetCursor().SetPosition({ 10, origin.y });
+        _stateMachine->ProcessString(Placeholder() + L"\x0305" + L"\x030D"); // explicit col 1 elsewhere
+        buffer.GetCursor().SetPosition({ 0, origin.y + 1 });
+        _stateMachine->ProcessString(Placeholder()); // no left cell => (0,0)
+
+        const auto* slice = DirectImageSlice(buffer, origin.y + 1);
+        VERIFY_IS_TRUE(SlicePixelIs(slice, 0, 0, 255, 0, 0), L"column 0 omission defaults to grid col 0 (red)");
+    }
+
+    // A no-diacritic cell inherits the optional image-id high byte as well as row/column.
+    // Old failure: the second cell looked up low id 1 and skipped instead of continuing the
+    // >24-bit image selected explicitly by its left neighbour.
+    TEST_METHOD(KittyPlaceholderOmittedHighByteInheritsFromLeft)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        const auto origin = _testGetSet->_textBuffer->GetCursor().GetPosition();
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=16777217,f=24,s=2,v=1,c=2,r=1;/wAAAP8A\x1b\\"); // id 0x01000001
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m"); // low 24 bits
+        _stateMachine->ProcessString(Placeholder() + L"\x0305" + L"\x0305" + L"\x030D" + Placeholder());
+
+        const auto* slice = DirectImageSlice(*_testGetSet->_textBuffer, origin.y);
+        VERIFY_IS_TRUE(SlicePixelIs(slice, 0, 0, 255, 0, 0), L"explicit high byte selects the >24-bit image at col 0");
+        VERIFY_IS_TRUE(SlicePixelIs(slice, 1, 0, 0, 255, 0), L"omitting all marks inherits high byte and advances to col 1");
+    }
+
+    // Placeholder metadata moves with its row. After copying the row downward (the same row
+    // lifecycle used by scrolling), an unrelated explicit write perturbs the old global counter;
+    // the adjacent omission must still inherit (1,1) from the moved left cell and render white.
+    TEST_METHOD(KittyPlaceholderMetadataSurvivesScroll)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        auto& buffer = *_testGetSet->_textBuffer;
+        const auto origin = buffer.GetCursor().GetPosition();
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,f=24,s=2,v=2,c=2,r=2;/wAAAP8AAAD/////\x1b\\");
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m");
+        _stateMachine->ProcessString(Placeholder() + L"\x030D" + L"\x0305"); // (1,0) blue
+        const auto surface = buffer.GetImages().All()[0].SurfacePointer();
+
+        buffer.ScrollRows(origin.y, 1, 1);
+        buffer.GetCursor().SetPosition({ 10, origin.y + 2 });
+        _stateMachine->ProcessString(Placeholder() + L"\x0305" + L"\x030D"); // unrelated (0,1)
+        buffer.GetCursor().SetPosition({ 1, origin.y + 1 });
+        _stateMachine->ProcessString(Placeholder()); // inherit from the moved (1,0) cell
+
+        const auto* slice = DirectImageSlice(buffer, origin.y + 1);
+        VERIFY_IS_TRUE(SlicePixelIs(slice, 0, 0, 0, 0, 255), L"the explicit blue cell moved with the row");
+        VERIFY_IS_TRUE(SlicePixelIs(slice, 1, 0, 255, 255, 255), L"the moved metadata resolves the adjacent omission as (1,1) white");
+        const auto* metadata = buffer.GetRowByOffset(origin.y + 1).GetImageCellRef(origin.x);
+        VERIFY_IS_NOT_NULL(metadata);
+        const til::rect expectedOriginal{ origin.x, origin.y, origin.x + 2, origin.y + 2 };
+        auto movedFragments = size_t{ 0 };
+        for (const auto& fragment : buffer.GetImages().All())
+        {
+            const auto bounds = fragment.CellBounds();
+            if (fragment.Identity() == ImagePlacement::Key{ 1, metadata->layerId } &&
+                bounds.top == origin.y + 1 && bounds.left >= origin.x && bounds.right <= origin.x + 2)
+            {
+                ++movedFragments;
+                VERIFY_ARE_EQUAL(expectedOriginal, fragment.OriginalCellBounds());
+                VERIFY_ARE_EQUAL(surface.get(), fragment.SurfacePointer().get());
+            }
+        }
+        VERIFY_ARE_EQUAL(size_t{ 2 }, movedFragments, L"the collection follows both moved placeholder cells");
+    }
+
+    // ICH moves cells horizontally through AdaptDispatch's cell-walking scroll path. The image
+    // pixels already moved via ImageSlice::CopyBlock, but the first metadata implementation lost
+    // the resolved placeholder coordinates because WriteLine cleared each destination cell. After
+    // shifting explicit (0,0) right, an adjacent omission must still inherit (0,1), not default
+    // back to (0,0).
+    TEST_METHOD(KittyPlaceholderMetadataSurvivesInsertCharacter)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        auto& buffer = *_testGetSet->_textBuffer;
+        const auto origin = buffer.GetCursor().GetPosition();
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,f=24,s=3,v=1,c=3,r=1;/wAAAP8AAAD/\x1b\\"); // red|green|blue
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m");
+        _stateMachine->ProcessString(Placeholder() + L"\x0305" + L"\x0305"); // explicit (0,0) red
+
+        buffer.GetCursor().SetPosition(origin);
+        _stateMachine->ProcessString(L"\x1b[@"); // ICH: move the explicit cell from x=0 to x=1
+        buffer.GetCursor().SetPosition({ origin.x + 2, origin.y });
+        _stateMachine->ProcessString(Placeholder()); // inherit (0,1) from moved x=1
+
+        const auto* slice = DirectImageSlice(buffer, origin.y);
+        VERIFY_IS_NOT_NULL(slice);
+        VERIFY_ARE_EQUAL(0u, slice->ColumnOwner(origin.x), L"ICH clears the newly inserted cell's image ownership");
+        VERIFY_ARE_EQUAL(1u, slice->ColumnOwner(origin.x + 1), L"ICH moved the explicit placeholder one cell right");
+        VERIFY_ARE_EQUAL(1u, slice->ColumnOwner(origin.x + 2), L"the adjacent omitted placeholder rendered for image 1");
+        VERIFY_IS_TRUE(SlicePixelIs(slice, origin.x + 1 - slice->ColumnOffset(), 0, 255, 0, 0), L"the moved explicit placeholder remains grid col 0 (red)");
+        VERIFY_IS_TRUE(SlicePixelIs(slice, origin.x + 2 - slice->ColumnOffset(), 0, 0, 255, 0), L"the adjacent omission inherits grid col 1 (green)");
+    }
+
+    // A partial-width vertical scroll uses the cell-walking path rather than rotating whole ROW
+    // storage. Metadata must be restored after each destination WriteLine just like image pixels
+    // are restored by CopyBlock. Otherwise the adjacent omission defaults to (0,0) red instead of
+    // inheriting (1,1) white from the moved (1,0) blue cell.
+    TEST_METHOD(KittyPlaceholderMetadataSurvivesPartialWidthScroll)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        auto& buffer = *_testGetSet->_textBuffer;
+        const auto origin = buffer.GetCursor().GetPosition();
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,f=24,s=2,v=2,c=2,r=2;/wAAAP8AAAD/////\x1b\\");
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m");
+        _stateMachine->ProcessString(Placeholder() + L"\x030D" + L"\x0305"); // explicit (1,0) blue
+
+        const auto page = _pDispatch->_pages.ActivePage();
+        _pDispatch->_ScrollRectVertically(page, { origin.x, origin.y, origin.x + 3, origin.y + 2 }, 1);
+        buffer.GetCursor().SetPosition({ origin.x + 1, origin.y + 1 });
+        _stateMachine->ProcessString(Placeholder()); // inherit from moved (1,0)
+
+        const auto* slice = DirectImageSlice(buffer, origin.y + 1);
+        VERIFY_IS_NOT_NULL(slice);
+        VERIFY_IS_TRUE(SlicePixelIs(slice, 0, 0, 0, 0, 255), L"the explicit blue cell moved down with the partial-width scroll");
+        VERIFY_IS_TRUE(SlicePixelIs(slice, 1, 0, 255, 255, 255), L"the adjacent omission inherits (1,1) white after the move");
+        const auto* metadata = buffer.GetRowByOffset(origin.y + 1).GetImageCellRef(origin.x);
+        VERIFY_IS_NOT_NULL(metadata);
+        const til::rect expectedOriginal{ origin.x, origin.y, origin.x + 2, origin.y + 2 };
+        auto movedFragments = size_t{ 0 };
+        for (const auto& fragment : buffer.GetImages().All())
+        {
+            const auto bounds = fragment.CellBounds();
+            if (fragment.Identity() == ImagePlacement::Key{ 1, metadata->layerId } &&
+                bounds.top == origin.y + 1 && bounds.left >= origin.x && bounds.right <= origin.x + 2)
+            {
+                ++movedFragments;
+                VERIFY_ARE_EQUAL(expectedOriginal, fragment.OriginalCellBounds());
+            }
+        }
+        VERIFY_ARE_EQUAL(size_t{ 2 }, movedFragments);
+    }
+
+    // DECCRA copies cells through the same WriteLine-plus-CopyBlock pattern. Copying explicit
+    // (0,1) green to x=5 must carry its resolved metadata so an omitted cell at x=6 continues to
+    // (0,2) blue. Without the metadata copy the omission falls back to (0,0) red.
+    TEST_METHOD(KittyPlaceholderMetadataSurvivesRectangularCopy)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        auto& buffer = *_testGetSet->_textBuffer;
+        const auto origin = buffer.GetCursor().GetPosition();
+        const auto page = _pDispatch->_pages.ActivePage();
+        const auto vtRow = origin.y - page.Top() + 1;
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,f=24,s=3,v=1,c=3,r=1;/wAAAP8AAAD/\x1b\\"); // red|green|blue
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m");
+        _stateMachine->ProcessString(Placeholder() + L"\x0305" + L"\x030D"); // explicit (0,1) green
+
+        const auto* sourceSlice = DirectImageSlice(buffer, origin.y);
+        const auto* sourceMetadata = buffer.GetRowByOffset(origin.y).GetImageCellRef(origin.x);
+        VERIFY_IS_NOT_NULL(sourceMetadata);
+        VERIFY_ARE_NOT_EQUAL(0u, sourceMetadata->layerId);
+        VERIFY_ARE_EQUAL(size_t{ 1 }, buffer.GetImages().Size());
+        VERIFY_IS_NOT_NULL(sourceSlice);
+        const auto sourcePixel = SlicePixelAt(sourceSlice, 0, 0);
+        VERIFY_ARE_EQUAL(static_cast<BYTE>(0), sourcePixel.rgbRed);
+        VERIFY_ARE_EQUAL(static_cast<BYTE>(255), sourcePixel.rgbGreen);
+        VERIFY_ARE_EQUAL(static_cast<BYTE>(0), sourcePixel.rgbBlue);
+        _pDispatch->CopyRectangularArea(vtRow, 1, vtRow, 1, 1, vtRow, 6, 1); // copy x=0 to x=5
+        buffer.GetCursor().SetPosition({ 6, origin.y });
+        _stateMachine->ProcessString(Placeholder()); // inherit (0,2) from copied x=5
+
+        const auto* slice = DirectImageSlice(buffer, origin.y);
+        VERIFY_IS_NOT_NULL(slice);
+        const auto copiedPixel = SlicePixelAt(slice, 5, 0);
+        VERIFY_ARE_EQUAL(static_cast<BYTE>(0), copiedPixel.rgbRed);
+        VERIFY_ARE_EQUAL(static_cast<BYTE>(255), copiedPixel.rgbGreen, L"DECCRA copied the explicit grid-col-1 cell (green)");
+        VERIFY_ARE_EQUAL(static_cast<BYTE>(0), copiedPixel.rgbBlue);
+        VERIFY_IS_TRUE(SlicePixelIs(slice, 6, 0, 0, 0, 255), L"the adjacent omission inherits grid col 2 (blue)");
+        const auto* metadata = buffer.GetRowByOffset(origin.y).GetImageCellRef(5);
+        VERIFY_IS_NOT_NULL(metadata);
+        const til::rect expectedOriginal{ 4, origin.y, 7, origin.y + 1 };
+        auto copiedFragments = size_t{ 0 };
+        for (const auto& fragment : buffer.GetImages().All())
+        {
+            const auto bounds = fragment.CellBounds();
+            if (fragment.Identity() == ImagePlacement::Key{ 1, metadata->layerId } &&
+                bounds.top == origin.y && bounds.left >= 5 && bounds.right <= 7)
+            {
+                ++copiedFragments;
+                VERIFY_ARE_EQUAL(expectedOriginal, fragment.OriginalCellBounds());
+            }
+        }
+        VERIFY_ARE_EQUAL(size_t{ 2 }, copiedFragments);
+    }
+
+    // Reflow copies text in cell ranges rather than moving whole ROW objects. The resolved
+    // placeholder metadata must follow that text to its new coordinates instead of remaining
+    // attached to the old absolute row/column.
+    TEST_METHOD(KittyPlaceholderMetadataSurvivesReflow)
+    {
+        _testGetSet->PrepData();
+        auto& buffer = *_testGetSet->_textBuffer;
+        const auto origin = buffer.GetCursor().GetPosition();
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,f=24,s=2,v=2,c=2,r=2;/wAAAP8AAAD/////\x1b\\");
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m");
+        buffer.GetCursor().SetPosition({ 10, origin.y });
+        _stateMachine->ProcessString(Placeholder() + L"\x030D" + L"\x030D"); // explicit (1,1)
+        const auto sourceSurface = buffer.GetImages().All()[0].SurfacePointer();
+        const auto sourceMetadata = *buffer.GetRowByOffset(origin.y).GetImageCellRef(10);
+
+        auto reflowed = std::make_unique<TextBuffer>(til::size{ 5, 600 }, TextAttribute{}, 0, false, &_testGetSet->_renderer);
+        TextBuffer::Reflow(buffer, *reflowed);
+
+        auto found = false;
+        til::point movedTo{ -1, -1 };
+        for (auto y = 0; y < reflowed->GetSize().Height() && !found; ++y)
+        {
+            const auto& row = reflowed->GetRowByOffset(y);
+            for (auto x = 0; x < reflowed->GetSize().Width(); ++x)
+            {
+                if (const auto metadata = row.GetImageCellRef(x))
+                {
+                    found = true;
+                    movedTo = { x, y };
+                    VERIFY_ARE_EQUAL(1u, metadata->column, L"reflow preserves the resolved grid column");
+                    VERIFY_ARE_EQUAL(static_cast<uint16_t>(1), metadata->row, L"reflow preserves the resolved grid row");
+                    break;
+                }
+            }
+        }
+
+        VERIFY_IS_TRUE(found, L"reflowed placeholder retains its resolved metadata");
+        const til::point oldPosition{ 10, origin.y };
+        VERIFY_IS_TRUE(movedTo != oldPosition, L"metadata moved with the text rather than staying at its old absolute position");
+        const til::rect expectedOriginal{ movedTo.x - 1, movedTo.y - 1, movedTo.x + 1, movedTo.y + 1 };
+        auto foundPlacement = false;
+        for (const auto& fragment : reflowed->GetImages().All())
+        {
+            if (fragment.Identity() == ImagePlacement::Key{ 1, sourceMetadata.layerId } &&
+                fragment.CellBounds() == til::rect{ movedTo.x, movedTo.y, movedTo.x + 1, movedTo.y + 1 })
+            {
+                foundPlacement = true;
+                VERIFY_ARE_EQUAL(expectedOriginal, fragment.OriginalCellBounds());
+                VERIFY_ARE_EQUAL(sourceSurface.get(), fragment.SurfacePointer().get());
+            }
+        }
+        VERIFY_IS_TRUE(foundPlacement, L"the collection fragment follows the exact placeholder cell");
+    }
+
+    // Two placeholder cells of a multi-COLUMN grid sent in SEPARATE writes on the same
+    // screen row must continue along the grid columns (0,0)->(0,1), not advance the grid
+    // row. Persisting the first cell's resolved coordinates makes chunked writes stable.
+    TEST_METHOD(KittyPlaceholderChunkedSameRowContinuesColumns)
+    {
+        _testGetSet->PrepData();
+        const auto origin = _testGetSet->_textBuffer->GetCursor().GetPosition();
+        // 2x2 image: TL red, TR green, BL blue, BR white.
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,f=24,s=2,v=2,c=2,r=2;/wAAAP8AAAD/////\x1b\\");
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m");
+        _stateMachine->ProcessString(Placeholder()); // (0,0) = TL red
+        _stateMachine->ProcessString(Placeholder()); // separate write, same row -> (0,1) = TR green
+        const auto* slice = DirectImageSlice(*_testGetSet->_textBuffer, origin.y);
+        VERIFY_IS_TRUE(SliceContainsColor(slice, 255, 0, 0), L"col 0 = TL red");
+        VERIFY_IS_TRUE(SliceContainsColor(slice, 0, 255, 0), L"col 1 = TR green (auto col continued, same grid row)");
+        VERIFY_IS_FALSE(SliceContainsColor(slice, 0, 0, 255), L"must not drop to grid row 1 (blue) on a same-row chunk");
+    }
+
+    // A write can be split anywhere, including between a placeholder's two diacritics - the console
+    // write path chunks long runs. The orphaned diacritic then opens the next segment, where it
+    // joins the cell the previous segment already wrote and so occupies no column of its own.
+    // Old failure: it was counted as a cell, shifting every placeholder after it one column right
+    // onto a cell with no image foreground, which dropped that tile silently. Reproduced in the
+    // real host as a hole in a 12x6 grid, at a different tile per screen column, deterministically.
+    TEST_METHOD(KittyPlaceholderSplitBetweenDiacriticsStillRenders)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,f=24,s=2,v=1,c=2,r=1;/wAAAP8A\x1b\\"); // red|green, grid 2x1
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m");
+        // Cell 0 is written with its row diacritic only; its column diacritic is orphaned into the
+        // next write, immediately ahead of cell 1's placeholder.
+        _stateMachine->ProcessString(Placeholder() + L"\x0305");
+        _stateMachine->ProcessString(L"\x0305" + Placeholder() + L"\x0305" + L"\x030D"); // orphan, then row 0 col 1
+        VERIFY_IS_TRUE(BufferContainsColor(*_testGetSet->_textBuffer, 255, 0, 0), L"col 0 = red");
+        VERIFY_IS_TRUE(BufferContainsColor(*_testGetSet->_textBuffer, 0, 255, 0), L"col 1 = green; a split between diacritics must not drop the cell");
+    }
+
+    // Re-storing a virtual placement must not erase the resolved metadata attached to existing
+    // placeholder text. Old failure: resetting placement-global counters made the adjacent
+    // no-diacritic cell repeat col 0 instead of inheriting col 1 from the left cell.
+    // The split can also fall between the placeholder base and its FIRST diacritic, so a whole
+    // write consists of nothing but the row/column marks. They join the cell the previous write
+    // placed, which was resolved from the base alone and therefore addressed grid (0,0). The
+    // completed cell has to be resolved again from the row's finished grapheme, or the tile the
+    // application asked for is never drawn.
+    TEST_METHOD(KittyPlaceholderSplitBeforeDiacriticsResolvesCell)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        const auto origin = _testGetSet->_textBuffer->GetCursor().GetPosition();
+        // 2x2 image: TL red, TR green, BL blue, BR white.
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,f=24,s=2,v=2,c=2,r=2;/wAAAP8AAAD/////\x1b\\");
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m");
+        _stateMachine->ProcessString(Placeholder()); // base only: resolves to (0,0)
+        _stateMachine->ProcessString(L"\x030D"
+                                     L"\x030D"); // row 1, col 1 arrive on their own
+
+        const auto* slice = DirectImageSlice(*_testGetSet->_textBuffer, origin.y);
+        VERIFY_IS_TRUE(SlicePixelIs(slice, 0, 0, 255, 255, 255), L"the completed cell is grid (1,1) = white, not the (0,0) red the base alone selected");
+        VERIFY_ARE_EQUAL(origin.x + 1, _testGetSet->_textBuffer->GetCursor().GetPosition().x, L"diacritics that join the previous cell consume no column");
+    }
+
+    // The re-resolved cell also has to keep feeding the inheritance chain, and must not shift
+    // anything: the marks occupy no column, so the next placeholder lands one cell to the right
+    // and continues from the column the re-resolved cell actually holds.
+    TEST_METHOD(KittyPlaceholderSplitBeforeDiacriticsKeepsColumns)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        const auto origin = _testGetSet->_textBuffer->GetCursor().GetPosition();
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,f=24,s=3,v=1,c=3,r=1;/wAAAP8AAAD/\x1b\\"); // red|green|blue
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m");
+        _stateMachine->ProcessString(Placeholder()); // base only
+        _stateMachine->ProcessString(L"\x0305"
+                                     L"\x030D"); // row 0, col 1
+        _stateMachine->ProcessString(Placeholder()); // inherits col 2 from the re-resolved cell
+
+        const auto* slice = DirectImageSlice(*_testGetSet->_textBuffer, origin.y);
+        VERIFY_IS_TRUE(SlicePixelIs(slice, 0, 0, 0, 255, 0), L"the re-resolved cell is grid col 1 (green)");
+        VERIFY_IS_TRUE(SlicePixelIs(slice, 1, 0, 0, 0, 255), L"the next cell inherits col 2 (blue) from it, with no column drift");
+    }
+
+    // Placeholder-rendered images are text, not physical placements, so d=a does not erase them.
+    TEST_METHOD(KittyPlaceholderDeleteAllPreservesVirtualPlacement)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,f=24,s=1,v=1;/wAA\x1b\\");
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m");
+        _stateMachine->ProcessString(Placeholder());
+        VERIFY_IS_TRUE(BufferContainsColor(*_testGetSet->_textBuffer, 255, 0, 0));
+        _stateMachine->ProcessString(L"\x1b_Ga=d,d=a;\x1b\\");
+        VERIFY_IS_TRUE(BufferContainsColor(*_testGetSet->_textBuffer, 255, 0, 0), L"delete-all must not erase Unicode-placeholder pixels");
+    }
+
+    // A leading combining mark that is a kitty diacritic but joins ordinary text must be left
+    // alone: there is no placeholder to resolve, and the text after it still starts at the
+    // write's own column.
+    TEST_METHOD(KittyPlaceholderDiacriticOnPlainTextIsInert)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        auto& buffer = *_testGetSet->_textBuffer;
+        const auto origin = buffer.GetCursor().GetPosition();
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,f=24,s=2,v=1,c=2,r=1;/wAAAP8A\x1b\\");
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m");
+        _stateMachine->ProcessString(L"A");
+        _stateMachine->ProcessString(L"\x0305"
+                                     L"B"); // combining overline joins the A, then a B
+
+        VERIFY_IS_NULL(DirectImageSlice(buffer, origin.y), L"a diacritic over ordinary text draws no image");
+        VERIFY_ARE_EQUAL(L"B", buffer.GetRowByOffset(origin.y).GlyphAt(origin.x + 1), L"the text after the mark keeps its column");
+    }
+
+    // Re-storing a virtual placement must not erase the resolved metadata attached to existing
+    // placeholder text. Old failure: resetting placement-global counters made the adjacent
+    // no-diacritic cell repeat col 0 instead of inheriting col 1 from the left cell.
+    TEST_METHOD(KittyPlaceholderRestoreKeepsLeftNeighborState)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        const auto origin = _testGetSet->_textBuffer->GetCursor().GetPosition();
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,f=24,s=2,v=1,c=2,r=1;/wAAAP8A\x1b\\"); // red|green
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m");
+
+        _stateMachine->ProcessString(Placeholder() + L"\x0305" + L"\x0305"); // explicit (0,0)
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,f=24,s=2,v=1,c=2,r=1;/wAAAP8A\x1b\\"); // re-store same virtual id
+        _testGetSet->_textBuffer->GetCursor().SetPosition({ origin.x + 1, origin.y });
+        _stateMachine->ProcessString(Placeholder());
+
+        const auto* slice = DirectImageSlice(*_testGetSet->_textBuffer, origin.y);
+        VERIFY_IS_NOT_NULL(slice);
+        VERIFY_ARE_EQUAL(origin.x + 1, slice->ColumnOffset(), L"only the newly rendered adjacent cell remains after re-transmit");
+        VERIFY_IS_TRUE(SlicePixelIs(slice, 0, 0, 0, 255, 0), L"re-storing the image preserves left-cell inheritance (col 1 = green)");
+    }
+
+    // Re-transmitting a virtual id as a NON-virtual image cancels placeholder eligibility, so a
+    // later U+10EEEE cell no longer overlays it (and the prior overlay is erased by the new
+    // transmit). The placeholder becomes inert.
+    TEST_METHOD(KittyPlaceholderVirtualToNonVirtualStopsOverlay)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,f=24,s=1,v=1;/wAA\x1b\\"); // virtual red
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m");
+        _stateMachine->ProcessString(Placeholder());
+        VERIFY_IS_TRUE(BufferContainsColor(*_testGetSet->_textBuffer, 255, 0, 0), L"virtual id overlays red");
+
+        // Re-transmit the same id WITHOUT U=1: non-virtual, so the placeholder eligibility is
+        // dropped (a=t does not draw at the cursor).
+        _stateMachine->ProcessString(L"\x1b_Ga=t,i=1,f=24,s=1,v=1;/wAA\x1b\\");
+        _stateMachine->ProcessString(Placeholder());
+        VERIFY_ARE_EQUAL(0, CountImageRows(*_testGetSet->_textBuffer), L"a non-virtual id must not overlay via placeholders");
+    }
+
+    // An anonymous non-virtual PUT creates a separate physical placement and leaves the
+    // previously registered anonymous virtual prototype available to later placeholders.
+    TEST_METHOD(KittyPlaceholderNonVirtualPutKeepsOverlay)
+    {
+        _testGetSet->PrepData();
+        const auto origin = _testGetSet->_textBuffer->GetCursor().GetPosition();
+        _stateMachine->ProcessString(L"\x1b_Ga=t,U=1,i=1,f=24,s=1,v=1;/wAA\x1b\\"); // transmit + virtual, no draw
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m");
+        _stateMachine->ProcessString(Placeholder());
+        VERIFY_IS_TRUE(BufferContainsColor(*_testGetSet->_textBuffer, 255, 0, 0), L"virtual id overlays red before the put");
+
+        // The non-virtual put draws once at the cursor without replacing the virtual prototype.
+        _stateMachine->ProcessString(L"\x1b_Ga=p,i=1;\x1b\\");
+
+        // A placeholder on a fresh empty row still resolves through the virtual prototype.
+        const auto freshRow = origin.y + 10;
+        _testGetSet->_textBuffer->GetCursor().SetPosition({ 0, freshRow });
+        _stateMachine->ProcessString(Placeholder());
+        VERIFY_IS_NOT_NULL(DirectImageSlice(*_testGetSet->_textBuffer, freshRow), L"non-virtual put preserves placeholder eligibility");
+    }
+
+    // Delete-all does not affect virtual placements, so later placeholder text can reuse the grid.
+    TEST_METHOD(KittyPlaceholderDeleteAllKeepsVirtualMap)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,f=24,s=1,v=1;/wAA\x1b\\"); // virtual red
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m");
+        _stateMachine->ProcessString(Placeholder());
+        VERIFY_IS_TRUE(BufferContainsColor(*_testGetSet->_textBuffer, 255, 0, 0), L"virtual id overlays red");
+
+        _stateMachine->ProcessString(L"\x1b_Ga=d,d=a;\x1b\\"); // delete all
+        _stateMachine->ProcessString(Placeholder());
+        VERIFY_ARE_EQUAL(static_cast<size_t>(1), _kitty()._virtualIds.count({ 1u, 0u }));
+        VERIFY_IS_TRUE(BufferContainsColor(*_testGetSet->_textBuffer, 255, 0, 0), L"the preserved virtual map renders later placeholder text");
+    }
+
+    // A virtual parent's anchor is min(x) and min(y) taken INDEPENDENTLY across all its
+    // placeholder cells, even when those mins come from different rows.
+    TEST_METHOD(KittyRelativeVirtualParentUsesMinXAndMinYAcrossRows)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,p=1,f=24,s=1,v=1;/wAA\x1b\\");
+        auto& buf = *_testGetSet->_textBuffer;
+
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m"); // fg = image id 1
+        _stateMachine->ProcessString(L"\x1b[58:2::0:0:1m"); // underline = placement id 1
+        _pDispatch->CursorPosition(11, 3);
+        const auto cellA = buf.GetCursor().GetPosition(); // first placeholder cell
+        _stateMachine->ProcessString(L"\xDBFB\xDEEE");
+        _pDispatch->CursorPosition(6, 21);
+        const auto cellB = buf.GetCursor().GetPosition(); // second placeholder cell, a different row/col
+        _stateMachine->ProcessString(L"\xDBFB\xDEEE");
+        VERIFY_ARE_NOT_EQUAL(cellA.x, cellB.x);
+        VERIFY_ARE_NOT_EQUAL(cellA.y, cellB.y);
+        const auto minX = std::min(cellA.x, cellB.x);
+        const auto minY = std::min(cellA.y, cellB.y);
+
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;0m"); // reset fg so the child isn't a placeholder
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=2,p=1,P=1,Q=1,H=1,V=1,f=24,s=1,v=1;AP8A\x1b\\");
+        // Child anchor = (min over all placeholder x, min over all placeholder y) + (H=1, V=1),
+        // with the two mins taken independently (so they may come from different rows).
+        const auto& child = _kitty()._placements.at({ 2u, 1u });
+        VERIFY_ARE_EQUAL(minX + 1, child.anchorCol, L"child x = min(all placeholder x) + H");
+        VERIFY_ARE_EQUAL(minY + 1, child.anchorRow, L"child y = min(all placeholder y) + V");
+        const auto* childSlice = DirectImageSlice(buf, minY + 1);
+        VERIFY_IS_NOT_NULL(childSlice);
+        VERIFY_ARE_EQUAL(2u, childSlice->ColumnOwner(minX + 1));
+    }
+
+    // A virtual put (a=p,U=1) with a NEW placement id must replace only that (i,p) -- it must not
+    // cascade-delete the image's other placements or their relative children.
+    TEST_METHOD(KittyVirtualPutDoesNotOverDeleteOtherPlacements)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        _pDispatch->CursorPosition(3, 3);
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,p=1,f=24,s=1,v=1,C=1;/wAA\x1b\\"); // real placement (1,1)
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=2,p=1,P=1,Q=1,H=1,f=24,s=1,v=1,C=1;AP8A\x1b\\"); // child image 2 rel (1,1)
+        VERIFY_ARE_EQUAL(static_cast<size_t>(2), _kitty()._placements.size());
+
+        _stateMachine->ProcessString(L"\x1b_Ga=p,U=1,i=1,p=2,c=2,r=2;\x1b\\"); // virtual put of image 1, new placement id 2
+        VERIFY_ARE_EQUAL(static_cast<size_t>(1), _kitty()._placements.count({ 1u, 1u }), L"the real placement (1,1) must survive");
+        VERIFY_ARE_EQUAL(static_cast<size_t>(1), _kitty()._placements.count({ 2u, 1u }), L"the relative child (2,1) must survive");
+
+        _testGetSet->_response.clear();
+        _stateMachine->ProcessString(L"\x1b_Ga=p,i=2,p=9;\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=2,p=9;OK\x1b\\"); // child image 2 was not deleted
+    }
+
+    // Referencing a virtual parent with a placement id it does not have is ENOPARENT (the
+    // virtual fallback only resolves the anonymous (imageId, 0) reference, not an arbitrary Q).
+    TEST_METHOD(KittyRelativeVirtualParentWrongPlacementIdIsEnoparent)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,p=1,f=24,s=1,v=1;/wAA\x1b\\"); // virtual placement (1,1)
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=2,p=1,P=1,Q=2,f=24,s=1,v=1;AP8A\x1b\\"); // wrong Q=2
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=2,p=1;ENOPARENT:relative parent not found\x1b\\");
+    }
+
+    TEST_METHOD(KittyGraphicsCoveredVirtualParentStillAnchorsRelativeChild)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        auto& buffer = *_testGetSet->_textBuffer;
+        const auto origin = buffer.GetCursor().GetPosition();
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,p=1,z=-1,f=24,s=1,v=1;/wAA\x1b\\");
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m");
+        _stateMachine->ProcessString(L"\x1b[58:2::0:0:1m");
+        _stateMachine->ProcessString(Placeholder() + L"\x0305" + L"\x0305");
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;0m");
+        buffer.GetCursor().SetPosition(origin);
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=2,z=1,f=24,s=1,v=1,C=1;AP8A\x1b\\");
+
+        const auto anchor = _kitty()._deriveVirtualPlacementAnchor(1, 1);
+        VERIFY_IS_TRUE(anchor.has_value());
+        VERIFY_ARE_EQUAL(origin, *anchor);
+    }
+
+    // Fix M1 (registry-cap eviction integrity): when _placements hits its cap, evicting a
+    // victim must erase the victim's drawn cells (no ghost pixels) AND cascade-delete its relative
+    // children (no dangling child referencing a gone parent). The prior code only erased the map
+    // entry. Here a real drawn parent (1,1) has a relative child (2,1); flooding the registry past
+    // the cap evicts (1,1) (the lowest key) and must take its child and its pixels with it.
+    TEST_METHOD(KittyRegistryCapEvictionErasesGhostAndCascadesChild)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        auto& buf = *_testGetSet->_textBuffer;
+        _stateMachine->ProcessString(L"\x1b_Ga=t,i=1,f=24,s=1,v=1;/wAA\x1b\\"); // store image 1 (red)
+
+        _pDispatch->CursorPosition(4, 4);
+        const auto parentPos = buf.GetCursor().GetPosition();
+        _stateMachine->ProcessString(L"\x1b_Ga=p,i=1,p=1,C=1;\x1b\\"); // parent (1,1) drawn at the cursor
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=2,p=1,P=1,Q=1,H=1,V=0,f=24,s=1,v=1,C=1;AP8A\x1b\\"); // child (2,1) rel (1,1)
+        VERIFY_ARE_EQUAL(static_cast<size_t>(1), _kitty()._placements.count({ 1u, 1u }));
+        VERIFY_ARE_EQUAL(static_cast<size_t>(1), _kitty()._placements.count({ 2u, 1u }));
+
+        // Flood the registry past its cap with cheap VIRTUAL placements of image 1 (no draw, no
+        // re-transmit). (1,1) is the lowest-keyed entry, so it is the first eviction victim.
+        for (uint32_t k = 2; k <= KittyParser::MaxPlacements + 2; ++k)
+        {
+            _stateMachine->ProcessString(L"\x1b_Ga=p,U=1,i=1,p=" + std::to_wstring(k) + L";\x1b\\");
+        }
+
+        VERIFY_IS_TRUE(_kitty()._placements.size() <= KittyParser::MaxPlacements, L"the placement registry must stay bounded");
+        VERIFY_ARE_EQUAL(static_cast<size_t>(0), _kitty()._placements.count({ 1u, 1u }), L"the parent (1,1) was evicted at the cap");
+        VERIFY_ARE_EQUAL(static_cast<size_t>(0), _kitty()._placements.count({ 2u, 1u }), L"the evicted parent's relative child must be cascaded, not left dangling");
+        const auto* ghost = DirectImageSlice(buf, parentPos.y);
+        VERIFY_IS_TRUE(ghost == nullptr || ghost->ColumnOwner(parentPos.x) == 0, L"the evicted parent's drawn cell must be erased (no ghost pixels)");
+    }
+
+    TEST_METHOD(KittyGraphicsDeleteByZPreservesCoexistingVirtualPlacement)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        auto& buffer = *_testGetSet->_textBuffer;
+        const auto origin = buffer.GetCursor().GetPosition();
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,p=1,z=3,f=24,s=1,v=1,C=1;/wAA\x1b\\");
+        _stateMachine->ProcessString(L"\x1b_Ga=p,U=1,i=1,z=5;\x1b\\");
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m");
+        buffer.GetCursor().SetPosition({ origin.x + 2, origin.y });
+        _stateMachine->ProcessString(Placeholder() + L"\x0305" + L"\x0305");
+
+        _stateMachine->ProcessString(L"\x1b_Ga=d,d=Z,z=3;\x1b\\");
+
+        const auto* slice = DirectImageSlice(buffer, origin.y);
+        VERIFY_IS_NOT_NULL(slice);
+        VERIFY_IS_TRUE(slice->ColumnOwner(origin.x) != 1, L"the physical z=3 placement must be deleted");
+        VERIFY_IS_TRUE(slice->ColumnOwner(origin.x + 2) == 1, L"the coexisting virtual z=5 placement must survive");
+        VERIFY_ARE_EQUAL(static_cast<size_t>(1), _kitty()._virtualIds.count({ 1u, 0u }));
+        VERIFY_ARE_EQUAL(static_cast<size_t>(1), _kitty()._images.count(1), L"the surviving virtual placement must retain shared data");
+    }
+
+    TEST_METHOD(KittyGraphicsDeleteByZAndQIgnoreVirtualPlacements)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        const auto origin = _testGetSet->_textBuffer->GetCursor().GetPosition();
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,p=1,z=5,f=24,s=1,v=1;/wAA\x1b\\");
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m");
+        _stateMachine->ProcessString(L"\x1b[58:2::0:0:1m");
+        _stateMachine->ProcessString(Placeholder() + L"\x0305" + L"\x0305");
+        auto page = _pDispatch->_pages.ActivePage();
+        const auto x = origin.x + 1;
+        const auto y = origin.y - page.Top() + 1;
+
+        _stateMachine->ProcessString(L"\x1b_Ga=d,d=z,z=5;\x1b\\");
+        _stateMachine->ProcessString(L"\x1b_Ga=d,d=Q,x=" + std::to_wstring(x) + L",y=" + std::to_wstring(y) + L",z=5;\x1b\\");
+
+        const auto* slice = DirectImageSlice(*_testGetSet->_textBuffer, origin.y);
+        VERIFY_IS_NOT_NULL(slice);
+        VERIFY_IS_TRUE(slice->Contains(1), L"z-based selectors must not affect virtual placements");
+        VERIFY_ARE_EQUAL(static_cast<size_t>(1), _kitty()._virtualIds.count({ 1u, 1u }));
+        VERIFY_ARE_EQUAL(static_cast<size_t>(1), _kitty()._images.count(1), L"uppercase d=Q must not free virtual image data");
+    }
+
+    TEST_METHOD(KittyGraphicsVirtualPlacementUsesZIndex)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        const auto origin = _testGetSet->_textBuffer->GetCursor().GetPosition();
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,p=1,z=-1,f=24,s=1,v=1;/wAA\x1b\\");
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m");
+        _stateMachine->ProcessString(L"\x1b[58:2::0:0:1m");
+        _stateMachine->ProcessString(Placeholder() + L"\x0305" + L"\x0305");
+
+        const auto* slice = DirectImageSlice(*_testGetSet->_textBuffer, origin.y);
+        VERIFY_IS_NOT_NULL(slice);
+        const auto pixel = SlicePixelAt(slice, ImageSlice::RenderPosition::BehindText, origin.x - slice->ColumnOffset(), 0);
+        VERIFY_ARE_EQUAL(static_cast<BYTE>(255), pixel.rgbRed);
+        VERIFY_IS_FALSE(slice->HasPixels(ImageSlice::RenderPosition::AboveText));
+    }
+
+    TEST_METHOD(KittyGraphicsUnresolvedPlaceholderDoesNotMoveOverlappingLayer)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        auto& buffer = *_testGetSet->_textBuffer;
+        const auto origin = buffer.GetCursor().GetPosition();
+        const til::point placeholderPosition{ 10, origin.y };
+
+        _stateMachine->ProcessString(L"\x1b_Ga=t,i=1,f=24,s=1,v=1;/wAA\x1b\\");
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m");
+        _stateMachine->ProcessString(L"\x1b[58:2::0:0:99m");
+        buffer.GetCursor().SetPosition(placeholderPosition);
+        _stateMachine->ProcessString(Placeholder() + L"\x0305" + L"\x0305");
+        const auto metadata = buffer.GetRowByOffset(placeholderPosition.y).GetImageCellRef(placeholderPosition.x);
+        VERIFY_IS_NOT_NULL(metadata);
+        VERIFY_ARE_EQUAL(0u, metadata->layerId, L"an unresolved placement has no retained-layer identity");
+
+        buffer.GetCursor().SetPosition({ 3, placeholderPosition.y });
+        _stateMachine->ProcessString(L"\x1b_Ga=p,i=1,p=1,z=1,C=1;\x1b\\");
+        const auto physicalLayer = _kitty()._placements.at({ 1u, 1u }).layerId;
+
+        auto reflowed = std::make_unique<TextBuffer>(til::size{ 5, 600 }, TextAttribute{}, 0, false, &_testGetSet->_renderer);
+        TextBuffer::Reflow(buffer, *reflowed);
+
+        auto foundPlaceholder = false;
+        auto foundPhysicalLayer = false;
+        for (auto y = 0; y < reflowed->GetSize().Height(); ++y)
+        {
+            const auto& row = reflowed->GetRowByOffset(y);
+            const auto* slice = DirectImageSlice(*reflowed, y);
+            foundPhysicalLayer |= slice && slice->ContainsPlacement(physicalLayer);
+            for (auto x = 0; x < reflowed->GetSize().Width(); ++x)
+            {
+                if (const auto* reflowedMetadata = row.GetImageCellRef(x))
+                {
+                    foundPlaceholder = true;
+                    VERIFY_ARE_EQUAL(0u, reflowedMetadata->layerId);
+                    VERIFY_IS_TRUE(slice == nullptr || !slice->ContainsPlacement(physicalLayer),
+                                   L"an unresolved placeholder must not wildcard-move another layer of the same image");
+                }
+            }
+        }
+
+        VERIFY_IS_TRUE(foundPlaceholder);
+        VERIFY_IS_TRUE(foundPhysicalLayer, L"the overlapping physical layer remains on the cloned source row");
+    }
+
+    // A placeholder that names a grid cell OUTSIDE the placement's grid draws nothing --
+    // and must therefore not claim the placement's layer id either. It used to record the
+    // layer id unconditionally, before knowing whether anything would be drawn, which left
+    // cells asserting "my pixels live in layer N" for columns that layer never covered.
+    // Reflow trusts that claim: it builds its move list from the cell reference alone and
+    // hands the source column straight to ImageSlice::CopyLayerCells, which read outside
+    // the layer's pixel plane and memmove'd the result into a layer that was then
+    // composited and painted -- an attacker-triggerable heap disclosure, since any process
+    // writing to the terminal can emit placeholders past the grid and any window resize
+    // reflows. Everything here is reachable from a plain escape-sequence stream.
+    TEST_METHOD(KittyPlaceholderOutsideGridClaimsNoLayerAcrossReflow)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        auto& buffer = *_testGetSet->_textBuffer;
+        const auto origin = buffer.GetCursor().GetPosition();
+
+        // A 2x1 virtual grid (red | green), then a long run of bare placeholders. The first
+        // two resolve to grid columns 0 and 1; every one after that is outside the grid.
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,f=24,s=2,v=1,c=2,r=1;/wAAAP8A\x1b\\");
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m");
+        std::wstring run;
+        for (auto n = 0; n < 40; ++n)
+        {
+            run += Placeholder();
+        }
+        _stateMachine->ProcessString(run);
+        _stateMachine->ProcessString(L"\x1b[0m");
+
+        const auto& row = buffer.GetRowByOffset(origin.y);
+        const auto* slice = DirectImageSlice(buffer, origin.y);
+        VERIFY_IS_NOT_NULL(slice);
+        auto sawInsideGrid = false;
+        auto sawOutsideGrid = false;
+        for (auto x = origin.x; x < buffer.GetSize().Width(); ++x)
+        {
+            const auto* metadata = row.GetImageCellRef(x);
+            if (!metadata)
+            {
+                continue;
+            }
+            if (metadata->column < 2)
+            {
+                sawInsideGrid = true;
+                VERIFY_ARE_NOT_EQUAL(0u, metadata->layerId, L"a drawn placeholder records the layer it drew into");
+            }
+            else
+            {
+                sawOutsideGrid = true;
+                VERIFY_ARE_EQUAL(0u, metadata->layerId, L"a placeholder outside the grid draws nothing, so it must claim no layer");
+                VERIFY_ARE_EQUAL(0u, slice->ColumnOwner(x), L"and the layer must genuinely not cover that column");
+            }
+        }
+        VERIFY_IS_TRUE(sawInsideGrid, L"sanity: the first two placeholders resolved inside the grid");
+        VERIFY_IS_TRUE(sawOutsideGrid, L"sanity: the run extends past the grid width");
+
+        // Reflowing is what consumed the bad claim. Narrowing forces every one of those
+        // cells through the move list. Under ASAN this read past the layer's allocation.
+        auto reflowed = std::make_unique<TextBuffer>(til::size{ 7, 600 }, TextAttribute{}, 0, false, &_testGetSet->_renderer);
+        TextBuffer::Reflow(buffer, *reflowed);
+
+        for (auto y = 0; y < reflowed->GetSize().Height(); ++y)
+        {
+            const auto& reflowedRow = reflowed->GetRowByOffset(y);
+            const auto* reflowedSlice = DirectImageSlice(*reflowed, y);
+            for (auto x = 0; x < reflowed->GetSize().Width(); ++x)
+            {
+                const auto* metadata = reflowedRow.GetImageCellRef(x);
+                if (metadata && metadata->column >= 2)
+                {
+                    VERIFY_ARE_EQUAL(0u, metadata->layerId, L"the claim must stay absent across reflow");
+                    VERIFY_IS_TRUE(reflowedSlice == nullptr || reflowedSlice->ColumnOwner(x) == 0u,
+                                   L"no pixels may be carried across for a cell that was never drawn");
+                }
+            }
+        }
+
+        // Only the two real tiles survive; nothing else was invented out of adjacent heap.
+        VERIFY_IS_TRUE(BufferContainsColor(*reflowed, 255, 0, 0), L"the red tile survives the reflow");
+        VERIFY_IS_TRUE(BufferContainsColor(*reflowed, 0, 255, 0), L"the green tile survives the reflow");
+    }
+
+    TEST_METHOD(KittyGraphicsPlaceholderReflowPreservesOverlappingDirectMapping)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        auto& buffer = *_testGetSet->_textBuffer;
+        const auto origin = buffer.GetCursor().GetPosition();
+        const til::point placeholderPosition{ 10, origin.y };
+
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,p=1,z=-1,f=24,s=1,v=1;/wAA\x1b\\");
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m");
+        _stateMachine->ProcessString(L"\x1b[58:2::0:0:1m");
+        buffer.GetCursor().SetPosition(placeholderPosition);
+        _stateMachine->ProcessString(Placeholder() + L"\x0305" + L"\x0305");
+        const auto virtualLayer = _kitty()._placements.at({ 1u, 1u }).layerId;
+        const auto* placeholderSlice = DirectImageSlice(buffer, placeholderPosition.y);
+        VERIFY_IS_NOT_NULL(placeholderSlice);
+        VERIFY_IS_TRUE(placeholderSlice->Contains(1));
+        VERIFY_IS_TRUE(placeholderSlice->ContainsPlacement(virtualLayer));
+        buffer.GetCursor().SetPosition(placeholderPosition);
+        _stateMachine->ProcessString(L"\x1b_Ga=p,i=1,p=2,z=1,C=1;\x1b\\");
+        const auto physicalLayer = _kitty()._placements.at({ 1u, 2u }).layerId;
+        buffer.GetCursor().SetPosition(placeholderPosition);
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=2,p=1,z=2,f=24,s=1,v=1,C=1;AP8A\x1b\\");
+        const auto* sourceSlice = DirectImageSlice(buffer, placeholderPosition.y);
+        VERIFY_IS_NOT_NULL(sourceSlice);
+        VERIFY_IS_TRUE(sourceSlice->Contains(1));
+        VERIFY_IS_TRUE(sourceSlice->Contains(2));
+        VERIFY_IS_TRUE(sourceSlice->ContainsPlacement(virtualLayer));
+        VERIFY_IS_TRUE(sourceSlice->ContainsPlacement(physicalLayer));
+
+        auto reflowed = std::make_unique<TextBuffer>(til::size{ 5, 600 }, TextAttribute{}, 0, false, &_testGetSet->_renderer);
+        TextBuffer::Reflow(buffer, *reflowed);
+
+        auto foundPlaceholder = false;
+        auto foundOverlappingImage = false;
+        auto foundOverlappingPlacement = false;
+        for (auto y = 0; y < reflowed->GetSize().Height(); ++y)
+        {
+            const auto& row = reflowed->GetRowByOffset(y);
+            const auto* slice = DirectImageSlice(*reflowed, y);
+            foundOverlappingImage |= slice && slice->Contains(2);
+            foundOverlappingPlacement |= slice && slice->ContainsPlacement(physicalLayer);
+            for (auto x = 0; x < reflowed->GetSize().Width(); ++x)
+            {
+                if (!row.GetImageCellRef(x))
+                {
+                    continue;
+                }
+
+                foundPlaceholder = true;
+                const auto foreground = row.GetAttrByColumn(x).GetForeground();
+                VERIFY_IS_TRUE(foreground.IsRgb());
+                VERIFY_ARE_EQUAL(RGB(0, 0, 1), foreground.GetRGB());
+                VERIFY_IS_NOT_NULL(slice);
+                VERIFY_IS_TRUE(slice->Contains(1), L"the placeholder's image follows its reflowed text cell");
+                VERIFY_IS_TRUE(slice->ContainsPlacement(virtualLayer), L"the placeholder's exact placement follows its reflowed text cell");
+                VERIFY_IS_TRUE(slice->ContainsPlacement(physicalLayer), L"another direct placement follows its own mapped source cell");
+                VERIFY_IS_TRUE(slice->Contains(2), L"an unrelated direct layer follows its own mapped source cell");
+                const auto pixel = SlicePixelAt(slice, ImageSlice::RenderPosition::BehindText, x - slice->ColumnOffset(), 0);
+                VERIFY_ARE_EQUAL(static_cast<BYTE>(255), pixel.rgbRed);
+            }
+        }
+
+        VERIFY_IS_TRUE(foundPlaceholder);
+        VERIFY_IS_TRUE(foundOverlappingPlacement, L"the overlapping direct placement follows the same exact source-cell mapping");
+        VERIFY_IS_TRUE(foundOverlappingImage, L"the unrelated direct layer follows its own source cells");
+        VERIFY_ARE_EQUAL(size_t{ 3 }, reflowed->GetImages().Size());
+    }
+
     TEST_METHOD(SixelNewlineOnlyScrollingStreamPrunesStaging)
     {
         _testGetSet->PrepData();
@@ -5424,6 +7960,63 @@ public:
         _testGetSet->PrepData();
         _stateMachine->ProcessString(L"\x1b_Ga=p,i=77,q=2;\x1b\\");
         VERIFY_IS_TRUE(_testGetSet->_response.empty(), L"q=2 should suppress error responses.");
+    }
+
+    // A virtual (U=1) placement that is also relative (P=) is a contradiction between two
+    // control keys, and it has to be settled before the image is stored. Registering first
+    // and failing afterwards replaced whatever was already at that id -- and could evict a
+    // different image to make room -- on behalf of a command that then reported EINVAL.
+    TEST_METHOD(KittyGraphicsVirtualRelativeRejectionLeavesRegistryIntact)
+    {
+        _testGetSet->PrepData();
+        // A parent placement for P=/Q= to name, and the image the rejected command targets.
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,p=7,f=24,s=1,v=1;/wAA\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=1,p=7;OK\x1b\\");
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=2,p=8,f=24,s=1,v=1;AP8A\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=2,p=8;OK\x1b\\");
+
+        auto& kitty = _kitty();
+        const auto images = kitty._images.size();
+        const auto order = kitty._imageOrder;
+        const auto numbers = kitty._imageNumbers;
+        const auto bytes = kitty._totalPixelBytes;
+        const auto placements = kitty._placements.size();
+        const auto anonymous = kitty._anonymousPlacements.size();
+        const auto virtualIds = kitty._virtualIds.size();
+        const auto storedPixels = kitty._images.at(2).pixels;
+
+        // Re-transmitting id 2 with a 2x2 image would replace the 1x1 image already stored
+        // there -- so if anything below has changed, the rejected command still mutated.
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=2,p=8,U=1,P=1,Q=7,f=24,s=2,v=2;AQIDBAUGBwgJCgsM\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=2,p=8;EINVAL:virtual placements cannot be relative\x1b\\");
+
+        VERIFY_ARE_EQUAL(images, kitty._images.size(), L"no image may be added or evicted.");
+        VERIFY_IS_TRUE(order == kitty._imageOrder, L"the eviction order must be untouched.");
+        VERIFY_IS_TRUE(numbers == kitty._imageNumbers, L"the number -> id map must be untouched.");
+        VERIFY_ARE_EQUAL(bytes, kitty._totalPixelBytes, L"the byte accounting must be untouched.");
+        VERIFY_ARE_EQUAL(placements, kitty._placements.size(), L"no placement may be added or replaced.");
+        VERIFY_ARE_EQUAL(anonymous, kitty._anonymousPlacements.size(), L"no anonymous placement may be added.");
+        VERIFY_ARE_EQUAL(virtualIds, kitty._virtualIds.size(), L"the rejected U=1 must not store a virtual grid.");
+        VERIFY_IS_TRUE(storedPixels == kitty._images.at(2).pixels, L"image 2 must still hold the pixels transmitted before the rejected command.");
+        VERIFY_ARE_EQUAL(static_cast<uint32_t>(1), kitty._images.at(2).width, L"image 2 must not have been replaced by the 2x2 image.");
+
+        // And it still displays from what was actually stored.
+        _stateMachine->ProcessString(L"\x1b_Ga=p,i=2;\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=2;OK\x1b\\");
+    }
+
+    // The same rejection on a transmit-only (a=t) command, where the id is auto-assigned
+    // from an image number: nothing is registered, so no id is minted or reported either.
+    TEST_METHOD(KittyGraphicsVirtualRelativeRejectionAssignsNoId)
+    {
+        _testGetSet->PrepData();
+        auto& kitty = _kitty();
+        const auto nextId = kitty._nextImageId;
+
+        _stateMachine->ProcessString(L"\x1b_Ga=t,I=5,U=1,P=1,f=24,s=1,v=1;/wAA\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_GI=5;EINVAL:virtual placements cannot be relative\x1b\\");
+        VERIFY_IS_TRUE(kitty._images.empty(), L"nothing may be registered.");
+        VERIFY_ARE_EQUAL(nextId, kitty._nextImageId, L"no id may be consumed for a command that stored nothing.");
     }
 
     TEST_METHOD(KittyGraphicsChunkedTransmitAssembles)
@@ -6465,6 +9058,38 @@ public:
         VERIFY_IS_TRUE(BufferContainsColor(*_testGetSet->_textBuffer, 255, 0, 0), L"a non-matching cell must not delete it");
         _stateMachine->ProcessString(L"\x1b_Ga=d,d=p,x=3,y=7;\x1b\\"); // protocol (3,7) -> col 2, buffer row 26: match
         VERIFY_IS_FALSE(BufferContainsColor(*_testGetSet->_textBuffer, 255, 0, 0), L"the image at viewport cell (3,7) must be deleted");
+    }
+
+    TEST_METHOD(KittyGraphicsDeleteAtCellPreservesCoexistingVirtualPlacement)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        auto& buffer = *_testGetSet->_textBuffer;
+        _stateMachine->ProcessString(L"\x1b_Ga=t,U=1,i=1,f=24,s=1,v=1;/wAA\x1b\\");
+        const auto virtualLayer = _kitty()._anonymousPlacements.front().layerId;
+
+        const til::point physicalPosition{ 2, 26 };
+        buffer.GetCursor().SetPosition(physicalPosition);
+        _stateMachine->ProcessString(L"\x1b_Ga=p,i=1,C=1;\x1b\\");
+        const auto physicalLayer = _kitty()._anonymousPlacements.back().layerId;
+
+        const til::point placeholderPosition{ 5, 26 };
+        buffer.GetCursor().SetPosition(placeholderPosition);
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m");
+        _stateMachine->ProcessString(Placeholder());
+        const auto* placeholderSlice = DirectImageSlice(buffer, placeholderPosition.y);
+        VERIFY_IS_NOT_NULL(placeholderSlice);
+        VERIFY_IS_TRUE(placeholderSlice->ContainsPlacement(virtualLayer));
+
+        _stateMachine->ProcessString(L"\x1b_Ga=d,d=p,x=3,y=7;\x1b\\");
+
+        const auto* physicalSlice = DirectImageSlice(buffer, physicalPosition.y);
+        VERIFY_IS_TRUE(physicalSlice == nullptr || !physicalSlice->ContainsPlacement(physicalLayer));
+        placeholderSlice = DirectImageSlice(buffer, placeholderPosition.y);
+        VERIFY_IS_NOT_NULL(placeholderSlice);
+        VERIFY_IS_TRUE(placeholderSlice->ContainsPlacement(virtualLayer), L"positional deletion must preserve a coexisting virtual placement");
+        VERIFY_ARE_EQUAL(static_cast<size_t>(1), _kitty()._virtualIds.count({ 1u, 0u }));
+        VERIFY_ARE_EQUAL(static_cast<size_t>(1), _kitty()._images.count(1));
     }
 
     TEST_METHOD(KittyGraphicsDeleteByColumnOrRow)
@@ -8129,6 +10754,447 @@ public:
             }
         }
         VERIFY_IS_TRUE(foundBoth, L"layers from both rows must survive when widening joins wrapped rows");
+    }
+
+    TEST_METHOD(MixedGraphicsHardResetPreservesSixelAndUniqueIdentity)
+    {
+        _testGetSet->PrepData();
+        auto& buffer = *_testGetSet->_textBuffer;
+        _stateMachine->ProcessString(L"\x1bP0;1q#0;2;100;0;0~\x1b\\");
+        const auto firstKey = buffer.GetImages().All().front().Identity();
+        const auto firstSurface = buffer.GetImages().All().front().SurfacePointer();
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,f=24,s=1,v=1,C=1;AP8A\x1b\\");
+
+        _pDispatch->HardReset(false);
+
+        auto images = buffer.GetImages().All();
+        VERIFY_ARE_EQUAL(size_t{ 1 }, images.size(), L"a Kitty reset must remove only Kitty placements");
+        VERIFY_ARE_EQUAL(firstKey, images.front().Identity());
+        VERIFY_ARE_EQUAL(firstSurface.get(), images.front().SurfacePointer().get());
+
+        buffer.GetCursor().SetPosition({ 10, 25 });
+        _stateMachine->ProcessString(L"\x1bP0;1q#0;2;0;0;100~\x1b\\");
+        images = buffer.GetImages().All();
+        VERIFY_ARE_EQUAL(size_t{ 2 }, images.size());
+        const auto second = std::ranges::find_if(images, [&](const auto& placement) {
+            return placement.Identity().protocol == ImagePlacement::Key::Protocol::Sixel && placement.Identity() != firstKey;
+        });
+        VERIFY_IS_TRUE(second != images.end(), L"parser recreation must allocate a new Sixel collection identity");
+        const auto first = std::ranges::find(images, firstKey, &ImagePlacement::Identity);
+        VERIFY_IS_TRUE(first != images.end());
+        if (first != images.end())
+        {
+            VERIFY_ARE_EQUAL(firstSurface.get(), first->SurfacePointer().get(), L"new Sixel output must not replace preserved output");
+        }
+    }
+
+    TEST_METHOD(KittyAnonymousVirtualParentDeleteCascadesNamedChild)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        auto& buffer = *_testGetSet->_textBuffer;
+        const til::point parentPosition{ 5, 5 };
+        buffer.GetCursor().SetPosition(parentPosition);
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,f=24,s=1,v=1;/wAA\x1b\\");
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m");
+        _stateMachine->ProcessString(Placeholder());
+        _stateMachine->ProcessString(L"\x1b[0m");
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=2,p=1,P=1,Q=0,H=1,V=0,f=24,s=1,v=1,C=1;AP8A\x1b\\");
+
+        const til::point childPosition{ parentPosition.x + 1, parentPosition.y };
+        VERIFY_ARE_EQUAL(2u, DirectImageSlice(buffer, childPosition.y)->ColumnOwner(childPosition.x));
+        _stateMachine->ProcessString(L"\x1b_Ga=d,d=i,i=1;\x1b\\");
+
+        VERIFY_IS_FALSE(_kitty()._placements.contains({ 2u, 1u }));
+        VERIFY_IS_FALSE(_kitty()._images.contains(2u));
+        const auto* slice = DirectImageSlice(buffer, childPosition.y);
+        VERIFY_IS_TRUE(slice == nullptr || slice->ColumnOwner(childPosition.x) != 2u);
+    }
+
+    TEST_METHOD(KittyAnonymousVirtualParentRetransmitAndReputCascadeNamedChild)
+    {
+        const auto createParentAndChild = [&]() {
+            _testGetSet->PrepData();
+            _testGetSet->_cellSize = { 1, 1 };
+            auto& buffer = *_testGetSet->_textBuffer;
+            buffer.GetCursor().SetPosition({ 5, 5 });
+            _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,f=24,s=1,v=1;/wAA\x1b\\");
+            _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m");
+            _stateMachine->ProcessString(Placeholder());
+            _stateMachine->ProcessString(L"\x1b[0m");
+            _stateMachine->ProcessString(L"\x1b_Ga=T,i=2,p=1,P=1,Q=0,H=1,V=0,f=24,s=1,v=1,C=1;AP8A\x1b\\");
+        };
+
+        createParentAndChild();
+        _stateMachine->ProcessString(L"\x1b_Ga=t,i=1,f=24,s=1,v=1;AAD/\x1b\\");
+        VERIFY_IS_FALSE(_kitty()._placements.contains({ 2u, 1u }), L"retransmitting an anonymous virtual parent cascades its named child");
+        VERIFY_IS_FALSE(_kitty()._images.contains(2u));
+
+        _kitty()._clearImages();
+        createParentAndChild();
+        _stateMachine->ProcessString(L"\x1b_Ga=p,U=1,i=1,c=1,r=1;\x1b\\");
+        VERIFY_IS_FALSE(_kitty()._placements.contains({ 2u, 1u }), L"re-putting an anonymous virtual parent cascades its named child");
+        VERIFY_IS_FALSE(_kitty()._images.contains(2u));
+    }
+
+    TEST_METHOD(KittyAnonymousVirtualParentEvictionCascadesNamedChild)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        auto& buffer = *_testGetSet->_textBuffer;
+        buffer.GetCursor().SetPosition({ 5, 5 });
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,f=24,s=1,v=1;/wAA\x1b\\");
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m");
+        _stateMachine->ProcessString(Placeholder());
+        _stateMachine->ProcessString(L"\x1b[0m");
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=2,p=1,P=1,Q=0,H=1,V=0,f=24,s=1,v=1,C=1;AP8A\x1b\\");
+
+        buffer.GetCursor().SetPosition({ 0, 0 });
+        for (auto id = 3u; id <= KittyParser::MaxImages; ++id)
+        {
+            _stateMachine->ProcessString(L"\x1b_Ga=T,i=" + std::to_wstring(id) + L",q=2,f=24,s=1,v=1,C=1;AAAA\x1b\\");
+        }
+        VERIFY_IS_TRUE(_kitty()._registerImage(KittyParser::MaxImages + 1, KittyParser::Image{}));
+        VERIFY_IS_FALSE(_kitty()._images.contains(1u));
+        VERIFY_IS_FALSE(_kitty()._images.contains(2u), L"evicting an anonymous virtual parent cascades the named child");
+        VERIFY_IS_FALSE(_kitty()._placements.contains({ 2u, 1u }));
+    }
+
+    TEST_METHOD(KittyAnonymousVirtualParentSurvivesDeleteAllException)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        auto& buffer = *_testGetSet->_textBuffer;
+        buffer.GetCursor().SetPosition({ 5, 5 });
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,f=24,s=1,v=1;/wAA\x1b\\");
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m");
+        _stateMachine->ProcessString(Placeholder());
+        _stateMachine->ProcessString(L"\x1b[0m");
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=2,p=1,P=1,Q=0,H=1,V=0,f=24,s=1,v=1,C=1;AP8A\x1b\\");
+
+        _stateMachine->ProcessString(L"\x1b_Ga=d,d=a;\x1b\\");
+        VERIFY_IS_TRUE(_kitty()._virtualIds.contains({ 1u, 0u }), L"d=a retains the anonymous virtual parent");
+        VERIFY_IS_TRUE(_kitty()._images.contains(1u));
+        VERIFY_IS_FALSE(_kitty()._placements.contains({ 2u, 1u }), L"d=a still removes the physical child");
+    }
+
+    TEST_METHOD(KittyAnonymousCascadeFailureRestoresDeleteReputAndEviction)
+    {
+        const til::point parent{ 10, 10 };
+        const til::point child{ parent.x + 1, parent.y };
+        const til::point grandchild{ parent.x + 2, parent.y + 1 };
+        const auto setup = [&]() {
+            _testGetSet->PrepData();
+            _testGetSet->_cellSize = { 1, 1 };
+            _kitty()._clearImages();
+            auto& buffer = *_testGetSet->_textBuffer;
+            _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,f=24,s=1,v=1;/wAA\x1b\\");
+            buffer.GetCursor().SetPosition(parent);
+            _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m");
+            _stateMachine->ProcessString(Placeholder());
+            _stateMachine->ProcessString(L"\x1b[0m");
+            _stateMachine->ProcessString(L"\x1b_Ga=T,i=2,p=1,P=1,Q=0,H=1,V=0,f=24,s=1,v=1,C=1;AP8A\x1b\\");
+            _stateMachine->ProcessString(L"\x1b_Ga=T,i=3,p=1,P=2,Q=1,H=1,V=1,f=24,s=1,v=1,C=1;AAD/\x1b\\");
+        };
+        const auto verify = [&]() {
+            const auto& buffer = *_testGetSet->_textBuffer;
+            VERIFY_IS_TRUE(_kitty()._virtualIds.contains({ 1u, 0u }));
+            VERIFY_IS_TRUE(_kitty()._placements.contains({ 2u, 1u }));
+            VERIFY_IS_TRUE(_kitty()._placements.contains({ 3u, 1u }));
+            VERIFY_IS_TRUE(_kitty()._images.contains(1u));
+            VERIFY_IS_TRUE(_kitty()._images.contains(2u));
+            VERIFY_IS_TRUE(_kitty()._images.contains(3u));
+            VERIFY_ARE_EQUAL(1u, DirectImageSlice(buffer, parent.y)->ColumnOwner(parent.x));
+            VERIFY_ARE_EQUAL(2u, DirectImageSlice(buffer, child.y)->ColumnOwner(child.x));
+            VERIFY_ARE_EQUAL(3u, DirectImageSlice(buffer, grandchild.y)->ColumnOwner(grandchild.x));
+            VERIFY_IS_FALSE(_kitty()._testCascadeFailureAfterEraseCountdown.has_value());
+        };
+
+        setup();
+        _kitty()._testCascadeFailureAfterEraseCountdown = 0;
+        _stateMachine->ProcessString(L"\x1b_Ga=d,d=i,i=1;\x1b\\");
+        verify();
+
+        setup();
+        _kitty()._testCascadeFailureAfterEraseCountdown = 0;
+        _stateMachine->ProcessString(L"\x1b_Ga=p,U=1,i=1,c=1,r=1;\x1b\\");
+        verify();
+
+        setup();
+        _testGetSet->_textBuffer->GetCursor().SetPosition({ 0, 0 });
+        for (auto id = 4u; id <= KittyParser::MaxImages; ++id)
+        {
+            _stateMachine->ProcessString(L"\x1b_Ga=T,i=" + std::to_wstring(id) + L",q=2,f=24,s=1,v=1,C=1;AAAA\x1b\\");
+        }
+        _kitty()._testCascadeFailureAfterEraseCountdown = 0;
+        VERIFY_THROWS(_kitty()._registerImage(KittyParser::MaxImages + 1, KittyParser::Image{}), std::bad_alloc);
+        verify();
+    }
+
+    TEST_METHOD(KittyNamedVirtualReputCascadesChildrenAndRollsBackFailure)
+    {
+        const til::point parent{ 10, 10 };
+        const til::point child{ parent.x + 1, parent.y };
+        const til::point grandchild{ parent.x + 2, parent.y + 1 };
+        const auto setup = [&]() {
+            _testGetSet->PrepData();
+            _testGetSet->_cellSize = { 1, 1 };
+            _kitty()._clearImages();
+            auto& buffer = *_testGetSet->_textBuffer;
+            _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,p=1,f=24,s=1,v=1;/wAA\x1b\\");
+            buffer.GetCursor().SetPosition(parent);
+            _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m\x1b[58:2::0:0:1m");
+            _stateMachine->ProcessString(Placeholder());
+            _stateMachine->ProcessString(L"\x1b[0m");
+            _stateMachine->ProcessString(L"\x1b_Ga=T,i=2,p=1,P=1,Q=1,H=1,V=0,f=24,s=1,v=1,C=1;AP8A\x1b\\");
+            _stateMachine->ProcessString(L"\x1b_Ga=T,i=3,p=1,P=2,Q=1,H=1,V=1,f=24,s=1,v=1,C=1;AAD/\x1b\\");
+        };
+        const auto verify = [&]() {
+            const auto& buffer = *_testGetSet->_textBuffer;
+            VERIFY_IS_TRUE(_kitty()._virtualIds.contains({ 1u, 1u }));
+            VERIFY_IS_TRUE(_kitty()._placements.contains({ 2u, 1u }));
+            VERIFY_IS_TRUE(_kitty()._placements.contains({ 3u, 1u }));
+            VERIFY_IS_TRUE(_kitty()._images.contains(1u));
+            VERIFY_IS_TRUE(_kitty()._images.contains(2u));
+            VERIFY_IS_TRUE(_kitty()._images.contains(3u));
+            VERIFY_ARE_EQUAL(1u, DirectImageSlice(buffer, parent.y)->ColumnOwner(parent.x));
+            VERIFY_ARE_EQUAL(2u, DirectImageSlice(buffer, child.y)->ColumnOwner(child.x));
+            VERIFY_ARE_EQUAL(3u, DirectImageSlice(buffer, grandchild.y)->ColumnOwner(grandchild.x));
+            VERIFY_IS_FALSE(_kitty()._testCascadeFailureAfterEraseCountdown.has_value());
+        };
+
+        setup();
+        _stateMachine->ProcessString(L"\x1b_Ga=p,U=1,i=1,p=1,c=1,r=1;\x1b\\");
+        VERIFY_IS_FALSE(_kitty()._placements.contains({ 2u, 1u }));
+        VERIFY_IS_FALSE(_kitty()._placements.contains({ 3u, 1u }));
+        VERIFY_IS_FALSE(_kitty()._images.contains(2u));
+        VERIFY_IS_FALSE(_kitty()._images.contains(3u));
+        const auto* oldSlice = DirectImageSlice(*_testGetSet->_textBuffer, parent.y);
+        VERIFY_IS_TRUE(oldSlice == nullptr || oldSlice->ColumnOwner(parent.x) != 1u);
+
+        setup();
+        _kitty()._testCascadeFailureAfterEraseCountdown = 0;
+        _stateMachine->ProcessString(L"\x1b_Ga=p,U=1,i=1,p=1,c=1,r=1;\x1b\\");
+        verify();
+    }
+
+    TEST_METHOD(KittyPhysicalReputFailureRestoresCursorAndDescendants)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        auto& buffer = *_testGetSet->_textBuffer;
+        const til::point textPosition{ 1, 1 };
+        const til::point parent{ 10, 10 };
+        const til::point child{ parent.x + 1, parent.y };
+        const til::point grandchild{ parent.x + 2, parent.y + 1 };
+        buffer.GetCursor().SetPosition(textPosition);
+        _stateMachine->ProcessString(L"K");
+        buffer.GetCursor().SetPosition(parent);
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,p=1,f=24,s=1,v=1,C=1;/wAA\x1b\\");
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=2,p=1,P=1,Q=1,H=1,V=0,f=24,s=1,v=1,C=1;AP8A\x1b\\");
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=3,p=1,P=2,Q=1,H=1,V=1,f=24,s=1,v=1,C=1;AAD/\x1b\\");
+
+        const til::point attemptedParent{ 20, 15 };
+        buffer.GetCursor().SetPosition(attemptedParent);
+        const auto cursorBeforeAttempt = buffer.GetCursor().GetPosition();
+        _kitty()._testMovePlacementFailureCountdown = 0;
+        _stateMachine->ProcessString(L"\x1b_Ga=p,i=1,p=1,c=1,r=1;\x1b\\");
+
+        VERIFY_ARE_EQUAL(cursorBeforeAttempt, buffer.GetCursor().GetPosition());
+        VERIFY_ARE_EQUAL(1u, DirectImageSlice(buffer, parent.y)->ColumnOwner(parent.x));
+        VERIFY_ARE_EQUAL(2u, DirectImageSlice(buffer, child.y)->ColumnOwner(child.x));
+        VERIFY_ARE_EQUAL(3u, DirectImageSlice(buffer, grandchild.y)->ColumnOwner(grandchild.x));
+        const auto& childPlacement = _kitty()._placements.at({ 2u, 1u });
+        const auto& grandchildPlacement = _kitty()._placements.at({ 3u, 1u });
+        VERIFY_ARE_EQUAL(child.x, childPlacement.anchorCol);
+        VERIFY_ARE_EQUAL(child.y, childPlacement.anchorRow);
+        VERIFY_ARE_EQUAL(grandchild.x, grandchildPlacement.anchorCol);
+        VERIFY_ARE_EQUAL(grandchild.y, grandchildPlacement.anchorRow);
+        VERIFY_ARE_EQUAL(L'K', buffer.GetRowByOffset(textPosition.y).GlyphAt(textPosition.x).front());
+        VERIFY_IS_FALSE(_kitty()._testMovePlacementFailureCountdown.has_value());
+    }
+
+    TEST_METHOD(KittyPlaceholderSplitMarksEraseStaleFragmentWhenCompletedCellIsOutsideGrid)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        auto& buffer = *_testGetSet->_textBuffer;
+        const auto origin = buffer.GetCursor().GetPosition();
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,f=24,s=1,v=1,c=1,r=1;/wAA\x1b\\");
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m");
+        _stateMachine->ProcessString(Placeholder());
+        VERIFY_IS_TRUE(BufferContainsColor(buffer, 255, 0, 0));
+
+        _stateMachine->ProcessString(L"\x0305\x030D"); // completed cell is row 0, column 1: outside 1x1
+        const auto* slice = DirectImageSlice(buffer, origin.y);
+        VERIFY_IS_TRUE(slice == nullptr || slice->ColumnOwner(origin.x) == 0u, L"re-resolving to no tile must erase the stale fragment");
+        const auto* metadata = buffer.GetRowByOffset(origin.y).GetImageCellRef(origin.x);
+        VERIFY_IS_NOT_NULL(metadata);
+        VERIFY_ARE_EQUAL(0u, metadata->layerId, L"a no-tile completed grapheme cannot retain old layer ownership");
+    }
+
+    TEST_METHOD(KittyPlaceholderSplitMarksReplaceStaleFragmentWhenIdentityChanges)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        auto& buffer = *_testGetSet->_textBuffer;
+        const auto origin = buffer.GetCursor().GetPosition();
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,f=24,s=1,v=1;/wAA\x1b\\");
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=2,f=24,s=1,v=1;AP8A\x1b\\");
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m");
+        _stateMachine->ProcessString(Placeholder());
+        VERIFY_ARE_EQUAL(1u, DirectImageSlice(buffer, origin.y)->ColumnOwner(origin.x));
+
+        auto& row = buffer.GetMutableRowByOffset(origin.y);
+        RowWriteState marks{
+            .text = L"\x0305",
+            .columnBegin = origin.x + 1,
+        };
+        row.ReplaceText(marks);
+        auto attributes = row.GetAttrByColumn(origin.x);
+        attributes.SetForeground(RGB(0, 0, 2));
+        row.ReplaceAttributes(origin.x, origin.x + 1, attributes);
+        _kitty().RenderPlaceholders(L"\x0305", origin.y, origin.x + 1);
+        const auto* slice = DirectImageSlice(buffer, origin.y);
+        VERIFY_IS_NOT_NULL(slice);
+        VERIFY_ARE_EQUAL(2u, slice->ColumnOwner(origin.x), L"the completed cell must replace image 1 with image 2");
+        VERIFY_IS_FALSE(slice->Contains(1), L"the old image identity must leave no stale fragment");
+    }
+
+    TEST_METHOD(KittyPlaceholderSplitMarksReplaceStaleFragmentWhenLayerChanges)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        auto& buffer = *_testGetSet->_textBuffer;
+        const auto origin = buffer.GetCursor().GetPosition();
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,p=1,f=24,s=1,v=1;/wAA\x1b\\");
+        _stateMachine->ProcessString(L"\x1b_Ga=p,U=1,i=1,p=2,c=1,r=1;\x1b\\");
+        const auto oldLayer = _kitty()._virtualIds.at({ 1u, 1u }).layerId;
+        const auto newLayer = _kitty()._virtualIds.at({ 1u, 2u }).layerId;
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m\x1b[58:2::0:0:1m");
+        _stateMachine->ProcessString(Placeholder());
+        VERIFY_IS_TRUE(DirectImageSlice(buffer, origin.y)->ContainsPlacement(oldLayer));
+
+        auto& row = buffer.GetMutableRowByOffset(origin.y);
+        RowWriteState marks{
+            .text = L"\x0305",
+            .columnBegin = origin.x + 1,
+        };
+        row.ReplaceText(marks);
+        auto attributes = row.GetAttrByColumn(origin.x);
+        attributes.SetUnderlineColor(RGB(0, 0, 2));
+        row.ReplaceAttributes(origin.x, origin.x + 1, attributes);
+        _kitty().RenderPlaceholders(L"\x0305", origin.y, origin.x + 1);
+
+        const auto* slice = DirectImageSlice(buffer, origin.y);
+        VERIFY_IS_NOT_NULL(slice);
+        VERIFY_IS_FALSE(slice->ContainsPlacement(oldLayer), L"the old virtual layer must leave no stale fragment");
+        VERIFY_IS_TRUE(slice->ContainsPlacement(newLayer), L"the completed cell must move to the new virtual layer");
+    }
+
+    TEST_METHOD(KittyVirtualParentMoveAllocationFailureRollsBackRecursiveDescendants)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        auto& buffer = *_testGetSet->_textBuffer;
+        const til::point oldParent{ 10, 10 };
+        const til::point attemptedParent{ 3, 3 };
+        buffer.GetCursor().SetPosition(oldParent);
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,p=1,f=24,s=1,v=1;/wAA\x1b\\");
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m\x1b[58:2::0:0:1m");
+        _stateMachine->ProcessString(Placeholder());
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;0m");
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=2,p=1,P=1,Q=1,H=1,V=0,f=24,s=1,v=1,C=1;AP8A\x1b\\");
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=3,p=1,P=2,Q=1,H=1,V=1,f=24,s=1,v=1,C=1;AAD/\x1b\\");
+        const til::point oldChild{ oldParent.x + 1, oldParent.y };
+        const til::point oldGrandchild{ oldParent.x + 2, oldParent.y + 1 };
+
+        _kitty()._testMovePlacementFailureCountdown = 1;
+        buffer.GetCursor().SetPosition(attemptedParent);
+        const auto cursorBeforeAttempt = buffer.GetCursor().GetPosition();
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m\x1b[58:2::0:0:1m");
+        _stateMachine->ProcessString(Placeholder());
+
+        const auto anchor = _kitty()._deriveVirtualPlacementAnchor(1, 1);
+        VERIFY_IS_TRUE(anchor.has_value());
+        VERIFY_ARE_EQUAL(oldParent, *anchor, L"the failed transaction must not publish the new parent fragment");
+        const auto* oldSlice = DirectImageSlice(buffer, oldChild.y);
+        VERIFY_IS_NOT_NULL(oldSlice);
+        VERIFY_ARE_EQUAL(2u, oldSlice->ColumnOwner(oldChild.x), L"the child remains at its original anchor after rollback");
+        const auto* oldGrandchildSlice = DirectImageSlice(buffer, oldGrandchild.y);
+        VERIFY_IS_NOT_NULL(oldGrandchildSlice);
+        VERIFY_ARE_EQUAL(3u, oldGrandchildSlice->ColumnOwner(oldGrandchild.x), L"the grandchild remains at its original anchor after rollback");
+        VERIFY_IS_FALSE(_kitty()._testMovePlacementFailureCountdown.has_value(), L"the one-shot failure injection must disarm after the transaction");
+        const auto* attemptedMetadata = buffer.GetRowByOffset(attemptedParent.y).GetImageCellRef(attemptedParent.x);
+        VERIFY_IS_NULL(attemptedMetadata, L"rollback removes uncommitted placeholder metadata");
+        VERIFY_ARE_EQUAL(std::wstring{ L" " }, std::wstring{ buffer.GetRowByOffset(attemptedParent.y).GlyphAt(attemptedParent.x) });
+        VERIFY_ARE_EQUAL(cursorBeforeAttempt, buffer.GetCursor().GetPosition());
+    }
+
+    TEST_METHOD(KittyPlaceholderSplitMarksRollbackRestoresMetadataAndDescendants)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        auto& buffer = *_testGetSet->_textBuffer;
+        const til::point textPosition{ 1, 1 };
+        const til::point firstParent{ 10, 10 };
+        const til::point secondParent{ 20, 10 };
+        buffer.GetCursor().SetPosition(textPosition);
+        _stateMachine->ProcessString(L"K");
+        _stateMachine->ProcessString(L"\x1b_Ga=T,U=1,i=1,p=1,f=24,s=2,v=1,c=2,r=1;/wAAAP8A\x1b\\");
+
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m\x1b[58:2::0:0:1m");
+        buffer.GetCursor().SetPosition(firstParent);
+        _stateMachine->ProcessString(Placeholder());
+        const auto oldMetadata = *buffer.GetRowByOffset(firstParent.y).GetImageCellRef(firstParent.x);
+        buffer.GetCursor().SetPosition(secondParent);
+        _stateMachine->ProcessString(Placeholder());
+
+        _stateMachine->ProcessString(L"\x1b[0m");
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=2,p=1,P=1,Q=1,H=3,V=0,f=24,s=1,v=1,C=1;AP8A\x1b\\");
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=3,p=1,P=2,Q=1,H=1,V=1,f=24,s=1,v=1,C=1;AAD/\x1b\\");
+        const til::point oldChild{ firstParent.x + 3, firstParent.y };
+        const til::point oldGrandchild{ firstParent.x + 4, firstParent.y + 1 };
+        const auto oldChildSurface = _kitty()._images.at(2).surface;
+        const auto oldGrandchildSurface = _kitty()._images.at(3).surface;
+        const auto oldChildRendered = _kitty()._images.at(2).hasRenderedPlacements;
+        const auto oldGrandchildRendered = _kitty()._images.at(3).hasRenderedPlacements;
+
+        _kitty()._testMovePlacementFailureCountdown = 3;
+        buffer.GetCursor().SetPosition({ firstParent.x + 1, firstParent.y });
+        _stateMachine->ProcessString(L"\x1b[38;2;0;0;1m\x1b[58:2::0:0:1m");
+        _stateMachine->ProcessString(L"\x0305\x030E");
+
+        const auto* restoredMetadata = buffer.GetRowByOffset(firstParent.y).GetImageCellRef(firstParent.x);
+        VERIFY_IS_NOT_NULL(restoredMetadata);
+        VERIFY_ARE_EQUAL(oldMetadata.layerId, restoredMetadata->layerId);
+        VERIFY_ARE_EQUAL(oldMetadata.column, restoredMetadata->column);
+        VERIFY_ARE_EQUAL(oldMetadata.row, restoredMetadata->row);
+        VERIFY_ARE_EQUAL(oldMetadata.imageIdHighByte, restoredMetadata->imageIdHighByte);
+        VERIFY_IS_TRUE(restoredMetadata->valid);
+        VERIFY_ARE_EQUAL(1u, DirectImageSlice(buffer, firstParent.y)->ColumnOwner(firstParent.x));
+        VERIFY_ARE_EQUAL(2u, DirectImageSlice(buffer, oldChild.y)->ColumnOwner(oldChild.x));
+        VERIFY_ARE_EQUAL(3u, DirectImageSlice(buffer, oldGrandchild.y)->ColumnOwner(oldGrandchild.x));
+        const auto& child = _kitty()._placements.at({ 2u, 1u });
+        const auto& grandchild = _kitty()._placements.at({ 3u, 1u });
+        VERIFY_ARE_EQUAL(oldChild.x, child.anchorCol);
+        VERIFY_ARE_EQUAL(oldChild.y, child.anchorRow);
+        VERIFY_ARE_EQUAL(oldGrandchild.x, grandchild.anchorCol);
+        VERIFY_ARE_EQUAL(oldGrandchild.y, grandchild.anchorRow);
+        VERIFY_ARE_EQUAL(oldChildSurface.get(), _kitty()._images.at(2).surface.get());
+        VERIFY_ARE_EQUAL(oldGrandchildSurface.get(), _kitty()._images.at(3).surface.get());
+        VERIFY_ARE_EQUAL(oldChildRendered, _kitty()._images.at(2).hasRenderedPlacements);
+        VERIFY_ARE_EQUAL(oldGrandchildRendered, _kitty()._images.at(3).hasRenderedPlacements);
+
+        buffer.GetCursor().SetPosition({ firstParent.x + 1, firstParent.y });
+        _stateMachine->ProcessString(Placeholder());
+        const auto* inherited = buffer.GetRowByOffset(firstParent.y).GetImageCellRef(firstParent.x + 1);
+        VERIFY_IS_NOT_NULL(inherited);
+        VERIFY_ARE_EQUAL(oldMetadata.layerId, inherited->layerId);
+        VERIFY_ARE_EQUAL(oldMetadata.row, inherited->row);
+        VERIFY_ARE_EQUAL(oldMetadata.column + 1, inherited->column);
+        VERIFY_ARE_EQUAL(1u, DirectImageSlice(buffer, firstParent.y)->ColumnOwner(firstParent.x + 1));
+        VERIFY_ARE_EQUAL(L'K', buffer.GetRowByOffset(textPosition.y).GlyphAt(textPosition.x).front());
     }
 
     TEST_METHOD(NonKittyApcIgnored)

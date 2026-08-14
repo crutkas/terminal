@@ -172,6 +172,7 @@ namespace Microsoft::Console::VirtualTerminal
                                        const VTParameter backgroundColor) override; // SIXEL
 
         StringHandler KittyGraphics() override; // Kitty graphics protocol (APC G)
+        bool SynchronizeImagePlacements() const;
 
         StringHandler DownloadDRCS(const VTInt fontNumber,
                                    const VTParameter startChar,
@@ -203,6 +204,8 @@ namespace Microsoft::Console::VirtualTerminal
         void SetOptionalFeatures(const til::enumset<OptionalFeature> features) noexcept override;
 
     private:
+        class ImageMutationGuard;
+
         enum class Mode
         {
             InsertReplace,
@@ -248,12 +251,27 @@ namespace Microsoft::Console::VirtualTerminal
             std::optional<TextColor> background;
             std::optional<TextColor> underlineColor;
         };
+        struct ImageMutationNotification
+        {
+            enum class Kind : uint8_t
+            {
+                ViewportPosition,
+                BufferRotation,
+                NewText,
+            };
+
+            Kind kind = Kind::ViewportPosition;
+            til::point viewportPosition;
+            int rotation = 0;
+            TextBuffer* textBuffer = nullptr;
+            std::wstring text;
+        };
 
         void _WriteToBuffer(const std::wstring_view string);
         std::pair<int, int> _GetVerticalMargins(const Page& page, const bool absolute) noexcept;
         std::pair<int, int> _GetHorizontalMargins(const til::CoordType bufferWidth) noexcept;
         void _CursorMovePosition(const Offset rowOffset, const Offset colOffset, const bool clampInMargins);
-        void _FillRect(const Page& page, const til::rect& fillRect, const std::wstring_view& fillChar, const TextAttribute& fillAttrs) const;
+        void _FillRect(const Page& page, const til::rect& fillRect, const std::wstring_view& fillChar, const TextAttribute& fillAttrs);
         void _SelectiveEraseRect(const Page& page, const til::rect& eraseRect);
         static std::vector<til::rect> _UnprotectedSpans(const Page& page, const til::rect& eraseRect);
         void _ChangeRectAttributes(const Page& page, const til::rect& changeRect, const ChangeOps& changeOps);
@@ -277,6 +295,11 @@ namespace Microsoft::Console::VirtualTerminal
                                              const bool homeCursor = false);
 
         bool _DoLineFeed(const Page& page, const bool withReturn, const bool wrapForced);
+        void _SetViewportPosition(const til::point position);
+        void _NotifyBufferRotation(int delta);
+        void _TriggerNewTextNotification(TextBuffer& buffer, std::wstring_view text);
+        void _FlushImageMutationNotifications() noexcept;
+        void _DiscardImageMutationNotifications() noexcept;
 
         void _DeviceStatusReport(const wchar_t* parameters) const;
         void _CursorPositionReport(const bool extendedReport);
@@ -326,6 +349,12 @@ namespace Microsoft::Console::VirtualTerminal
         std::shared_ptr<SixelParser> _sixelParser;
         friend class KittyParser;
         std::unique_ptr<KittyParser> _kittyParser;
+        size_t _imageMutationDepth = 0;
+        bool _imageMutationNotificationsActive = false;
+        std::vector<ImageMutationNotification> _pendingImageMutationNotifications;
+        std::optional<til::point> _speculativeViewportOrigin;
+        std::optional<size_t> _testThrowAfterRowMutationCountdown;
+        std::function<void(std::wstring_view)> _testOnNewTextNotification;
         std::unique_ptr<FontBuffer> _fontBuffer;
         std::shared_ptr<MacroBuffer> _macroBuffer;
         std::optional<unsigned int> _initialCodePage;

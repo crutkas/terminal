@@ -58,18 +58,49 @@ try
     {
         const auto bufferSize = _mainBuffer->GetSize().Dimensions();
         const auto viewSize = _GetMutableViewport().Dimensions();
+        const auto originalPosition = _speculativeViewportOrigin.value_or(_GetMutableViewport().Origin());
 
         // Ensure the given position is in bounds.
         position.x = std::clamp(position.x, 0, bufferSize.width - viewSize.width);
         position.y = std::clamp(position.y, 0, bufferSize.height - viewSize.height);
 
-        const auto viewportDelta = position.y - _GetMutableViewport().Origin().y;
+        const auto viewportDelta = position.y - originalPosition.y;
         _mutableViewport = Viewport::FromDimensions(position, viewSize);
         _PreserveUserScrollOffset(viewportDelta);
+        _speculativeViewportOrigin.reset();
         _NotifyScrollEvent();
     }
 }
 CATCH_LOG()
+
+void Terminal::SetViewportPositionInternal(til::point position)
+{
+    _assertLocked();
+    if (_inAltBuffer())
+    {
+        return;
+    }
+
+    const auto bufferSize = _mainBuffer->GetSize().Dimensions();
+    const auto viewSize = _GetMutableViewport().Dimensions();
+    position.x = std::clamp(position.x, 0, bufferSize.width - viewSize.width);
+    position.y = std::clamp(position.y, 0, bufferSize.height - viewSize.height);
+    if (!_speculativeViewportOrigin)
+    {
+        _speculativeViewportOrigin = _GetMutableViewport().Origin();
+    }
+    _mutableViewport = Viewport::FromDimensions(position, viewSize);
+}
+
+void Terminal::RestoreViewportPositionInternal(const til::point position)
+{
+    _assertLocked();
+    if (!_inAltBuffer())
+    {
+        _mutableViewport = Viewport::FromDimensions(position, _GetMutableViewport().Dimensions());
+    }
+    _speculativeViewportOrigin.reset();
+}
 
 void Terminal::SetSystemMode(const Mode mode, const bool enabled) noexcept
 {

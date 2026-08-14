@@ -187,6 +187,32 @@ void Cursor::CopyProperties(const Cursor& other) noexcept
     _fIsDouble = other._fIsDouble;
 }
 
+Cursor::State Cursor::GetState() const noexcept
+{
+    return {
+        .mutationId = _mutationId,
+        .position = _cPosition,
+        .delayedAt = _coordDelayedAt,
+        .size = _ulSize,
+        .type = _cursorType,
+        .visible = _isVisible,
+        .blinking = _isBlinking,
+        .doubled = _fIsDouble,
+    };
+}
+
+void Cursor::RestoreState(const State& state) noexcept
+{
+    _mutationId = state.mutationId;
+    _cPosition = state.position;
+    _coordDelayedAt = state.delayedAt;
+    _ulSize = state.size;
+    _cursorType = state.type;
+    _isVisible = state.visible;
+    _isBlinking = state.blinking;
+    _fIsDouble = state.doubled;
+}
+
 void Cursor::DelayEOLWrap() noexcept
 {
     _coordDelayedAt = _cPosition;

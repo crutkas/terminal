@@ -188,6 +188,7 @@ public:
     size_t EraseProtocol(ImagePlacement::Key::Protocol protocol) noexcept;
     bool Erase(ImagePlacement::Key key);
     size_t EraseImage(ImagePlacement::Key::Protocol protocol, uint32_t imageId);
+    void EraseArea(ImagePlacement::Key key, til::rect area);
     void EraseArea(til::rect area);
     void EraseAreas(std::span<const til::rect> areas);
     void CopyArea(til::rect source, til::point target, ImageCollection& destination) const;

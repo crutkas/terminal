@@ -685,6 +685,43 @@ size_t ImageCollection::EraseImage(const ImagePlacement::Key::Protocol protocol,
     return erased;
 }
 
+void ImageCollection::EraseArea(const ImagePlacement::Key key, const til::rect area)
+{
+    if (area.empty() || _images.empty())
+    {
+        return;
+    }
+
+    const auto current = All();
+    const auto intersects = std::any_of(current.begin(), current.end(), [&](const auto& image) {
+        return image.Identity() == key && !(image.CellBounds() & area).empty();
+    });
+    if (!intersects)
+    {
+        return;
+    }
+
+    std::vector<ImagePlacement> remaining;
+    remaining.reserve(current.size());
+    for (const auto& image : current)
+    {
+        if (image.Identity() != key || (image.CellBounds() & area).empty())
+        {
+            remaining.emplace_back(image);
+            continue;
+        }
+
+        for (const auto fragment : image.CellBounds() - area)
+        {
+            if (auto cropped = image.Crop(fragment))
+            {
+                remaining.emplace_back(std::move(*cropped));
+            }
+        }
+    }
+    _replace(std::move(remaining));
+}
+
 void ImageCollection::EraseArea(const til::rect area)
 {
     const std::array areas{ area };

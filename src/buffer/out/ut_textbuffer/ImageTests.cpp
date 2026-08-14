@@ -43,6 +43,8 @@ class ImageTests
     TEST_METHOD(TraditionalResizeClipsAndRetainsImages);
     TEST_METHOD(ResizeRetainsMixedCellSizesWithoutRowStorage);
     TEST_METHOD(ReflowAppliesDirectPlacementPolicy);
+    TEST_METHOD(ReflowDistinguishesPlaceholderProtocol);
+    TEST_METHOD(InvalidImageCellRefDoesNotAllocateStorage);
 
     static constexpr til::size CellSize{ 2, 3 };
 
@@ -130,6 +132,24 @@ void ImageTests::RowIndexRebuildsAfterMutation()
 
     VERIFY_IS_TRUE(images.Erase({ 2, 2 }));
     VERIFY_ARE_EQUAL(size_t{ 0 }, images.IntersectingRows(5, 6).size());
+}
+
+void ImageTests::InvalidImageCellRefDoesNotAllocateStorage()
+{
+    TextBuffer buffer{ til::size{ 4, 1 }, TextAttribute{}, 0, false, nullptr };
+    auto& row = buffer.GetMutableRowByOffset(0);
+    VERIFY_IS_NULL(row._imageCellRefs.get());
+
+    row.SetImageCellRef(0, {});
+    row.RestoreImageCellRefNoAlloc(0, {});
+    VERIFY_IS_NULL(row._imageCellRefs.get(), L"invalid metadata must not materialize row metadata storage");
+
+    ImageCellRef valid{
+        .valid = true,
+    };
+    row.SetImageCellRef(0, valid);
+    VERIFY_IS_NOT_NULL(row._imageCellRefs.get());
+    VERIFY_IS_NOT_NULL(row.GetImageCellRef(0));
 }
 
 void ImageTests::EraseOutsideImageIsNoOp()
@@ -853,4 +873,43 @@ void ImageTests::ReflowAppliesDirectPlacementPolicy()
     VERIFY_IS_TRUE(PlacementCoversCell(reflowed, 1, { 2, 2 }));
     VERIFY_IS_TRUE(PlacementCoversCell(reflowed, 1, { 0, 3 }));
     VERIFY_IS_TRUE(PlacementCoversCell(reflowed, 2, { 0, 6 }));
+}
+
+void ImageTests::ReflowDistinguishesPlaceholderProtocol()
+{
+    DummyRenderer renderer;
+    TextBuffer buffer{ til::size{ 4, 2 }, TextAttribute{}, 0, false, &renderer };
+    RowWriteState text{ .text = L"AB" };
+    buffer.Replace(0, TextAttribute{}, text);
+    const ImageCellRef metadata{
+        .layerId = 9,
+        .valid = true,
+    };
+    buffer.GetMutableRowByOffset(0).SetImageCellRef(0, metadata);
+
+    constexpr ImagePlacement::Key kittyKey{ 0, 9, ImagePlacement::Key::Protocol::Kitty };
+    constexpr ImagePlacement::Key sixelKey{ 0, 9, ImagePlacement::Key::Protocol::Sixel };
+    const auto kittySurface = MakeSurface({ 0, 0, 1, 1 });
+    const auto sixelSurface = MakeSurface({ 1, 0, 2, 1 });
+    buffer.GetMutableImages().Add(ImagePlacement{ kittyKey, kittySurface, { 0, 0, 1, 1 }, 0 });
+    buffer.GetMutableImages().Add(ImagePlacement{ sixelKey, sixelSurface, { 1, 0, 2, 1 }, 0 });
+    buffer.GetCursor().SetPosition({ 1, 0 });
+
+    TextBuffer reflowed{ til::size{ 2, 4 }, TextAttribute{}, 0, false, &renderer };
+    TextBuffer::Reflow(buffer, reflowed);
+
+    VERIFY_ARE_EQUAL(size_t{ 2 }, reflowed.GetImages().Size());
+    const auto result = reflowed.GetImages().All();
+    const auto kitty = std::ranges::find(result, kittyKey, &ImagePlacement::Identity);
+    const auto sixel = std::ranges::find(result, sixelKey, &ImagePlacement::Identity);
+    VERIFY_IS_TRUE(kitty != result.end());
+    VERIFY_IS_TRUE(sixel != result.end(), L"a Sixel with the same numeric ids is not a Kitty placeholder fragment");
+    if (kitty != result.end())
+    {
+        VERIFY_ARE_EQUAL(kittySurface.get(), kitty->SurfacePointer().get());
+    }
+    if (sixel != result.end())
+    {
+        VERIFY_ARE_EQUAL(sixelSurface.get(), sixel->SurfacePointer().get());
+    }
 }

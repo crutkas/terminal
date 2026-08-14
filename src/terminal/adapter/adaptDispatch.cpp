@@ -19,6 +19,15 @@ using namespace Microsoft::Console::VirtualTerminal;
 
 static constexpr std::wstring_view whitespace{ L" " };
 
+static ImageCellRef getImageCellRef(const TextBuffer& buffer, const til::point position) noexcept
+{
+    if (const auto metadata = buffer.GetRowByOffset(position.y).GetImageCellRef(position.x))
+    {
+        return *metadata;
+    }
+    return {};
+}
+
 struct XtermResourceColorTableEntry
 {
     int ColorTableIndex;
@@ -48,6 +57,264 @@ AdaptDispatch::AdaptDispatch(ITerminalApi& api, Renderer* renderer, RenderSettin
     _pages{ api, renderer }
 {
 }
+
+void AdaptDispatch::_SetViewportPosition(const til::point position)
+{
+    if (_imageMutationNotificationsActive)
+    {
+        if (!_speculativeViewportOrigin)
+        {
+            _speculativeViewportOrigin = _api.GetBufferAndViewport().viewport.origin();
+        }
+        _api.SetViewportPositionInternal(position);
+        _pendingImageMutationNotifications.push_back({
+            .kind = ImageMutationNotification::Kind::ViewportPosition,
+            .viewportPosition = position,
+        });
+        return;
+    }
+    _api.SetViewportPosition(position);
+}
+
+void AdaptDispatch::_NotifyBufferRotation(const int delta)
+{
+    if (_imageMutationNotificationsActive)
+    {
+        _pendingImageMutationNotifications.push_back({
+            .kind = ImageMutationNotification::Kind::BufferRotation,
+            .rotation = delta,
+        });
+        return;
+    }
+    _api.NotifyBufferRotation(delta);
+}
+
+void AdaptDispatch::_TriggerNewTextNotification(TextBuffer& buffer, const std::wstring_view text)
+{
+    if (_imageMutationNotificationsActive)
+    {
+        _pendingImageMutationNotifications.push_back({
+            .kind = ImageMutationNotification::Kind::NewText,
+            .textBuffer = &buffer,
+            .text = std::wstring{ text },
+        });
+        return;
+    }
+    buffer.TriggerNewTextNotification(text);
+    if (_testOnNewTextNotification)
+    {
+        _testOnNewTextNotification(text);
+    }
+}
+
+void AdaptDispatch::_FlushImageMutationNotifications() noexcept
+{
+    _imageMutationNotificationsActive = false;
+    try
+    {
+        for (const auto& notification : _pendingImageMutationNotifications)
+        {
+            if (notification.kind == ImageMutationNotification::Kind::ViewportPosition)
+            {
+                _api.SetViewportPosition(notification.viewportPosition);
+            }
+            else
+            {
+                if (notification.kind == ImageMutationNotification::Kind::BufferRotation)
+                {
+                    _api.NotifyBufferRotation(notification.rotation);
+                }
+                else if (notification.textBuffer)
+                {
+                    notification.textBuffer->TriggerNewTextNotification(notification.text);
+                    if (_testOnNewTextNotification)
+                    {
+                        _testOnNewTextNotification(notification.text);
+                    }
+                }
+            }
+        }
+    }
+    catch (const wil::ResultException&)
+    {
+        LOG_HR(E_FAIL);
+    }
+    catch (const std::exception&)
+    {
+        LOG_HR(E_FAIL);
+    }
+    _pendingImageMutationNotifications.clear();
+    _speculativeViewportOrigin.reset();
+}
+
+void AdaptDispatch::_DiscardImageMutationNotifications() noexcept
+{
+    if (_speculativeViewportOrigin)
+    {
+        _api.RestoreViewportPositionInternal(*_speculativeViewportOrigin);
+    }
+    _imageMutationNotificationsActive = false;
+    _pendingImageMutationNotifications.clear();
+    _speculativeViewportOrigin.reset();
+}
+
+class AdaptDispatch::ImageMutationGuard final : public TextBuffer::MutationJournal
+{
+public:
+    explicit ImageMutationGuard(AdaptDispatch& dispatch) :
+        _dispatch{ dispatch },
+        _root{ dispatch._imageMutationDepth++ == 0 },
+        _uncaughtExceptions{ std::uncaught_exceptions() }
+    {
+        if (!_root || !dispatch._kittyParser || !dispatch._kittyParser->HasRelativeVirtualDescendants())
+        {
+            return;
+        }
+
+        try
+        {
+            dispatch._pendingImageMutationNotifications.clear();
+            dispatch._speculativeViewportOrigin.reset();
+            dispatch._imageMutationNotificationsActive = true;
+            dispatch._pages.ForEachPage([&](const Page page) {
+                auto snapshot = std::make_unique<BufferSnapshot>();
+                snapshot->buffer = &page.Buffer();
+                snapshot->state = page.Buffer().CreateMutationState();
+                _buffers.push_back(std::move(snapshot));
+            });
+            _kittySnapshot = dispatch._kittyParser->CreateMutationSnapshot();
+            for (const auto& buffer : _buffers)
+            {
+                buffer->buffer->SetMutationJournal(this);
+            }
+        }
+        catch (const std::bad_alloc&)
+        {
+            _ready = false;
+        }
+        catch (const wil::ResultException&)
+        {
+            _ready = false;
+        }
+        catch (const std::exception&)
+        {
+            _ready = false;
+        }
+        if (!_ready)
+        {
+            _detach();
+            _dispatch._DiscardImageMutationNotifications();
+        }
+    }
+
+    ~ImageMutationGuard() noexcept
+    {
+        if (!_root)
+        {
+            --_dispatch._imageMutationDepth;
+            return;
+        }
+
+        --_dispatch._imageMutationDepth;
+        _detach();
+        const auto failed = _failed || std::uncaught_exceptions() > _uncaughtExceptions;
+        auto synchronized = !failed;
+        if (synchronized && _ready && _kittySnapshot)
+        {
+            try
+            {
+                synchronized = _dispatch.SynchronizeImagePlacements();
+            }
+            catch (const wil::ResultException&)
+            {
+                synchronized = false;
+            }
+            catch (const std::exception&)
+            {
+                synchronized = false;
+            }
+        }
+        if (_ready && _kittySnapshot && !synchronized)
+        {
+            _dispatch._kittyParser->RestoreMutationSnapshot(*_kittySnapshot);
+            for (auto& buffer : _buffers)
+            {
+                for (auto& row : buffer->rows)
+                {
+                    row.rowBuffer->RestoreSnapshot(*row.snapshot);
+                }
+                buffer->buffer->RestoreMutationState(std::move(buffer->state));
+            }
+            _dispatch._DiscardImageMutationNotifications();
+            LOG_HR(E_FAIL);
+        }
+        else if (_ready && _kittySnapshot)
+        {
+            _dispatch._FlushImageMutationNotifications();
+        }
+        else
+        {
+            _dispatch._DiscardImageMutationNotifications();
+        }
+    }
+
+    explicit operator bool() const noexcept
+    {
+        return _ready;
+    }
+
+    void Fail() noexcept
+    {
+        _failed = true;
+    }
+
+    void SaveRow(TextBuffer& buffer, ROW& rowBuffer, const til::CoordType row) override
+    {
+        const auto bufferSnapshot = std::ranges::find_if(_buffers, [&](const auto& entry) {
+            return entry->buffer == &buffer;
+        });
+        if (bufferSnapshot == _buffers.end())
+        {
+            return;
+        }
+        auto& rows = (*bufferSnapshot)->rows;
+        if (std::ranges::none_of(rows, [&](const auto& entry) { return entry.rowBuffer == &rowBuffer; }))
+        {
+            rows.push_back({ &rowBuffer, row, rowBuffer.CreateSnapshot() });
+        }
+    }
+
+private:
+    struct BufferSnapshot
+    {
+        struct RowSnapshot
+        {
+            ROW* rowBuffer = nullptr;
+            til::CoordType row = 0;
+            std::shared_ptr<ROW::Snapshot> snapshot;
+        };
+
+        TextBuffer* buffer = nullptr;
+        TextBuffer::MutationState state;
+        std::vector<RowSnapshot> rows;
+    };
+
+    void _detach() noexcept
+    {
+        for (const auto& buffer : _buffers)
+        {
+            buffer->buffer->SetMutationJournal(nullptr);
+        }
+    }
+
+    AdaptDispatch& _dispatch;
+    bool _root = false;
+    bool _ready = true;
+    bool _failed = false;
+    int _uncaughtExceptions = 0;
+    std::vector<std::unique_ptr<BufferSnapshot>> _buffers;
+    std::shared_ptr<KittyParser::MutationSnapshot> _kittySnapshot;
+};
 
 void AdaptDispatch::UnknownSequence() noexcept
 {
@@ -104,8 +371,23 @@ void AdaptDispatch::_WriteToBuffer(const std::wstring_view string)
     auto& textBuffer = page.Buffer();
     auto& cursor = page.Cursor();
     auto cursorPosition = cursor.GetPosition();
+    ImageMutationGuard mutation{ *this };
+    if (!mutation)
+    {
+        LOG_HR(E_OUTOFMEMORY);
+        return;
+    }
     const auto wrapAtEOL = _api.GetSystemMode(ITerminalApi::Mode::AutoWrap);
     const auto& attributes = page.Attributes();
+    // Kitty Unicode placeholders (cells holding U+10EEEE) overlay a sub-rect of a virtually
+    // placed image. They're rendered per written segment inside the loop below, after each
+    // segment's wrap resolves, so a wrapped or scrolled run lands every cell on its real row.
+    // A write may also begin with nothing but a placeholder's row/column diacritics, when the
+    // split fell before them: they carry no U+10EEEE, but they complete - and so re-resolve -
+    // the cell the previous write placed.
+    const auto hasKittyPlaceholders = _kittyParser &&
+                                      (string.find(KittyParser::PlaceholderCodePointHigh) != std::wstring_view::npos ||
+                                       KittyParser::StartsWithPlaceholderDiacritic(string));
 
     auto [topMargin, bottomMargin] = _GetVerticalMargins(page, true);
     const auto [leftMargin, rightMargin] = _GetHorizontalMargins(page.Width());
@@ -150,6 +432,19 @@ void AdaptDispatch::_WriteToBuffer(const std::wstring_view string)
         }
 
         state.columnBegin = cursorPosition.x;
+        std::optional<ImageCellRef> leadingCellMetadataBeforeWrite;
+        if (hasKittyPlaceholders && KittyParser::StartsWithPlaceholderDiacritic(state.text))
+        {
+            const auto& row = textBuffer.GetRowByOffset(cursorPosition.y);
+            const auto previous = row.NavigateToPrevious(state.columnBegin);
+            if (previous < state.columnBegin)
+            {
+                if (const auto metadata = row.GetImageCellRef(previous))
+                {
+                    leadingCellMetadataBeforeWrite = *metadata;
+                }
+            }
+        }
 
         const auto textPositionBefore = state.text.data();
         if (_modes.test(Mode::InsertReplace))
@@ -160,7 +455,36 @@ void AdaptDispatch::_WriteToBuffer(const std::wstring_view string)
         {
             textBuffer.Replace(cursorPosition.y, attributes, state);
         }
+        if (_testThrowAfterRowMutationCountdown)
+        {
+            if (*_testThrowAfterRowMutationCountdown == 0)
+            {
+                _testThrowAfterRowMutationCountdown.reset();
+                throw std::bad_alloc{};
+            }
+            --*_testThrowAfterRowMutationCountdown;
+        }
         const auto textPositionAfter = state.text.data();
+
+        // Overlay any placeholders in the segment just written, on its real (post-wrap) row
+        // and from its true start column, so wrapping and bottom-of-buffer scrolls place each
+        // cell correctly rather than replaying the whole run from one pre-wrap origin.
+        if (hasKittyPlaceholders && textPositionAfter > textPositionBefore)
+        {
+            const std::wstring_view segment{ textPositionBefore, static_cast<size_t>(textPositionAfter - textPositionBefore) };
+            if (segment.find(KittyParser::PlaceholderCodePointHigh) != std::wstring_view::npos ||
+                KittyParser::StartsWithPlaceholderDiacritic(segment))
+            {
+                if (!_kittyParser->RenderPlaceholders(segment,
+                                                      cursorPosition.y,
+                                                      state.columnBegin,
+                                                      leadingCellMetadataBeforeWrite ? &*leadingCellMetadataBeforeWrite : nullptr))
+                {
+                    mutation.Fail();
+                    return;
+                }
+            }
+        }
 
         // If we're past the end of the line, we need to clamp the cursor
         // back into range, and if wrapping is enabled, set the delayed wrap
@@ -198,7 +522,7 @@ void AdaptDispatch::_WriteToBuffer(const std::wstring_view string)
     // It's important to do this here instead of in TextBuffer, because here you
     // have access to the entire line of text, whereas TextBuffer writes it one
     // character at a time via the OutputCellIterator.
-    textBuffer.TriggerNewTextNotification(string);
+    _TriggerNewTextNotification(textBuffer, string);
 }
 
 // Routine Description:
@@ -549,6 +873,12 @@ TextAttribute AdaptDispatch::_GetEraseAttributes(const Page& page) const noexcep
 // - <none>
 void AdaptDispatch::_ScrollRectVertically(const Page& page, const til::rect& scrollRect, const VTInt delta)
 {
+    ImageMutationGuard mutation{ *this };
+    if (!mutation)
+    {
+        LOG_HR(E_OUTOFMEMORY);
+        return;
+    }
     auto& textBuffer = page.Buffer();
     const auto absoluteDelta = std::min(std::abs(delta), scrollRect.height());
     if (absoluteDelta < scrollRect.height())
@@ -579,7 +909,12 @@ void AdaptDispatch::_ScrollRectVertically(const Page& page, const til::rect& scr
             do
             {
                 const auto current = OutputCell(*textBuffer.GetCellDataAt(srcPos));
+                const auto metadata = getImageCellRef(textBuffer, srcPos);
                 textBuffer.WriteLine(OutputCellIterator({ &current, 1 }), dstPos);
+                if (metadata.valid)
+                {
+                    textBuffer.GetMutableRowByOffset(dstPos.y).SetImageCellRef(dstPos.x, metadata);
+                }
                 srcView.WalkInBounds(srcPos, walkDirection);
             } while (dstView.WalkInBounds(dstPos, walkDirection));
             sourceImages.CopyArea(srcView.ToExclusive(), dstOrigin, textBuffer.GetMutableImages());
@@ -607,6 +942,12 @@ void AdaptDispatch::_ScrollRectVertically(const Page& page, const til::rect& scr
 // - <none>
 void AdaptDispatch::_ScrollRectHorizontally(const Page& page, const til::rect& scrollRect, const VTInt delta)
 {
+    ImageMutationGuard mutation{ *this };
+    if (!mutation)
+    {
+        LOG_HR(E_OUTOFMEMORY);
+        return;
+    }
     auto& textBuffer = page.Buffer();
     const auto absoluteDelta = std::min(std::abs(delta), scrollRect.width());
     if (absoluteDelta < scrollRect.width())
@@ -627,12 +968,19 @@ void AdaptDispatch::_ScrollRectHorizontally(const Page& page, const til::rect& s
         // to the target, so a two-cell DBCS character can't accidentally delete
         // itself when moving one cell horizontally.
         auto next = OutputCell(*textBuffer.GetCellDataAt(sourcePos));
+        auto nextMetadata = getImageCellRef(textBuffer, sourcePos);
         do
         {
             const auto current = next;
+            const auto currentMetadata = nextMetadata;
             source.WalkInBounds(sourcePos, walkDirection);
             next = OutputCell(*textBuffer.GetCellDataAt(sourcePos));
+            nextMetadata = getImageCellRef(textBuffer, sourcePos);
             textBuffer.WriteLine(OutputCellIterator({ &current, 1 }), targetPos);
+            if (currentMetadata.valid)
+            {
+                textBuffer.GetMutableRowByOffset(targetPos.y).SetImageCellRef(targetPos.x, currentMetadata);
+            }
         } while (target.WalkInBounds(targetPos, walkDirection));
         sourceImages.CopyArea(source.ToExclusive(), { left + actualDelta, top }, textBuffer.GetMutableImages());
     }
@@ -699,8 +1047,14 @@ void AdaptDispatch::DeleteCharacter(const VTInt count)
 // - fillAttrs - Attributes to be written to the buffer.
 // Return Value:
 // - <none>
-void AdaptDispatch::_FillRect(const Page& page, const til::rect& fillRect, const std::wstring_view& fillChar, const TextAttribute& fillAttrs) const
+void AdaptDispatch::_FillRect(const Page& page, const til::rect& fillRect, const std::wstring_view& fillChar, const TextAttribute& fillAttrs)
 {
+    ImageMutationGuard mutation{ *this };
+    if (!mutation)
+    {
+        LOG_HR(E_OUTOFMEMORY);
+        return;
+    }
     page.Buffer().FillRect(fillRect, fillChar, fillAttrs);
 }
 
@@ -868,6 +1222,12 @@ std::vector<til::rect> AdaptDispatch::_UnprotectedSpans(const Page& page, const 
 // - <none>
 void AdaptDispatch::_SelectiveEraseRect(const Page& page, const til::rect& eraseRect)
 {
+    ImageMutationGuard mutation{ *this };
+    if (!mutation)
+    {
+        LOG_HR(E_OUTOFMEMORY);
+        return;
+    }
     if (eraseRect)
     {
         const auto areas = _UnprotectedSpans(page, eraseRect);
@@ -1192,6 +1552,12 @@ void AdaptDispatch::CopyRectangularArea(const VTInt top, const VTInt left, const
     const auto dstBottom = dstTop + srcRect.height() - 1;
     const auto dstRight = dstLeft + srcRect.width() - 1;
     const auto dstRect = _CalculateRectArea(dst, dstTop, dstLeft, dstBottom, dstRight);
+    ImageMutationGuard mutation{ *this };
+    if (!mutation)
+    {
+        LOG_HR(E_OUTOFMEMORY);
+        return;
+    }
 
     if (dstRect && (dstRect.origin() != srcRect.origin() || src.Number() != dst.Number()))
     {
@@ -1207,17 +1573,24 @@ void AdaptDispatch::CopyRectangularArea(const VTInt top, const VTInt left, const
         // to the target, so a two-cell DBCS character can't accidentally delete
         // itself when moving one cell horizontally.
         auto next = OutputCell(*src.Buffer().GetCellDataAt(srcPos));
+        auto nextMetadata = getImageCellRef(src.Buffer(), srcPos);
         do
         {
             const auto current = next;
+            const auto currentMetadata = nextMetadata;
             const auto currentSrcPos = srcPos;
             srcView.WalkInBounds(srcPos, walkDirection);
             next = OutputCell(*src.Buffer().GetCellDataAt(srcPos));
+            nextMetadata = getImageCellRef(src.Buffer(), srcPos);
             // If the source position is offscreen (which can occur on double
             // width lines), then we shouldn't copy anything to the destination.
             if (currentSrcPos.x < src.Buffer().GetLineWidth(currentSrcPos.y))
             {
                 dst.Buffer().WriteLine(OutputCellIterator({ &current, 1 }), dstPos);
+                if (currentMetadata.valid)
+                {
+                    dst.Buffer().GetMutableRowByOffset(dstPos.y).SetImageCellRef(dstPos.x, currentMetadata);
+                }
             }
         } while (dstView.WalkInBounds(dstPos, walkDirection));
         sourceImages.CopyArea(srcView.ToExclusive(), dstRect.origin(), dst.Buffer().GetMutableImages());
@@ -1801,11 +2174,24 @@ void AdaptDispatch::_SetAlternateScreenBufferMode(const bool enable)
         }
         _api.UseMainScreenBuffer();
         _usingAltBuffer = false;
+        const auto restoreCursor = wil::scope_exit([&] {
+            CursorRestoreState();
+        });
         if (_kittyParser)
         {
             _kittyParser->RestoreMainBufferState();
+            if (!SynchronizeImagePlacements())
+            {
+                // A deterministic failure seam is one-shot, so retry before
+                // failing closed. Never retain a restored parent with stale
+                // descendants if memory remains unavailable.
+                if (!SynchronizeImagePlacements())
+                {
+                    _kittyParser->HardReset();
+                    THROW_HR(E_FAIL);
+                }
+            }
         }
-        CursorRestoreState();
     }
 }
 
@@ -2518,7 +2904,7 @@ bool AdaptDispatch::_DoLineFeed(const Page& page, const bool withReturn, const b
         // the content up by panning the viewport down, and also move the cursor
         // down a row. But we only do this if the viewport hasn't yet reached
         // the end of the buffer.
-        _api.SetViewportPosition({ page.XPanOffset(), page.Top() + 1 });
+        _SetViewportPosition({ page.XPanOffset(), page.Top() + 1 });
         newPosition.y++;
         viewportMoved = true;
 
@@ -2542,7 +2928,7 @@ bool AdaptDispatch::_DoLineFeed(const Page& page, const bool withReturn, const b
         // content up. In this case we don't need to move the cursor down.
         const auto eraseAttributes = _GetEraseAttributes(page);
         textBuffer.IncrementCircularBuffer(eraseAttributes);
-        _api.NotifyBufferRotation(1);
+        _NotifyBufferRotation(1);
 
         // We trigger a scroll rather than a redraw, since that's more efficient.
         textBuffer.TriggerScroll({ 0, -1 });
@@ -2567,6 +2953,12 @@ bool AdaptDispatch::_DoLineFeed(const Page& page, const bool withReturn, const b
 void AdaptDispatch::LineFeed(const DispatchTypes::LineFeedType lineFeedType)
 {
     const auto page = _pages.ActivePage();
+    ImageMutationGuard mutation{ *this };
+    if (!mutation)
+    {
+        LOG_HR(E_OUTOFMEMORY);
+        return;
+    }
     switch (lineFeedType)
     {
     case DispatchTypes::LineFeedType::DependsOnMode:
@@ -3239,7 +3631,7 @@ void AdaptDispatch::_EraseScrollback()
 
     page.Buffer().ClearScrollback(page.Top(), page.Height());
     // Move the viewport
-    _api.SetViewportPosition({ page.XPanOffset(), 0 });
+    _SetViewportPosition({ page.XPanOffset(), 0 });
     // Move the cursor to the same relative location.
     cursor.SetYPosition(row - page.Top());
 }
@@ -3281,7 +3673,7 @@ void AdaptDispatch::_EraseAll()
         {
             textBuffer.IncrementCircularBuffer();
         }
-        _api.NotifyBufferRotation(delta);
+        _NotifyBufferRotation(delta);
         newPageTop -= delta;
         newPageBottom -= delta;
         textBuffer.TriggerScroll({ 0, -delta });
@@ -3289,7 +3681,7 @@ void AdaptDispatch::_EraseAll()
     // Move the viewport if necessary.
     if (newPageTop != page.Top())
     {
-        _api.SetViewportPosition({ page.XPanOffset(), newPageTop });
+        _SetViewportPosition({ page.XPanOffset(), newPageTop });
     }
     // Restore the relative cursor position
     cursor.SetYPosition(row + newPageTop);
@@ -4955,6 +5347,11 @@ ITermDispatch::StringHandler AdaptDispatch::KittyGraphics()
         _kittyParser = std::make_unique<KittyParser>(*this);
     }
     return _kittyParser->DefineImage();
+}
+
+bool AdaptDispatch::SynchronizeImagePlacements() const
+{
+    return !_kittyParser || _kittyParser->SynchronizeVirtualPlacementChildren();
 }
 
 void AdaptDispatch::_ReturnOscResponse(const std::wstring_view response) const

@@ -103,11 +103,25 @@ ITerminalApi::BufferState ConhostInternalGetSet::GetBufferAndViewport()
 void ConhostInternalGetSet::SetViewportPosition(const til::point position)
 {
     auto& info = _io.GetActiveOutputBuffer();
+    if (info.HasSpeculativeViewportOrigin())
+    {
+        info.PrepareViewportNotificationReplay();
+    }
     THROW_IF_FAILED(info.SetViewportOrigin(true, position, true));
     // SetViewportOrigin() only updates the virtual bottom (the bottom coordinate of the area
     // in the text buffer a VT client writes its output into) when it's moving downwards.
     // But this function is meant to truly move the viewport no matter what. Otherwise, `tput reset` breaks.
     info.UpdateBottom();
+}
+
+void ConhostInternalGetSet::SetViewportPositionInternal(const til::point position)
+{
+    _io.GetActiveOutputBuffer().SetViewportOriginInternal(position);
+}
+
+void ConhostInternalGetSet::RestoreViewportPositionInternal(const til::point /*position*/)
+{
+    _io.GetActiveOutputBuffer().RestoreViewportOriginInternal();
 }
 
 // Routine Description:

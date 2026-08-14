@@ -69,6 +69,13 @@ namespace Microsoft::Console::Render
 class TextBuffer final
 {
 public:
+    class MutationJournal
+    {
+    public:
+        virtual ~MutationJournal() = default;
+        virtual void SaveRow(TextBuffer& buffer, ROW& row, til::CoordType rowIndex) = 0;
+    };
+
     TextBuffer(const til::size screenBufferSize,
                const TextAttribute defaultAttributes,
                const UINT cursorSize,
@@ -84,6 +91,25 @@ public:
 
     // Used for duplicating properties to another text buffer
     void CopyProperties(const TextBuffer& OtherBuffer) noexcept;
+
+    struct MutationState
+    {
+        ImageCollection images;
+        Cursor::State cursor;
+        TextAttribute currentAttributes;
+        til::CoordType firstRow = 0;
+        uint64_t lastMutationId = 0;
+    };
+    MutationState CreateMutationState() const;
+    void RestoreMutationState(MutationState&& state) noexcept;
+    void SetMutationJournal(MutationJournal* journal) noexcept;
+
+    class ResizeSnapshot;
+    // ResizeTraditional replaces the backing allocation, so alternate-buffer
+    // resize rollback needs a whole-buffer snapshot. Regular VT mutations use
+    // the bounded row journal above instead.
+    std::unique_ptr<ResizeSnapshot> CreateResizeSnapshot() const;
+    void RestoreResizeSnapshot(ResizeSnapshot& snapshot) noexcept;
 
     // row manipulation
     ROW& GetScratchpadRow();
@@ -416,9 +442,18 @@ private:
 
     Cursor _cursor;
     bool _isActiveBuffer = false;
+    MutationJournal* _mutationJournal = nullptr;
 
 #ifdef UNIT_TESTING
     friend class TextBufferTests;
     friend class UiaTextRangeTests;
+    friend class AdapterTest;
 #endif
+};
+
+class TextBuffer::ResizeSnapshot final
+{
+private:
+    friend class TextBuffer;
+    std::unique_ptr<TextBuffer> buffer;
 };

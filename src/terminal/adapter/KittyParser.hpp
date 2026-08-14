@@ -18,6 +18,9 @@
 class AdapterTest;
 #endif
 
+class ROW;
+struct ImageCellRef;
+
 namespace Microsoft::Console::VirtualTerminal
 {
     class AdaptDispatch;
@@ -25,11 +28,38 @@ namespace Microsoft::Console::VirtualTerminal
     class KittyParser
     {
     public:
+        // The kitty Unicode placeholder code point. A cell holding this glyph, with a
+        // 24-bit RGB foreground giving the image id, draws a sub-rect of a virtual
+        // (U=1) image rather than the cursor-anchored placement. The writer has to
+        // recognize it before any image has been transmitted, so it does not need an
+        // instance.
+        static constexpr wchar_t PlaceholderCodePointHigh = 0xDBFB; // surrogate pair for U+10EEEE
+        static constexpr wchar_t PlaceholderCodePointLow = 0xDEEE;
+
         explicit KittyParser(AdaptDispatch& dispatcher) noexcept;
 
         // Collects one APC G sequence. The parser has already consumed the 'G'
         // identifier and routed us here on the strength of it.
         ITermDispatch::StringHandler DefineImage();
+
+        // Resolves the placeholder cells in a run of text the writer just placed.
+        bool RenderPlaceholders(const std::wstring_view segment,
+                                til::CoordType screenRow,
+                                til::CoordType startColumn,
+                                const ImageCellRef* leadingCellMetadataBeforeWrite = nullptr);
+
+        // True when a run of text opens with kitty rowcolumn diacritics, i.e. it may be the tail
+        // of a placeholder cell whose write was split before its marks. The writer has to notice
+        // such a run even though it carries no U+10EEEE of its own.
+        static bool StartsWithPlaceholderDiacritic(const std::wstring_view text) noexcept;
+
+        // Reconciles relative descendants after a text-buffer operation moved or erased
+        // placeholder fragments without routing through RenderPlaceholders.
+        bool SynchronizeVirtualPlacementChildren();
+        bool HasRelativeVirtualDescendants() const noexcept;
+        class MutationSnapshot;
+        std::shared_ptr<MutationSnapshot> CreateMutationSnapshot() const;
+        void RestoreMutationSnapshot(MutationSnapshot& snapshot) noexcept;
 
         // Drops every image, every placement, and any transfer in progress.
         void HardReset() noexcept;
@@ -46,6 +76,8 @@ namespace Microsoft::Console::VirtualTerminal
         void RestoreMainBufferState() noexcept;
 
     private:
+        class PlacementMutationGuard;
+
         struct Control
         {
             wchar_t action = L't';
@@ -73,6 +105,7 @@ namespace Microsoft::Console::VirtualTerminal
             bool noCursorMovement = false;
             bool hasNonChunkKey = false;
             bool hasNonChunkKeyOtherThanAction = false;
+            bool virtualPlacement = false; // U=1: virtual placement (store only; drawn later via Unicode placeholders)
             uint32_t placementId = 0;
             uint32_t parentImageId = 0;
             uint32_t parentPlacementId = 0;
@@ -107,6 +140,33 @@ namespace Microsoft::Console::VirtualTerminal
             int64_t height = 0;
         };
 
+        // A virtual (U=1) placement's fixed grid geometry and source sampling state.
+        // The grid (cols x rows) is recorded at store time so placeholder rendering slices
+        // the image consistently no matter how the cells are chunked across writes.
+        struct VirtualPlacement
+        {
+            uint32_t cols = 1;
+            uint32_t rows = 1;
+            // Source crop rect (pixels) captured from x/y/w/h at store time (w/h=0/past-edge
+            // already resolved and clamped to the image), so placeholder rendering samples the
+            // same sub-rect a direct c/r placement would instead of the whole image. cropW/cropH
+            // are always > 0 after _storeVirtualPlacement (0 = unset => full image).
+            uint32_t cropX = 0;
+            uint32_t cropY = 0;
+            uint32_t cropW = 0;
+            uint32_t cropH = 0;
+            // Exact scaled target pixel size (== _placeImage's targetW/targetH). Placeholder
+            // cells sample this continuous scaled space so a virtual grid is pixel-identical to a
+            // direct c/r placement even for non-divisible geometry; pixels past it are the
+            // aspect-preserving padding (transparent). 0 => fall back to gridCols/Rows * cell size.
+            // 64-bit: aspect-preserving (c-only/r-only) scaling can exceed 2^32, and truncating it
+            // would diverge the placeholder render from the direct one.
+            uint64_t targetW = 0;
+            uint64_t targetH = 0;
+            uint64_t layerId = 0;
+            int32_t zIndex = 0;
+        };
+
         struct Placement
         {
             uint32_t imageId = 0;
@@ -130,6 +190,7 @@ namespace Microsoft::Console::VirtualTerminal
             int32_t offsetV = 0;
             int32_t zIndex = 0;
             bool hasParent = false;
+            bool isVirtual = false;
         };
 
         struct BufferState
@@ -140,8 +201,16 @@ namespace Microsoft::Console::VirtualTerminal
             std::unordered_map<uint32_t, Image> images;
             ImageNumberMap imageNumbers;
             std::deque<uint32_t> imageOrder;
+            std::map<std::pair<uint32_t, uint32_t>, VirtualPlacement> virtualIds;
             std::map<std::pair<uint32_t, uint32_t>, Placement> placements;
             std::vector<Placement> anonymousPlacements;
+        };
+
+        struct ImageCacheState
+        {
+            uint32_t id = 0;
+            bool hasRenderedPlacements = false;
+            ::Image::Pointer surface;
         };
 
         static Control _ParseControl(std::wstring_view control) noexcept;
@@ -164,10 +233,13 @@ namespace Microsoft::Console::VirtualTerminal
         void _restoreBufferState(BufferState&& state) noexcept;
         size_t _retainedPixelBytes() const noexcept;
         void _releaseImageSurface(Image& image) noexcept;
+        std::vector<ImageCacheState> _snapshotImageCacheStates() const;
+        void _restoreImageCacheStates(const std::vector<ImageCacheState>& states) noexcept;
+        void _storeVirtualPlacement(const uint32_t id, uint32_t placementId, const Image& image, const uint32_t cols, const uint32_t rows, const uint32_t srcX, const uint32_t srcY, const uint32_t srcW, const uint32_t srcH, const int32_t zIndex, uint64_t layerId);
         static TargetSize _targetPixels(int64_t cropW, int64_t cropH, uint32_t cols, uint32_t rows, int64_t cellWidth, int64_t cellHeight) noexcept;
         til::size _placeImage(const Image& image, bool moveCursor, uint32_t imageId, uint64_t layerId, uint32_t cols = 0, uint32_t rows = 0, uint32_t srcX = 0, uint32_t srcY = 0, uint32_t srcW = 0, uint32_t srcH = 0, uint32_t cellOffsetX = 0, uint32_t cellOffsetY = 0, int32_t zIndex = 0, std::optional<til::point> anchor = std::nullopt);
         void _registerPlacement(const Placement& placement);
-        bool _movePlacementChildren(const std::pair<uint32_t, uint32_t>& parent, til::point parentAnchor, bool apply, std::wstring_view& code);
+        bool _movePlacementChildren(const std::pair<uint32_t, uint32_t>& parent, std::optional<til::point> parentAnchor, bool apply, std::wstring_view& code);
         void _erasePlacementCells(const Placement& placement);
         void _erasePlacementsForImage(uint32_t imageId);
         bool _imageHasPlacements(uint32_t id) const noexcept;
@@ -181,6 +253,14 @@ namespace Microsoft::Console::VirtualTerminal
         void _deletePlacementsByZ(int32_t zIndex, bool freeData, std::optional<til::point> cell = std::nullopt);
         std::optional<til::point> _resolvePlacementAnchor(uint32_t parentImageId, uint32_t parentPlacementId, std::pair<uint32_t, uint32_t> origin, std::wstring_view& code) const;
         std::optional<til::point> _derivePlacementAnchor(const Placement& placement) const;
+        std::optional<til::point> _deriveVirtualPlacementAnchor(uint32_t imageId, uint32_t placementId) const;
+        // Returns true if a placeholder tile was staged (the caller publishes and redraws once per segment).
+        bool _placeImageCellRef(const Image& image, const uint32_t imageId, const til::CoordType column, const til::CoordType row, const uint32_t cellRow, const uint32_t cellCol, const VirtualPlacement& place, std::vector<ImagePlacement>& fragments);
+        // Resolves one placeholder text cell from its complete grapheme cluster and stages the
+        // tile it addresses. Returns true if a tile was staged.
+        bool _renderPlaceholderCell(ROW& row, const std::wstring_view cluster, const til::CoordType column, const til::CoordType screenRow, std::vector<ImagePlacement>& fragments);
+        static int _PlaceholderDiacriticIndex(const char32_t ch) noexcept;
+        static bool _IsPlaceholderDiacriticRun(const std::wstring_view cluster) noexcept;
 
         static constexpr size_t MaxImages = 4096;
         static constexpr size_t MaxControl = 1024;
@@ -194,6 +274,9 @@ namespace Microsoft::Console::VirtualTerminal
         std::unordered_map<uint32_t, Image> _images;
         ImageNumberMap _imageNumbers;
         std::deque<uint32_t> _imageOrder;
+        // Virtual placements keyed by the external (image id, placement id). U+10EEEE selects
+        // this key through its foreground and underline colors.
+        std::map<std::pair<uint32_t, uint32_t>, VirtualPlacement> _virtualIds;
         std::map<std::pair<uint32_t, uint32_t>, Placement> _placements;
         std::vector<Placement> _anonymousPlacements;
         std::optional<BufferState> _mainBufferState;
@@ -209,5 +292,11 @@ namespace Microsoft::Console::VirtualTerminal
 #ifdef UNIT_TESTING
         friend class ::AdapterTest;
 #endif
+        // Test seams. Each operation takes and clears its one-shot mutation
+        // checkpoint countdown before planning, so an armed failure cannot leak
+        // into another transaction.
+        std::optional<size_t> _testMovePlacementFailureCountdown;
+        std::optional<size_t> _testCascadeFailureAfterEraseCountdown;
+        bool _testPersistentMovePlacementFailure = false;
     };
 }

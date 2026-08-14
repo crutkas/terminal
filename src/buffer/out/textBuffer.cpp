@@ -34,6 +34,30 @@ constexpr bool allWhitespace(const std::wstring_view& text) noexcept
     return true;
 }
 
+static uint32_t imageCellRefImageId(const ROW& row, const til::CoordType column) noexcept
+{
+    const auto metadata = row.GetImageCellRef(column);
+    if (!metadata)
+    {
+        return 0;
+    }
+
+    const auto foreground = row.GetAttrByColumn(column).GetForeground();
+    const auto low = foreground.IsRgb() ?
+                         (static_cast<uint32_t>(GetRValue(foreground.GetRGB())) << 16) |
+                             (static_cast<uint32_t>(GetGValue(foreground.GetRGB())) << 8) |
+                             GetBValue(foreground.GetRGB()) :
+                     foreground.IsIndex256() ? static_cast<uint32_t>(foreground.GetIndex()) :
+                                               0u;
+    return low | (static_cast<uint32_t>(metadata->imageIdHighByte) << 24);
+}
+
+static uint64_t imageCellRefLayerId(const ROW& row, const til::CoordType column) noexcept
+{
+    const auto metadata = row.GetImageCellRef(column);
+    return metadata ? metadata->layerId : 0;
+}
+
 static std::atomic<uint64_t> s_lastMutationIdInitialValue;
 
 // Routine Description:
@@ -243,7 +267,12 @@ const ROW& TextBuffer::GetRowByOffset(const til::CoordType index) const
 ROW& TextBuffer::GetMutableRowByOffset(const til::CoordType index)
 {
     _lastMutationId++;
-    return _getRow(index);
+    auto& row = _getRow(index);
+    if (_mutationJournal)
+    {
+        _mutationJournal->SaveRow(*this, row, index);
+    }
+    return row;
 }
 
 const ImageCollection& TextBuffer::GetImages() const noexcept
@@ -287,6 +316,78 @@ ROW& TextBuffer::GetScratchpadRow(const TextAttribute& attributes)
 void TextBuffer::CopyProperties(const TextBuffer& OtherBuffer) noexcept
 {
     GetCursor().CopyProperties(OtherBuffer.GetCursor());
+}
+
+TextBuffer::MutationState TextBuffer::CreateMutationState() const
+{
+    return {
+        .images = _images.Snapshot(),
+        .cursor = _cursor.GetState(),
+        .currentAttributes = _currentAttributes,
+        .firstRow = _firstRow,
+        .lastMutationId = _lastMutationId,
+    };
+}
+
+void TextBuffer::RestoreMutationState(MutationState&& state) noexcept
+{
+    _images = std::move(state.images);
+    _cursor.RestoreState(state.cursor);
+    _currentAttributes = state.currentAttributes;
+    _firstRow = state.firstRow;
+    _lastMutationId = state.lastMutationId;
+}
+
+void TextBuffer::SetMutationJournal(MutationJournal* const journal) noexcept
+{
+    _mutationJournal = journal;
+}
+
+std::unique_ptr<TextBuffer::ResizeSnapshot> TextBuffer::CreateResizeSnapshot() const
+{
+    auto snapshot = std::make_unique<ResizeSnapshot>();
+    auto copy = std::make_unique<TextBuffer>(GetSize().Dimensions(),
+                                             _initialAttributes,
+                                             _cursor.GetSize(),
+                                             _isActiveBuffer,
+                                             _renderer);
+    copy->_firstRow = _firstRow;
+    for (size_t row = 0; row <= _height; ++row)
+    {
+        auto& source = const_cast<TextBuffer*>(this)->_getRowByOffsetDirect(row);
+        copy->_getRowByOffsetDirect(row).CopyFrom(source);
+    }
+    copy->_images = _images.Snapshot();
+    copy->_hyperlinkMap = _hyperlinkMap;
+    copy->_hyperlinkCustomIdMap = _hyperlinkCustomIdMap;
+    copy->_currentHyperlinkId = _currentHyperlinkId;
+    copy->_currentAttributes = _currentAttributes;
+    copy->_lastMutationId = _lastMutationId;
+    copy->_cursor.CopyProperties(_cursor);
+    snapshot->buffer = std::move(copy);
+    return snapshot;
+}
+
+void TextBuffer::RestoreResizeSnapshot(ResizeSnapshot& snapshot) noexcept
+{
+    auto& source = *snapshot.buffer;
+    std::swap(_images, source._images);
+    std::swap(_hyperlinkMap, source._hyperlinkMap);
+    std::swap(_hyperlinkCustomIdMap, source._hyperlinkCustomIdMap);
+    std::swap(_currentHyperlinkId, source._currentHyperlinkId);
+    std::swap(_buffer, source._buffer);
+    std::swap(_bufferEnd, source._bufferEnd);
+    std::swap(_commitWatermark, source._commitWatermark);
+    std::swap(_initialAttributes, source._initialAttributes);
+    std::swap(_bufferRowStride, source._bufferRowStride);
+    std::swap(_bufferOffsetChars, source._bufferOffsetChars);
+    std::swap(_bufferOffsetCharOffsets, source._bufferOffsetCharOffsets);
+    std::swap(_width, source._width);
+    std::swap(_height, source._height);
+    std::swap(_currentAttributes, source._currentAttributes);
+    std::swap(_firstRow, source._firstRow);
+    std::swap(_lastMutationId, source._lastMutationId);
+    _cursor.CopyProperties(source._cursor);
 }
 
 // Routine Description:
@@ -585,6 +686,7 @@ void TextBuffer::Insert(til::CoordType row, const TextAttribute& attributes, Row
         const auto& scratchAttr = scratch.Attributes();
         const auto restoreAttr = scratchAttr.slice(gsl::narrow<uint16_t>(state.columnBegin), gsl::narrow<uint16_t>(state.columnBegin + copyAmount));
         rowAttr.replace(gsl::narrow<uint16_t>(restoreState.columnBegin), gsl::narrow<uint16_t>(restoreState.columnEnd), restoreAttr);
+        r.CopyImageCellRefs(scratch, state.columnBegin, restoreState.columnBegin, restoreState.columnEnd);
         _images.CopyArea(
             { state.columnBegin, row, state.columnBegin + copyAmount, row + 1 },
             { restoreState.columnBegin, row },
@@ -2843,6 +2945,14 @@ void TextBuffer::Reflow(TextBuffer& oldBuffer, TextBuffer& newBuffer, const View
     const auto newHeight = newBuffer.GetSize().Height();
     const auto newWidthU16 = gsl::narrow_cast<uint16_t>(newWidth);
 
+    struct ImageCellMove
+    {
+        til::point source;
+        til::point destination;
+        uint32_t imageId = 0;
+        uint64_t layerId = 0;
+    };
+    std::vector<ImageCellMove> imageCellMoves;
     struct ImageSegmentMove
     {
         til::rect source;
@@ -2885,6 +2995,22 @@ void TextBuffer::Reflow(TextBuffer& oldBuffer, TextBuffer& newBuffer, const View
                     .source = { 0, oldY, copiedColumns, oldY + 1 },
                     .destination = { 0, newY },
                 });
+            }
+            for (auto column = 0; column < copiedColumns; ++column)
+            {
+                if (oldRow.GetImageCellRef(column))
+                {
+                    const auto layerId = imageCellRefLayerId(oldRow, column);
+                    if (layerId != 0)
+                    {
+                        imageCellMoves.push_back({
+                            .source = { column, oldY },
+                            .destination = { column, newY },
+                            .imageId = imageCellRefImageId(oldRow, column),
+                            .layerId = layerId,
+                        });
+                    }
+                }
             }
 
             if (oldY == oldCursorPos.y)
@@ -2988,6 +3114,23 @@ void TextBuffer::Reflow(TextBuffer& oldBuffer, TextBuffer& newBuffer, const View
                 });
             }
 
+            for (auto sourceColumn = oldX; sourceColumn < mappedSourceEnd; ++sourceColumn)
+            {
+                if (oldRow.GetImageCellRef(sourceColumn))
+                {
+                    const auto layerId = imageCellRefLayerId(oldRow, sourceColumn);
+                    if (layerId != 0)
+                    {
+                        imageCellMoves.push_back({
+                            .source = { sourceColumn, oldY },
+                            .destination = { newX + sourceColumn - oldX, newY },
+                            .imageId = imageCellRefImageId(oldRow, sourceColumn),
+                            .layerId = layerId,
+                        });
+                    }
+                }
+            }
+
             const auto& oldAttr = oldRow.Attributes();
             auto& newAttr = newRow.Attributes();
             const auto attributes = oldAttr.slice(gsl::narrow_cast<uint16_t>(oldX), oldAttr.size());
@@ -3077,6 +3220,22 @@ void TextBuffer::Reflow(TextBuffer& oldBuffer, TextBuffer& newBuffer, const View
         return til::point{ destination.x, destination.y - firstRetainedRow };
     };
 
+    std::vector<ImagePlacement::Key> placeholderKeys;
+    placeholderKeys.reserve(imageCellMoves.size());
+    for (const auto& move : imageCellMoves)
+    {
+        placeholderKeys.push_back({ move.imageId, move.layerId, ImagePlacement::Key::Protocol::Kitty });
+    }
+    const auto keyLess = [](const auto lhs, const auto rhs) {
+        return std::tie(lhs.protocol, lhs.imageId, lhs.layerId) <
+               std::tie(rhs.protocol, rhs.imageId, rhs.layerId);
+    };
+    std::sort(placeholderKeys.begin(), placeholderKeys.end(), keyLess);
+    placeholderKeys.erase(std::unique(placeholderKeys.begin(), placeholderKeys.end()), placeholderKeys.end());
+    const auto isPlaceholder = [&](const ImagePlacement::Key key) {
+        return std::binary_search(placeholderKeys.begin(), placeholderKeys.end(), key, keyLess);
+    };
+
     ImageCollection reflowedImages;
     // Direct placements follow the exact source-cell segments copied by reflow.
     // Wrapping can split one rectangle into multiple fragments with the same key.
@@ -3090,6 +3249,11 @@ void TextBuffer::Reflow(TextBuffer& oldBuffer, TextBuffer& newBuffer, const View
 
         for (const auto placement : oldBuffer._images.IntersectingRows(move.source.top, move.source.bottom))
         {
+            if (isPlaceholder(placement->Identity()))
+            {
+                continue;
+            }
+
             if (auto sourceFragment = placement->Crop(move.source))
             {
                 const auto translated = sourceFragment->Translated(*destination - move.source.origin());
@@ -3098,6 +3262,46 @@ void TextBuffer::Reflow(TextBuffer& oldBuffer, TextBuffer& newBuffer, const View
                     reflowedImages.Add(std::move(*clipped));
                 }
             }
+        }
+    }
+
+    // Placeholder-backed fragments follow the exact text-cell move. Cropping
+    // the old one-cell fragment before translating retains its source-grid
+    // identity and original sampling transform.
+    for (const auto& move : imageCellMoves)
+    {
+        const auto destination = finalDestination(move.destination);
+        if (!destination)
+        {
+            continue;
+        }
+
+        const auto& destinationRow = newBuffer.GetRowByOffset(destination->y);
+        if (!destinationRow.GetImageCellRef(destination->x) ||
+            imageCellRefImageId(destinationRow, destination->x) != move.imageId ||
+            imageCellRefLayerId(destinationRow, destination->x) != move.layerId)
+        {
+            continue;
+        }
+
+        for (const auto placement : oldBuffer._images.IntersectingRows(move.source.y, move.source.y + 1))
+        {
+            const auto bounds = placement->CellBounds();
+            if (placement->Identity() != ImagePlacement::Key{ move.imageId, move.layerId, ImagePlacement::Key::Protocol::Kitty } ||
+                move.source.x < bounds.left || move.source.x >= bounds.right)
+            {
+                continue;
+            }
+
+            if (auto sourceFragment = placement->Crop({ move.source.x, move.source.y, move.source.x + 1, move.source.y + 1 }))
+            {
+                auto translated = sourceFragment->Translated(*destination - move.source);
+                if (auto clipped = translated.Crop(newBounds))
+                {
+                    reflowedImages.Add(std::move(*clipped));
+                }
+            }
+            break;
         }
     }
 
