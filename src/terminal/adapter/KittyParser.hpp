@@ -74,9 +74,14 @@ namespace Microsoft::Console::VirtualTerminal
             bool hasNonChunkKey = false;
             bool hasNonChunkKeyOtherThanAction = false;
             uint32_t placementId = 0;
+            uint32_t parentImageId = 0;
+            uint32_t parentPlacementId = 0;
+            int32_t offsetH = 0;
+            int32_t offsetV = 0;
             int32_t zIndex = 0;
             bool haveZ = false;
             bool havePlacementId = false;
+            bool haveParent = false;
         };
 
         struct Image
@@ -119,7 +124,12 @@ namespace Microsoft::Console::VirtualTerminal
             uint32_t srcH = 0;
             uint32_t cellOffsetX = 0;
             uint32_t cellOffsetY = 0;
+            uint32_t parentImageId = 0;
+            uint32_t parentPlacementId = 0;
+            int32_t offsetH = 0;
+            int32_t offsetV = 0;
             int32_t zIndex = 0;
+            bool hasParent = false;
         };
 
         struct BufferState
@@ -155,23 +165,28 @@ namespace Microsoft::Console::VirtualTerminal
         size_t _retainedPixelBytes() const noexcept;
         void _releaseImageSurface(Image& image) noexcept;
         static TargetSize _targetPixels(int64_t cropW, int64_t cropH, uint32_t cols, uint32_t rows, int64_t cellWidth, int64_t cellHeight) noexcept;
-        til::size _placeImage(const Image& image, bool moveCursor, uint32_t imageId, uint64_t layerId, uint32_t cols = 0, uint32_t rows = 0, uint32_t srcX = 0, uint32_t srcY = 0, uint32_t srcW = 0, uint32_t srcH = 0, uint32_t cellOffsetX = 0, uint32_t cellOffsetY = 0, int32_t zIndex = 0);
+        til::size _placeImage(const Image& image, bool moveCursor, uint32_t imageId, uint64_t layerId, uint32_t cols = 0, uint32_t rows = 0, uint32_t srcX = 0, uint32_t srcY = 0, uint32_t srcW = 0, uint32_t srcH = 0, uint32_t cellOffsetX = 0, uint32_t cellOffsetY = 0, int32_t zIndex = 0, std::optional<til::point> anchor = std::nullopt);
         void _registerPlacement(const Placement& placement);
+        bool _movePlacementChildren(const std::pair<uint32_t, uint32_t>& parent, til::point parentAnchor, bool apply, std::wstring_view& code);
         void _erasePlacementCells(const Placement& placement);
         void _erasePlacementsForImage(uint32_t imageId);
         bool _imageHasPlacements(uint32_t id) const noexcept;
         bool _imageHasRenderedPlacements(uint32_t id) const;
+        void _cascadePlacementChildren(std::deque<std::pair<uint32_t, uint32_t>>& removed, uint32_t keepImageId);
         void _deletePlacement(uint32_t imageId, uint32_t placementId, bool freeData);
         void _eraseImagePlacements(uint32_t imageId);
         void _deleteAllPlacements(bool freeData);
         void _deleteImagesIntersecting(til::CoordType left, til::CoordType top, til::CoordType right, til::CoordType bottom, bool freeData);
         void _deleteImagesInIdRange(uint32_t lo, uint32_t hi, bool freeData);
         void _deletePlacementsByZ(int32_t zIndex, bool freeData, std::optional<til::point> cell = std::nullopt);
+        std::optional<til::point> _resolvePlacementAnchor(uint32_t parentImageId, uint32_t parentPlacementId, std::pair<uint32_t, uint32_t> origin, std::wstring_view& code) const;
+        std::optional<til::point> _derivePlacementAnchor(const Placement& placement) const;
 
         static constexpr size_t MaxImages = 4096;
         static constexpr size_t MaxControl = 1024;
         static constexpr size_t MaxPayload = 32 * 1024 * 1024;
         static constexpr size_t MaxTotalBytes = 320 * 1024 * 1024;
+        static constexpr int MaxPlacementDepth = 8;
         static constexpr size_t MaxPlacements = MaxImages * 4;
         uint32_t _nextImageId = 1;
         uint64_t _nextLayerId = 1;

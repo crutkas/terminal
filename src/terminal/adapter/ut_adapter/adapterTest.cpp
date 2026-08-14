@@ -673,6 +673,7 @@ namespace
         { L"unsupported delete target", L"\x1b_Ga=d,d=b,i=5;\x1b\\", L"\x1b_Gi=5;EINVAL:unsupported delete target\x1b\\" },
         { L"delete by id needs i", L"\x1b_Ga=d,d=i;\x1b\\", L"\x1b_G;EINVAL:delete by id requires i\x1b\\" },
         { L"q=1 does not suppress error", L"\x1b_Ga=p,i=77,q=1;\x1b\\", L"\x1b_Gi=77;ENOENT:image not found\x1b\\" },
+        { L"relative missing parent", L"\x1b_Ga=T,i=2,p=1,P=99,Q=1,H=0,V=0,f=24,s=1,v=1;/wAA\x1b\\", L"\x1b_Gi=2,p=1;ENOPARENT:relative parent not found\x1b\\" },
     };
 
     // Well-formed (or gracefully tolerated) requests each echo the expected OK acknowledgement.
@@ -6336,6 +6337,21 @@ public:
         _testGetSet->ValidateInputEvent(L"\x1b_Gi=5;OK\x1b\\");
     }
 
+    // Group lifetime: even a LOWERCASE parent delete frees a relative child's image (the child has
+    // no placement left), per the group semantics, while the parent's OWN data is kept (lowercase).
+    TEST_METHOD(KittyGraphicsDeleteLowercaseParentKeepsDataFreesChild)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,p=1,f=24,s=1,v=1,C=1;/wAA\x1b\\"); // parent (1,1)
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=2,p=1,P=1,Q=1,f=24,s=1,v=1,C=1;AP8A\x1b\\"); // child (2,1) rel parent
+        _stateMachine->ProcessString(L"\x1b_Ga=d,d=i,i=1;\x1b\\"); // lowercase delete of the parent image
+        _testGetSet->_response.clear();
+        _stateMachine->ProcessString(L"\x1b_Ga=p,i=2;\x1b\\"); // child image freed by the group cascade
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=2;ENOENT:image not found\x1b\\");
+        _stateMachine->ProcessString(L"\x1b_Ga=p,i=1;\x1b\\"); // parent DATA kept (lowercase)
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=1;OK\x1b\\");
+    }
+
     TEST_METHOD(KittyGraphicsTallImageSpansRows)
     {
         _testGetSet->PrepData();
@@ -6659,6 +6675,95 @@ public:
         }
     }
 
+    TEST_METHOD(KittyRelativePlacementPositionsFromParent)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        _pDispatch->CursorPosition(6, 6); // row 5, col 5 (within the viewport)
+        auto& buf = *_testGetSet->_textBuffer;
+        const auto parentPos = buf.GetCursor().GetPosition();
+        // Parent (id 1, placement 1) at the cursor; C=1 leaves the cursor put.
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,p=1,f=24,s=1,v=1,C=1;/wAA\x1b\\"); // red
+        const auto* parentSlice = DirectImageSlice(buf, parentPos.y);
+        VERIFY_IS_NOT_NULL(parentSlice);
+        VERIFY_ARE_EQUAL(1u, parentSlice->ColumnOwner(parentPos.x), L"parent owns its cursor cell");
+
+        // Child (id 2) +H=2,+V=1 => anchor parent+(2,1).
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=2,p=1,P=1,Q=1,H=2,V=1,f=24,s=1,v=1;AP8A\x1b\\"); // green
+        VERIFY_ARE_EQUAL(parentPos, buf.GetCursor().GetPosition(), L"relative placement must not move the cursor");
+        const auto* childSlice = DirectImageSlice(buf, parentPos.y + 1);
+        VERIFY_IS_NOT_NULL(childSlice);
+        VERIFY_ARE_EQUAL(2u, childSlice->ColumnOwner(parentPos.x + 2), L"+offset child anchored at parent+(2,1)");
+
+        // Child (id 3) -H=2,-V=1 => anchor parent+(-2,-1).
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=3,p=1,P=1,Q=1,H=-2,V=-1,f=24,s=1,v=1;AAD/\x1b\\"); // blue
+        const auto* child2Slice = DirectImageSlice(buf, parentPos.y - 1);
+        VERIFY_IS_NOT_NULL(child2Slice);
+        VERIFY_ARE_EQUAL(3u, child2Slice->ColumnOwner(parentPos.x - 2), L"-offset child anchored at parent+(-2,-1)");
+    }
+
+    // A re-put that makes A relative to B while B is relative to A closes a cycle: ECYCLE.
+    TEST_METHOD(KittyRelativeCycleIsEcycle)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,p=1,f=24,s=1,v=1,C=1;/wAA\x1b\\"); // A normal
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=2,p=1,P=1,Q=1,f=24,s=1,v=1,C=1;AP8A\x1b\\"); // B rel A
+        // Re-put A relative to B => A -> B -> A.
+        _stateMachine->ProcessString(L"\x1b_Ga=p,i=1,p=1,P=2,Q=1,C=1;\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=1,p=1;ECYCLE:relative placement cycle\x1b\\");
+    }
+
+    // A chain of relative placements is allowed to depth 8; the 9th link is ETOODEEP.
+    TEST_METHOD(KittyRelativeChainDepth)
+    {
+        _testGetSet->PrepData();
+        // A0 (id 1) is a normal placement; Ak (id k+1) is relative to A(k-1) (id k).
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,p=1,f=24,s=1,v=1,C=1;/wAA\x1b\\");
+        for (uint32_t k = 1; k <= 8; ++k)
+        {
+            const auto cmd = L"\x1b_Ga=T,i=" + std::to_wstring(k + 1) + L",p=1,P=" + std::to_wstring(k) + L",Q=1,H=0,V=0,f=24,s=1,v=1,C=1;/wAA\x1b\\";
+            _stateMachine->ProcessString(cmd);
+        }
+        // Depth 8 (id 9, parent id 8) succeeded above.
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=9,p=1;OK\x1b\\");
+        // Depth 9 (id 10, parent id 9) exceeds the maximum.
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=10,p=1,P=9,Q=1,H=0,V=0,f=24,s=1,v=1,C=1;/wAA\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=10,p=1;ETOODEEP:relative placement chain too deep\x1b\\");
+    }
+
+    TEST_METHOD(KittyRelativeCursorDoesNotMove)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        _pDispatch->CursorPosition(4, 4);
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,p=1,f=24,s=1,v=1,C=1;/wAA\x1b\\"); // parent
+        auto& buf = *_testGetSet->_textBuffer;
+        const auto pos = buf.GetCursor().GetPosition();
+        // C absent.
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=2,p=1,P=1,Q=1,H=1,V=1,f=24,s=1,v=1;AP8A\x1b\\");
+        VERIFY_ARE_EQUAL(pos, buf.GetCursor().GetPosition(), L"C absent: relative placement keeps the cursor put");
+        // C=0 (would otherwise move the cursor) must also keep it put for a relative placement.
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=3,p=1,P=1,Q=1,H=2,V=2,f=24,s=1,v=1,C=0;AAD/\x1b\\");
+        VERIFY_ARE_EQUAL(pos, buf.GetCursor().GetPosition(), L"C=0: relative placement still keeps the cursor put");
+    }
+
+    // Deleting the parent image cascades to its relative children; an image left with no
+    // placements is deleted too, leaving the placement registry empty.
+    TEST_METHOD(KittyPlacementGroupDeleteCascades)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,p=1,f=24,s=1,v=1,C=1;/wAA\x1b\\"); // parent
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=2,p=1,P=1,Q=1,f=24,s=1,v=1,C=1;AP8A\x1b\\"); // child rel parent
+        VERIFY_ARE_EQUAL(static_cast<size_t>(2), _kitty()._placements.size());
+        _stateMachine->ProcessString(L"\x1b_Ga=d,d=I,i=1;\x1b\\"); // delete parent image
+        VERIFY_IS_TRUE(_kitty()._placements.empty(), L"deleting the parent cascades to remove all group placements");
+        _testGetSet->_response.clear();
+        _stateMachine->ProcessString(L"\x1b_Ga=p,i=2;\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=2;ENOENT:image not found\x1b\\"); // child image gone too
+        _stateMachine->ProcessString(L"\x1b_Ga=p,i=1;\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=1;ENOENT:image not found\x1b\\");
+    }
+
     TEST_METHOD(KittyRePutReplacesPlacement)
     {
         _testGetSet->PrepData();
@@ -6706,6 +6811,248 @@ public:
         VERIFY_ARE_EQUAL(sizeof(RGBQUAD) * 4, _kitty()._totalPixelBytes);
     }
 
+    TEST_METHOD(KittyParentRePutMovesRelativeChild)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        auto& buffer = *_testGetSet->_textBuffer;
+
+        _pDispatch->CursorPosition(4, 4);
+        const auto oldParent = buffer.GetCursor().GetPosition();
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,p=1,f=24,s=1,v=1,C=1;/wAA\x1b\\");
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=2,p=1,P=1,Q=1,H=1,V=1,f=24,s=1,v=1,C=1;AP8A\x1b\\");
+        const til::point oldChild{ oldParent.x + 1, oldParent.y + 1 };
+        VERIFY_ARE_EQUAL(2u, DirectImageSlice(buffer, oldChild.y)->ColumnOwner(oldChild.x));
+
+        _pDispatch->CursorPosition(10, 8);
+        const auto newParent = buffer.GetCursor().GetPosition();
+        _stateMachine->ProcessString(L"\x1b_Ga=p,i=1,p=1,C=1;\x1b\\");
+        const til::point newChild{ newParent.x + 1, newParent.y + 1 };
+
+        const auto* oldSlice = DirectImageSlice(buffer, oldChild.y);
+        VERIFY_IS_TRUE(oldSlice == nullptr || oldSlice->ColumnOwner(oldChild.x) == 0, L"the child's old cells must be erased");
+        const auto* newSlice = DirectImageSlice(buffer, newChild.y);
+        VERIFY_IS_NOT_NULL(newSlice);
+        VERIFY_ARE_EQUAL(2u, newSlice->ColumnOwner(newChild.x), L"the child must follow its moved parent");
+        const auto& child = _kitty()._placements.at({ 2u, 1u });
+        VERIFY_ARE_EQUAL(newChild.x, child.anchorCol);
+        VERIFY_ARE_EQUAL(newChild.y, child.anchorRow);
+    }
+
+    // Issue #33: relocation is recursive and each link remains relative to its immediate parent.
+    TEST_METHOD(KittyParentRePutMovesRelativeGrandchild)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        auto& buffer = *_testGetSet->_textBuffer;
+
+        _pDispatch->CursorPosition(3, 3);
+        const auto oldParent = buffer.GetCursor().GetPosition();
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,p=1,f=24,s=1,v=1,C=1;/wAA\x1b\\");
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=2,p=1,P=1,Q=1,H=1,V=1,f=24,s=1,v=1,C=1;AP8A\x1b\\");
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=3,p=1,P=2,Q=1,H=2,V=1,f=24,s=1,v=1,C=1;AAD/\x1b\\");
+        const til::point oldGrandchild{ oldParent.x + 3, oldParent.y + 2 };
+        VERIFY_ARE_EQUAL(3u, DirectImageSlice(buffer, oldGrandchild.y)->ColumnOwner(oldGrandchild.x));
+
+        _pDispatch->CursorPosition(12, 9);
+        const auto newParent = buffer.GetCursor().GetPosition();
+        _stateMachine->ProcessString(L"\x1b_Ga=p,i=1,p=1,C=1;\x1b\\");
+        const til::point newChild{ newParent.x + 1, newParent.y + 1 };
+        const til::point newGrandchild{ newChild.x + 2, newChild.y + 1 };
+
+        const auto* oldSlice = DirectImageSlice(buffer, oldGrandchild.y);
+        VERIFY_IS_TRUE(oldSlice == nullptr || oldSlice->ColumnOwner(oldGrandchild.x) == 0, L"the grandchild's old cells must be erased");
+        const auto* newSlice = DirectImageSlice(buffer, newGrandchild.y);
+        VERIFY_IS_NOT_NULL(newSlice);
+        VERIFY_ARE_EQUAL(3u, newSlice->ColumnOwner(newGrandchild.x), L"the grandchild must follow its immediate parent");
+        const auto& grandchild = _kitty()._placements.at({ 3u, 1u });
+        VERIFY_ARE_EQUAL(newGrandchild.x, grandchild.anchorCol);
+        VERIFY_ARE_EQUAL(newGrandchild.y, grandchild.anchorRow);
+    }
+
+    // Anonymous relative placements are tracked outside the registered-placement map, but they
+    // are still members of the parent group and must follow a re-put.
+    TEST_METHOD(KittyParentRePutMovesAnonymousRelativeChild)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        auto& buffer = *_testGetSet->_textBuffer;
+
+        _pDispatch->CursorPosition(4, 4);
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,p=1,f=24,s=1,v=1,C=1;/wAA\x1b\\");
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=2,P=1,Q=1,H=1,V=1,f=24,s=1,v=1,C=1;AP8A\x1b\\");
+        VERIFY_ARE_EQUAL(static_cast<size_t>(1), _kitty()._anonymousPlacements.size());
+        const auto oldChild = _kitty()._anonymousPlacements.front();
+
+        _pDispatch->CursorPosition(10, 8);
+        const auto newParent = buffer.GetCursor().GetPosition();
+        _stateMachine->ProcessString(L"\x1b_Ga=p,i=1,p=1,C=1;\x1b\\");
+        const til::point newChild{ newParent.x + 1, newParent.y + 1 };
+
+        const auto* oldSlice = DirectImageSlice(buffer, oldChild.anchorRow);
+        VERIFY_IS_TRUE(oldSlice == nullptr || oldSlice->ColumnOwner(oldChild.anchorCol) == 0);
+        const auto* newSlice = DirectImageSlice(buffer, newChild.y);
+        VERIFY_IS_NOT_NULL(newSlice);
+        VERIFY_ARE_EQUAL(2u, newSlice->ColumnOwner(newChild.x));
+        VERIFY_ARE_EQUAL(newChild.x, _kitty()._anonymousPlacements.front().anchorCol);
+        VERIFY_ARE_EQUAL(newChild.y, _kitty()._anonymousPlacements.front().anchorRow);
+    }
+
+    // Moving a group is erase-all-then-draw-all. Without that ordering, the first same-image
+    // sibling can move into the second sibling's old cell and then be erased when the second moves.
+    TEST_METHOD(KittyParentRePutKeepsOverlappingSameImageChildren)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        auto& buffer = *_testGetSet->_textBuffer;
+
+        _pDispatch->CursorPosition(4, 4);
+        const auto oldParent = buffer.GetCursor().GetPosition();
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,p=1,f=24,s=1,v=1,C=1;/wAA\x1b\\");
+        _stateMachine->ProcessString(L"\x1b_Ga=t,i=2,f=24,s=1,v=1;AP8A\x1b\\");
+        _stateMachine->ProcessString(L"\x1b_Ga=p,i=2,p=1,P=1,Q=1,H=1,C=1;\x1b\\");
+        _stateMachine->ProcessString(L"\x1b_Ga=p,i=2,p=2,P=1,Q=1,H=3,C=1;\x1b\\");
+
+        _pDispatch->CursorPosition(oldParent.y + 1, oldParent.x + 3);
+        const auto newParent = buffer.GetCursor().GetPosition();
+        _stateMachine->ProcessString(L"\x1b_Ga=p,i=1,p=1,C=1;\x1b\\");
+        const til::point firstChild{ newParent.x + 1, newParent.y };
+        const til::point secondChild{ newParent.x + 3, newParent.y };
+
+        const auto* slice = DirectImageSlice(buffer, newParent.y);
+        VERIFY_IS_NOT_NULL(slice);
+        VERIFY_ARE_EQUAL(2u, slice->ColumnOwner(firstChild.x), L"the first sibling must survive the second sibling's old-cell erase");
+        VERIFY_ARE_EQUAL(2u, slice->ColumnOwner(secondChild.x), L"the second sibling must be redrawn at its new anchor");
+    }
+
+    // A same-image child's old rectangle can overlap the parent's new rectangle. The group move
+    // must restore the parent after stale child cells are erased, not leave a hole in the parent.
+    TEST_METHOD(KittyParentRePutKeepsOverlappingSameImageParent)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        auto& buffer = *_testGetSet->_textBuffer;
+
+        _pDispatch->CursorPosition(4, 4);
+        const auto oldParent = buffer.GetCursor().GetPosition();
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,p=1,f=24,s=1,v=1,C=1;/wAA\x1b\\");
+        _stateMachine->ProcessString(L"\x1b_Ga=p,i=1,p=2,P=1,Q=1,H=1,C=1;\x1b\\");
+
+        _pDispatch->CursorPosition(oldParent.y + 1, oldParent.x + 2);
+        const auto newParent = buffer.GetCursor().GetPosition();
+        _stateMachine->ProcessString(L"\x1b_Ga=p,i=1,p=1,C=1;\x1b\\");
+        const til::point newChild{ newParent.x + 1, newParent.y };
+
+        const auto* slice = DirectImageSlice(buffer, newParent.y);
+        VERIFY_IS_NOT_NULL(slice);
+        VERIFY_ARE_EQUAL(1u, slice->ColumnOwner(newParent.x), L"the child's stale erase must not punch a hole in the parent");
+        VERIFY_ARE_EQUAL(1u, slice->ColumnOwner(newChild.x), L"the same-image child must move after the restored parent");
+    }
+
+    TEST_METHOD(KittyParentRePutMovesChildAfterScroll)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        auto& buffer = *_testGetSet->_textBuffer;
+
+        _pDispatch->CursorPosition(4, 4);
+        const auto originalParent = buffer.GetCursor().GetPosition();
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,p=1,f=24,s=1,v=1,C=1;/wAA\x1b\\");
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=2,p=1,P=1,Q=1,H=1,V=1,f=24,s=1,v=1,C=1;AP8A\x1b\\");
+        const auto childLayer = _kitty()._placements.at({ 2u, 1u }).layerId;
+        buffer.ScrollRows(originalParent.y, 2, 1);
+        buffer.GetMutableImages().EraseArea({ 0, originalParent.y, buffer.GetSize().Width(), originalParent.y + 1 });
+        VERIFY_IS_TRUE(DirectImageSlice(buffer, originalParent.y + 2)->ContainsPlacement(childLayer));
+
+        // The registry still contains the creation-time anchor. Re-put at that same coordinate
+        // must compare against the retained layer's scrolled position and move the child back.
+        buffer.GetCursor().SetPosition(originalParent);
+        _stateMachine->ProcessString(L"\x1b_Ga=p,i=1,p=1,C=1;\x1b\\");
+        const til::point expectedChild{ originalParent.x + 1, originalParent.y + 1 };
+
+        const auto* oldSlice = DirectImageSlice(buffer, originalParent.y + 2);
+        VERIFY_IS_TRUE(oldSlice == nullptr || !oldSlice->ContainsPlacement(childLayer));
+        const auto* newSlice = DirectImageSlice(buffer, expectedChild.y);
+        VERIFY_IS_NOT_NULL(newSlice);
+        VERIFY_IS_TRUE(newSlice->PlacementCoversColumn(childLayer, expectedChild.x));
+    }
+
+    TEST_METHOD(KittyRelativeChildUsesScrolledParentAnchor)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        auto& buffer = *_testGetSet->_textBuffer;
+
+        _pDispatch->CursorPosition(4, 4);
+        const auto originalParent = buffer.GetCursor().GetPosition();
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,p=1,f=24,s=1,v=1,C=1;/wAA\x1b\\");
+        buffer.ScrollRows(originalParent.y, 1, 1);
+        buffer.GetMutableImages().EraseArea({ 0, originalParent.y, buffer.GetSize().Width(), originalParent.y + 1 });
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=2,p=1,P=1,Q=1,H=1,V=1,f=24,s=1,v=1,C=1;AP8A\x1b\\");
+
+        const til::point expectedChild{ originalParent.x + 1, originalParent.y + 2 };
+        const auto childLayer = _kitty()._placements.at({ 2u, 1u }).layerId;
+        const auto* slice = DirectImageSlice(buffer, expectedChild.y);
+        VERIFY_IS_NOT_NULL(slice);
+        VERIFY_IS_TRUE(slice->PlacementCoversColumn(childLayer, expectedChild.x), L"relative resolution must use the parent's retained scrolled layer");
+    }
+
+    // The retained redraw parameters must preserve sub-cell offsets, scaling, crop, and z rather
+    // than changing the child's appearance when only its parent anchor changes.
+    TEST_METHOD(KittyParentRePutPreservesRelativeChildGeometry)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 4, 4 };
+        auto& buffer = *_testGetSet->_textBuffer;
+
+        _pDispatch->CursorPosition(4, 4);
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,p=1,f=24,s=1,v=1,C=1;/wAA\x1b\\");
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=2,p=1,P=1,Q=1,V=1,c=1,r=1,X=2,Y=1,z=4,f=24,s=1,v=1,C=1;AP8A\x1b\\");
+
+        _pDispatch->CursorPosition(10, 8);
+        const auto newParent = buffer.GetCursor().GetPosition();
+        _stateMachine->ProcessString(L"\x1b_Ga=p,i=1,p=1,C=1;\x1b\\");
+        const til::point newChild{ newParent.x, newParent.y + 1 };
+
+        const auto* slice = DirectImageSlice(buffer, newChild.y);
+        VERIFY_IS_NOT_NULL(slice);
+        VERIFY_ARE_EQUAL(0, static_cast<int>(SlicePixelAt(slice, 0, 0).rgbGreen), L"the retained X/Y gutter remains transparent");
+        VERIFY_ARE_EQUAL(255, static_cast<int>(SlicePixelAt(slice, 2, 1).rgbGreen), L"the child retains its scaled, shifted pixels");
+        const auto& placement = _kitty()._placements.at({ 2u, 1u });
+        VERIFY_ARE_EQUAL(1u, placement.displayCols);
+        VERIFY_ARE_EQUAL(1u, placement.displayRows);
+        VERIFY_ARE_EQUAL(2u, placement.cellOffsetX);
+        VERIFY_ARE_EQUAL(1u, placement.cellOffsetY);
+        VERIFY_ARE_EQUAL(4, placement.zIndex);
+    }
+
+    // Reparenting must account for both the new ancestor depth and the existing subtree depth.
+    TEST_METHOD(KittyRelativeReparentRejectsOverdeepSubtree)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        _pDispatch->CursorPosition(4, 4);
+        const auto oldRoot = _testGetSet->_textBuffer->GetCursor().GetPosition();
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,p=1,f=24,s=1,v=1,C=1;/wAA\x1b\\");
+        for (uint32_t id = 2; id <= 9; ++id)
+        {
+            const auto parentId = id - 1;
+            const auto command = L"\x1b_Ga=T,i=" + std::to_wstring(id) +
+                                 L",p=1,P=" + std::to_wstring(parentId) +
+                                 L",Q=1,H=1,f=24,s=1,v=1,C=1;/wAA\x1b\\";
+            _stateMachine->ProcessString(command);
+        }
+        _pDispatch->CursorPosition(15, 15);
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=20,p=1,f=24,s=1,v=1,C=1;/wAA\x1b\\");
+
+        _stateMachine->ProcessString(L"\x1b_Ga=p,i=1,p=1,P=20,Q=1,C=1;\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=1,p=1;ETOODEEP:relative placement chain too deep\x1b\\");
+        const auto& root = _kitty()._placements.at({ 1u, 1u });
+        VERIFY_IS_FALSE(root.hasParent, L"the rejected reparent must retain the prior root placement");
+        VERIFY_ARE_EQUAL(oldRoot.x, root.anchorCol);
+        VERIFY_ARE_EQUAL(oldRoot.y, root.anchorRow);
+    }
+
     TEST_METHOD(KittyPlacementIdEchoedInAck)
     {
         _testGetSet->PrepData();
@@ -6714,6 +7061,79 @@ public:
         // A query with a placement id but no image id/number ignores p in the response.
         _stateMachine->ProcessString(L"\x1b_Ga=q,p=5,f=24,s=1,v=1;/wAA\x1b\\");
         _testGetSet->ValidateInputEvent(L"\x1b_G;OK\x1b\\");
+    }
+
+    TEST_METHOD(KittyRetransmitClearsPlacementsAndGrandchildren)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        _pDispatch->CursorPosition(4, 4);
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,p=1,f=24,s=1,v=1,C=1;/wAA\x1b\\");
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=2,p=1,P=1,Q=1,V=1,f=24,s=1,v=1,C=1;AP8A\x1b\\");
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=3,p=1,P=2,Q=1,V=1,f=24,s=1,v=1,C=1;AAD/\x1b\\");
+        VERIFY_ARE_EQUAL(static_cast<size_t>(3), _kitty()._placements.size());
+
+        _stateMachine->ProcessString(L"\x1b_Ga=t,i=1,f=24,s=1,v=1;////\x1b\\"); // re-transmit id 1
+        VERIFY_IS_TRUE(_kitty()._placements.empty(), L"re-transmit must clear the image's placements + group");
+        VERIFY_ARE_EQUAL(0, CountImageRows(*_testGetSet->_textBuffer), L"cascaded children's pixels must be erased");
+
+        _stateMachine->ProcessString(L"\x1b_Ga=p,i=2;\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=2;ENOENT:image not found\x1b\\");
+        _stateMachine->ProcessString(L"\x1b_Ga=p,i=3;\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=3;ENOENT:image not found\x1b\\");
+        _stateMachine->ProcessString(L"\x1b_Ga=p,i=1;\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=1;OK\x1b\\"); // id 1 itself was re-registered
+    }
+
+    // Deleting a parent removes its relative children, but a child image that ALSO holds an
+    // independent (non-relative) placement must survive.
+    TEST_METHOD(KittyDeletingParentKeepsChildImageWithIndependentPlacement)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        _pDispatch->CursorPosition(3, 3);
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,p=1,f=24,s=1,v=1,C=1;/wAA\x1b\\");
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=2,p=1,P=1,Q=1,H=1,f=24,s=1,v=1,C=1;AP8A\x1b\\"); // (2,1) rel (1,1)
+        _pDispatch->CursorPosition(10, 10);
+        _stateMachine->ProcessString(L"\x1b_Ga=p,i=2,p=2,C=1;\x1b\\"); // (2,2) independent placement of image 2
+        VERIFY_ARE_EQUAL(static_cast<size_t>(3), _kitty()._placements.size());
+
+        _stateMachine->ProcessString(L"\x1b_Ga=d,d=i,i=1;\x1b\\"); // delete parent image 1
+        VERIFY_ARE_EQUAL(static_cast<size_t>(1), _kitty()._placements.size());
+        VERIFY_ARE_EQUAL(static_cast<size_t>(0), _kitty()._placements.count({ 2u, 1u }), L"the relative child is removed");
+        VERIFY_ARE_EQUAL(static_cast<size_t>(1), _kitty()._placements.count({ 2u, 2u }), L"the independent placement survives");
+
+        _testGetSet->_response.clear();
+        _stateMachine->ProcessString(L"\x1b_Ga=p,i=2,p=3;\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=2,p=3;OK\x1b\\"); // image 2 still exists
+    }
+
+    // Negative H/V that would place a child off the top-left is clamped to the page origin.
+    TEST_METHOD(KittyRelativeNegativeOffsetsClampToPage)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        _pDispatch->CursorPosition(2, 2);
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,p=1,f=24,s=1,v=1,C=1;/wAA\x1b\\");
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=2,p=1,P=1,Q=1,H=-999,V=-999,f=24,s=1,v=1,C=1;AP8A\x1b\\");
+
+        const auto& placement = _kitty()._placements.at({ 2u, 1u });
+        VERIFY_ARE_EQUAL(0, placement.anchorCol);
+        VERIFY_ARE_EQUAL(0, placement.anchorRow);
+        const auto* slice = DirectImageSlice(*_testGetSet->_textBuffer, 0);
+        VERIFY_IS_NOT_NULL(slice);
+        VERIFY_ARE_EQUAL(2u, slice->ColumnOwner(0));
+    }
+
+    // A cycle longer than two links (A -> C -> B -> A, closed by a re-put) is ECYCLE.
+    TEST_METHOD(KittyRelativeLongerCycleIsEcycle)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,p=1,f=24,s=1,v=1,C=1;/wAA\x1b\\");
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=2,p=1,P=1,Q=1,f=24,s=1,v=1,C=1;AP8A\x1b\\");
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=3,p=1,P=2,Q=1,f=24,s=1,v=1,C=1;AAD/\x1b\\");
+        _stateMachine->ProcessString(L"\x1b_Ga=p,i=1,p=1,P=3,Q=1;\x1b\\"); // close the loop 1 -> 3 -> 2 -> 1
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=1,p=1;ECYCLE:relative placement cycle\x1b\\");
     }
 
     TEST_METHOD(KittyRePutMoveErasesOldPixels)
@@ -6850,6 +7270,101 @@ public:
         VERIFY_ARE_EQUAL(3, placement.CellBounds().left, L"an unwrapped direct placement follows its source cells");
     }
 
+    TEST_METHOD(KittyAnonymousRelativeCascadeErasesPixels)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        _pDispatch->CursorPosition(4, 4);
+        auto& buf = *_testGetSet->_textBuffer;
+        const auto parentPos = buf.GetCursor().GetPosition();
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,p=1,f=24,s=1,v=1,C=1;/wAA\x1b\\"); // parent red
+
+        // Anonymous relative child (image 2, NO p=) at parent+(1,1).
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=2,P=1,Q=1,H=1,V=1,f=24,s=1,v=1;AP8A\x1b\\"); // green
+        VERIFY_ARE_EQUAL(static_cast<size_t>(1), _kitty()._anonymousPlacements.size(), L"an anonymous relative placement is tracked for cascade");
+        const auto* childSlice = DirectImageSlice(buf, parentPos.y + 1);
+        VERIFY_IS_NOT_NULL(childSlice);
+        VERIFY_ARE_EQUAL(2u, childSlice->ColumnOwner(parentPos.x + 1), L"anonymous child drew at parent+(1,1)");
+
+        _stateMachine->ProcessString(L"\x1b_Ga=d,d=i,i=1;\x1b\\"); // delete parent image 1
+        VERIFY_IS_TRUE(_kitty()._anonymousPlacements.empty(), L"deleting the parent removes the anonymous child tracking");
+        const auto* gone = DirectImageSlice(buf, parentPos.y + 1);
+        VERIFY_IS_TRUE(gone == nullptr || gone->ColumnOwner(parentPos.x + 1) == 0, L"the anonymous child's pixels must be erased");
+
+        _testGetSet->_response.clear();
+        _stateMachine->ProcessString(L"\x1b_Ga=p,i=2;\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=2;ENOENT:image not found\x1b\\"); // child image 2 deleted too
+    }
+
+    // Bug #29 (precise cascade): deleting a parent erases a registered relative child's pixels, but
+    // an independent placement of the SAME child image must survive (not be cleared by a broad erase).
+    TEST_METHOD(KittyChildPlacementCascadeKeepsSiblingImagePixels)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        _pDispatch->CursorPosition(3, 3);
+        auto& buf = *_testGetSet->_textBuffer;
+        const auto parentPos = buf.GetCursor().GetPosition();
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,p=1,f=24,s=1,v=1,C=1;/wAA\x1b\\"); // parent (1,1)
+
+        // Image 2 placed relative to (1,1) as (2,1), at parent+(1,0).
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=2,p=1,P=1,Q=1,H=1,V=0,f=24,s=1,v=1,C=1;AP8A\x1b\\");
+        const auto relChildCol = parentPos.x + 1;
+        const auto relChildRow = parentPos.y;
+        const auto* relSlice = DirectImageSlice(buf, relChildRow);
+        VERIFY_IS_NOT_NULL(relSlice);
+        VERIFY_ARE_EQUAL(2u, relSlice->ColumnOwner(relChildCol), L"relative child of image 2 drew next to parent");
+
+        // Image 2 ALSO placed independently (no parent) elsewhere as (2,2).
+        _pDispatch->CursorPosition(9, 9);
+        const auto indepPos = buf.GetCursor().GetPosition();
+        _stateMachine->ProcessString(L"\x1b_Ga=p,i=2,p=2,C=1;\x1b\\");
+        const auto* indepSlice = DirectImageSlice(buf, indepPos.y);
+        VERIFY_IS_NOT_NULL(indepSlice);
+        VERIFY_ARE_EQUAL(2u, indepSlice->ColumnOwner(indepPos.x), L"independent placement of image 2 drew at the cursor");
+        VERIFY_ARE_EQUAL(static_cast<size_t>(3), _kitty()._placements.size());
+
+        _stateMachine->ProcessString(L"\x1b_Ga=d,d=i,i=1;\x1b\\"); // delete parent image 1
+        VERIFY_ARE_EQUAL(static_cast<size_t>(1), _kitty()._placements.size());
+        VERIFY_ARE_EQUAL(static_cast<size_t>(0), _kitty()._placements.count({ 2u, 1u }), L"the relative child placement is removed");
+        VERIFY_ARE_EQUAL(static_cast<size_t>(1), _kitty()._placements.count({ 2u, 2u }), L"the independent placement survives");
+
+        const auto* relGone = DirectImageSlice(buf, relChildRow);
+        VERIFY_IS_TRUE(relGone == nullptr || relGone->ColumnOwner(relChildCol) == 0, L"the relative child's pixels must be erased");
+
+        const auto* indepStill = DirectImageSlice(buf, indepPos.y);
+        VERIFY_IS_NOT_NULL(indepStill);
+        VERIFY_ARE_EQUAL(2u, indepStill->ColumnOwner(indepPos.x), L"the independent placement of image 2 must survive");
+    }
+
+    // Fix H1 (mutate-after-validate): a RELATIVE re-put that fails to resolve must NOT destroy the
+    // existing placement. The prior code erased the old (i,p) placement and removed its registry
+    // entry BEFORE resolving the new anchor, so a re-put resolving to ECYCLE/ENOPARENT/ETOODEEP
+    // wiped a still-valid placement. This guards that a failed re-put leaves the placement intact.
+    TEST_METHOD(KittyFailedRelativeRePutKeepsExistingPlacement)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        _pDispatch->CursorPosition(4, 4);
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,p=1,f=24,s=1,v=1,C=1;/wAA\x1b\\"); // (1,1) normal (no parent)
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=2,p=1,P=1,Q=1,f=24,s=1,v=1,C=1;AP8A\x1b\\"); // (2,1) relative to (1,1)
+        VERIFY_ARE_EQUAL(static_cast<size_t>(2), _kitty()._placements.size());
+        const auto before = _kitty()._placements.at({ 1u, 1u });
+
+        _testGetSet->_response.clear();
+        // Re-put (1,1) as a child of (2,1): 1 -> 2 -> 1 closes a cycle, so resolution fails.
+        _stateMachine->ProcessString(L"\x1b_Ga=p,i=1,p=1,P=2,Q=1,C=1;\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=1,p=1;ECYCLE:relative placement cycle\x1b\\");
+
+        // The original (1,1) must still exist, unchanged (not destroyed by the failed re-put).
+        VERIFY_ARE_EQUAL(static_cast<size_t>(2), _kitty()._placements.size(), L"a failed re-put must not add or remove a placement");
+        VERIFY_ARE_EQUAL(static_cast<size_t>(1), _kitty()._placements.count({ 1u, 1u }), L"the existing placement must survive a failed relative re-put");
+        const auto after = _kitty()._placements.at({ 1u, 1u });
+        VERIFY_ARE_EQUAL(before.anchorCol, after.anchorCol, L"the surviving placement keeps its original anchor column");
+        VERIFY_ARE_EQUAL(before.anchorRow, after.anchorRow, L"the surviving placement keeps its original anchor row");
+        VERIFY_ARE_EQUAL(before.hasParent, after.hasParent, L"the surviving placement keeps its original (non-relative) parentage");
+    }
+
     TEST_METHOD(KittyDeletePlacementKeepsCoResidentImage)
     {
         _testGetSet->PrepData();
@@ -6884,6 +7399,23 @@ public:
         VERIFY_ARE_EQUAL(2u, after->ColumnOwner(pos1.x + 1), L"co-resident image2 must survive the owner-scoped erase");
         VERIFY_ARE_EQUAL(2u, after->ColumnOwner(pos1.x + 2), L"co-resident image2 must survive the owner-scoped erase");
         VERIFY_IS_TRUE(SliceContainsColor(after, 0, 255, 0), L"image2's green pixels must remain");
+    }
+
+    TEST_METHOD(KittyAnonymousRelativePlacementsAreBounded)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        _pDispatch->CursorPosition(4, 4);
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,p=1,f=24,s=1,v=1,C=1;/wAA\x1b\\"); // parent (1,1)
+        _stateMachine->ProcessString(L"\x1b_Ga=t,i=2,f=24,s=1,v=1;AP8A\x1b\\"); // store image 2 (green)
+
+        // Each a=p,i=2,P=1,Q=1 (NO p=) creates an anonymous relative placement of image 2.
+        for (uint32_t k = 0; k < KittyParser::MaxPlacements + 50; ++k)
+        {
+            _stateMachine->ProcessString(L"\x1b_Ga=p,i=2,P=1,Q=1,H=1,V=1,C=1;\x1b\\");
+        }
+        VERIFY_IS_TRUE(_kitty()._anonymousPlacements.size() <= KittyParser::MaxPlacements,
+                       L"anonymous relative placements must stay bounded by MaxPlacements");
     }
 
     TEST_METHOD(KittyDeletePlacementByIdAndPlacementId)
@@ -6944,6 +7476,36 @@ public:
         _testGetSet->_response.clear();
         _stateMachine->ProcessString(L"\x1b_Ga=p,i=1;\x1b\\");
         _testGetSet->ValidateInputEvent(L"\x1b_Gi=1;ENOENT:image not found\x1b\\"); // image deleted with its last placement
+    }
+
+    TEST_METHOD(KittyDeletePlacementCascadesToRelativeChildren)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        auto& buf = *_testGetSet->_textBuffer;
+        _pDispatch->CursorPosition(4, 4);
+        const auto parentPos = buf.GetCursor().GetPosition();
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,p=1,f=24,s=1,v=1,C=1;/wAA\x1b\\"); // parent (1,1) red
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=2,p=1,P=1,Q=1,H=1,V=0,f=24,s=1,v=1,C=1;AP8A\x1b\\"); // child (2,1) green rel (1,1)
+        VERIFY_ARE_EQUAL(static_cast<size_t>(2), _kitty()._placements.size());
+
+        const auto childCol = parentPos.x + 1;
+        const auto* childSlice = DirectImageSlice(buf, parentPos.y);
+        VERIFY_IS_NOT_NULL(childSlice);
+        VERIFY_ARE_EQUAL(2u, childSlice->ColumnOwner(childCol));
+
+        _stateMachine->ProcessString(L"\x1b_Ga=d,d=I,i=1,p=1;\x1b\\"); // delete (1,1) -> cascades to its child
+        VERIFY_IS_TRUE(_kitty()._placements.empty(), L"deleting the parent placement cascades to its relative child");
+
+        const auto* erased = DirectImageSlice(buf, parentPos.y);
+        VERIFY_IS_TRUE(erased == nullptr || erased->ColumnOwner(parentPos.x) == 0, L"the parent placement's pixels must be erased");
+        VERIFY_IS_TRUE(erased == nullptr || erased->ColumnOwner(childCol) == 0, L"the child placement's pixels must be erased");
+
+        _testGetSet->_response.clear();
+        _stateMachine->ProcessString(L"\x1b_Ga=p,i=2;\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=2;ENOENT:image not found\x1b\\"); // child image 2 deleted too
+        _stateMachine->ProcessString(L"\x1b_Ga=p,i=1;\x1b\\");
+        _testGetSet->ValidateInputEvent(L"\x1b_Gi=1;ENOENT:image not found\x1b\\"); // parent image 1 deleted (last placement)
     }
 
     TEST_METHOD(KittyDeleteImageWithoutPlacementIdStillDeletesWholeImage)
@@ -7081,6 +7643,33 @@ public:
         _stateMachine->ProcessString(L"\x1b_Ga=d,d=Z,z=2;\x1b\\");
         VERIFY_ARE_EQUAL(static_cast<size_t>(0), _kitty()._images.count(1), L"uppercase d=Z must free data after the final placement");
         VERIFY_ARE_EQUAL(static_cast<size_t>(0), _kitty()._placements.count({ 1u, 2u }));
+    }
+
+    TEST_METHOD(KittyGraphicsDeleteByZCascadesRelativeChildren)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,p=1,z=7,f=24,s=1,v=1,C=1;/wAA\x1b\\");
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=2,p=1,P=1,Q=1,H=1,z=8,f=24,s=1,v=1,C=1;AP8A\x1b\\");
+        _stateMachine->ProcessString(L"\x1b_Ga=d,d=z,z=7;\x1b\\");
+
+        VERIFY_ARE_EQUAL(static_cast<size_t>(0), _kitty()._placements.count({ 1u, 1u }));
+        VERIFY_ARE_EQUAL(static_cast<size_t>(0), _kitty()._placements.count({ 2u, 1u }));
+        VERIFY_ARE_EQUAL(static_cast<size_t>(1), _kitty()._images.count(1), L"lowercase d=z keeps the selected parent's data");
+        VERIFY_ARE_EQUAL(static_cast<size_t>(0), _kitty()._images.count(2), L"relative children are deleted with the selected parent");
+    }
+
+    TEST_METHOD(KittyGraphicsDeleteByZCascadesSameZChildBeforeLowerKey)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=2,p=1,z=7,f=24,s=1,v=1,C=1;/wAA\x1b\\");
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,p=1,P=2,Q=1,H=1,z=7,f=24,s=1,v=1,C=1;AP8A\x1b\\");
+        _stateMachine->ProcessString(L"\x1b_Ga=d,d=z,z=7;\x1b\\");
+
+        VERIFY_IS_TRUE(_kitty()._placements.empty());
+        VERIFY_ARE_EQUAL(static_cast<size_t>(1), _kitty()._images.count(2), L"lowercase d=z keeps the selected parent's data");
+        VERIFY_ARE_EQUAL(static_cast<size_t>(0), _kitty()._images.count(1), L"the lower-keyed same-z child must still be cascade-freed");
     }
 
     TEST_METHOD(KittyGraphicsDeleteByQMatchesViewportCellAndZ)
@@ -7242,6 +7831,21 @@ public:
         VERIFY_ARE_EQUAL(static_cast<BYTE>(255), SlicePixelAt(slice, ImageSlice::RenderPosition::AboveText, x, 0).rgbRed);
         VERIFY_IS_FALSE(slice->HasPixels(ImageSlice::RenderPosition::BehindText));
         VERIFY_IS_FALSE(slice->HasPixels(ImageSlice::RenderPosition::BehindBackground));
+    }
+
+    TEST_METHOD(KittyGraphicsRelativePlacementUsesZIndex)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        auto& buffer = *_testGetSet->_textBuffer;
+        const auto origin = buffer.GetCursor().GetPosition();
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,p=1,f=24,s=1,v=1,C=1;/wAA\x1b\\");
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=2,p=1,P=1,Q=1,H=1,z=-1,f=24,s=1,v=1,C=1;AP8A\x1b\\");
+
+        const auto* slice = DirectImageSlice(buffer, origin.y);
+        VERIFY_IS_NOT_NULL(slice);
+        const auto pixel = SlicePixelAt(slice, ImageSlice::RenderPosition::BehindText, origin.x + 1 - slice->ColumnOffset(), 0);
+        VERIFY_ARE_EQUAL(static_cast<BYTE>(255), pixel.rgbGreen);
     }
 
     TEST_METHOD(KittyGraphicsZLayersSurviveDECCRA)
@@ -7445,6 +8049,27 @@ public:
                             return placement.Identity().imageId == 1;
                         }),
                         L"No orphaned id 1 layer may remain after eviction.");
+    }
+
+    TEST_METHOD(KittyGraphicsQuotaEvictionCascadesRelativeChildren)
+    {
+        _testGetSet->PrepData();
+        _testGetSet->_cellSize = { 1, 1 };
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=1,p=1,f=24,s=1,v=1,C=1;/wAA\x1b\\");
+        _stateMachine->ProcessString(L"\x1b_Ga=T,i=2,p=1,P=1,Q=1,H=1,f=24,s=1,v=1,C=1;AP8A\x1b\\");
+        // Fill the registry with placed images so the repaired unplaced-first policy
+        // reaches the oldest placed parent and exercises its relative cascade.
+        for (auto id = 3u; id <= KittyParser::MaxImages; ++id)
+        {
+            _stateMachine->ProcessString(L"\x1b_Ga=T,i=" + std::to_wstring(id) + L",q=2,f=24,s=1,v=1,C=1;AAAA\x1b\\");
+        }
+        VERIFY_ARE_EQUAL(KittyParser::MaxImages, _kitty()._images.size());
+
+        VERIFY_IS_TRUE(_kitty()._registerImage(KittyParser::MaxImages + 1, KittyParser::Image{}));
+        VERIFY_ARE_EQUAL(static_cast<size_t>(0), _kitty()._images.count(1), L"the oldest parent is evicted");
+        VERIFY_ARE_EQUAL(static_cast<size_t>(0), _kitty()._images.count(2), L"normal admission cascades its relative child");
+        VERIFY_IS_TRUE(_kitty()._placements.empty());
+        VERIFY_ARE_EQUAL(KittyParser::MaxImages - 1, _kitty()._images.size());
     }
 
     TEST_METHOD(KittyGraphicsEraseDisplayClearsPlacementsButKeepsImage)
