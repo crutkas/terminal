@@ -5,7 +5,6 @@
 
 #include <til/rle.h>
 
-#include "ImageSlice.hpp"
 #include "LineRendition.hpp"
 #include "OutputCell.hpp"
 #include "OutputCellIterator.hpp"
@@ -164,9 +163,6 @@ public:
     const RowAttributes& Attributes() const noexcept;
     TextAttribute GetAttrByColumn(til::CoordType column) const;
     std::vector<uint16_t> GetHyperlinks() const;
-    ImageSlice* SetImageSlice(ImageSlice::Pointer imageSlice) noexcept;
-    const ImageSlice* GetImageSlice() const noexcept;
-    ImageSlice* GetMutableImageSlice() noexcept;
     uint16_t size() const noexcept;
     til::CoordType GetLastNonSpaceColumn() const noexcept;
     til::CoordType MeasureLeft() const noexcept;
@@ -321,9 +317,6 @@ private:
     bool _doubleBytePadded = false;
 
     std::optional<ScrollbarData> _promptData = std::nullopt;
-
-    // Stores any image content covering the row.
-    ImageSlice::Pointer _imageSlice;
 };
 
 #ifdef UNIT_TESTING

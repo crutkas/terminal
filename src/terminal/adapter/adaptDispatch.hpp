@@ -317,6 +317,7 @@ namespace Microsoft::Console::VirtualTerminal
         TerminalOutput _termOutput;
         PageManager _pages;
         friend class SixelParser;
+        uint64_t _nextSixelLayerId = 1;
         std::shared_ptr<SixelParser> _sixelParser;
         std::unique_ptr<FontBuffer> _fontBuffer;
         std::shared_ptr<MacroBuffer> _macroBuffer;

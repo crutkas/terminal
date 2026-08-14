@@ -332,11 +332,6 @@ void BackendD2D::_drawText(RenderingPayload& p)
 
         _drawImages(p, *row, y, ImagePlacement::RenderPosition::AboveText);
 
-        if (row->bitmap.revision != 0)
-        {
-            _drawBitmap(p, row, y);
-        }
-
         if (p.invalidatedRows.contains(y))
         {
             dirtyTop = std::min(dirtyTop, row->dirtyTop);
@@ -958,39 +953,6 @@ void BackendD2D::_drawImage(const RenderingPayload& p, const ImagePlacement& pla
     _renderTarget->PushAxisAlignedClip(&clip, D2D1_ANTIALIAS_MODE_ALIASED);
     _renderTarget->DrawBitmap(cached.bitmap.get(), &target, 1, D2D1_BITMAP_INTERPOLATION_MODE_NEAREST_NEIGHBOR, &sourceRect);
     _renderTarget->PopAxisAlignedClip();
-}
-
-void BackendD2D::_drawBitmap(const RenderingPayload& p, const ShapedRow* row, u16 y) const
-{
-    const auto& b = row->bitmap;
-
-    // TODO: This could use some caching logic like BackendD3D.
-    const D2D1_SIZE_U size{
-        gsl::narrow_cast<UINT32>(b.sourceSize.x),
-        gsl::narrow_cast<UINT32>(b.sourceSize.y),
-    };
-    const D2D1_BITMAP_PROPERTIES bitmapProperties{
-        .pixelFormat = { DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED },
-        .dpiX = static_cast<f32>(p.s->font->dpi),
-        .dpiY = static_cast<f32>(p.s->font->dpi),
-    };
-    wil::com_ptr<ID2D1Bitmap> bitmap;
-    THROW_IF_FAILED(_renderTarget->CreateBitmap(size, b.source.data(), static_cast<UINT32>(b.sourceSize.x) * 4, &bitmapProperties, bitmap.addressof()));
-
-    const i32 cellWidth = p.s->font->cellSize.x;
-    const i32 cellHeight = p.s->font->cellSize.y;
-    const auto left = (b.targetOffset - p.scrollOffsetX) * cellWidth;
-    const auto right = left + b.targetWidth * cellWidth;
-    const auto top = y * cellHeight;
-    const auto bottom = top + cellHeight;
-
-    const D2D1_RECT_F rectF{
-        static_cast<f32>(left),
-        static_cast<f32>(top),
-        static_cast<f32>(right),
-        static_cast<f32>(bottom),
-    };
-    _renderTarget->DrawBitmap(bitmap.get(), &rectF, 1, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
 }
 
 void BackendD2D::_drawCursorPart1(const RenderingPayload& p)

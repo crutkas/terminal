@@ -13,6 +13,7 @@ Abstract:
 
 #include "til.h"
 #include "DispatchTypes.hpp"
+#include "../buffer/out/Image.hpp"
 
 class Cursor;
 class TextBuffer;
@@ -41,6 +42,10 @@ namespace Microsoft::Console::VirtualTerminal
         // change the IndexType to uint16_t, and use a bit field in IndexedPixel
         // to retain the 16-bit size.
         static constexpr size_t MAX_COLORS = 256;
+        // This preserves the old worst-case staging allocation while allowing
+        // either axis to exceed a renderer surface dimension.
+        static constexpr size_t MAX_STAGING_PIXELS =
+            static_cast<size_t>(Image::MaximumDimension) * Image::MaximumDimension;
         using IndexType = uint8_t;
         struct alignas(int16_t) IndexedPixel
         {
@@ -74,6 +79,7 @@ namespace Microsoft::Console::VirtualTerminal
         void _updateRasterAttributes(const VTParameters& rasterAttributes);
         void _scrollTextBuffer(Page& page, const int scrollAmount);
         void _updateTextCursor(Cursor& cursor) noexcept;
+        void _releaseImageState(const bool restoreCursorVisibility) noexcept;
 
         const til::size _cellSize;
         bool _displayMode = true;
@@ -108,16 +114,27 @@ namespace Microsoft::Console::VirtualTerminal
         bool _colorTableChanged = false;
 
         void _initImageBuffer();
+        til::CoordType _maximumImageBufferHeight() const noexcept;
         void _resizeImageBuffer(const til::CoordType requiredHeight);
         void _fillImageBackground();
-        void _fillImageBackground(const int backgroundHeight);
+        void _fillImageBackground(const til::CoordType backgroundHeight);
+        void _fillImageBackgroundInChunks(const til::CoordType backgroundHeight);
         void _fillImageBackgroundWhenScrolled();
         void _decreaseFilledBackgroundHeight(const int decreasedHeight) noexcept;
         void _writeToImageBuffer(const int sixelValue, const int repeatCount);
         void _eraseImageBufferRows(const int rowCount, const til::CoordType startRow = 0) noexcept;
-        void _maybeFlushImageBuffer(const bool endOfSequence = false);
+        void _maybeFlushImageBuffer(const bool endOfSequence = false, const bool force = false);
+        ImagePlacement::Key _allocateImageKey() noexcept;
+
+        struct ActiveTile
+        {
+            til::rect area;
+            ImagePlacement::Key key;
+            Image::Pointer surface;
+        };
 
         std::vector<IndexedPixel> _imageBuffer;
+        std::vector<ActiveTile> _activeTiles;
         til::point _imageOriginCell;
         til::point _imageCursor;
         til::CoordType _imageWidth = 0;
@@ -125,5 +142,9 @@ namespace Microsoft::Console::VirtualTerminal
         size_t _imageLineCount = 0;
         size_t _lastFlushLine = 0;
         std::chrono::steady_clock::time_point _lastFlushTime;
+
+#ifdef UNIT_TESTING
+        friend class AdapterTest;
+#endif
     };
 }

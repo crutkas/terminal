@@ -438,7 +438,8 @@ bool GdiEngine::FontHasWesternScript(HDC hdc)
         // content this row has sitting below its text. It is a single flag for
         // the whole run, but coverage varies cell by cell, so wherever a run
         // meets the image at all we drop the flag and fill only the cells the
-        // image does not cover.
+        // image does not cover. `rcl` is pre-transform, so it is in buffer
+        // columns times the font width; the slice indexes screen columns.
         if (!_underlayColumns.empty() && coordFontSize.width > 0)
         {
             const auto beginColumn = (pPolyTextLine->rcl.left / coordFontSize.width) << _underlayScale;
@@ -782,6 +783,9 @@ CATCH_RETURN();
 [[nodiscard]] HRESULT GdiEngine::_PrepareImageSurface(const ImageFrameInfo::Surface& surface) noexcept
 try
 {
+    // A malformed snapshot is skipped without raising an error: one bad image must
+    // not abort preparation of the others. Genuine GDI failures below are real
+    // errors that the caller logs and skips.
     if (!surface.IsRenderable())
     {
         return S_FALSE;
@@ -839,6 +843,8 @@ CATCH_RETURN();
 try
 {
     const auto found = _imageSurfaces.find(placement.SurfacePointer().get());
+    // A placement whose malformed or stale surface was skipped during preparation
+    // simply has nothing to draw. S_FALSE lets the rest of the row continue.
     if (found == _imageSurfaces.end())
     {
         return S_FALSE;
@@ -949,6 +955,10 @@ try
         if (position == ImagePlacement::RenderPosition::BehindBackground)
         {
             RETURN_HR_IF(S_OK, defaultBackgroundMask.empty());
+            // The mask has one entry per visible screen column, so a placement that
+            // extends past the right edge (its bounds are clamped only to the buffer,
+            // not to the mask) must not index past it. Clamp the scan the same way
+            // _MarkDirectImageUnderlay clamps against _underlayColumns.
             const auto maskRight = _imageViewportOrigin.x + gsl::narrow_cast<til::CoordType>(defaultBackgroundMask.size());
             const auto scanRight = std::min(right, maskRight);
             auto run = left;
@@ -998,12 +1008,63 @@ void GdiEngine::_RecordImageError(const HRESULT result) noexcept
     }
 }
 
+// Routine Description:
+// - Hands back a device context holding a top-down 32bpp surface of this size,
+//   creating or resizing it as needed, so that image content can be blended from
+//   it. GDI can only blend between device contexts, not from loose pixels.
+// Arguments:
+// - size - the surface size required, in pixels
+// - bits - receives the surface's pixels, laid out top row first
+// Return Value:
+// - S_OK or a GDI failure.
+[[nodiscard]] HRESULT GdiEngine::_PrepareImageSourceSurface(const til::size size, _Outptr_result_maybenull_ RGBQUAD** const bits) noexcept
+{
+    *bits = nullptr;
+    RETURN_HR_IF(E_INVALIDARG, size.width <= 0 || size.height <= 0);
+
+    if (!_hdcImageSource)
+    {
+        _hdcImageSource.reset(CreateCompatibleDC(nullptr));
+        RETURN_LAST_ERROR_IF_NULL(_hdcImageSource.get());
+    }
+
+    if (!_hbitmapImageSource || _szImageSource != size)
+    {
+        const BITMAPINFO info{
+            .bmiHeader = {
+                .biSize = sizeof(BITMAPINFOHEADER),
+                .biWidth = size.width,
+                .biHeight = -size.height,
+                .biPlanes = 1,
+                .biBitCount = 32,
+                .biCompression = BI_RGB,
+            }
+        };
+
+        void* surface = nullptr;
+        wil::unique_hbitmap bitmap{ CreateDIBSection(_hdcImageSource.get(), &info, DIB_RGB_COLORS, &surface, nullptr, 0) };
+        RETURN_LAST_ERROR_IF_NULL(bitmap.get());
+        // Selecting the replacement first is what releases the one being
+        // replaced, which has to happen before it is destroyed below.
+        RETURN_LAST_ERROR_IF_NULL(SelectObject(_hdcImageSource.get(), bitmap.get()));
+
+        _hbitmapImageSource = std::move(bitmap);
+        _szImageSource = size;
+        _imageSourceBits = static_cast<RGBQUAD*>(surface);
+    }
+
+    *bits = _imageSourceBits;
+    return S_OK;
+}
+
 [[nodiscard]] HRESULT GdiEngine::BeginRowImages(const til::CoordType targetRow,
                                                 const til::CoordType viewportLeft,
                                                 const std::span<const uint8_t> defaultBackgroundMask,
                                                 const std::span<const COLORREF> cellBackgrounds) noexcept
 try
 {
+    // Text is buffered until something forces it out, so flushing here means
+    // only this row's text can end up above what we're about to paint.
     LOG_IF_FAILED(_FlushBufferLines());
 
     _underlayColumns.assign(defaultBackgroundMask.size(), uint8_t{ 0 });
@@ -1025,9 +1086,20 @@ try
             }
         }
     }
+    // Content between the background and the text has to be composited over the
+    // cell's own background, and the text pass will not paint one for any cell
+    // this row's images cover. Lay it down now, in the one window where the plane
+    // below the background is already painted and the plane above it is not.
     _RecordImageError(_FillImageRowCellBackgrounds(targetRow, defaultBackgroundMask, cellBackgrounds));
     _RecordImageError(_PaintDirectImages(ImagePlacement::RenderPosition::BehindText, targetRow, {}, false));
 
+    // Withholding ETO_OPAQUE stops the text filling its background *rectangle*,
+    // but a device context also fills the box behind every individual glyph
+    // when its background mode is OPAQUE, which is GDI's default and is what
+    // the rest of this engine relies on. That fill alone is enough to paint out
+    // everything we just drew, so it has to go too. Runs the image does not
+    // cover keep ETO_OPAQUE, and that fill happens whatever the mode is, so
+    // they are unaffected.
     if (!_underlayColumns.empty())
     {
         const auto previous = SetBkMode(_hdcMemoryContext, TRANSPARENT);
@@ -1043,6 +1115,7 @@ try
 }
 CATCH_RETURN();
 
+// Reports whether image content below the text covers this screen column.
 bool GdiEngine::_UnderlayCoversColumn(const til::CoordType column) const noexcept
 {
     const auto index = column - _underlayColumnOffset;
@@ -1053,6 +1126,10 @@ bool GdiEngine::_UnderlayCoversColumn(const til::CoordType column) const noexcep
     return til::at(_underlayColumns, gsl::narrow_cast<size_t>(index)) != 0;
 }
 
+// Reports whether image content covers any part of the buffer cell whose first
+// screen column is this one. Under a double-width rendition one buffer cell
+// spans two screen columns, and a cell only half covered still has to leave the
+// image alone.
 bool GdiEngine::_UnderlayCoversBufferCell(const til::CoordType bufferColumn) const noexcept
 {
     const auto screenColumn = bufferColumn << _underlayScale;
@@ -1060,6 +1137,8 @@ bool GdiEngine::_UnderlayCoversBufferCell(const til::CoordType bufferColumn) con
            (_underlayScale != 0 && _UnderlayCoversColumn(screenColumn + 1));
 }
 
+// Reports whether image content below the text covers any of these screen
+// columns, which is what decides whether a run can keep its own background fill.
 bool GdiEngine::_UnderlayCoversAnyOf(const til::CoordType columnBegin, const til::CoordType columnEnd) const noexcept
 {
     if (_underlayColumns.empty() || columnBegin >= columnEnd)
@@ -1077,6 +1156,16 @@ bool GdiEngine::_UnderlayCoversAnyOf(const til::CoordType columnBegin, const til
     return false;
 }
 
+// Routine Description:
+// - Fills the background of the cells of a run that no image covers, standing in
+//   for the ETO_OPAQUE that had to be dropped so the rest of the run could show
+//   the image through. Uses the device context's current background colour,
+//   which is the one already selected for this run.
+// Arguments:
+// - runRect - the run's rectangle, pre-transform, so measured in buffer columns
+// - fontWidth - the width of one buffer cell in pixels
+// Return Value:
+// - S_OK or E_FAIL if GDI failed.
 [[nodiscard]] HRESULT GdiEngine::_FillUncoveredRunBackground(const RECT& runRect, const til::CoordType fontWidth) noexcept
 {
     auto spanLeft = runRect.left;
@@ -1102,6 +1191,23 @@ bool GdiEngine::_UnderlayCoversAnyOf(const til::CoordType columnBegin, const til
     return S_OK;
 }
 
+// Routine Description:
+// - Paints each cell of a row's image slice in its own background colour, for the
+//   cells whose background is not the default one. `PaintBackground` has already
+//   covered the frame in the default colour, and the text pass fills the rest --
+//   but it skips every cell an image covers, and it runs after the image is drawn,
+//   so a cell with an explicit background would otherwise composite the image over
+//   the default colour and show the default colour anywhere the image is
+//   transparent. Called with the slice's own untransformed geometry.
+// Arguments:
+// - imageSlice - the row's slice, whose columns these are
+// - targetRow - the screen row the slice paints on
+// - viewportLeft - the leftmost visible column, which the slice is offset from
+// - defaultBackgroundMask - one byte per slice column, non-zero where the cell's
+//   background is the default one and this fill is unnecessary
+// - cellBackgrounds - one color per slice column
+// Return Value:
+// - S_OK, or E_FAIL if GDI failed.
 [[nodiscard]] HRESULT GdiEngine::_FillImageRowCellBackgrounds(const til::CoordType targetRow,
                                                               const std::span<const uint8_t> defaultBackgroundMask,
                                                               const std::span<const COLORREF> cellBackgrounds) noexcept
@@ -1113,7 +1219,9 @@ try
     const auto dstCellSize = _GetFontSize();
     RETURN_HR_IF(S_OK, dstCellSize.width <= 0 || dstCellSize.height <= 0);
     const auto top = targetRow * dstCellSize.height;
+    const auto left = 0;
 
+    // Adjacent cells usually share a colour, so they are filled as one rectangle.
     for (size_t column = 0; column < columnCount;)
     {
         if (til::at(defaultBackgroundMask, column) != 0 || til::at(_underlayColumns, column) == 0)
@@ -1132,9 +1240,9 @@ try
         }
 
         const RECT fill{
-            gsl::narrow_cast<til::CoordType>(column) * dstCellSize.width,
+            left + gsl::narrow_cast<til::CoordType>(column) * dstCellSize.width,
             top,
-            gsl::narrow_cast<til::CoordType>(end) * dstCellSize.width,
+            left + gsl::narrow_cast<til::CoordType>(end) * dstCellSize.width,
             top + dstCellSize.height,
         };
         wil::unique_hbrush brush{ CreateSolidBrush(color) };
@@ -1150,6 +1258,7 @@ CATCH_RETURN();
 try
 {
     const auto rendition = _currentLineRendition;
+    // Push the row's text out over whatever was painted below it...
     _underlayColumns.clear();
     LOG_IF_FAILED(_FlushBufferLines());
     if (_restoreBkMode != 0)
@@ -1158,67 +1267,10 @@ try
         _restoreBkMode = 0;
     }
 
+    // ...and only then put the above-text content on top of all of it.
     LOG_IF_FAILED(ResetLineTransform());
     _RecordImageError(_PaintDirectImages(ImagePlacement::RenderPosition::AboveText, _rowImageTargetRow, {}, false));
     LOG_IF_FAILED(PrepareLineTransform(rendition, _rowImageTargetRow, _rowImageViewportLeft));
-
-    return S_OK;
-}
-CATCH_RETURN();
-
-[[nodiscard]] HRESULT GdiEngine::PaintImageSlice(const ImageSlice& imageSlice,
-                                                 const til::CoordType targetRow,
-                                                 const til::CoordType viewportLeft) noexcept
-try
-{
-    LOG_IF_FAILED(_FlushBufferLines());
-    LOG_IF_FAILED(ResetLineTransform());
-
-    const auto& imagePixels = imageSlice.Pixels();
-    if (_imageMask.size() < imagePixels.size())
-    {
-        _imageMask.resize(imagePixels.size());
-    }
-
-    const auto srcCellSize = imageSlice.CellSize();
-    const auto dstCellSize = _GetFontSize();
-    const auto srcWidth = imageSlice.PixelWidth();
-    const auto srcHeight = srcCellSize.height;
-    const auto dstWidth = srcWidth * dstCellSize.width / srcCellSize.width;
-    const auto dstHeight = dstCellSize.height;
-    const auto x = (imageSlice.ColumnOffset() - viewportLeft) * dstCellSize.width;
-    const auto y = targetRow * dstCellSize.height;
-
-    auto bitmapInfo = BITMAPINFO{
-        .bmiHeader = {
-            .biSize = sizeof(BITMAPINFOHEADER),
-            .biWidth = srcWidth,
-            .biHeight = -srcHeight,
-            .biPlanes = 1,
-            .biBitCount = 32,
-            .biCompression = BI_RGB,
-        }
-    };
-
-    auto allOpaque = true;
-    auto allTransparent = true;
-    for (size_t i = 0; i < imagePixels.size(); i++)
-    {
-        const auto opaque = til::at(imagePixels, i).rgbReserved != 0;
-        allOpaque &= opaque;
-        allTransparent &= !opaque;
-        til::at(_imageMask, i) = (opaque ? 0 : 0xFFFFFF);
-    }
-
-    if (allOpaque)
-    {
-        StretchDIBits(_hdcMemoryContext, x, y, dstWidth, dstHeight, 0, 0, srcWidth, srcHeight, imagePixels.data(), &bitmapInfo, DIB_RGB_COLORS, SRCCOPY);
-    }
-    else if (!allTransparent)
-    {
-        StretchDIBits(_hdcMemoryContext, x, y, dstWidth, dstHeight, 0, 0, srcWidth, srcHeight, _imageMask.data(), &bitmapInfo, DIB_RGB_COLORS, SRCAND);
-        StretchDIBits(_hdcMemoryContext, x, y, dstWidth, dstHeight, 0, 0, srcWidth, srcHeight, imagePixels.data(), &bitmapInfo, DIB_RGB_COLORS, SRCPAINT);
-    }
 
     return S_OK;
 }

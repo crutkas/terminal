@@ -230,7 +230,6 @@ void ROW::Reset(const TextAttribute& attr) noexcept
     // Constructing and then moving objects into place isn't free.
     // Modifying the existing object is _much_ faster.
     *_attr.runs().unsafe_shrink_to_size(1) = til::rle_pair{ attr, _columnCount };
-    _imageSlice = nullptr;
     _lineRendition = LineRendition::SingleWidth;
     _wrapForced = false;
     _doubleBytePadded = false;
@@ -1018,28 +1017,6 @@ std::vector<uint16_t> ROW::GetHyperlinks() const
         }
     }
     return ids;
-}
-
-ImageSlice* ROW::SetImageSlice(ImageSlice::Pointer imageSlice) noexcept
-{
-    _imageSlice = std::move(imageSlice);
-    return GetMutableImageSlice();
-}
-
-const ImageSlice* ROW::GetImageSlice() const noexcept
-{
-    return _imageSlice.get();
-}
-
-ImageSlice* ROW::GetMutableImageSlice() noexcept
-{
-    const auto ptr = _imageSlice.get();
-    if (!ptr)
-    {
-        return nullptr;
-    }
-    ptr->BumpRevision();
-    return ptr;
 }
 
 uint16_t ROW::size() const noexcept

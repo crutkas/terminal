@@ -556,9 +556,6 @@ CATCH_RETURN();
             totalOffset += bufferStride;
         }
 
-        // If we've overwritten image content, it needs to be erased.
-        ImageSlice::EraseBlock(storageBuffer.GetTextBuffer(), clippedRectangle.ToExclusive());
-
         // Since we've managed to write part of the request, return the clamped part that we actually used.
         writtenRectangle = clippedRectangle;
 

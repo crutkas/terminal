@@ -1148,11 +1148,12 @@ void Renderer::_PaintBufferOutput(_In_ IRenderEngine* const pEngine, const bool 
             // Prepare the appropriate line transform for the current row and viewport offset.
             LOG_IF_FAILED(pEngine->PrepareLineTransform(lineRendition, screenPosition.y, _viewport.Left()));
 
-            // Direct surfaces are bracketed around text so each backend can compose
-            // below the background, below text, and above text independently.
+            // Image content is painted around the text so that it can sit below
+            // it. The engine decides how; all we do is bracket the text.
             ImagePlacement::RenderPosition directUnderlay{};
             const auto hasDirectImages = directImagesSupported && _rowHasDirectImages(row, &directUnderlay);
-            if (hasDirectImages) [[unlikely]]
+            const auto hasImages = hasDirectImages;
+            if (hasImages) [[unlikely]]
             {
                 if (directUnderlay != ImagePlacement::RenderPosition::AboveText)
                 {
@@ -1166,8 +1167,10 @@ void Renderer::_PaintBufferOutput(_In_ IRenderEngine* const pEngine, const bool 
                 LOG_IF_FAILED(pEngine->BeginRowImages(screenPosition.y, _viewport.Left(), _backgroundMask, _backgroundColors));
             }
 
-            auto endRowImages = wil::scope_exit([&]() noexcept {
-                if (hasDirectImages)
+            // Painting text can throw, and an engine left mid-row would keep
+            // suppressing cell backgrounds on every row after it.
+            const auto endRowImages = wil::scope_exit([&]() noexcept {
+                if (hasImages)
                 {
                     LOG_IF_FAILED(pEngine->EndRowImages());
                 }
@@ -1175,17 +1178,6 @@ void Renderer::_PaintBufferOutput(_In_ IRenderEngine* const pEngine, const bool 
 
             // Ask the helper to paint through this specific line.
             _PaintBufferOutputHelper(pEngine, it, screenPosition);
-
-            // Complete direct-surface composition before the legacy row-owned
-            // ImageSlice is painted.
-            endRowImages.reset();
-
-            // Paint any image content on top of the text.
-            const auto imageSlice = buffer.GetRowByOffset(row).GetImageSlice();
-            if (imageSlice) [[unlikely]]
-            {
-                LOG_IF_FAILED(pEngine->PaintImageSlice(*imageSlice, screenPosition.y, _viewport.Left()));
-            }
         }
     }
 }

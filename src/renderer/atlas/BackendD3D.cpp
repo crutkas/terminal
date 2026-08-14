@@ -1224,11 +1224,6 @@ void BackendD3D::_drawText(RenderingPayload& p)
 
         _drawImages(p, *row, y, ImagePlacement::RenderPosition::AboveText);
 
-        if (row->bitmap.revision != 0)
-        {
-            _drawBitmap(p, row, y);
-        }
-
         if (p.invalidatedRows.contains(y))
         {
             dirtyTop = std::min(dirtyTop, row->dirtyTop);
@@ -1908,9 +1903,12 @@ void BackendD3D::_drawGridlines(const RenderingPayload& p, u16 y)
 
 void BackendD3D::_pruneImageCache(const RenderingPayload& p)
 {
-    // An image leaving the viewport is no reason to throw away the glyph atlas:
-    // evict only that image cache entry. Atlas rectangles are reclaimed on genuine
-    // allocation exhaustion, which is the one case that resets the atlas.
+    // An image leaving the viewport is no reason to throw away the glyph atlas: the
+    // text cache is expensive to rebuild and has nothing to do with images. Match
+    // BackendD2D and simply drop the stale entries individually. Their atlas
+    // rectangles are only reclaimed the next time an allocation genuinely runs out
+    // of room in _drawGlyphAtlasAllocate(), which is the one case that still resets
+    // the atlas. A resized image is handled in _uploadImage(), not here.
     for (auto it = _imageCache.begin(); it != _imageCache.end();)
     {
         it = ImageFrameInfo::ImageCacheEntryIsStale(it->first, p.imageSurfaces) ? _imageCache.erase(it) : std::next(it);
@@ -1920,12 +1918,20 @@ void BackendD3D::_pruneImageCache(const RenderingPayload& p)
 [[nodiscard]] bool BackendD3D::_uploadImage(const RenderingPayload& p, const ImageFrameInfo::Surface& surface)
 {
     const auto& image = surface.image;
+    // A malformed snapshot is skipped rather than thrown: one bad image must not
+    // abort the frame or discard the backend. This is a data condition (not a code
+    // bug), so it is handled quietly. Device failures below still throw (via
+    // THROW_IF_FAILED) so that genuine device-lost is recovered as usual.
     if (!surface.IsRenderable())
     {
         return false;
     }
     auto found = _imageCache.find(image.get());
     const auto size = surface.size;
+    // A resized surface cannot reuse its fixed-size atlas rectangle, so drop the
+    // stale entry and let it be re-allocated below at the new size. This mirrors
+    // how BackendD2D recreates its bitmap on a size change, and keeps
+    // _pruneImageCache free of any atlas-affecting logic.
     if (found != _imageCache.end() && (found->second.size.x != size.width || found->second.size.y != size.height))
     {
         _imageCache.erase(found);
@@ -2123,61 +2129,6 @@ void BackendD3D::_drawImages(const RenderingPayload& p, const ShapedRow& row, co
                        });
         }
     }
-}
-
-void BackendD3D::_drawBitmap(const RenderingPayload& p, const ShapedRow* row, u16 y)
-{
-    const auto& b = row->bitmap;
-    auto ab = _glyphAtlasBitmaps.lookup(b.revision);
-    if (!ab)
-    {
-        stbrp_rect rect{
-            .w = p.s->font->cellSize.x * b.targetWidth,
-            .h = p.s->font->cellSize.y,
-        };
-        _drawGlyphAtlasAllocate(p, rect);
-        _d2dBeginDrawing();
-
-        const D2D1_SIZE_U size{
-            static_cast<UINT32>(b.sourceSize.x),
-            static_cast<UINT32>(b.sourceSize.y),
-        };
-        const D2D1_BITMAP_PROPERTIES bitmapProperties{
-            .pixelFormat = { DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED },
-            .dpiX = static_cast<f32>(p.s->font->dpi),
-            .dpiY = static_cast<f32>(p.s->font->dpi),
-        };
-        wil::com_ptr<ID2D1Bitmap> bitmap;
-        THROW_IF_FAILED(_d2dRenderTarget->CreateBitmap(size, b.source.data(), static_cast<UINT32>(b.sourceSize.x) * 4, &bitmapProperties, bitmap.addressof()));
-
-        const D2D1_RECT_F rectF{
-            static_cast<f32>(rect.x),
-            static_cast<f32>(rect.y),
-            static_cast<f32>(rect.x + rect.w),
-            static_cast<f32>(rect.y + rect.h),
-        };
-        _d2dRenderTarget->DrawBitmap(bitmap.get(), &rectF, 1, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
-
-        ab = _glyphAtlasBitmaps.insert(b.revision).first;
-        ab->size.x = static_cast<u16>(rect.w);
-        ab->size.y = static_cast<u16>(rect.h);
-        ab->texcoord.x = static_cast<u16>(rect.x);
-        ab->texcoord.y = static_cast<u16>(rect.y);
-    }
-
-    const auto left = p.s->font->cellSize.x * (b.targetOffset - p.scrollOffsetX);
-    const auto top = p.s->font->cellSize.y * y;
-
-    _appendQuad() = {
-        .shadingType = static_cast<u16>(ShadingType::TextPassthrough),
-        .renditionScale = { 1, 1 },
-        .position = { static_cast<i16>(left), static_cast<i16>(top) },
-        .size = ab->size,
-        .texcoord = {
-            static_cast<f32>(ab->texcoord.x),
-            static_cast<f32>(ab->texcoord.y),
-        },
-    };
 }
 
 void BackendD3D::_drawCursorBackground(const RenderingPayload& p)
