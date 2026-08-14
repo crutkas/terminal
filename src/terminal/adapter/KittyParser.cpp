@@ -16,6 +16,7 @@
 
 using namespace Microsoft::Console::Types;
 using namespace Microsoft::Console::VirtualTerminal;
+using Microsoft::Console::Utils::ReadSharedMemoryResult;
 
 KittyParser::KittyParser(AdaptDispatch& dispatcher) noexcept :
     _dispatcher{ dispatcher }
@@ -332,6 +333,17 @@ KittyParser::Control KittyParser::_ParseControl(const std::wstring_view control)
                 c.cellOffsetY = _ParseUint(value);
                 c.upperY = c.cellOffsetY;
                 break;
+            case L'O':
+                // Uppercase O is the byte offset into a transmitted file (t=f / t=t);
+                // lowercase keys s/v are the pixel width/height, so case matters here.
+                // Parsed as 64-bit so a real >4 GiB offset is preserved, not truncated.
+                c.fileOffset = _ParseUint64(value);
+                break;
+            case L'S':
+                // Uppercase S is the number of file bytes to read (0 = to EOF), 64-bit so
+                // a large request is not silently wrapped (the host caps the actual read).
+                c.fileSize = _ParseUint64(value);
+                break;
             case L'o':
                 c.compression = value.front();
                 break;
@@ -389,6 +401,7 @@ KittyParser::Control KittyParser::_ParseControl(const std::wstring_view control)
 void KittyParser::_HandleSequence(const std::wstring_view control, const std::string_view payload, const bool controlValid, const bool payloadValid, const bool payloadTooLarge)
 {
     const auto command = _ParseControl(control);
+    const auto isSharedMemory = command.medium == L's';
 
     if (!controlValid)
     {
@@ -400,16 +413,28 @@ void KittyParser::_HandleSequence(const std::wstring_view control, const std::st
         return;
     }
 
+    const auto hasTransmissionPayload = command.action == L't' || command.action == L'T' || command.action == L'q' || command.action == L'f';
+    if (hasTransmissionPayload && !_transmissionMediumAllowed(command))
+    {
+        // Do not retain even one chunk of a denied local resource name. Unknown media
+        // take the same path, so the default-off response and side effects are identical.
+        _clearChunk();
+        _ProcessCommand(command, payload, payloadValid, payloadTooLarge);
+        return;
+    }
+
     const auto repeatsActiveAction = _chunkActive &&
                                      command.action == _chunkControl.action &&
                                      !command.hasNonChunkKeyOtherThanAction;
-    const auto isContinuation = command.mPresent && (!command.hasNonChunkKey || repeatsActiveAction);
+    // Per the protocol, m= applies only to direct transmission and is ignored for
+    // shared-memory media, whose payload is already just a local resource name.
+    const auto isContinuation = command.mPresent && !isSharedMemory && (!command.hasNonChunkKey || repeatsActiveAction);
     if (_chunkActive && !isContinuation)
     {
         _clearChunk();
     }
 
-    if (_chunkActive || command.moreChunks)
+    if (_chunkActive || (command.moreChunks && !isSharedMemory))
     {
         if (!_chunkActive)
         {
@@ -459,6 +484,119 @@ bool KittyParser::_localMediaAllowed() const noexcept
     return _dispatcher._optionalFeatures.test(ITermDispatch::OptionalFeature::KittyLocalMedia);
 }
 
+bool KittyParser::_transmissionMediumAllowed(const Control& command) const noexcept
+{
+    return command.medium == L'd' ||
+           ((command.medium == L'f' || command.medium == L't' || command.medium == L's') && _localMediaAllowed());
+}
+
+bool KittyParser::_loadTransmissionData(const Control& command, const std::string_view payload, const bool payloadValid, const bool payloadTooLarge, std::vector<uint8_t>& bytes, std::wstring_view& code)
+{
+    const auto medium = command.medium;
+    if (!_transmissionMediumAllowed(command))
+    {
+        // Local media names resources chosen by the terminal writer. Reject it before
+        // decoding the name or touching any host resource, using the unknown-medium
+        // response so the denial cannot reveal machine state.
+        code = L"EINVAL:unsupported transmission medium";
+        return false;
+    }
+    if (command.compression != 0 && command.compression != L'z')
+    {
+        code = L"EINVAL:unsupported compression";
+        return false;
+    }
+    if (!payloadValid || !_DecodeBase64(payload, bytes))
+    {
+        code = payloadTooLarge ? L"EFBIG:payload exceeds maximum size" : L"EINVAL:bad payload";
+        return false;
+    }
+
+    const auto decodeResourceName = [](const std::vector<uint8_t>& encodedName, const size_t maxBytes, std::wstring& result) {
+        if (encodedName.empty() || encodedName.size() > maxBytes ||
+            std::find(encodedName.begin(), encodedName.end(), uint8_t{ 0 }) != encodedName.end())
+        {
+            return false;
+        }
+
+        const std::string utf8(encodedName.begin(), encodedName.end());
+        const auto length = static_cast<int>(utf8.size());
+        const auto needed = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, utf8.data(), length, nullptr, 0);
+        if (needed <= 0)
+        {
+            return false;
+        }
+
+        result.resize(static_cast<size_t>(needed));
+        if (MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, utf8.data(), length, result.data(), needed) != needed)
+        {
+            result.clear();
+            return false;
+        }
+        return true;
+    };
+
+    if (medium == L'f' || medium == L't')
+    {
+        static constexpr std::wstring_view temporaryFileMarker{ L"tty-graphics-protocol" };
+
+        std::wstring path;
+        if (!decodeResourceName(bytes, static_cast<size_t>(INT_MAX), path))
+        {
+            code = L"EINVAL:invalid image file request";
+            return false;
+        }
+
+        std::vector<uint8_t> fileBytes;
+        if (_dispatcher._api.ReadLocalFile(path, command.fileOffset, command.fileSize, medium == L't', temporaryFileMarker, fileBytes) != til::read_file_result::ok)
+        {
+            code = L"EBADF:could not read file";
+            return false;
+        }
+        bytes = std::move(fileBytes);
+    }
+    else if (medium == L's')
+    {
+        std::wstring name;
+        constexpr size_t maxMappingNameBytes = 32767;
+        if (!decodeResourceName(bytes, maxMappingNameBytes, name))
+        {
+            code = L"EINVAL:invalid shared memory request";
+            return false;
+        }
+
+        auto readSize = command.fileSize;
+        if (readSize == 0 && command.compression != L'z' && (command.format == 24 || command.format == 32) && command.width != 0 && command.height != 0)
+        {
+            const auto depth = command.format == 24 ? 3ull : 4ull;
+            const auto area = static_cast<uint64_t>(command.width) * command.height;
+            readSize = area <= UINT64_MAX / depth ? area * depth : UINT64_MAX;
+        }
+
+        std::vector<uint8_t> sharedBytes;
+        if (_dispatcher._api.ReadSharedMemory(name, command.fileOffset, readSize, sharedBytes) != ReadSharedMemoryResult::ok)
+        {
+            code = L"EBADF:could not read shared memory";
+            return false;
+        }
+        bytes = std::move(sharedBytes);
+    }
+
+    if (command.compression == L'z')
+    {
+        std::vector<uint8_t> inflated;
+        const auto allowSharedMemoryPadding = medium == L's' && command.fileSize == 0;
+        if (!_inflateZlib(bytes, inflated, MaxPayload, allowSharedMemoryPadding))
+        {
+            code = L"EINVAL:invalid compressed data";
+            return false;
+        }
+        bytes = std::move(inflated);
+    }
+
+    return true;
+}
+
 void KittyParser::_ProcessCommand(const Control& command, const std::string_view payload, const bool payloadValid, const bool payloadTooLarge)
 {
     const auto action = command.action;
@@ -469,10 +607,8 @@ void KittyParser::_ProcessCommand(const Control& command, const std::string_view
     const auto format = command.format;
     const auto width = command.width;
     const auto height = command.height;
-    const auto compression = command.compression;
     const auto haveId = command.haveId;
     const auto haveNumber = command.haveNumber;
-    const auto medium = command.medium;
     const auto moveCursor = !command.noCursorMovement;
 
     auto success = true;
@@ -809,15 +945,6 @@ void KittyParser::_ProcessCommand(const Control& command, const std::string_view
                 code = L"EINVAL:unsupported format";
                 break;
             }
-            if (medium != L'd')
-            {
-                // The final capability check is present, but local transports are not
-                // wired until their dedicated layer. No path or mapping access occurs here.
-                static_cast<void>(_localMediaAllowed());
-                success = false;
-                code = L"EINVAL:unsupported transmission medium";
-                break;
-            }
             if (command.virtualPlacement && command.haveParent)
             {
                 // A virtual (U=1) placement cannot itself be relative. This is a conflict
@@ -829,28 +956,10 @@ void KittyParser::_ProcessCommand(const Control& command, const std::string_view
                 code = L"EINVAL:virtual placements cannot be relative";
                 break;
             }
-            if (compression != 0 && compression != L'z')
+            if (!_loadTransmissionData(command, payload, payloadValid, payloadTooLarge, bytes, code))
             {
                 success = false;
-                code = L"EINVAL:unsupported compression";
                 break;
-            }
-            if (!payloadValid || !_DecodeBase64(payload, bytes))
-            {
-                success = false;
-                code = payloadTooLarge ? L"EFBIG:payload exceeds maximum size" : L"EINVAL:bad payload";
-                break;
-            }
-            if (compression == L'z')
-            {
-                std::vector<uint8_t> inflated;
-                if (!_inflateZlib(bytes, inflated, MaxPayload))
-                {
-                    success = false;
-                    code = L"EINVAL:invalid compressed data";
-                    break;
-                }
-                bytes = std::move(inflated);
             }
 
             const auto depth = format == 24 ? 3u : (format == 32 ? 4u : 0u);
@@ -1288,6 +1397,31 @@ int32_t KittyParser::_ParseInt(const std::wstring_view value) noexcept
     return magnitude > 0x7FFFFFFFu ? INT32_MAX : static_cast<int32_t>(magnitude);
 }
 
+// Like _ParseUint but for the 64-bit file offset/size keys (O=/S=). Clamps to
+// UINT64_MAX on overflow so a hostile run of digits cannot wrap; the host bounds the
+// actual read and rejects an offset past EOF, so a clamped value just fails cleanly.
+uint64_t KittyParser::_ParseUint64(const std::wstring_view value) noexcept
+{
+    uint64_t result = 0;
+    for (const auto ch : value)
+    {
+        if (ch < L'0' || ch > L'9')
+        {
+            break;
+        }
+        const auto digit = static_cast<uint64_t>(ch - L'0');
+        // Detect overflow before it happens: clamp rather than wrap.
+        if (result > (UINT64_MAX - digit) / 10)
+        {
+            result = UINT64_MAX;
+            break;
+        }
+        result = result * 10 + digit;
+    }
+    return result;
+}
+
+// Returns an unused image id, skipping ids that are already registered.
 uint32_t KittyParser::_assignImageId()
 {
     while (_images.find(_nextImageId) != _images.end() || _nextImageId == 0)
@@ -1808,16 +1942,6 @@ try
         code = L"ENOENT:image not found";
         return false;
     }
-    if (command.medium != L'd')
-    {
-        code = L"EINVAL:unsupported transmission medium";
-        return false;
-    }
-    if (command.compression != 0 && command.compression != L'z')
-    {
-        code = L"EINVAL:unsupported compression";
-        return false;
-    }
     if (command.format != 24 && command.format != 32 && command.format != 100)
     {
         code = L"EINVAL:unsupported format";
@@ -1828,22 +1952,10 @@ try
         code = L"EINVAL:invalid frame composition mode";
         return false;
     }
-
     std::vector<uint8_t> bytes;
-    if (!payloadValid || !_DecodeBase64(payload, bytes))
+    if (!_loadTransmissionData(command, payload, payloadValid, payloadTooLarge, bytes, code))
     {
-        code = payloadTooLarge ? L"EFBIG:payload exceeds maximum size" : L"EINVAL:bad payload";
         return false;
-    }
-    if (command.compression == L'z')
-    {
-        std::vector<uint8_t> inflated;
-        if (!_inflateZlib(bytes, inflated, MaxPayload))
-        {
-            code = L"EINVAL:invalid compressed data";
-            return false;
-        }
-        bytes = std::move(inflated);
     }
 
     uint32_t frameWidth = 0;
@@ -5062,7 +5174,15 @@ bool KittyParser::_DecodeBase64(const std::string_view input, std::vector<uint8_
     return true;
 }
 
-bool KittyParser::_inflateZlib(const std::vector<uint8_t>& input, std::vector<uint8_t>& output, const size_t cap) noexcept
+// Inflate an RFC 1950 zlib stream (kitty's o=z transmission). On success `output`
+// holds the decompressed bytes and the function returns true; malformed input, an
+// inflated size of zero, or a size exceeding `cap` returns false (the caller maps
+// that to an EINVAL ACK). The RFC 1951 DEFLATE body is inflated by inflatelib.
+// noexcept: any allocation failure is caught and reported as false.
+//
+// Protocol: https://sw.kovidgoyal.net/kitty/graphics-protocol/#compression  (o=z)
+// zlib container format: https://www.rfc-editor.org/rfc/rfc1950
+bool KittyParser::_inflateZlib(const std::vector<uint8_t>& input, std::vector<uint8_t>& output, const size_t cap, const bool allowTrailingZeroPadding) noexcept
 try
 {
     output.clear();
@@ -5130,9 +5250,15 @@ try
     }
     output.resize(produced);
 
+    // inflatelib stops at the end of the DEFLATE stream, so whatever it did not consume
+    // is the 4-byte Adler-32 plus any padding. Require the stream to end where that
+    // trailer begins, rejecting trailing garbage and multi-member streams. When an S=0
+    // shared-memory transfer includes page-rounded zero padding, only zeros may follow.
     const auto consumed = deflateAvailable - remainingInput.size();
     const auto streamEnd = 2u + consumed + 4u;
-    if (streamEnd != input.size())
+    if (streamEnd > input.size() ||
+        (!allowTrailingZeroPadding && streamEnd != input.size()) ||
+        (allowTrailingZeroPadding && !std::all_of(input.begin() + streamEnd, input.end(), [](const auto value) noexcept { return value == 0; })))
     {
         output.clear();
         return false;

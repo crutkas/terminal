@@ -350,6 +350,7 @@ namespace winrt::Microsoft::Terminal::Settings
         _RainbowSuggestions = profile.RainbowSuggestions();
         _ForceVTInput = profile.ForceVTInput();
         _AllowKittyKeyboardMode = profile.AllowKittyKeyboardMode();
+        _AllowKittyLocalMedia = profile.AllowKittyLocalMedia();
         _AllowVtChecksumReport = profile.AllowVtChecksumReport();
         _AllowVtClipboardWrite = profile.AllowVtClipboardWrite();
         _AllowOscNotifications = profile.AllowOscNotifications();

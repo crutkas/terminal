@@ -107,11 +107,13 @@ namespace Microsoft::Console::VirtualTerminal
             uint32_t cellOffsetY = 0;
             uint32_t upperX = 0; // X=: animation replacement mode or composition source x
             uint32_t upperY = 0; // Y=: animation background RGBA or composition source y
+            uint64_t fileOffset = 0; // O=: byte offset into a file or shared-memory object
+            uint64_t fileSize = 0; // S=: bytes to read (0 = to end, host-bounded)
             bool moreChunks = false;
             bool mPresent = false;
             bool haveId = false;
             bool haveNumber = false;
-            wchar_t medium = L'd';
+            wchar_t medium = L'd'; // t=: transmission medium (d/f/t/s)
             bool noCursorMovement = false;
             bool hasNonChunkKey = false;
             bool hasNonChunkKeyOtherThanAction = false;
@@ -256,13 +258,16 @@ namespace Microsoft::Console::VirtualTerminal
 
         static Control _ParseControl(std::wstring_view control) noexcept;
         bool _localMediaAllowed() const noexcept;
+        bool _transmissionMediumAllowed(const Control& command) const noexcept;
+        bool _loadTransmissionData(const Control& command, std::string_view payload, bool payloadValid, bool payloadTooLarge, std::vector<uint8_t>& bytes, std::wstring_view& code);
         void _HandleSequence(std::wstring_view control, std::string_view payload, bool controlValid, bool payloadValid, bool payloadTooLarge);
         void _ProcessCommand(const Control& command, std::string_view payload, bool payloadValid, bool payloadTooLarge);
         void _clearChunk() noexcept;
         static uint32_t _ParseUint(std::wstring_view value) noexcept;
         static int32_t _ParseInt(std::wstring_view value) noexcept;
+        static uint64_t _ParseUint64(std::wstring_view value) noexcept;
         static bool _DecodeBase64(std::string_view input, std::vector<uint8_t>& output) noexcept;
-        static bool _inflateZlib(const std::vector<uint8_t>& input, std::vector<uint8_t>& output, size_t cap) noexcept;
+        static bool _inflateZlib(const std::vector<uint8_t>& input, std::vector<uint8_t>& output, size_t cap, bool allowTrailingZeroPadding = false) noexcept;
         static std::vector<RGBQUAD> _decodePixels(uint32_t format, const std::vector<uint8_t>& bytes);
         static RGBQUAD _rgbaColor(uint32_t rgba) noexcept;
         static void _compositePixels(std::span<RGBQUAD> destination, std::span<const RGBQUAD> source, bool replace) noexcept;

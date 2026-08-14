@@ -2822,6 +2822,11 @@
           "description": "When set to true, the terminal will support the DECRQCRA (Request Checksum of Rectangular Area) escape sequence.",
           "type": "boolean"
         },
+        "compatibility.allowKittyLocalMedia": {
+          "default": false,
+          "description": "When set to true, applications can use the Kitty graphics protocol's local transmission media (t=f, t=t and t=s) to transmit an image by naming a file, a temporary file the terminal then deletes, or a shared memory object, instead of sending the image data inline.",
+          "type": "boolean"
+        },
         "compatibility.allowOSC52": {
           "default": true,
           "description": "When set to true, VT applications will be allowed to set the contents of the local clipboard using OSC 52 (Manipulate Selection Data).",
