@@ -17,6 +17,31 @@ static constexpr unsigned int maxRetriesForRenderEngine = 5;
 // The renderer will wait this number of milliseconds * 2^tries before trying again.
 static constexpr DWORD renderBackoffBaseTimeMilliseconds = 100;
 
+void ImageFrameInfo::BuildSurfaceSnapshot(const std::span<const ImagePlacement> placements, std::vector<Surface>& surfaces)
+{
+    surfaces.clear();
+    surfaces.reserve(placements.size());
+    for (const auto& placement : placements)
+    {
+        surfaces.emplace_back(Surface{ .image = placement.SurfacePointer() });
+    }
+
+    const auto imageIdentity = [](const Surface& surface) noexcept {
+        return surface.image.get();
+    };
+    std::ranges::sort(surfaces, std::less<>{}, imageIdentity);
+    const auto duplicates = std::ranges::unique(surfaces, std::ranges::equal_to{}, imageIdentity);
+    surfaces.erase(duplicates.begin(), duplicates.end());
+
+    for (auto& surface : surfaces)
+    {
+        const auto& image = surface.image;
+        surface.pixels = image->Storage();
+        surface.size = image->PixelSize();
+        surface.revision = image->Revision();
+    }
+}
+
 // Routine Description:
 // - Creates a new renderer controller for a console.
 // Arguments:
@@ -362,6 +387,21 @@ DWORD Renderer::_timerToMillis(TimerRepr t) noexcept
         }
 
         LOG_HR_IF(hr, hr != E_PENDING);
+        if (attempt < maxRetriesForRenderEngine)
+        {
+            // EndPaint finalizes an attempted frame and consumes each engine's dirty
+            // state. Re-invalidate under the console lock, which also serializes normal
+            // dirty-state updates, so the replacement frame repaints everything the
+            // failed attempt may have cleared or partially updated.
+            _pData->LockConsole();
+            auto unlock = wil::scope_exit([&]() {
+                _pData->UnlockConsole();
+            });
+            for (const auto pEngine : _engines)
+            {
+                LOG_IF_FAILED(pEngine->InvalidateAll());
+            }
+        }
     }
 
     if (FAILED(hr))
@@ -416,6 +456,7 @@ DWORD Renderer::_timerToMillis(TimerRepr t) noexcept
         _updateCursorInfo();
         _invalidateCurrentCursor(); // NOTE: This now refers to the updated cursor position.
         _prepareNewComposition();
+        _prepareImageFrame();
 
         for (const auto pEngine : _engines)
         {
@@ -468,12 +509,20 @@ try
 
     // C. Prepare the engine with additional information before we start drawing.
     RETURN_IF_FAILED(_PrepareRenderInfo(pEngine));
+    const auto imageFrameResult = pEngine->PrepareImageFrame({
+        .placements = _imagePlacements,
+        .surfaces = _imageSurfaces,
+        .viewportOrigin = _viewport.Origin(),
+    });
+    // S_FALSE is the supported text-only fallback. Actual preparation failures must
+    // propagate so the renderer can retry or recover the graphics device.
+    RETURN_IF_FAILED(imageFrameResult);
 
     // 1. Paint Background
     RETURN_IF_FAILED(_PaintBackground(pEngine));
 
     // 2. Paint Rows of Text
-    _PaintBufferOutput(pEngine);
+    _PaintBufferOutput(pEngine, imageFrameResult == S_OK);
 
     // 4. Paint Selection
     _PaintSelection(pEngine);
@@ -1020,7 +1069,7 @@ bool Renderer::IsGlyphWideByFont(const std::wstring_view glyph)
 // - <none>
 // Return Value:
 // - <none>
-void Renderer::_PaintBufferOutput(_In_ IRenderEngine* const pEngine)
+void Renderer::_PaintBufferOutput(_In_ IRenderEngine* const pEngine, const bool directImagesSupported)
 {
     // This is the subsection of the entire screen buffer that is currently being presented.
     // It can move left/right or top/bottom depending on how the viewport is scrolled
@@ -1032,6 +1081,8 @@ void Renderer::_PaintBufferOutput(_In_ IRenderEngine* const pEngine)
     // The origin is always 0, 0 because it represents the screen itself, not the underlying buffer.
     std::span<const til::rect> dirtyAreas;
     LOG_IF_FAILED(pEngine->GetDirtyArea(dirtyAreas));
+
+    auto& buffer = _pData->GetTextBuffer();
 
     // This is to make sure any transforms are reset when this paint is finished.
     auto resetLineTransform = wil::scope_exit([&]() {
@@ -1056,8 +1107,6 @@ void Renderer::_PaintBufferOutput(_In_ IRenderEngine* const pEngine)
         // we need to walk through line-by-line and repaint onto the screen.
         const auto redraw = Viewport::Intersect(dirty, _viewport);
 
-        // Retrieve the text buffer so we can read information out of it.
-        auto& buffer = _pData->GetTextBuffer();
         // Now walk through each row of text that we need to redraw.
         for (auto row = redraw.Top(); row < redraw.BottomExclusive(); row++)
         {
@@ -1099,8 +1148,37 @@ void Renderer::_PaintBufferOutput(_In_ IRenderEngine* const pEngine)
             // Prepare the appropriate line transform for the current row and viewport offset.
             LOG_IF_FAILED(pEngine->PrepareLineTransform(lineRendition, screenPosition.y, _viewport.Left()));
 
+            // Direct surfaces are bracketed around text so each backend can compose
+            // below the background, below text, and above text independently.
+            ImagePlacement::RenderPosition directUnderlay{};
+            const auto hasDirectImages = directImagesSupported && _rowHasDirectImages(row, &directUnderlay);
+            if (hasDirectImages) [[unlikely]]
+            {
+                if (directUnderlay != ImagePlacement::RenderPosition::AboveText)
+                {
+                    _buildImageRowBackgrounds(r);
+                }
+                else
+                {
+                    _backgroundMask.clear();
+                    _backgroundColors.clear();
+                }
+                LOG_IF_FAILED(pEngine->BeginRowImages(screenPosition.y, _viewport.Left(), _backgroundMask, _backgroundColors));
+            }
+
+            auto endRowImages = wil::scope_exit([&]() noexcept {
+                if (hasDirectImages)
+                {
+                    LOG_IF_FAILED(pEngine->EndRowImages());
+                }
+            });
+
             // Ask the helper to paint through this specific line.
             _PaintBufferOutputHelper(pEngine, it, screenPosition);
+
+            // Complete direct-surface composition before the legacy row-owned
+            // ImageSlice is painted.
+            endRowImages.reset();
 
             // Paint any image content on top of the text.
             const auto imageSlice = buffer.GetRowByOffset(row).GetImageSlice();
@@ -1108,6 +1186,74 @@ void Renderer::_PaintBufferOutput(_In_ IRenderEngine* const pEngine)
             {
                 LOG_IF_FAILED(pEngine->PaintImageSlice(*imageSlice, screenPosition.y, _viewport.Left()));
             }
+        }
+    }
+}
+
+void Renderer::_prepareImageFrame()
+{
+    _imagePlacements.clear();
+    _imageSurfaces.clear();
+    const auto bounds = _viewport.ToExclusive();
+    const auto placements = _pData->GetTextBuffer().GetImages().IntersectingRows(bounds.top, bounds.bottom);
+    _imagePlacements.reserve(placements.size());
+    for (const auto placement : placements)
+    {
+        if (auto cropped = placement->Crop(bounds))
+        {
+            _imagePlacements.emplace_back(std::move(*cropped));
+        }
+    }
+    std::stable_sort(_imagePlacements.begin(), _imagePlacements.end(), [](const auto& lhs, const auto& rhs) {
+        const auto lhsKey = lhs.Identity();
+        const auto rhsKey = rhs.Identity();
+        return std::tuple{ lhs.ZIndex(), lhsKey.protocol, lhsKey.imageId, lhsKey.layerId } <
+               std::tuple{ rhs.ZIndex(), rhsKey.protocol, rhsKey.imageId, rhsKey.layerId };
+    });
+    ImageFrameInfo::BuildSurfaceSnapshot(_imagePlacements, _imageSurfaces);
+}
+
+bool Renderer::_rowHasDirectImages(const til::CoordType row, ImagePlacement::RenderPosition* const underlay) const noexcept
+{
+    auto found = false;
+    auto firstPosition = ImagePlacement::RenderPosition::AboveText;
+    for (const auto& placement : _imagePlacements)
+    {
+        const auto bounds = placement.CellBounds();
+        if (row >= bounds.top && row < bounds.bottom)
+        {
+            found = true;
+            firstPosition = std::min(firstPosition, placement.Position());
+        }
+    }
+    if (underlay)
+    {
+        *underlay = firstPosition;
+    }
+    return found;
+}
+
+void Renderer::_buildImageRowBackgrounds(const ROW& r)
+{
+    _backgroundMask.clear();
+    _backgroundColors.clear();
+
+    const auto columnCount = gsl::narrow_cast<size_t>(_viewport.Width());
+    const auto defaultBackground = _renderSettings.GetAttributeColors({}).second;
+    _backgroundMask.assign(columnCount, uint8_t{ 0 });
+    _backgroundColors.assign(columnCount, defaultBackground);
+
+    const auto scale = r.GetLineRendition() != LineRendition::SingleWidth ? 1 : 0;
+    const auto readableColumns = r.GetReadableColumnCount();
+    for (size_t column = 0; column < columnCount; column++)
+    {
+        const auto screenColumn = _viewport.Left() + gsl::narrow_cast<til::CoordType>(column);
+        const auto bufferColumn = screenColumn >> scale;
+        if (bufferColumn >= 0 && bufferColumn < readableColumns)
+        {
+            const auto attributes = r.GetAttrByColumn(bufferColumn);
+            til::at(_backgroundMask, column) = attributes.GetBackground().IsDefault() ? 1 : 0;
+            til::at(_backgroundColors, column) = _renderSettings.GetAttributeColors(attributes).second;
         }
     }
 }

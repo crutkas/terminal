@@ -37,6 +37,7 @@ namespace Microsoft::Console::Render
                                              const size_t centeringHint) noexcept override;
 
         [[nodiscard]] HRESULT PrepareRenderInfo(RenderFrameInfo info) noexcept override;
+        [[nodiscard]] HRESULT PrepareImageFrame(ImageFrameInfo info) noexcept override;
 
         [[nodiscard]] HRESULT ResetLineTransform() noexcept override;
         [[nodiscard]] HRESULT PrepareLineTransform(const LineRendition lineRendition,
@@ -46,6 +47,11 @@ namespace Microsoft::Console::Render
         [[nodiscard]] HRESULT PaintImageSlice(const ImageSlice& imageSlice,
                                               const til::CoordType targetRow,
                                               const til::CoordType viewportLeft) noexcept override;
+        [[nodiscard]] HRESULT BeginRowImages(til::CoordType targetRow,
+                                             til::CoordType viewportLeft,
+                                             std::span<const uint8_t> defaultBackgroundMask,
+                                             std::span<const COLORREF> cellBackgrounds) noexcept override;
+        [[nodiscard]] HRESULT EndRowImages() noexcept override;
 
         [[nodiscard]] bool RequiresContinuousRedraw() noexcept override;
 

@@ -25,7 +25,8 @@ struct VSData
     uint2 renditionScale : renditionScale;
     int2 position : position;
     uint2 size : size;
-    uint2 texcoord : texcoord;
+    float2 texcoord : texcoord;
+    float2 textureSize : textureSize;
     float4 color : color;
 };
 

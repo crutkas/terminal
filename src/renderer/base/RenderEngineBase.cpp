@@ -57,6 +57,11 @@ HRESULT RenderEngineBase::PrepareRenderInfo(RenderFrameInfo /*info*/) noexcept
     return S_FALSE;
 }
 
+HRESULT RenderEngineBase::PrepareImageFrame(ImageFrameInfo /*info*/) noexcept
+{
+    return S_FALSE;
+}
+
 HRESULT RenderEngineBase::ResetLineTransform() noexcept
 {
     return S_FALSE;
@@ -72,6 +77,19 @@ HRESULT RenderEngineBase::PrepareLineTransform(const LineRendition /*lineRenditi
 HRESULT RenderEngineBase::PaintImageSlice(const ImageSlice& /*imageSlice*/,
                                           const til::CoordType /*targetRow*/,
                                           const til::CoordType /*viewportLeft*/) noexcept
+{
+    return S_FALSE;
+}
+
+HRESULT RenderEngineBase::BeginRowImages(const til::CoordType /*targetRow*/,
+                                         const til::CoordType /*viewportLeft*/,
+                                         const std::span<const uint8_t> /*defaultBackgroundMask*/,
+                                         const std::span<const COLORREF> /*cellBackgrounds*/) noexcept
+{
+    return S_FALSE;
+}
+
+HRESULT RenderEngineBase::EndRowImages() noexcept
 {
     return S_FALSE;
 }

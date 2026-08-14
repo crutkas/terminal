@@ -20,6 +20,7 @@ PSData main(VSData data)
     // addition below this will transform our "position" from pixel into normalized device coordinate (NDC) space.
     output.position.xy = (data.position + data.vertex.xy * data.size) * positionScale + float2(-1.0f, 1.0f);
     output.position.zw = float2(0, 1);
-    output.texcoord = data.texcoord + data.vertex.xy * data.size;
+    float2 textureSize = any(data.textureSize) ? data.textureSize : data.size;
+    output.texcoord = data.texcoord + data.vertex.xy * textureSize;
     return output;
 }

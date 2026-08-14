@@ -76,6 +76,13 @@ namespace Microsoft::Console::Render
         void UpdateHyperlinkHoveredId(uint16_t id) noexcept;
         void UpdateLastHoveredInterval(const std::optional<interval_tree::IntervalTree<til::point, size_t>::interval>& newInterval);
 
+    protected:
+        // Paints one frame on the calling thread. The render thread is the only caller in
+        // a real host, which is why this is not public; it is reachable by a derived class
+        // so that DummyRenderer can offer tests a paint that does not depend on a thread
+        // being scheduled.
+        [[nodiscard]] HRESULT PaintFrame();
+
     private:
         struct TimerRoutine
         {
@@ -112,7 +119,6 @@ namespace Microsoft::Console::Render
         static DWORD _timerToMillis(TimerRepr t) noexcept;
 
         // Actual rendering
-        [[nodiscard]] HRESULT PaintFrame();
         [[nodiscard]] HRESULT _PaintFrame() noexcept;
         [[nodiscard]] HRESULT _PaintFrameForEngine(_In_ IRenderEngine* const pEngine) noexcept;
         void _disablePainting() noexcept;
@@ -120,9 +126,12 @@ namespace Microsoft::Console::Render
         bool _CheckViewportAndScroll();
         void _scheduleRenditionBlink();
         [[nodiscard]] HRESULT _PaintBackground(_In_ IRenderEngine* const pEngine);
-        void _PaintBufferOutput(_In_ IRenderEngine* const pEngine);
+        void _PaintBufferOutput(_In_ IRenderEngine* const pEngine, bool directImagesSupported);
         ROW* _PaintBufferOutputComposition(TextBuffer& buffer, const ROW& r, const Composition& activeComposition);
         void _PaintBufferOutputHelper(_In_ IRenderEngine* const pEngine, TextBufferCellIterator it, const til::point target);
+        void _prepareImageFrame();
+        void _buildImageRowBackgrounds(const ROW& r);
+        bool _rowHasDirectImages(til::CoordType row, ImagePlacement::RenderPosition* underlay = nullptr) const noexcept;
         void _PaintBufferOutputGridLineHelper(_In_ IRenderEngine* const pEngine, const TextAttribute textAttribute, const size_t cchLine, const til::point coordTarget);
         bool _isHoveredHyperlink(const TextAttribute& textAttribute) const noexcept;
         void _PaintSelection(_In_ IRenderEngine* const pEngine);
@@ -171,6 +180,10 @@ namespace Microsoft::Console::Render
         Microsoft::Console::Types::Viewport _viewport;
         std::optional<CompositionCache> _compositionCache;
         std::vector<Cluster> _clusterBuffer;
+        std::vector<uint8_t> _backgroundMask;
+        std::vector<COLORREF> _backgroundColors;
+        std::vector<ImagePlacement> _imagePlacements;
+        std::vector<ImageFrameInfo::Surface> _imageSurfaces;
         std::function<void()> _pfnBackgroundColorChanged;
         std::function<void()> _pfnFrameColorChanged;
         std::function<void()> _pfnRendererEnteredErrorState;

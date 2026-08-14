@@ -40,6 +40,10 @@ bool GdiEngine::FontHasWesternScript(HDC hdc)
 
     // At the beginning of a new frame, we have 0 lines ready for painting in PolyTextOut
     _cPolyText = 0;
+    // A row that failed mid-paint could have left these set, and stale underlay
+    // state would suppress cell backgrounds on unrelated rows.
+    _underlayColumns.clear();
+    _restoreBkMode = 0;
 
     // Prepare our in-memory bitmap for double-buffered composition.
     RETURN_IF_FAILED(_PrepareMemoryBitmap(_hwndTargetWindow));
@@ -227,7 +231,11 @@ bool GdiEngine::FontHasWesternScript(HDC hdc)
     const auto pt = _GetInvalidRectPoint();
     const auto sz = _GetInvalidRectSize();
 
-    LOG_HR_IF(E_FAIL, !(BitBlt(_psInvalidData.hdc, pt.x, pt.y, sz.width, sz.height, _hdcMemoryContext, pt.x, pt.y, SRCCOPY)));
+    if (SUCCEEDED(_imageRenderResult) &&
+        !BitBlt(_psInvalidData.hdc, pt.x, pt.y, sz.width, sz.height, _hdcMemoryContext, pt.x, pt.y, SRCCOPY))
+    {
+        _RecordImageError(E_FAIL);
+    }
     WHEN_DBG(_DebugBltAll());
 
     _rcInvalid = {};
@@ -254,10 +262,11 @@ bool GdiEngine::FontHasWesternScript(HDC hdc)
 // Arguments:
 // - <none>
 // Return Value:
-// - S_FALSE since we do nothing.
+// - S_FALSE when no error was latched; otherwise the latched image-rendering failure.
 [[nodiscard]] HRESULT GdiEngine::Present() noexcept
 {
-    return S_FALSE;
+    const auto result = std::exchange(_imageRenderResult, S_OK);
+    return FAILED(result) ? result : S_FALSE;
 }
 
 // Routine Description:
@@ -423,6 +432,22 @@ bool GdiEngine::FontHasWesternScript(HDC hdc)
         if (trimLeft)
         {
             pPolyTextLine->rcl.left += coordFontSize.width;
+        }
+
+        // ETO_OPAQUE fills the run's background, which would paint over image
+        // content this row has sitting below its text. It is a single flag for
+        // the whole run, but coverage varies cell by cell, so wherever a run
+        // meets the image at all we drop the flag and fill only the cells the
+        // image does not cover.
+        if (!_underlayColumns.empty() && coordFontSize.width > 0)
+        {
+            const auto beginColumn = (pPolyTextLine->rcl.left / coordFontSize.width) << _underlayScale;
+            const auto endColumn = (pPolyTextLine->rcl.right / coordFontSize.width) << _underlayScale;
+            if (_UnderlayCoversAnyOf(beginColumn, endColumn))
+            {
+                WI_ClearFlag(pPolyTextLine->uiFlags, ETO_OPAQUE);
+                LOG_IF_FAILED(_FillUncoveredRunBackground(pPolyTextLine->rcl, coordFontSize.width));
+            }
         }
 
         _cPolyText++;
@@ -661,6 +686,481 @@ try
     {
         return DrawStrokedLine(ptTarget.x, ptTarget.y + _lineMetrics.underlineCenter, widthOfAllCells);
     }
+
+    return S_OK;
+}
+CATCH_RETURN();
+
+namespace
+{
+    struct DirectImageTarget
+    {
+        int64_t left;
+        int64_t top;
+        int64_t right;
+        int64_t bottom;
+    };
+
+    int64_t scaleImagePixels(const uint64_t value, const int64_t numerator, const int64_t denominator) noexcept
+    {
+        if (denominator <= 0 || numerator <= 0)
+        {
+            return 0;
+        }
+        const auto limit = static_cast<uint64_t>(INT64_MAX / numerator);
+        if (value > limit)
+        {
+            return INT64_MAX;
+        }
+        return static_cast<int64_t>(value * numerator / denominator);
+    }
+
+    DirectImageTarget resolveImageTarget(const ImagePlacement& placement, const til::size cellSize, const til::point viewportOrigin) noexcept
+    {
+        const auto bounds = placement.OriginalCellBounds();
+        const auto& geometry = placement.Geometry();
+        const auto left = (static_cast<int64_t>(bounds.left) - viewportOrigin.x) * cellSize.width +
+                          static_cast<int64_t>(geometry.offset.x) * cellSize.width / geometry.cellSize.width;
+        const auto top = (static_cast<int64_t>(bounds.top) - viewportOrigin.y) * cellSize.height +
+                         static_cast<int64_t>(geometry.offset.y) * cellSize.height / geometry.cellSize.height;
+        return {
+            left,
+            top,
+            left + scaleImagePixels(geometry.targetWidth, cellSize.width, geometry.cellSize.width),
+            top + scaleImagePixels(geometry.targetHeight, cellSize.height, geometry.cellSize.height),
+        };
+    }
+
+    LONG clampToLong(const int64_t value) noexcept
+    {
+        return static_cast<LONG>(std::clamp<int64_t>(value, LONG_MIN, LONG_MAX));
+    }
+}
+
+[[nodiscard]] HRESULT GdiEngine::PrepareImageFrame(const ImageFrameInfo info) noexcept
+try
+{
+    _imageRenderResult = S_OK;
+    _frameImagePlacements.assign(info.placements.begin(), info.placements.end());
+    _imageViewportOrigin = info.viewportOrigin;
+
+    std::vector<const Image*> preparedImages;
+    preparedImages.reserve(info.surfaces.size());
+    for (const auto& surface : info.surfaces)
+    {
+        const auto image = surface.image.get();
+        const auto result = _PrepareImageSurface(surface);
+        if (result == S_OK)
+        {
+            preparedImages.emplace_back(image);
+        }
+        else
+        {
+            // Malformed data returns S_FALSE and skips only this image. A real GDI
+            // failure clears any stale pixels and propagates for renderer recovery.
+            _imageSurfaces.erase(image);
+            RETURN_IF_FAILED(result);
+        }
+    }
+
+    for (auto it = _imageSurfaces.begin(); it != _imageSurfaces.end();)
+    {
+        const auto active = std::ranges::find(preparedImages, it->first) != preparedImages.end();
+        if (active)
+        {
+            ++it;
+        }
+        else
+        {
+            it = _imageSurfaces.erase(it);
+        }
+    }
+    return S_OK;
+}
+CATCH_RETURN();
+
+[[nodiscard]] HRESULT GdiEngine::_PrepareImageSurface(const ImageFrameInfo::Surface& surface) noexcept
+try
+{
+    if (!surface.IsRenderable())
+    {
+        return S_FALSE;
+    }
+    const auto& image = surface.image;
+    auto& cached = _imageSurfaces.try_emplace(image.get()).first->second;
+    cached.image = image;
+
+    const auto size = surface.size;
+    if (!cached.context)
+    {
+        cached.context.reset(CreateCompatibleDC(nullptr));
+        RETURN_LAST_ERROR_IF_NULL(cached.context.get());
+    }
+    if (!cached.bitmap || cached.size != size)
+    {
+        const BITMAPINFO info{
+            .bmiHeader = {
+                .biSize = sizeof(BITMAPINFOHEADER),
+                .biWidth = size.width,
+                .biHeight = -size.height,
+                .biPlanes = 1,
+                .biBitCount = 32,
+                .biCompression = BI_RGB,
+            }
+        };
+        void* bits = nullptr;
+        wil::unique_hbitmap bitmap{ CreateDIBSection(cached.context.get(), &info, DIB_RGB_COLORS, &bits, nullptr, 0) };
+        RETURN_LAST_ERROR_IF_NULL(bitmap.get());
+        RETURN_LAST_ERROR_IF_NULL(SelectObject(cached.context.get(), bitmap.get()));
+        cached.bitmap = std::move(bitmap);
+        cached.bits = static_cast<RGBQUAD*>(bits);
+        cached.size = size;
+        cached.revision = 0;
+    }
+
+    if (cached.revision != surface.revision)
+    {
+        const auto pixels = std::span{ *surface.pixels };
+        memcpy(cached.bits, pixels.data(), pixels.size_bytes());
+        cached.allOpaque = true;
+        cached.allTransparent = true;
+        for (const auto& pixel : pixels)
+        {
+            cached.allOpaque &= pixel.rgbReserved == 0xff;
+            cached.allTransparent &= pixel.rgbReserved == 0;
+        }
+        cached.revision = surface.revision;
+    }
+    return S_OK;
+}
+CATCH_RETURN();
+
+[[nodiscard]] HRESULT GdiEngine::_PaintDirectImage(const ImagePlacement& placement, const RECT& clip) noexcept
+try
+{
+    const auto found = _imageSurfaces.find(placement.SurfacePointer().get());
+    if (found == _imageSurfaces.end())
+    {
+        return S_FALSE;
+    }
+    const auto& cached = found->second;
+    RETURN_HR_IF(S_OK, cached.allTransparent);
+
+    const auto cellSize = _GetFontSize();
+    const auto target = resolveImageTarget(placement, cellSize, _imageViewportOrigin);
+    const auto targetWidth = target.right - target.left;
+    const auto targetHeight = target.bottom - target.top;
+    RETURN_HR_IF(S_OK, targetWidth <= 0 || targetHeight <= 0);
+
+    const auto saved = SaveDC(_hdcMemoryContext);
+    RETURN_LAST_ERROR_IF(saved == 0);
+    const auto restore = wil::scope_exit([&]() {
+        RestoreDC(_hdcMemoryContext, saved);
+    });
+    RETURN_HR_IF(S_OK, IntersectClipRect(_hdcMemoryContext, clip.left, clip.top, clip.right, clip.bottom) == NULLREGION);
+
+    const auto source = placement.SourceInPixels();
+    const auto x = clampToLong(target.left);
+    const auto y = clampToLong(target.top);
+    const auto width = clampToLong(targetWidth);
+    const auto height = clampToLong(targetHeight);
+    if (cached.allOpaque)
+    {
+        SetStretchBltMode(_hdcMemoryContext, COLORONCOLOR);
+        RETURN_HR_IF(E_FAIL, !StretchBlt(_hdcMemoryContext, x, y, width, height, cached.context.get(), source.left, source.top, source.width(), source.height(), SRCCOPY));
+    }
+    else
+    {
+        constexpr BLENDFUNCTION blend{ .BlendOp = AC_SRC_OVER, .BlendFlags = 0, .SourceConstantAlpha = 255, .AlphaFormat = AC_SRC_ALPHA };
+        RETURN_HR_IF(E_FAIL, !GdiAlphaBlend(_hdcMemoryContext, x, y, width, height, cached.context.get(), source.left, source.top, source.width(), source.height(), blend));
+    }
+    return S_OK;
+}
+CATCH_RETURN();
+
+void GdiEngine::_MarkDirectImageUnderlay(const ImagePlacement& placement,
+                                         const til::CoordType targetRow,
+                                         const std::span<const uint8_t> defaultBackgroundMask) noexcept
+{
+    const auto found = _imageSurfaces.find(placement.SurfacePointer().get());
+    if (found == _imageSurfaces.end() || found->second.allTransparent)
+    {
+        return;
+    }
+
+    const auto cellSize = _GetFontSize();
+    const auto target = resolveImageTarget(placement, cellSize, _imageViewportOrigin);
+    const auto rowTop = static_cast<int64_t>(targetRow) * cellSize.height;
+    const auto rowBottom = rowTop + cellSize.height;
+    if (target.bottom <= rowTop || target.top >= rowBottom)
+    {
+        return;
+    }
+
+    const auto bounds = placement.CellBounds();
+    const auto left = std::max(bounds.left, _imageViewportOrigin.x);
+    const auto right = std::min(bounds.right, _imageViewportOrigin.x + gsl::narrow_cast<til::CoordType>(_underlayColumns.size()));
+    for (auto column = left; column < right; ++column)
+    {
+        const auto index = gsl::narrow_cast<size_t>(column - _imageViewportOrigin.x);
+        const auto cellLeft = static_cast<int64_t>(column - _imageViewportOrigin.x) * cellSize.width;
+        const auto cellRight = cellLeft + cellSize.width;
+        if (target.right <= cellLeft || target.left >= cellRight)
+        {
+            continue;
+        }
+        if (placement.Position() == ImagePlacement::RenderPosition::BehindBackground &&
+            (index >= defaultBackgroundMask.size() || til::at(defaultBackgroundMask, index) == 0))
+        {
+            continue;
+        }
+        til::at(_underlayColumns, index) = 1;
+    }
+}
+
+[[nodiscard]] HRESULT GdiEngine::_PaintDirectImages(const ImagePlacement::RenderPosition position,
+                                                    const til::CoordType targetRow,
+                                                    const std::span<const uint8_t> defaultBackgroundMask,
+                                                    const bool markUnderlay) noexcept
+try
+{
+    const auto cellSize = _GetFontSize();
+    const auto bufferRow = targetRow + _imageViewportOrigin.y;
+    for (const auto& placement : _frameImagePlacements)
+    {
+        const auto bounds = placement.CellBounds();
+        if (placement.Position() != position || bufferRow < bounds.top || bufferRow >= bounds.bottom)
+        {
+            continue;
+        }
+        if (markUnderlay)
+        {
+            _MarkDirectImageUnderlay(placement, targetRow, defaultBackgroundMask);
+        }
+
+        const auto left = std::max(bounds.left, _imageViewportOrigin.x);
+        const auto right = bounds.right;
+        if (left >= right)
+        {
+            continue;
+        }
+        const auto topPx = targetRow * cellSize.height;
+        const auto bottomPx = topPx + cellSize.height;
+        if (position == ImagePlacement::RenderPosition::BehindBackground)
+        {
+            RETURN_HR_IF(S_OK, defaultBackgroundMask.empty());
+            const auto maskRight = _imageViewportOrigin.x + gsl::narrow_cast<til::CoordType>(defaultBackgroundMask.size());
+            const auto scanRight = std::min(right, maskRight);
+            auto run = left;
+            while (run < scanRight)
+            {
+                while (run < scanRight && til::at(defaultBackgroundMask, gsl::narrow_cast<size_t>(run - _imageViewportOrigin.x)) == 0)
+                {
+                    ++run;
+                }
+                const auto runBegin = run;
+                while (run < scanRight && til::at(defaultBackgroundMask, gsl::narrow_cast<size_t>(run - _imageViewportOrigin.x)) != 0)
+                {
+                    ++run;
+                }
+                if (runBegin < run)
+                {
+                    const RECT clip{
+                        (runBegin - _imageViewportOrigin.x) * cellSize.width,
+                        topPx,
+                        (run - _imageViewportOrigin.x) * cellSize.width,
+                        bottomPx,
+                    };
+                    RETURN_IF_FAILED(_PaintDirectImage(placement, clip));
+                }
+            }
+        }
+        else
+        {
+            const RECT clip{
+                (left - _imageViewportOrigin.x) * cellSize.width,
+                topPx,
+                (right - _imageViewportOrigin.x) * cellSize.width,
+                bottomPx,
+            };
+            RETURN_IF_FAILED(_PaintDirectImage(placement, clip));
+        }
+    }
+    return S_OK;
+}
+CATCH_RETURN();
+
+void GdiEngine::_RecordImageError(const HRESULT result) noexcept
+{
+    if (FAILED(result) && SUCCEEDED(_imageRenderResult))
+    {
+        _imageRenderResult = result;
+    }
+}
+
+[[nodiscard]] HRESULT GdiEngine::BeginRowImages(const til::CoordType targetRow,
+                                                const til::CoordType viewportLeft,
+                                                const std::span<const uint8_t> defaultBackgroundMask,
+                                                const std::span<const COLORREF> cellBackgrounds) noexcept
+try
+{
+    LOG_IF_FAILED(_FlushBufferLines());
+
+    _underlayColumns.assign(defaultBackgroundMask.size(), uint8_t{ 0 });
+    _underlayColumnOffset = viewportLeft;
+    _underlayScale = _currentLineRendition != LineRendition::SingleWidth ? 1 : 0;
+    const auto rendition = _currentLineRendition;
+    LOG_IF_FAILED(ResetLineTransform());
+
+    _RecordImageError(_PaintDirectImages(ImagePlacement::RenderPosition::BehindBackground, targetRow, defaultBackgroundMask, true));
+    for (const auto& placement : _frameImagePlacements)
+    {
+        if (placement.Position() == ImagePlacement::RenderPosition::BehindText)
+        {
+            const auto bounds = placement.CellBounds();
+            const auto bufferRow = targetRow + _imageViewportOrigin.y;
+            if (bufferRow >= bounds.top && bufferRow < bounds.bottom)
+            {
+                _MarkDirectImageUnderlay(placement, targetRow, {});
+            }
+        }
+    }
+    _RecordImageError(_FillImageRowCellBackgrounds(targetRow, defaultBackgroundMask, cellBackgrounds));
+    _RecordImageError(_PaintDirectImages(ImagePlacement::RenderPosition::BehindText, targetRow, {}, false));
+
+    if (!_underlayColumns.empty())
+    {
+        const auto previous = SetBkMode(_hdcMemoryContext, TRANSPARENT);
+        _restoreBkMode = previous != TRANSPARENT ? previous : 0;
+    }
+
+    LOG_IF_FAILED(PrepareLineTransform(rendition, targetRow, viewportLeft));
+
+    _rowImageTargetRow = targetRow;
+    _rowImageViewportLeft = viewportLeft;
+
+    return S_OK;
+}
+CATCH_RETURN();
+
+bool GdiEngine::_UnderlayCoversColumn(const til::CoordType column) const noexcept
+{
+    const auto index = column - _underlayColumnOffset;
+    if (index < 0 || gsl::narrow_cast<size_t>(index) >= _underlayColumns.size())
+    {
+        return false;
+    }
+    return til::at(_underlayColumns, gsl::narrow_cast<size_t>(index)) != 0;
+}
+
+bool GdiEngine::_UnderlayCoversBufferCell(const til::CoordType bufferColumn) const noexcept
+{
+    const auto screenColumn = bufferColumn << _underlayScale;
+    return _UnderlayCoversColumn(screenColumn) ||
+           (_underlayScale != 0 && _UnderlayCoversColumn(screenColumn + 1));
+}
+
+bool GdiEngine::_UnderlayCoversAnyOf(const til::CoordType columnBegin, const til::CoordType columnEnd) const noexcept
+{
+    if (_underlayColumns.empty() || columnBegin >= columnEnd)
+    {
+        return false;
+    }
+
+    for (auto column = columnBegin; column < columnEnd; column++)
+    {
+        if (_UnderlayCoversColumn(column))
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+[[nodiscard]] HRESULT GdiEngine::_FillUncoveredRunBackground(const RECT& runRect, const til::CoordType fontWidth) noexcept
+{
+    auto spanLeft = runRect.left;
+    for (auto x = runRect.left; x < runRect.right; x += fontWidth)
+    {
+        if (!_UnderlayCoversBufferCell(x / fontWidth))
+        {
+            continue;
+        }
+        if (spanLeft < x)
+        {
+            RECT fill{ spanLeft, runRect.top, x, runRect.bottom };
+            RETURN_HR_IF(E_FAIL, !ExtTextOutW(_hdcMemoryContext, 0, 0, ETO_OPAQUE, &fill, nullptr, 0, nullptr));
+        }
+        spanLeft = x + fontWidth;
+    }
+
+    if (spanLeft < runRect.right)
+    {
+        RECT fill{ spanLeft, runRect.top, runRect.right, runRect.bottom };
+        RETURN_HR_IF(E_FAIL, !ExtTextOutW(_hdcMemoryContext, 0, 0, ETO_OPAQUE, &fill, nullptr, 0, nullptr));
+    }
+    return S_OK;
+}
+
+[[nodiscard]] HRESULT GdiEngine::_FillImageRowCellBackgrounds(const til::CoordType targetRow,
+                                                              const std::span<const uint8_t> defaultBackgroundMask,
+                                                              const std::span<const COLORREF> cellBackgrounds) noexcept
+try
+{
+    const auto columnCount = _underlayColumns.size();
+    RETURN_HR_IF(S_OK, cellBackgrounds.size() != columnCount || defaultBackgroundMask.size() != columnCount);
+
+    const auto dstCellSize = _GetFontSize();
+    RETURN_HR_IF(S_OK, dstCellSize.width <= 0 || dstCellSize.height <= 0);
+    const auto top = targetRow * dstCellSize.height;
+
+    for (size_t column = 0; column < columnCount;)
+    {
+        if (til::at(defaultBackgroundMask, column) != 0 || til::at(_underlayColumns, column) == 0)
+        {
+            column++;
+            continue;
+        }
+        const auto color = til::at(cellBackgrounds, column);
+        auto end = column + 1;
+        while (end < columnCount &&
+               til::at(defaultBackgroundMask, end) == 0 &&
+               til::at(_underlayColumns, end) != 0 &&
+               til::at(cellBackgrounds, end) == color)
+        {
+            end++;
+        }
+
+        const RECT fill{
+            gsl::narrow_cast<til::CoordType>(column) * dstCellSize.width,
+            top,
+            gsl::narrow_cast<til::CoordType>(end) * dstCellSize.width,
+            top + dstCellSize.height,
+        };
+        wil::unique_hbrush brush{ CreateSolidBrush(color) };
+        RETURN_HR_IF_NULL(E_FAIL, brush.get());
+        RETURN_HR_IF(E_FAIL, !FillRect(_hdcMemoryContext, &fill, brush.get()));
+        column = end;
+    }
+    return S_OK;
+}
+CATCH_RETURN();
+
+[[nodiscard]] HRESULT GdiEngine::EndRowImages() noexcept
+try
+{
+    const auto rendition = _currentLineRendition;
+    _underlayColumns.clear();
+    LOG_IF_FAILED(_FlushBufferLines());
+    if (_restoreBkMode != 0)
+    {
+        SetBkMode(_hdcMemoryContext, _restoreBkMode);
+        _restoreBkMode = 0;
+    }
+
+    LOG_IF_FAILED(ResetLineTransform());
+    _RecordImageError(_PaintDirectImages(ImagePlacement::RenderPosition::AboveText, _rowImageTargetRow, {}, false));
+    LOG_IF_FAILED(PrepareLineTransform(rendition, _rowImageTargetRow, _rowImageViewportLeft));
 
     return S_OK;
 }
