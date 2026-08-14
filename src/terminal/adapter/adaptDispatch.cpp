@@ -5,6 +5,7 @@
 
 #include "adaptDispatch.hpp"
 #include "SixelParser.hpp"
+#include "KittyParser.hpp"
 #include "../../inc/unicode.hpp"
 #include "../../renderer/base/renderer.hpp"
 #include "../../types/inc/CodepointWidthDetector.hpp"
@@ -1776,17 +1777,34 @@ void AdaptDispatch::_SetColumnMode(const bool enable)
 // - <none>
 void AdaptDispatch::_SetAlternateScreenBufferMode(const bool enable)
 {
+    if (enable == _usingAltBuffer)
+    {
+        return;
+    }
+
     if (enable)
     {
         CursorSaveState();
+        if (_kittyParser)
+        {
+            _kittyParser->SaveMainBufferState();
+        }
         const auto page = _pages.ActivePage();
         _api.UseAlternateScreenBuffer(_GetEraseAttributes(page));
         _usingAltBuffer = true;
     }
     else
     {
+        if (_kittyParser)
+        {
+            _kittyParser->DiscardBufferState();
+        }
         _api.UseMainScreenBuffer();
         _usingAltBuffer = false;
+        if (_kittyParser)
+        {
+            _kittyParser->RestoreMainBufferState();
+        }
         CursorRestoreState();
     }
 }
@@ -3090,6 +3108,12 @@ void AdaptDispatch::HardReset(bool erase)
     // Reset the Sixel parser.
     _sixelParser = nullptr;
 
+    // Reset the Kitty graphics parser.
+    if (_kittyParser)
+    {
+        _kittyParser->HardReset();
+    }
+
     // Completely reset the TerminalOutput state.
     _termOutput = {};
     // Reset the code page to the default value.
@@ -3276,6 +3300,13 @@ void AdaptDispatch::_EraseAll()
 
     // Also reset the line rendition for the erased rows.
     textBuffer.ResetLineRenditionRange(newPageTop, newPageBottom);
+
+    // The kitty protocol requires that clearing the screen also clears images.
+    // The image data itself is kept, matching the protocol's d=a semantics.
+    if (_kittyParser)
+    {
+        _kittyParser->ErasePlacements();
+    }
 }
 
 //Routine Description:
@@ -4903,6 +4934,27 @@ void AdaptDispatch::_ReturnDcsResponse(const std::wstring_view response) const
     const auto dcs = _terminalInput.GetInputMode(TerminalInput::Mode::SendC1) ? L"\x90" : L"\x1BP";
     const auto st = _terminalInput.GetInputMode(TerminalInput::Mode::SendC1) ? L"\x9C" : L"\x1B\\";
     _api.ReturnResponse(fmt::format(FMT_COMPILE(L"{}{}{}"), dcs, response, st));
+}
+
+void AdaptDispatch::_ReturnApcResponse(const std::wstring_view response) const
+{
+    const auto c1 = _terminalInput.GetInputMode(TerminalInput::Mode::SendC1);
+    const auto apc = c1 ? L"\x9F" : L"\x1B_";
+    const auto st = c1 ? L"\x9C" : L"\x1B\\";
+    _api.ReturnResponse(fmt::format(FMT_COMPILE(L"{}{}{}"), apc, response, st));
+}
+
+ITermDispatch::StringHandler AdaptDispatch::KittyGraphics()
+{
+    if (_api.IsConPTY())
+    {
+        return [](const wchar_t) noexcept { return true; };
+    }
+    if (!_kittyParser)
+    {
+        _kittyParser = std::make_unique<KittyParser>(*this);
+    }
+    return _kittyParser->DefineImage();
 }
 
 void AdaptDispatch::_ReturnOscResponse(const std::wstring_view response) const

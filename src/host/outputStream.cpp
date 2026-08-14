@@ -463,3 +463,16 @@ void ConhostInternalGetSet::ShowNotification(std::wstring_view /*title*/, std::w
 {
     // Not implemented for conhost.
 }
+
+bool ConhostInternalGetSet::DecodeImageToBgra(const std::span<const uint8_t> /*data*/, std::vector<RGBQUAD>& pixels, til::size& /*size*/) noexcept
+{
+    // conhost has no image decoder. Under ConPTY the connected terminal decodes; standalone,
+    // an encoded image simply isn't displayed.
+    pixels.clear();
+    return false;
+}
+
+til::size ConhostInternalGetSet::GetCellSize() const noexcept
+{
+    return _io.GetActiveOutputBuffer().GetCurrentFont().GetSize();
+}

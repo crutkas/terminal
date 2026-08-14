@@ -270,6 +270,52 @@ class ::Microsoft::Console::VirtualTerminal::VtIoTests
         VERIFY_ARE_EQUAL(expected, actual);
     }
 
+    // Proves that graphics sequences (Kitty APC, Sixel DCS) emitted by a shell are
+    // forwarded verbatim through the ConPTY to the connected terminal, rather than being
+    // consumed by conhost. This is what lets a real terminal render shell graphics.
+    // Kitty graphics protocol: https://sw.kovidgoyal.net/kitty/graphics-protocol/
+    TEST_METHOD(GraphicsSequencesArePassedThroughToConpty)
+    {
+        resetContents();
+        const auto initialMode = screenInfo->OutputMode;
+        const auto restoreMode = wil::scope_exit([&]() {
+            screenInfo->OutputMode = initialMode;
+        });
+        screenInfo->OutputMode |= ENABLE_PROCESSED_OUTPUT | ENABLE_VIRTUAL_TERMINAL_PROCESSING;
+
+        size_t written;
+
+        // A Kitty graphics transmit-and-display APC must appear verbatim downstream.
+        const auto kitty = L"\x1b_Ga=T,i=1,f=24,s=1,v=1;/wAA\x1b\\";
+        const auto cursorBeforeKitty = screenInfo->GetTextBuffer().GetCursor().GetPosition();
+        const auto imageCountBeforeKitty = screenInfo->GetTextBuffer().GetImages().Size();
+        const auto imageRevisionBeforeKitty = screenInfo->GetTextBuffer().GetImages().Revision();
+        THROW_IF_FAILED(routines.WriteConsoleWImpl(*screenInfo, kitty, written, nullptr));
+        const auto kittyOut = std::string{ readOutput() };
+        // Byte-for-byte equality: the ENTIRE forwarded output must equal the APC exactly. A
+        // substring search would let conhost prepend/append/mutate bytes and still pass. The
+        // Kitty APC contains no newline, so conhost does not split it.
+        VERIFY_ARE_EQUAL(std::string("\x1b_Ga=T,i=1,f=24,s=1,v=1;/wAA\x1b\\"), kittyOut, L"the Kitty APC must be forwarded verbatim through ConPTY");
+        VERIFY_ARE_EQUAL(cursorBeforeKitty, screenInfo->GetTextBuffer().GetCursor().GetPosition(), L"conhost must not move its cursor while forwarding Kitty graphics");
+        VERIFY_ARE_EQUAL(imageCountBeforeKitty, screenInfo->GetTextBuffer().GetImages().Size(), L"conhost must not add an image while forwarding Kitty graphics");
+        VERIFY_ARE_EQUAL(imageRevisionBeforeKitty, screenInfo->GetTextBuffer().GetImages().Revision(), L"conhost must not mutate image placements while forwarding Kitty graphics");
+
+        resetContents();
+        std::ignore = readOutput();
+
+        // A Sixel image DCS must likewise pass through untouched.
+        const auto sixel = L"\x1bPq#0;2;100;0;0~\x1b\\";
+        THROW_IF_FAILED(routines.WriteConsoleWImpl(*screenInfo, sixel, written, nullptr));
+        const auto sixelOut = std::string{ readOutput() };
+        // conhost may insert a CRLF before the ST (a documented DCS-wrapping quirk), so the Sixel
+        // stream is not byte-identical. Strip any inserted CR/LF and assert the remainder equals
+        // the input EXACTLY -- this proves no OTHER mutation, which a substring search would miss.
+        auto sixelStripped = sixelOut;
+        sixelStripped.erase(std::remove(sixelStripped.begin(), sixelStripped.end(), '\r'), sixelStripped.end());
+        sixelStripped.erase(std::remove(sixelStripped.begin(), sixelStripped.end(), '\n'), sixelStripped.end());
+        VERIFY_ARE_EQUAL(std::string("\x1bPq#0;2;100;0;0~\x1b\\"), sixelStripped, L"the Sixel DCS must be forwarded verbatim (modulo an inserted CRLF) through ConPTY");
+    }
+
     TEST_METHOD(WriteConsoleOutputW)
     {
         resetContents();

@@ -76,6 +76,9 @@ public:
 
     void ShowNotification(std::wstring_view title, std::wstring_view body) override;
 
+    bool DecodeImageToBgra(const std::span<const uint8_t> data, std::vector<RGBQUAD>& pixels, til::size& size) noexcept override;
+    til::size GetCellSize() const noexcept override;
+
 private:
     Microsoft::Console::IIoProvider& _io;
 };
