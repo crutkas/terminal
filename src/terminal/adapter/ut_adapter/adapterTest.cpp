@@ -8,6 +8,7 @@
 #include "../../../renderer/inc/DummyRenderer.hpp"
 
 #include "adaptDispatch.hpp"
+#include "../../../buffer/out/ImageSlice.hpp"
 
 using namespace WEX::Common;
 using namespace WEX::Logging;
@@ -4029,6 +4030,475 @@ public:
 
         _pDispatch->RequestColorTableEntry(0);
         _testGetSet->ValidateInputEvent(L"\x1b]4;0;rgb:0c0c/0c0c/0c0c\x1b\\");
+    }
+
+    // Scans the whole buffer for the first row that carries an image slice.
+    // Sixel images are written at the cursor position, so the exact row depends
+    // on cursor/viewport state; scanning keeps these tests position-independent.
+    static const ImageSlice* FindFirstImageSlice(const TextBuffer& buffer, til::CoordType& outRow)
+    {
+        const auto height = buffer.GetSize().Height();
+        for (til::CoordType y = 0; y < height; y++)
+        {
+            if (const auto slice = buffer.GetRowByOffset(y).GetImageSlice())
+            {
+                outRow = y;
+                return slice;
+            }
+        }
+        outRow = -1;
+        return nullptr;
+    }
+
+    static bool SliceContainsColor(const ImageSlice* slice, BYTE r, BYTE g, BYTE b)
+    {
+        if (!slice)
+        {
+            return false;
+        }
+        for (const auto& px : slice->Pixels())
+        {
+            if (px.rgbRed == r && px.rgbGreen == g && px.rgbBlue == b)
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    static bool BufferContainsColor(const TextBuffer& buffer, BYTE r, BYTE g, BYTE b)
+    {
+        const auto height = buffer.GetSize().Height();
+        for (til::CoordType y = 0; y < height; y++)
+        {
+            if (SliceContainsColor(buffer.GetRowByOffset(y).GetImageSlice(), r, g, b))
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    static int CountImageRows(const TextBuffer& buffer)
+    {
+        auto count = 0;
+        const auto height = buffer.GetSize().Height();
+        for (til::CoordType y = 0; y < height; y++)
+        {
+            if (buffer.GetRowByOffset(y).GetImageSlice())
+            {
+                count++;
+            }
+        }
+        return count;
+    }
+
+    // Returns the pixel at (px, py) within an image slice's own pixel buffer (px is
+    // relative to the slice's left edge). Used for exact positional color checks
+    // rather than the "is this color anywhere in the slice" SliceContainsColor scan.
+    static RGBQUAD SlicePixelAt(const ImageSlice* slice, til::CoordType px, til::CoordType py)
+    {
+        const auto pixels = slice->Pixels();
+        const auto idx = static_cast<size_t>(py) * slice->PixelWidth() + px;
+        return idx < pixels.size() ? pixels[idx] : RGBQUAD{};
+    }
+
+    // Counts device-pixel columns whose pixel in the given row exactly matches a color.
+    // A sixel column is one device pixel wide, so with a transparent background this
+    // yields the precise drawn width -- unlike the slice's cell-rounded PixelWidth(),
+    // which an opaque (row-filling) background inflates to the full row.
+    static int CountColorColumnsInRow(const ImageSlice* slice, til::CoordType py, BYTE r, BYTE g, BYTE b)
+    {
+        auto count = 0;
+        const auto width = slice->PixelWidth();
+        for (til::CoordType px = 0; px < width; px++)
+        {
+            const auto p = SlicePixelAt(slice, px, py);
+            if (p.rgbRed == r && p.rgbGreen == g && p.rgbBlue == b)
+            {
+                count++;
+            }
+        }
+        return count;
+    }
+
+    // Baseline smoke test: the simplest valid sixel (one color, one full column) must produce a
+    // rendered image slice whose pixels contain the declared color. The other tests assume this
+    // fundamental path works, so this is the canary if the Sixel pipeline breaks entirely.
+    TEST_METHOD(SixelBasicRedImageTest)
+    {
+        _testGetSet->PrepData();
+
+        // DCS q ... ST: define color 0 as RGB(100%,0,0) = red, then '~' (0x7E),
+        // which sets all six pixels of a single sixel column.
+        _stateMachine->ProcessString(L"\x1bPq#0;2;100;0;0~\x1b\\");
+
+        const auto& buffer = *_testGetSet->_textBuffer;
+        til::CoordType imageRow = -1;
+        const auto slice = FindFirstImageSlice(buffer, imageRow);
+
+        VERIFY_IS_NOT_NULL(slice, L"A sixel image should produce an image slice in the buffer.");
+        VERIFY_IS_TRUE(slice->PixelWidth() > 0, L"The image slice should have a non-zero pixel width.");
+
+        auto foundRed = false;
+        for (const auto& px : slice->Pixels())
+        {
+            if (px.rgbRed == 255 && px.rgbGreen == 0 && px.rgbBlue == 0)
+            {
+                foundRed = true;
+                break;
+            }
+        }
+        VERIFY_IS_TRUE(foundRed, L"The image should contain the red pixel defined by the sixel data.");
+    }
+
+    // The default (P2=0) opaque background is painted across the full available row width, so even
+    // a one-column sixel yields a slice spanning the whole buffer. Pins that width contract; the
+    // transparent-background counterpart below asserts the opposite, so a background-handling
+    // regression flips exactly one of the pair.
+    TEST_METHOD(SixelOpaqueBackgroundFillsRow)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1bPq#0;2;100;0;0~\x1b\\");
+
+        const auto& buffer = *_testGetSet->_textBuffer;
+        til::CoordType imageRow = -1;
+        const auto slice = FindFirstImageSlice(buffer, imageRow);
+
+        VERIFY_IS_NOT_NULL(slice);
+        VERIFY_ARE_EQUAL(0, slice->ColumnOffset());
+        VERIFY_ARE_EQUAL(buffer.GetSize().Width() * slice->CellSize().width, slice->PixelWidth());
+    }
+
+    // '!N' run-length compression must be exactly equivalent to N explicit sixels; this guards the
+    // repeat decoder against off-by-one or leftover-count bugs. A transparent background (P2=1) is
+    // used so the drawn width reflects the run-length expansion itself -- with an opaque background
+    // both forms fill the whole row, so the count of drawn columns (not PixelWidth()) is asserted.
+    TEST_METHOD(SixelRepeatMatchesExplicit)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1bP0;1q#0;2;100;0;0!12~\x1b\\");
+        til::CoordType repeatRow = -1;
+        const auto repeatSlice = FindFirstImageSlice(*_testGetSet->_textBuffer, repeatRow);
+        VERIFY_IS_NOT_NULL(repeatSlice);
+        const auto repeatColumns = CountColorColumnsInRow(repeatSlice, 0, 255, 0, 0);
+
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1bP0;1q#0;2;100;0;0~~~~~~~~~~~~\x1b\\");
+        til::CoordType explicitRow = -1;
+        const auto explicitSlice = FindFirstImageSlice(*_testGetSet->_textBuffer, explicitRow);
+        VERIFY_IS_NOT_NULL(explicitSlice);
+        const auto explicitColumns = CountColorColumnsInRow(explicitSlice, 0, 255, 0, 0);
+
+        VERIFY_ARE_EQUAL(12, explicitColumns, L"Twelve explicit sixels must draw twelve columns.");
+        VERIFY_ARE_EQUAL(explicitColumns, repeatColumns, L"!12~ must draw the same twelve columns as twelve explicit sixels.");
+    }
+
+    // Exercises the HLS -> RGB conversion (sixel color format 1), a separate decode path from the
+    // RGB format (2) used by the other tests. In DEC's HLS convention (hue 0 deg = blue, 120 deg =
+    // red) HLS 120;50;100 is pure red, so it must resolve to the same pixel as an RGB red --
+    // isolating the HLS math. (Color introducer: VT330/VT340 Programmer Reference, Ch.14 Sixel
+    // Graphics -- https://vt100.net/docs/vt3xx-gp/chapter14.html)
+    TEST_METHOD(SixelHlsColorMatchesRgb)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1bPq#0;1;120;50;100~\x1b\\");
+
+        const auto& buffer = *_testGetSet->_textBuffer;
+        til::CoordType imageRow = -1;
+        const auto slice = FindFirstImageSlice(buffer, imageRow);
+
+        VERIFY_IS_NOT_NULL(slice);
+        auto foundRed = false;
+        for (const auto& px : slice->Pixels())
+        {
+            if (px.rgbRed == 255 && px.rgbGreen == 0 && px.rgbBlue == 0)
+            {
+                foundRed = true;
+                break;
+            }
+        }
+        VERIFY_IS_TRUE(foundRed, L"HLS 120;50;100 should decode to red.");
+    }
+
+    // Regression (#18855): erasing the display must clear image content.
+    TEST_METHOD(SixelEraseDisplayClearsImage)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1bPq#0;2;100;0;0~\x1b\\");
+        VERIFY_IS_TRUE(BufferContainsColor(*_testGetSet->_textBuffer, 255, 0, 0), L"Image should be present before erase.");
+
+        _stateMachine->ProcessString(L"\x1b[2J");
+        VERIFY_IS_FALSE(BufferContainsColor(*_testGetSet->_textBuffer, 255, 0, 0), L"Erase in Display should clear image content.");
+    }
+
+    // Regression (#17951): a sixel present during reflow must not crash.
+    TEST_METHOD(SixelReflowDoesNotCrash)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1bPq#0;2;100;0;0~~~~~~\x1b\\");
+        VERIFY_IS_TRUE(BufferContainsColor(*_testGetSet->_textBuffer, 255, 0, 0));
+
+        auto newBuffer = std::make_unique<TextBuffer>(til::size{ 50, 600 }, TextAttribute{}, 0, false, &_testGetSet->_renderer);
+        TextBuffer::Reflow(*_testGetSet->_textBuffer, *newBuffer);
+
+        // Reaching here without crashing or asserting is the regression guard.
+        VERIFY_ARE_EQUAL(50, newBuffer->GetSize().Width());
+    }
+
+    // A tall sixel spans multiple buffer rows (cf. alignment fix #17724). Uses a
+    // transparent background so the height reflects the drawn content rather than
+    // the (vertically-filling) opaque background.
+    TEST_METHOD(SixelTallImageSpansMultipleRows)
+    {
+        _testGetSet->PrepData();
+
+        // Six transparent sixel bands (6px each = 36px) clearly exceed one 20px
+        // cell row, so the image spans multiple rows.
+        _stateMachine->ProcessString(L"\x1bP0;1q#0;2;100;0;0~-~-~-~-~-~\x1b\\");
+
+        VERIFY_IS_TRUE(CountImageRows(*_testGetSet->_textBuffer) >= 2, L"A 36px-tall image should span multiple rows.");
+    }
+
+    // Transparent background (P2=1) does not fill the row, unlike the opaque default.
+    TEST_METHOD(SixelTransparentBackgroundDoesNotFillRow)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1bPq#0;2;100;0;0~\x1b\\");
+        til::CoordType opaqueRow = -1;
+        const auto opaqueSlice = FindFirstImageSlice(*_testGetSet->_textBuffer, opaqueRow);
+        VERIFY_IS_NOT_NULL(opaqueSlice);
+        const auto opaqueWidth = opaqueSlice->PixelWidth();
+
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1bP0;1q#0;2;100;0;0~\x1b\\");
+        til::CoordType transparentRow = -1;
+        const auto transparentSlice = FindFirstImageSlice(*_testGetSet->_textBuffer, transparentRow);
+        VERIFY_IS_NOT_NULL(transparentSlice);
+
+        VERIFY_IS_TRUE(transparentSlice->PixelWidth() < opaqueWidth, L"Transparent background should not fill the whole row.");
+    }
+
+    // Robustness: a degenerate (empty) sixel sequence must be handled gracefully.
+    // The default opaque background still allocates a slice, but with no color
+    // defined it must not produce any drawn (colored) content.
+    TEST_METHOD(SixelEmptySequenceNoCrash)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1bPq\x1b\\");
+
+        VERIFY_IS_FALSE(BufferContainsColor(*_testGetSet->_textBuffer, 255, 0, 0), L"An empty sixel must not produce colored content.");
+    }
+
+    // Switching the color register mid-image (#0 draws, then #1 draws) must apply per column so
+    // both colors appear -- guards that a '#Pc' select updates the active color mid-stream instead
+    // of latching the first register.
+    TEST_METHOD(SixelMultipleColorsRendered)
+    {
+        _testGetSet->PrepData();
+
+        // Color 0 = red, color 1 = blue; draw one column with each.
+        _stateMachine->ProcessString(L"\x1bPq#0;2;100;0;0~#1;2;0;0;100~\x1b\\");
+
+        const auto& buffer = *_testGetSet->_textBuffer;
+        VERIFY_IS_TRUE(BufferContainsColor(buffer, 255, 0, 0), L"Red (color 0) should be rendered.");
+        VERIFY_IS_TRUE(BufferContainsColor(buffer, 0, 0, 255), L"Blue (color 1) should be rendered.");
+    }
+
+    // Robustness: an image far wider than the buffer must not crash and must
+    // stay bounded by the row width.
+    TEST_METHOD(SixelOversizedWidthClamped)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1bPq#0;2;100;0;0!5000~\x1b\\");
+
+        const auto& buffer = *_testGetSet->_textBuffer;
+        til::CoordType imageRow = -1;
+        const auto slice = FindFirstImageSlice(buffer, imageRow);
+
+        VERIFY_IS_NOT_NULL(slice);
+        VERIFY_IS_TRUE(slice->PixelWidth() > 0);
+        VERIFY_IS_TRUE(slice->PixelWidth() <= buffer.GetSize().Width() * slice->CellSize().width, L"An oversized image should be bounded by the row width.");
+    }
+
+    // Sixel images anchor at the CURRENT cursor column, not column 0. After advancing the cursor
+    // with text, a (transparent, non-row-filling) image must start its slice at that column --
+    // guards cursor-relative horizontal placement.
+    TEST_METHOD(SixelImageRendersAtCursorColumn)
+    {
+        _testGetSet->PrepData();
+
+        // Advance the cursor five cells with text, then draw a transparent image
+        // (so the slice starts at the drawn column rather than filling the row).
+        _stateMachine->ProcessString(L"     ");
+        _stateMachine->ProcessString(L"\x1bP0;1q#0;2;100;0;0~\x1b\\");
+
+        til::CoordType imageRow = -1;
+        const auto slice = FindFirstImageSlice(*_testGetSet->_textBuffer, imageRow);
+
+        VERIFY_IS_NOT_NULL(slice);
+        VERIFY_ARE_EQUAL(5, slice->ColumnOffset(), L"The image should begin at the cursor column.");
+    }
+
+    // A taller image occupies more rows than a shorter one (monotonic, so it does
+    // not depend on the exact band-to-row rounding).
+    TEST_METHOD(SixelTallerImageOccupiesMoreRows)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1bP0;1q#0;2;100;0;0~\x1b\\");
+        const auto shortRows = CountImageRows(*_testGetSet->_textBuffer);
+
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1bP0;1q#0;2;100;0;0~-~-~-~-~-~\x1b\\");
+        const auto tallRows = CountImageRows(*_testGetSet->_textBuffer);
+
+        VERIFY_IS_TRUE(tallRows > shortRows, L"A taller image should occupy more rows than a shorter one.");
+    }
+
+    // Raster attributes (") are parsed; a zero x-aspect (the division-by-zero guard)
+    // and an oversized raster size must not crash and must stay screen-bounded.
+    // (Raster attributes " Pan;Pad;Ph;Pv: VT330/VT340 Programmer Reference, Ch.14 Sixel
+    //  Graphics -- https://vt100.net/docs/vt3xx-gp/chapter14.html)
+    TEST_METHOD(SixelRasterAttributesAreBounded)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1bPq\"5;0;100;100#0;2;100;0;0~\x1b\\"); // xAspect=0 div-guard
+        VERIFY_IS_TRUE(BufferContainsColor(*_testGetSet->_textBuffer, 255, 0, 0), L"A zero x-aspect raster must be ignored, not crash.");
+
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1bPq\"1;1;99999;99999#0;2;100;0;0~\x1b\\"); // oversized raster
+        til::CoordType row = -1;
+        const auto slice = FindFirstImageSlice(*_testGetSet->_textBuffer, row);
+        VERIFY_IS_NOT_NULL(slice);
+        VERIFY_IS_TRUE(slice->PixelWidth() <= _testGetSet->_textBuffer->GetSize().Width() * slice->CellSize().width, L"Oversized raster width must stay bounded by the row.");
+    }
+
+    // '$' (graphics carriage return) returns to the band start so a second color
+    // overlays the SAME band, unlike '-' which advances to a new band. Uses a
+    // transparent background (P2=1) so only the drawn band occupies a row.
+    TEST_METHOD(SixelDollarOverlaysSameBand)
+    {
+        _testGetSet->PrepData();
+        // Red across three columns, then '$' back to start, then blue on the first column.
+        _stateMachine->ProcessString(L"\x1bP0;1q#0;2;100;0;0~~~$#1;2;0;0;100~\x1b\\");
+        const auto& buffer = *_testGetSet->_textBuffer;
+        til::CoordType overlayRow = -1;
+        const auto slice = FindFirstImageSlice(buffer, overlayRow);
+        VERIFY_IS_NOT_NULL(slice);
+        // '$' returned to the band start, so column 0 must now be the BLUE overlay while the
+        // columns the overlay didn't cover keep the original red. Asserting exact columns (not
+        // just "blue exists somewhere") is what actually proves the graphics carriage return:
+        // had '$' failed, the blue '~' would have drawn at column 3, leaving column 0 red.
+        const auto col0 = SlicePixelAt(slice, 0, 0);
+        VERIFY_ARE_EQUAL(static_cast<BYTE>(0), col0.rgbRed, L"Column 0 was overlaid, so it is no longer red.");
+        VERIFY_ARE_EQUAL(static_cast<BYTE>(255), col0.rgbBlue, L"Column 0 shows the blue overlaid at the band start via '$'.");
+        const auto col2 = SlicePixelAt(slice, 2, 0);
+        VERIFY_ARE_EQUAL(static_cast<BYTE>(255), col2.rgbRed, L"Column 2 keeps the original red the overlay did not cover.");
+        VERIFY_ARE_EQUAL(static_cast<BYTE>(0), col2.rgbBlue, L"Column 2 was not overlaid, so it has no blue.");
+        VERIFY_ARE_EQUAL(1, CountImageRows(buffer), L"'$' overlays the same band; it must not advance to a new row.");
+    }
+
+    // P1=9 selects pixel aspect ratio 1:1, a separately optimized render path that none of the
+    // other tests (all default 2:1) exercise. Beyond "it renders", assert the geometry actually
+    // differs: 1:1 pixels are half as tall as the default 2:1, so the SAME six-band image must
+    // occupy no more buffer rows at 1:1 than at 2:1 (fewer once it crosses a cell boundary).
+    // Transparent background (P2=1) so row occupancy reflects the drawn content's height.
+    TEST_METHOD(SixelAspectRatioOneRenders)
+    {
+        // Six green bands at the default 2:1 aspect (pixels twice as tall).
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1bP0;1q#0;2;0;100;0~-~-~-~-~-~\x1b\\");
+        const auto tallRows = CountImageRows(*_testGetSet->_textBuffer);
+
+        // The same six bands at 1:1 (square pixels) -- half the device height.
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1bP9;1q#0;2;0;100;0~-~-~-~-~-~\x1b\\");
+        til::CoordType squareRow = -1;
+        const auto squareSlice = FindFirstImageSlice(*_testGetSet->_textBuffer, squareRow);
+        VERIFY_IS_NOT_NULL(squareSlice);
+        const auto squareRows = CountImageRows(*_testGetSet->_textBuffer);
+
+        VERIFY_IS_TRUE(SliceContainsColor(squareSlice, 0, 255, 0), L"The 1:1 aspect render path should render the image.");
+        VERIFY_IS_TRUE(squareRows <= tallRows, L"1:1 (square) pixels are half as tall, so must occupy no more rows than 2:1.");
+    }
+
+    // '!1' is the lower boundary of the run-length parser; it must draw exactly one column,
+    // identical to a bare '~'. Guards an off-by-one where a count of 1 could draw zero or two
+    // columns. Transparent background (P2=1) + an exact drawn-column count is required: an
+    // opaque background would hide the miscount behind a full-row-width slice.
+    TEST_METHOD(SixelRepeatCountOne)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1bP0;1q#0;2;100;0;0~\x1b\\");
+        til::CoordType r1 = -1;
+        const auto single = FindFirstImageSlice(*_testGetSet->_textBuffer, r1);
+        VERIFY_IS_NOT_NULL(single);
+        const auto singleColumns = CountColorColumnsInRow(single, 0, 255, 0, 0);
+
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1bP0;1q#0;2;100;0;0!1~\x1b\\");
+        til::CoordType r2 = -1;
+        const auto repeated = FindFirstImageSlice(*_testGetSet->_textBuffer, r2);
+        VERIFY_IS_NOT_NULL(repeated);
+        const auto repeatedColumns = CountColorColumnsInRow(repeated, 0, 255, 0, 0);
+
+        VERIFY_ARE_EQUAL(1, singleColumns, L"A bare '~' draws exactly one column.");
+        VERIFY_ARE_EQUAL(singleColumns, repeatedColumns, L"!1~ must draw the same single column as a bare '~'.");
+    }
+
+    // HLS and RGB can define the same color. WT also wraps the HLS hue modulo 360
+    // (Utils::ColorFromHLS does `hue = h % 360`), so hue 480 resolves to 120. NOTE this is
+    // WT's own leniency, not cross-emulator parity -- xterm instead rejects hue > 360. This
+    // test pins WT's documented behavior; it is not a claim about the DEC spec or xterm.
+    TEST_METHOD(SixelHlsEquivalentToRgb)
+    {
+        _testGetSet->PrepData();
+        // col 0 = RGB red; col 1 = HLS red (hue 120); col 2 = HLS red, hue wrapped (480 % 360 = 120).
+        _stateMachine->ProcessString(L"\x1bPq#0;2;100;0;0~#1;1;120;50;100~#2;1;480;50;100~\x1b\\");
+        til::CoordType row = -1;
+        const auto slice = FindFirstImageSlice(*_testGetSet->_textBuffer, row);
+        VERIFY_IS_NOT_NULL(slice);
+        const auto rgb = SlicePixelAt(slice, 0, 0);
+        const auto hls = SlicePixelAt(slice, 1, 0);
+        const auto wrapped = SlicePixelAt(slice, 2, 0);
+        VERIFY_ARE_EQUAL(static_cast<BYTE>(255), rgb.rgbRed);
+        VERIFY_ARE_EQUAL(static_cast<BYTE>(0), rgb.rgbGreen);
+        VERIFY_ARE_EQUAL(static_cast<BYTE>(0), rgb.rgbBlue);
+        VERIFY_ARE_EQUAL(rgb.rgbRed, hls.rgbRed, L"HLS red must equal RGB red.");
+        VERIFY_ARE_EQUAL(rgb.rgbGreen, hls.rgbGreen);
+        VERIFY_ARE_EQUAL(rgb.rgbBlue, hls.rgbBlue);
+        VERIFY_ARE_EQUAL(rgb.rgbRed, wrapped.rgbRed, L"A wrapped HLS hue (480) must equal hue 120.");
+        VERIFY_ARE_EQUAL(rgb.rgbGreen, wrapped.rgbGreen);
+        VERIFY_ARE_EQUAL(rgb.rgbBlue, wrapped.rgbBlue);
+    }
+
+    // Percent color channels (0..100) are converted to WT's internal 8-bit values; 50% -> 128
+    // via ((50*255 + 50) / 100). This pins WT's own conversion/rounding -- the DEC spec defines
+    // only the 0..100 percent input, not the resulting 8-bit value.
+    TEST_METHOD(SixelRgb100MidpointRounding)
+    {
+        _testGetSet->PrepData();
+        _stateMachine->ProcessString(L"\x1bPq#0;2;50;50;50~\x1b\\");
+        til::CoordType row = -1;
+        const auto slice = FindFirstImageSlice(*_testGetSet->_textBuffer, row);
+        VERIFY_IS_NOT_NULL(slice);
+        const auto p = SlicePixelAt(slice, 0, 0);
+        VERIFY_ARE_EQUAL(static_cast<BYTE>(128), p.rgbRed);
+        VERIFY_ARE_EQUAL(static_cast<BYTE>(128), p.rgbGreen);
+        VERIFY_ARE_EQUAL(static_cast<BYTE>(128), p.rgbBlue);
+    }
+
+    // Sixel has two '#' forms: '#Pc;...' DEFINES a register while a bare '#Pc' SELECTS a
+    // previously defined one. This pins the bare-select form (define 0 and 1 up front, then switch
+    // by bare id) so the parser doesn't conflate select with define or drop earlier definitions.
+    TEST_METHOD(SixelBareColorRegisterSelect)
+    {
+        _testGetSet->PrepData();
+        // Define 0=red and 1=blue up front, then bare-select each and draw a column.
+        _stateMachine->ProcessString(L"\x1bPq#0;2;100;0;0#1;2;0;0;100#0~#1~\x1b\\");
+        const auto& buffer = *_testGetSet->_textBuffer;
+        VERIFY_IS_TRUE(BufferContainsColor(buffer, 255, 0, 0), L"Bare #0 must select the red register.");
+        VERIFY_IS_TRUE(BufferContainsColor(buffer, 0, 0, 255), L"Bare #1 must select the blue register.");
     }
 
 private:
