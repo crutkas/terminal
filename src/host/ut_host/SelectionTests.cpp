@@ -7,6 +7,7 @@
 
 #include "CommonState.hpp"
 
+#include "../../buffer/out/Image.hpp"
 #include "globals.h"
 
 #include "selection.hpp"
@@ -54,6 +55,30 @@ class SelectionTests
     TEST_METHOD_CLEANUP(MethodCleanup)
     {
         return true;
+    }
+
+    TEST_METHOD(ColorSelectionPreservesImages)
+    {
+        auto& gci = ServiceLocator::LocateGlobals().getConsoleInformation();
+        auto& buffer = gci.GetActiveOutputBuffer().GetTextBuffer();
+        auto& row = buffer.GetMutableRowByOffset(0);
+        auto& images = buffer.GetMutableImages();
+        const auto cleanup = wil::scope_exit([&] {
+            images.Clear();
+            row.Reset(TextAttribute{});
+        });
+
+        row.ReplaceCharacters(1, 2, L"\x4e00");
+        const til::rect imageBounds{ 1, 0, 3, 1 };
+        const auto surface = std::make_shared<Image>(til::size{ 2, 1 }, std::vector<RGBQUAD>(2));
+        images.Add(ImagePlacement{ { 1, 1 }, surface, imageBounds, 0 });
+
+        const TextAttribute selectionAttribute{ FOREGROUND_RED | BACKGROUND_GREEN };
+        m_pSelection->ColorSelection({ 2, 0, 3, 1 }, selectionAttribute);
+
+        VERIFY_ARE_EQUAL(size_t{ 1 }, images.Size());
+        VERIFY_ARE_EQUAL(imageBounds, images.All().front().CellBounds());
+        VERIFY_ARE_EQUAL(selectionAttribute, row.GetAttrByColumn(2));
     }
 
     void VerifyGetSelectionSpans_BoxMode()

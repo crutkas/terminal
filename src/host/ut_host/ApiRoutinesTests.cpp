@@ -7,6 +7,8 @@
 
 #include "CommonState.hpp"
 
+#include "../../buffer/out/Image.hpp"
+#include "../../buffer/out/ImageSlice.hpp"
 #include "ApiRoutines.h"
 #include "getset.h"
 #include "dbcs.h"
@@ -57,6 +59,54 @@ class ApiRoutinesTests
         m_state.reset(nullptr);
 
         return true;
+    }
+
+    static void AddImageContent(TextBuffer& buffer, const til::point target)
+    {
+        const til::rect imageBounds{ target.x, target.y, target.x + 1, target.y + 1 };
+        const auto surface = std::make_shared<Image>(til::size{ 1, 1 }, std::vector<RGBQUAD>(1));
+        buffer.GetMutableImages().Add(ImagePlacement{ { 1, 1 }, surface, imageBounds, 0 });
+
+        auto slice = std::make_unique<ImageSlice>(til::size{ 1, 1 });
+        slice->MutablePixels(target.x, target.x + 1);
+        buffer.GetMutableRowByOffset(target.y).SetImageSlice(std::move(slice));
+    }
+
+    static void VerifyImageContentErased(const TextBuffer& buffer, const til::point target)
+    {
+        VERIFY_IS_TRUE(buffer.GetImages().Empty());
+        VERIFY_IS_NULL(buffer.GetRowByOffset(target.y).GetImageSlice());
+    }
+
+    TEST_METHOD(ApiWriteConsoleOutputAttributeErasesImages)
+    {
+        auto& gci = ServiceLocator::LocateGlobals().getConsoleInformation();
+        auto& screenInfo = gci.GetActiveOutputBuffer();
+        auto& buffer = screenInfo.GetTextBuffer();
+        const til::point target{ 2, 0 };
+        AddImageContent(buffer, target);
+
+        static constexpr std::array attributes{ WORD{ FOREGROUND_RED } };
+        size_t used = 0;
+        VERIFY_SUCCEEDED(_Routines.WriteConsoleOutputAttributeImpl(screenInfo, attributes, target, used));
+
+        VERIFY_ARE_EQUAL(size_t{ 1 }, used);
+        VerifyImageContentErased(buffer, target);
+    }
+
+    TEST_METHOD(ApiFillConsoleOutputAttributeErasesImages)
+    {
+        auto& gci = ServiceLocator::LocateGlobals().getConsoleInformation();
+        auto& screenInfo = gci.GetActiveOutputBuffer();
+        auto& buffer = screenInfo.GetTextBuffer();
+        const til::point target{ 2, 0 };
+        AddImageContent(buffer, target);
+
+        size_t used = 0;
+        VERIFY_SUCCEEDED(_Routines.FillConsoleOutputAttributeImpl(screenInfo, FOREGROUND_RED, 1, target, used, false));
+
+        VERIFY_ARE_EQUAL(size_t{ 1 }, used);
+        VerifyImageContentErased(buffer, target);
     }
 
     BOOL _fPrevInsertMode;

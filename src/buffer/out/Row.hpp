@@ -48,6 +48,12 @@ struct RowWriteState
     til::CoordType columnEndDirty = 0; // OUT
 };
 
+struct RowTextDirtyRange
+{
+    til::CoordType columnBegin;
+    til::CoordType columnEnd;
+};
+
 struct RowCopyTextFromState
 {
     // The row to copy text from.
@@ -147,10 +153,10 @@ public:
     til::CoordType AdjustToGlyphEnd(til::CoordType column) const noexcept;
 
     void ClearCell(til::CoordType column);
-    OutputCellIterator WriteCells(OutputCellIterator it, til::CoordType columnBegin, std::optional<bool> wrap = std::nullopt, std::optional<til::CoordType> limitRight = std::nullopt);
+    OutputCellIterator WriteCells(OutputCellIterator it, til::CoordType columnBegin, std::optional<bool> wrap = std::nullopt, std::optional<til::CoordType> limitRight = std::nullopt, til::CoordType* columnBeginDirty = nullptr, til::CoordType* columnEndDirty = nullptr, std::vector<RowTextDirtyRange>* textDirtyRanges = nullptr);
     void SetAttrToEnd(til::CoordType columnBegin, TextAttribute attr);
     void ReplaceAttributes(til::CoordType beginIndex, til::CoordType endIndex, const TextAttribute& newAttr);
-    void ReplaceCharacters(til::CoordType columnBegin, til::CoordType width, const std::wstring_view& chars);
+    void ReplaceCharacters(til::CoordType columnBegin, til::CoordType width, const std::wstring_view& chars, til::CoordType* columnBeginDirty = nullptr, til::CoordType* columnEndDirty = nullptr);
     void ReplaceText(RowWriteState& state);
     void CopyTextFrom(RowCopyTextFromState& state);
 

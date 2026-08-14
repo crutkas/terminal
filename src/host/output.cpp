@@ -95,6 +95,8 @@ static void _CopyRectangle(SCREEN_INFORMATION& screenInfo,
     //    erase the source material before it can be copied/moved to the new location.
     {
         const auto target = Viewport::FromDimensions(targetOrigin, source.Dimensions());
+        auto& textBuffer = screenInfo.GetTextBuffer();
+        const auto sourceImages = textBuffer.GetImages().Snapshot();
         const auto walkDirection = Viewport::DetermineWalkDirection(source, target);
 
         auto sourcePos = source.GetWalkOrigin(walkDirection);
@@ -109,10 +111,10 @@ static void _CopyRectangle(SCREEN_INFORMATION& screenInfo,
             const auto current = next;
             source.WalkInBounds(sourcePos, walkDirection);
             next = OutputCell(*screenInfo.GetCellDataAt(sourcePos));
-            screenInfo.GetTextBuffer().WriteLine(OutputCellIterator({ &current, 1 }), targetPos);
+            textBuffer.WriteLine(OutputCellIterator({ &current, 1 }), targetPos);
         } while (target.WalkInBounds(targetPos, walkDirection));
 
-        auto& textBuffer = screenInfo.GetTextBuffer();
+        sourceImages.CopyArea(source.ToExclusive(), targetOrigin, textBuffer.GetMutableImages());
         ImageSlice::CopyBlock(textBuffer, source.ToExclusive(), textBuffer, target.ToExclusive());
     }
 }

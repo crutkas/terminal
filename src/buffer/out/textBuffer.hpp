@@ -50,6 +50,7 @@ filling in the last row, and updating the screen.
 #pragma once
 
 #include "cursor.h"
+#include "Image.hpp"
 #include "Row.hpp"
 #include "TextAttribute.hpp"
 #include "../types/inc/Viewport.hpp"
@@ -89,6 +90,8 @@ public:
     ROW& GetScratchpadRow(const TextAttribute& attributes);
     const ROW& GetRowByOffset(til::CoordType index) const;
     ROW& GetMutableRowByOffset(til::CoordType index);
+    const ImageCollection& GetImages() const noexcept;
+    ImageCollection& GetMutableImages() noexcept;
 
     TextBufferCellIterator GetCellDataAt(const til::point at) const;
     TextBufferCellIterator GetCellLineDataAt(const til::point at) const;
@@ -155,6 +158,7 @@ public:
     til::point BufferToScreenPosition(const til::point position) const;
 
     void Reset() noexcept;
+    void ResetRow(til::CoordType row, const TextAttribute& attributes);
     void ClearScrollback(const til::CoordType start, const til::CoordType height);
 
     void ResizeTraditional(const til::size newSize);
@@ -324,6 +328,8 @@ private:
     til::CoordType _estimateOffsetOfLastCommittedRow() const noexcept;
     bool _isRowCommitted(til::CoordType y) const noexcept;
 
+    void _copyRowData(til::CoordType srcRow, til::CoordType dstRow, TextBuffer& dstBuffer) const;
+    void _scrollRows(til::CoordType firstRow, til::CoordType size, til::CoordType delta, bool copyImages);
     void _SetFirstRowIndex(const til::CoordType FirstRowIndex) noexcept;
     void _ExpandTextRow(til::inclusive_rect& selectionRow) const;
     DelimiterClass _GetDelimiterClassAt(const til::point pos, const std::wstring_view wordDelimiters) const;
@@ -342,6 +348,7 @@ private:
     static void _AppendRTFText(std::string& contentBuilder, const std::wstring_view& text);
 
     Microsoft::Console::Render::Renderer* _renderer = nullptr;
+    ImageCollection _images;
 
     std::unordered_map<uint16_t, std::wstring> _hyperlinkMap;
     std::unordered_map<std::wstring, uint16_t> _hyperlinkCustomIdMap;
