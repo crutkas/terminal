@@ -1099,15 +1099,77 @@ void Renderer::_PaintBufferOutput(_In_ IRenderEngine* const pEngine)
             // Prepare the appropriate line transform for the current row and viewport offset.
             LOG_IF_FAILED(pEngine->PrepareLineTransform(lineRendition, screenPosition.y, _viewport.Left()));
 
+            // Image content is painted around the text so that it can sit below
+            // it. The engine decides how; all we do is bracket the text.
+            const auto imageSlice = r.GetImageSlice();
+            const auto hasImages = imageSlice && (imageSlice->HasPixels(ImageSlice::RenderPosition::BehindBackground) ||
+                                                  imageSlice->HasPixels(ImageSlice::RenderPosition::BehindText) ||
+                                                  imageSlice->HasPixels(ImageSlice::RenderPosition::AboveText));
+            if (hasImages) [[unlikely]]
+            {
+                _buildImageRowBackgrounds(r, *imageSlice);
+                LOG_IF_FAILED(pEngine->BeginRowImages(*imageSlice, screenPosition.y, _viewport.Left(), _backgroundMask, _backgroundColors));
+            }
+
+            // Painting text can throw, and an engine left mid-row would keep
+            // suppressing cell backgrounds on every row after it.
+            const auto endRowImages = wil::scope_exit([&]() noexcept {
+                if (hasImages)
+                {
+                    LOG_IF_FAILED(pEngine->EndRowImages());
+                }
+            });
+
             // Ask the helper to paint through this specific line.
             _PaintBufferOutputHelper(pEngine, it, screenPosition);
+        }
+    }
+}
 
-            // Paint any image content on top of the text.
-            const auto imageSlice = buffer.GetRowByOffset(row).GetImageSlice();
-            if (imageSlice) [[unlikely]]
-            {
-                LOG_IF_FAILED(pEngine->PaintImageSlice(*imageSlice, screenPosition.y, _viewport.Left()));
-            }
+// Resolves, for each column of `imageSlice`, whether the cell's background is the
+// default one - content below the background only shows through where it is - and
+// what that background's color is, which content above the background has to be
+// composited over. Both are left empty when the slice has nothing to draw beneath
+// the text, which is the case for every image that predates layering.
+void Renderer::_buildImageRowBackgrounds(const ROW& r, const ImageSlice& imageSlice)
+{
+    _backgroundMask.clear();
+    _backgroundColors.clear();
+
+    if (!imageSlice.HasPixels(ImageSlice::RenderPosition::BehindBackground) &&
+        !imageSlice.HasPixels(ImageSlice::RenderPosition::BehindText))
+    {
+        return;
+    }
+
+    const auto cellWidth = imageSlice.CellSize().width;
+    if (cellWidth <= 0)
+    {
+        return;
+    }
+
+    const auto columnCount = gsl::narrow_cast<size_t>(imageSlice.PixelWidth() / cellWidth);
+    // Reused across rows and frames; painting is hot and this would otherwise
+    // be a heap allocation per row per frame. Columns we can't resolve keep the
+    // default background, which hides content below it rather than letting it
+    // bleed through, and makes the fill above it a no-op.
+    const auto defaultBackground = _renderSettings.GetAttributeColors({}).second;
+    _backgroundMask.assign(columnCount, uint8_t{ 0 });
+    _backgroundColors.assign(columnCount, defaultBackground);
+
+    // A slice indexes screen columns, which a non-single-width rendition
+    // doubles; the row's attributes are indexed by buffer column.
+    const auto scale = r.GetLineRendition() != LineRendition::SingleWidth ? 1 : 0;
+    const auto readableColumns = r.GetReadableColumnCount();
+    for (size_t column = 0; column < columnCount; column++)
+    {
+        const auto sliceColumn = imageSlice.ColumnOffset() + gsl::narrow_cast<til::CoordType>(column);
+        const auto bufferColumn = sliceColumn >> scale;
+        if (bufferColumn >= 0 && bufferColumn < readableColumns)
+        {
+            const auto attributes = r.GetAttrByColumn(bufferColumn);
+            til::at(_backgroundMask, column) = attributes.GetBackground().IsDefault() ? 1 : 0;
+            til::at(_backgroundColors, column) = _renderSettings.GetAttributeColors(attributes).second;
         }
     }
 }
