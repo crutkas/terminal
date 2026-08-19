@@ -225,6 +225,7 @@ void ImageSlice::_ensureRange(const til::CoordType columnBegin, const til::Coord
     {
         const auto before = _layerBytes(layer);
         RelocatePlane(layer.pixels, oldPixelWidth, _pixelWidth, newPixelOffset, _cellSize.height);
+        RelocatePlane(layer.sourceIndices, oldPixelWidth, _pixelWidth, newPixelOffset, _cellSize.height, NoSourceIndex);
         RelocateColumns(layer.columns, newColumnCount, newColumnOffset);
         // This growth is forced by geometry rather than requested by a write,
         // so it is charged to the budget but not refused.
@@ -477,7 +478,7 @@ void ImageSlice::_eraseBasePlane(const til::CoordType columnBegin, const til::Co
 
 size_t ImageSlice::_layerBytes(const Layer& layer) noexcept
 {
-    return layer.pixels.size() * sizeof(RGBQUAD) + layer.columns.size();
+    return layer.pixels.size() * sizeof(RGBQUAD) + layer.sourceIndices.size() * sizeof(uint32_t) + layer.columns.size();
 }
 
 // A revision of 0 is never handed out by BumpRevision, so it doubles as the
@@ -522,6 +523,20 @@ void ImageSlice::_clearLayerColumns(Layer& layer, const til::CoordType columnBeg
         for (auto y = 0; y < _cellSize.height; y++)
         {
             std::memset(iterator, 0, static_cast<size_t>(length) * sizeof(RGBQUAD));
+            std::advance(iterator, _pixelWidth);
+        }
+    }
+
+    // Cleared cells no longer sample the source image, so a later update must
+    // not write pixels back into them.
+    if (!layer.sourceIndices.empty())
+    {
+        const auto offset = (clearBegin - _columnBegin) * _cellSize.width;
+        const auto length = (clearEnd - clearBegin) * _cellSize.width;
+        auto iterator = std::next(layer.sourceIndices.data(), offset);
+        for (auto y = 0; y < _cellSize.height; y++)
+        {
+            std::fill_n(iterator, length, NoSourceIndex);
             std::advance(iterator, _pixelWidth);
         }
     }
@@ -691,6 +706,7 @@ RGBQUAD* ImageSlice::TryMutablePixels(const til::CoordType columnBegin, const ti
     auto& layer = _getLayer(key, zIndex);
     const auto before = _layerBytes(layer);
     layer.pixels.resize(planeSize);
+    layer.sourceIndices.resize(planeSize, NoSourceIndex);
     layer.columns.resize(columnCount, 0);
     for (auto column = columnBegin; column < columnEnd; column++)
     {
@@ -914,6 +930,25 @@ void ImageSlice::_copyLayers(const ImageSlice& srcSlice, const til::CoordType sr
             std::advance(dstIterator, _pixelWidth);
         }
 
+        // The sampling record travels with the pixels, so a copied layer still
+        // follows changes to its source image.
+        if (!srcLayer.sourceIndices.empty())
+        {
+            const auto dstIndices = MutableSourceIndices(dstColumnBegin, dstColumnEnd, srcLayer.key, srcLayer.zIndex);
+            if (dstIndices)
+            {
+                auto srcIndexIterator = std::next(srcLayer.sourceIndices.data(), (srcColumn - srcColumnBegin) * _cellSize.width);
+                auto dstIndexIterator = dstIndices;
+                const auto indexCount = static_cast<size_t>(columnCount) * _cellSize.width;
+                for (auto y = 0; y < _cellSize.height; y++)
+                {
+                    std::memmove(dstIndexIterator, srcIndexIterator, indexCount * sizeof(uint32_t));
+                    std::advance(srcIndexIterator, srcPixelWidth);
+                    std::advance(dstIndexIterator, _pixelWidth);
+                }
+            }
+        }
+
         // Coverage has to follow the pixels, otherwise a later targeted erase
         // would skip the cells we just wrote.
         auto& dstLayer = _getLayer(srcLayer.key, srcLayer.zIndex);
@@ -933,6 +968,55 @@ void ImageSlice::_copyLayers(const ImageSlice& srcSlice, const til::CoordType sr
     _invalidateComposites();
 }
 
+uint32_t* ImageSlice::MutableSourceIndices(const til::CoordType columnBegin, const til::CoordType columnEnd, const LayerKey key, const int32_t zIndex)
+{
+    // The base plane carries no identity, so nothing can ever re-sample it.
+    if (key.Untagged())
+    {
+        return nullptr;
+    }
+
+    // MutablePixels is what decides whether the layer may exist at all; asking
+    // it first keeps the budget and layer-count rules in exactly one place.
+    if (!TryMutablePixels(columnBegin, columnEnd, key, zIndex))
+    {
+        return nullptr;
+    }
+
+    auto& layer = _getLayer(key, zIndex);
+    const auto pixelOffset = (columnBegin - _columnBegin) * _cellSize.width;
+    return &til::at(layer.sourceIndices, pixelOffset);
+}
+
+// Re-samples every layer of an image from new pixel data, in place. Only cells
+// that recorded a source index are touched, so cells that were erased or
+// overwritten since the placement stay gone.
+bool ImageSlice::UpdateImage(const uint32_t imageId, const std::span<const RGBQUAD> pixels)
+{
+    auto changed = false;
+    for (auto& layer : _layers)
+    {
+        if (layer.key.imageId != imageId || layer.sourceIndices.size() != layer.pixels.size())
+        {
+            continue;
+        }
+        for (size_t i = 0; i < layer.pixels.size(); i++)
+        {
+            const auto sourceIndex = til::at(layer.sourceIndices, i);
+            if (sourceIndex != NoSourceIndex)
+            {
+                til::at(layer.pixels, i) = sourceIndex < pixels.size() ? pixels[sourceIndex] : RGBQUAD{};
+                changed = true;
+            }
+        }
+    }
+    if (changed)
+    {
+        BumpRevision();
+        _invalidateComposites();
+    }
+    return changed;
+}
 
 size_t ImageSlice::WriteMemoryUpperBound(const til::CoordType columnBegin, const til::CoordType columnEnd, const LayerKey key, const int32_t zIndex) const noexcept
 {
@@ -1137,6 +1221,23 @@ bool ImageSlice::_copyLayerCells(const ImageSlice& srcSlice, const til::CoordTyp
             std::advance(dstIterator, _pixelWidth);
         }
 
+        if (!srcLayer.sourceIndices.empty())
+        {
+            const auto dstIndices = MutableSourceIndices(dstColumnBegin, dstColumnEnd, srcLayer.key, srcLayer.zIndex);
+            if (dstIndices)
+            {
+                auto srcIndexIterator = std::next(srcLayer.sourceIndices.data(), srcOffset * _cellSize.width);
+                auto dstIndexIterator = dstIndices;
+                const auto indexCount = static_cast<size_t>(columnCount) * _cellSize.width;
+                for (auto y = 0; y < _cellSize.height; y++)
+                {
+                    std::memmove(dstIndexIterator, srcIndexIterator, indexCount * sizeof(uint32_t));
+                    std::advance(srcIndexIterator, srcPixelWidth);
+                    std::advance(dstIndexIterator, _pixelWidth);
+                }
+            }
+        }
+
         auto& dstLayer = _getLayer(srcLayer.key, srcLayer.zIndex);
         for (auto column = 0; column < columnCount; column++)
         {
@@ -1258,6 +1359,22 @@ void ImageSlice::_mergePreservedCells(const ImageSlice& srcSlice)
                 std::memcpy(destination, source, rowByteCount);
                 std::advance(source, srcSlice._pixelWidth);
                 std::advance(destination, _pixelWidth);
+            }
+
+            if (!srcLayer.sourceIndices.empty())
+            {
+                const auto dstIndices = MutableSourceIndices(column, column + 1, srcLayer.key, srcLayer.zIndex);
+                if (dstIndices)
+                {
+                    auto sourceIndices = std::next(srcLayer.sourceIndices.data(), static_cast<til::CoordType>(srcIndex) * _cellSize.width);
+                    auto destinationIndices = dstIndices;
+                    for (auto y = 0; y < _cellSize.height; y++)
+                    {
+                        std::memcpy(destinationIndices, sourceIndices, static_cast<size_t>(_cellSize.width) * sizeof(uint32_t));
+                        std::advance(sourceIndices, srcSlice._pixelWidth);
+                        std::advance(destinationIndices, _pixelWidth);
+                    }
+                }
             }
         }
     }
