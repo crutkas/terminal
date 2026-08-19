@@ -5,18 +5,33 @@
 
 #include "adaptDispatch.hpp"
 #include "SixelParser.hpp"
+#include "KittyParser.hpp"
+#include "../buffer/out/ImageSlice.hpp"
 #include "../../inc/unicode.hpp"
+#include <til/unicode.h>
 #include "../../renderer/base/renderer.hpp"
 #include "../../types/inc/CodepointWidthDetector.hpp"
 #include "../../types/inc/utils.hpp"
 #include "../../types/inc/Viewport.hpp"
 #include "../parser/ascii.hpp"
 
+#include <mutex>
+
+
 using namespace Microsoft::Console::Types;
 using namespace Microsoft::Console::Render;
 using namespace Microsoft::Console::VirtualTerminal;
 
 static constexpr std::wstring_view whitespace{ L" " };
+
+static ImageCellRef getImageCellRef(const TextBuffer& buffer, const til::point position) noexcept
+{
+    if (const auto metadata = buffer.GetRowByOffset(position.y).GetImageCellRef(position.x))
+    {
+        return *metadata;
+    }
+    return {};
+}
 
 struct XtermResourceColorTableEntry
 {
@@ -105,6 +120,10 @@ void AdaptDispatch::_WriteToBuffer(const std::wstring_view string)
     auto cursorPosition = cursor.GetPosition();
     const auto wrapAtEOL = _api.GetSystemMode(ITerminalApi::Mode::AutoWrap);
     const auto& attributes = page.Attributes();
+    // Kitty Unicode placeholders (cells holding U+10EEEE) overlay a sub-rect of a virtually
+    // placed image. They're rendered per written segment inside the loop below, after each
+    // segment's wrap resolves, so a wrapped or scrolled run lands every cell on its real row.
+    const auto hasKittyPlaceholders = _kittyParser && string.find(KittyParser::PlaceholderCodePointHigh) != std::wstring_view::npos;
 
     auto [topMargin, bottomMargin] = _GetVerticalMargins(page, true);
     const auto [leftMargin, rightMargin] = _GetHorizontalMargins(page.Width());
@@ -160,6 +179,18 @@ void AdaptDispatch::_WriteToBuffer(const std::wstring_view string)
             textBuffer.Replace(cursorPosition.y, attributes, state);
         }
         const auto textPositionAfter = state.text.data();
+
+        // Overlay any placeholders in the segment just written, on its real (post-wrap) row
+        // and from its true start column, so wrapping and bottom-of-buffer scrolls place each
+        // cell correctly rather than replaying the whole run from one pre-wrap origin.
+        if (hasKittyPlaceholders && textPositionAfter > textPositionBefore)
+        {
+            const std::wstring_view segment{ textPositionBefore, static_cast<size_t>(textPositionAfter - textPositionBefore) };
+            if (segment.find(KittyParser::PlaceholderCodePointHigh) != std::wstring_view::npos)
+            {
+                _kittyParser->RenderPlaceholders(segment, cursorPosition.y, state.columnBegin);
+            }
+        }
 
         // If we're past the end of the line, we need to clamp the cursor
         // back into range, and if wrapping is enabled, set the delayed wrap
@@ -577,7 +608,12 @@ void AdaptDispatch::_ScrollRectVertically(const Page& page, const til::rect& scr
             do
             {
                 const auto current = OutputCell(*textBuffer.GetCellDataAt(srcPos));
+                const auto metadata = getImageCellRef(textBuffer, srcPos);
                 textBuffer.WriteLine(OutputCellIterator({ &current, 1 }), dstPos);
+                if (metadata.valid)
+                {
+                    textBuffer.GetMutableRowByOffset(dstPos.y).SetImageCellRef(dstPos.x, metadata);
+                }
                 srcView.WalkInBounds(srcPos, walkDirection);
             } while (dstView.WalkInBounds(dstPos, walkDirection));
             // Copy any image content in the affected area.
@@ -625,12 +661,19 @@ void AdaptDispatch::_ScrollRectHorizontally(const Page& page, const til::rect& s
         // to the target, so a two-cell DBCS character can't accidentally delete
         // itself when moving one cell horizontally.
         auto next = OutputCell(*textBuffer.GetCellDataAt(sourcePos));
+        auto nextMetadata = getImageCellRef(textBuffer, sourcePos);
         do
         {
             const auto current = next;
+            const auto currentMetadata = nextMetadata;
             source.WalkInBounds(sourcePos, walkDirection);
             next = OutputCell(*textBuffer.GetCellDataAt(sourcePos));
+            nextMetadata = getImageCellRef(textBuffer, sourcePos);
             textBuffer.WriteLine(OutputCellIterator({ &current, 1 }), targetPos);
+            if (currentMetadata.valid)
+            {
+                textBuffer.GetMutableRowByOffset(targetPos.y).SetImageCellRef(targetPos.x, currentMetadata);
+            }
         } while (target.WalkInBounds(targetPos, walkDirection));
         // Copy any image content in the affected area.
         ImageSlice::CopyBlock(textBuffer, source.ToExclusive(), textBuffer, target.ToExclusive());
@@ -1169,17 +1212,24 @@ void AdaptDispatch::CopyRectangularArea(const VTInt top, const VTInt left, const
         // to the target, so a two-cell DBCS character can't accidentally delete
         // itself when moving one cell horizontally.
         auto next = OutputCell(*src.Buffer().GetCellDataAt(srcPos));
+        auto nextMetadata = getImageCellRef(src.Buffer(), srcPos);
         do
         {
             const auto current = next;
+            const auto currentMetadata = nextMetadata;
             const auto currentSrcPos = srcPos;
             srcView.WalkInBounds(srcPos, walkDirection);
             next = OutputCell(*src.Buffer().GetCellDataAt(srcPos));
+            nextMetadata = getImageCellRef(src.Buffer(), srcPos);
             // If the source position is offscreen (which can occur on double
             // width lines), then we shouldn't copy anything to the destination.
             if (currentSrcPos.x < src.Buffer().GetLineWidth(currentSrcPos.y))
             {
                 dst.Buffer().WriteLine(OutputCellIterator({ &current, 1 }), dstPos);
+                if (currentMetadata.valid)
+                {
+                    dst.Buffer().GetMutableRowByOffset(dstPos.y).SetImageCellRef(dstPos.x, currentMetadata);
+                }
             }
         } while (dstView.WalkInBounds(dstPos, walkDirection));
         // Copy any image content in the affected area.
@@ -1740,17 +1790,34 @@ void AdaptDispatch::_SetColumnMode(const bool enable)
 // - <none>
 void AdaptDispatch::_SetAlternateScreenBufferMode(const bool enable)
 {
+    if (enable == _usingAltBuffer)
+    {
+        return;
+    }
+
     if (enable)
     {
         CursorSaveState();
+        if (_kittyParser)
+        {
+            _kittyParser->SaveMainBufferState();
+        }
         const auto page = _pages.ActivePage();
         _api.UseAlternateScreenBuffer(_GetEraseAttributes(page));
         _usingAltBuffer = true;
     }
     else
     {
+        if (_kittyParser)
+        {
+            _kittyParser->DiscardBufferState();
+        }
         _api.UseMainScreenBuffer();
         _usingAltBuffer = false;
+        if (_kittyParser)
+        {
+            _kittyParser->RestoreMainBufferState();
+        }
         CursorRestoreState();
     }
 }
@@ -3042,6 +3109,10 @@ void AdaptDispatch::SoftReset()
 void AdaptDispatch::HardReset(bool erase)
 {
     // If in the alt buffer, switch back to main before doing anything else.
+    // This deliberately does not go through _SetAlternateScreenBufferMode: that
+    // helper also restores the saved cursor state, which a hard reset must not
+    // do, and its Kitty save/discard work is redundant here because the whole
+    // point of this function is to throw everything away, which it does below.
     if (_usingAltBuffer)
     {
         _api.UseMainScreenBuffer();
@@ -3053,6 +3124,12 @@ void AdaptDispatch::HardReset(bool erase)
 
     // Reset the Sixel parser.
     _sixelParser = nullptr;
+
+    // Reset the Kitty graphics parser.
+    if (_kittyParser)
+    {
+        _kittyParser->HardReset();
+    }
 
     // Completely reset the TerminalOutput state.
     _termOutput = {};
@@ -3240,6 +3317,17 @@ void AdaptDispatch::_EraseAll()
 
     // Also reset the line rendition for the erased rows.
     textBuffer.ResetLineRenditionRange(newPageTop, newPageBottom);
+
+    // The kitty protocol requires that clearing the screen also clears images.
+    // The pixels go with the rows above, but the placement registry has to be
+    // told as well, otherwise cleared images keep a placement slot and keep
+    // looking "still displayed" to the quota evictor and to d=I. The image data
+    // itself is kept, matching the protocol's d=a semantics.
+    // https://sw.kovidgoyal.net/kitty/graphics-protocol/#deleting-images
+    if (_kittyParser)
+    {
+        _kittyParser->ErasePlacements();
+    }
 }
 
 //Routine Description:
@@ -4867,6 +4955,29 @@ void AdaptDispatch::_ReturnDcsResponse(const std::wstring_view response) const
     const auto dcs = _terminalInput.GetInputMode(TerminalInput::Mode::SendC1) ? L"\x90" : L"\x1BP";
     const auto st = _terminalInput.GetInputMode(TerminalInput::Mode::SendC1) ? L"\x9C" : L"\x1B\\";
     _api.ReturnResponse(fmt::format(FMT_COMPILE(L"{}{}{}"), dcs, response, st));
+}
+
+void AdaptDispatch::_ReturnApcResponse(const std::wstring_view response) const
+{
+    const auto c1 = _terminalInput.GetInputMode(TerminalInput::Mode::SendC1);
+    const auto apc = c1 ? L"\x9F" : L"\x1B_";
+    const auto st = c1 ? L"\x9C" : L"\x1B\\";
+    _api.ReturnResponse(fmt::format(FMT_COMPILE(L"{}{}{}"), apc, response, st));
+}
+
+// Routine Description:
+// - Kitty graphics protocol (APC G). The parser has already read the 'G'
+//   identifier and routed us here on the strength of it; everything after it is
+//   the protocol's business, so hand the rest of the string to the parser.
+// Return Value:
+// - a function to receive the remaining characters of the control string.
+ITermDispatch::StringHandler AdaptDispatch::KittyGraphics()
+{
+    if (!_kittyParser)
+    {
+        _kittyParser = std::make_unique<KittyParser>(*this);
+    }
+    return _kittyParser->DefineImage();
 }
 
 void AdaptDispatch::_ReturnOscResponse(const std::wstring_view response) const

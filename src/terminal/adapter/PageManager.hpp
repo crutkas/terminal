@@ -52,6 +52,28 @@ namespace Microsoft::Console::VirtualTerminal
         Page Get(const til::CoordType pageNumber) const;
         Page ActivePage() const;
         Page VisiblePage() const;
+        template<typename Callback>
+        void ForEachPage(Callback&& callback) const
+        {
+            auto [visibleBuffer, visibleViewport, isMainBuffer] = _api.GetBufferAndViewport();
+            if (!isMainBuffer)
+            {
+                callback(Page{ visibleBuffer, visibleViewport, 1 });
+                return;
+            }
+
+            callback(Page{ visibleBuffer, visibleViewport, _visiblePageNumber });
+            const auto pageSize = visibleViewport.size();
+            for (til::CoordType pageNumber = 1; pageNumber <= MAX_PAGES; ++pageNumber)
+            {
+                if (pageNumber == _visiblePageNumber || !_buffers.at(pageNumber - 1))
+                {
+                    continue;
+                }
+
+                callback(Page{ _getBuffer(pageNumber, pageSize), til::rect{ pageSize }, pageNumber });
+            }
+        }
         void MoveTo(const til::CoordType pageNumber, const bool makeVisible);
         void MoveRelative(const til::CoordType pageCount, const bool makeVisible);
         void MakeActivePageVisible();

@@ -76,6 +76,13 @@ namespace Microsoft::Console::Render
         void UpdateHyperlinkHoveredId(uint16_t id) noexcept;
         void UpdateLastHoveredInterval(const std::optional<interval_tree::IntervalTree<til::point, size_t>::interval>& newInterval);
 
+    protected:
+        // Paints one frame on the calling thread. The render thread is the only caller in
+        // a real host, which is why this is not public; it is reachable by a derived class
+        // so that DummyRenderer can offer tests a paint that does not depend on a thread
+        // being scheduled.
+        [[nodiscard]] HRESULT PaintFrame();
+
     private:
         struct TimerRoutine
         {
@@ -112,7 +119,6 @@ namespace Microsoft::Console::Render
         static DWORD _timerToMillis(TimerRepr t) noexcept;
 
         // Actual rendering
-        [[nodiscard]] HRESULT PaintFrame();
         [[nodiscard]] HRESULT _PaintFrame() noexcept;
         [[nodiscard]] HRESULT _PaintFrameForEngine(_In_ IRenderEngine* const pEngine) noexcept;
         void _disablePainting() noexcept;

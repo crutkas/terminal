@@ -20,6 +20,15 @@ Author(s):
 #include "MacroBuffer.hpp"
 #include "PageManager.hpp"
 #include "terminalOutput.hpp"
+#include "../../renderer/inc/IRenderData.hpp"
+
+#include <unordered_map>
+#include <map>
+#include <deque>
+#include <optional>
+#include <algorithm>
+#include <memory>
+#include <mutex>
 #include "../input/terminalInput.hpp"
 #include "../../types/inc/sgrStack.hpp"
 
@@ -30,6 +39,8 @@ class AdapterTest;
 
 namespace Microsoft::Console::VirtualTerminal
 {
+    class KittyParser;
+
     class AdaptDispatch : public ITermDispatch
     {
         using Renderer = Microsoft::Console::Render::Renderer;
@@ -169,6 +180,8 @@ namespace Microsoft::Console::VirtualTerminal
                                        const DispatchTypes::SixelBackground backgroundSelect,
                                        const VTParameter backgroundColor) override; // SIXEL
 
+        StringHandler KittyGraphics() override; // Kitty graphics protocol (APC G)
+
         StringHandler DownloadDRCS(const VTInt fontNumber,
                                    const VTParameter startChar,
                                    const DispatchTypes::DrcsEraseControl eraseControl,
@@ -304,6 +317,7 @@ namespace Microsoft::Console::VirtualTerminal
 
         void _ReturnCsiResponse(const std::wstring_view response) const;
         void _ReturnDcsResponse(const std::wstring_view response) const;
+        void _ReturnApcResponse(const std::wstring_view response) const;
         void _ReturnOscResponse(const std::wstring_view response) const;
 
         std::vector<uint8_t> _tabStopColumns;
@@ -317,10 +331,13 @@ namespace Microsoft::Console::VirtualTerminal
         PageManager _pages;
         friend class SixelParser;
         std::shared_ptr<SixelParser> _sixelParser;
+        friend class KittyParser;
+        std::unique_ptr<KittyParser> _kittyParser;
         std::unique_ptr<FontBuffer> _fontBuffer;
         std::shared_ptr<MacroBuffer> _macroBuffer;
         std::optional<unsigned int> _initialCodePage;
         til::enumset<OptionalFeature> _optionalFeatures = { OptionalFeature::ClipboardWrite };
+
 
         // We have two instances of the saved cursor state, because we need
         // one for the main buffer (at index 0), and another for the alt buffer

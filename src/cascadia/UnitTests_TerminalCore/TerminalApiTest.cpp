@@ -7,13 +7,398 @@
 #include "../cascadia/TerminalCore/Terminal.hpp"
 #include "MockTermSettings.h"
 #include "../renderer/inc/DummyRenderer.hpp"
+#include "../renderer/inc/RenderEngineBase.hpp"
 #include "consoletaeftemplates.hpp"
+
+#include <wil/resource.h>
 
 using namespace winrt::Microsoft::Terminal::Core;
 using namespace Microsoft::Terminal::Core;
+using namespace Microsoft::Console::Render;
 
 using namespace WEX::Logging;
 using namespace WEX::TestExecution;
+
+namespace
+{
+    struct PaintedCluster
+    {
+        til::point position;
+        til::CoordType columns;
+        std::wstring text;
+        TextAttribute attribute;
+    };
+
+    struct PaintedImage
+    {
+        til::CoordType targetRow;
+        til::CoordType columnOffset;
+        std::vector<uint32_t> columnOwners;
+        std::vector<bool> columnsContainRed;
+        std::vector<bool> columnsContainGreen;
+        std::vector<uint8_t> defaultBackgroundMask;
+        std::vector<COLORREF> cellBackgrounds;
+    };
+
+    struct PaintedFrame
+    {
+        std::vector<PaintedCluster> clusters;
+        std::vector<PaintedImage> images;
+    };
+
+    class KittyRecordingRenderEngine final : public RenderEngineBase
+    {
+    public:
+        HRESULT StartPaint() noexcept override
+        {
+            const auto guard = _lock.lock_exclusive();
+            _clusters.clear();
+            _images.clear();
+            return S_OK;
+        }
+
+        HRESULT EndPaint() noexcept override
+        {
+            return S_OK;
+        }
+
+        HRESULT Present() noexcept override
+        try
+        {
+            const auto guard = _lock.lock_exclusive();
+            _presentedClusters = _clusters;
+            _presentedImages = _images;
+            return S_OK;
+        }
+        CATCH_RETURN()
+
+        HRESULT ScrollFrame() noexcept override
+        {
+            return S_OK;
+        }
+
+        HRESULT Invalidate(const til::rect* /*region*/) noexcept override
+        {
+            return S_OK;
+        }
+
+        HRESULT InvalidateCursor(const til::rect* /*region*/) noexcept override
+        {
+            return S_OK;
+        }
+
+        HRESULT InvalidateSystem(const til::rect* /*region*/) noexcept override
+        {
+            return S_OK;
+        }
+
+        HRESULT InvalidateScroll(const til::point* /*delta*/) noexcept override
+        {
+            return S_OK;
+        }
+
+        HRESULT InvalidateAll() noexcept override
+        {
+            return S_OK;
+        }
+
+        HRESULT PaintBackground() noexcept override
+        {
+            return S_OK;
+        }
+
+        HRESULT PaintBufferLine(const std::span<const Cluster> clusters, til::point position, bool /*trimLeft*/) noexcept override
+        try
+        {
+            const auto guard = _lock.lock_exclusive();
+            for (const auto& cluster : clusters)
+            {
+                _clusters.emplace_back(position, cluster.GetColumns(), std::wstring{ cluster.GetText() }, _currentAttribute);
+                position.x += cluster.GetColumns();
+            }
+            return S_OK;
+        }
+        CATCH_RETURN()
+
+        HRESULT PaintBufferGridLines(GridLineSet /*lines*/, COLORREF /*gridlineColor*/, COLORREF /*underlineColor*/, size_t /*length*/, til::point /*position*/) noexcept override
+        {
+            return S_OK;
+        }
+
+        HRESULT BeginRowImages(const ImageSlice& imageSlice,
+                               const til::CoordType targetRow,
+                               const til::CoordType viewportLeft,
+                               const std::span<const uint8_t> defaultBackgroundMask,
+                               const std::span<const COLORREF> cellBackgrounds) noexcept override
+        try
+        {
+            // The real engines decide when each plane lands relative to the
+            // text; this mock only cares what pixels each plane holds, so it
+            // records one entry per plane and lets the assertions search.
+            for (size_t plane = 0; plane < ImageSlice::RenderPositionCount; ++plane)
+            {
+                _recordPlane(imageSlice, static_cast<ImageSlice::RenderPosition>(plane), targetRow, viewportLeft, defaultBackgroundMask, cellBackgrounds);
+            }
+            return S_OK;
+        }
+        CATCH_RETURN()
+
+        HRESULT EndRowImages() noexcept override
+        {
+            return S_OK;
+        }
+
+        void _recordPlane(const ImageSlice& imageSlice,
+                          const ImageSlice::RenderPosition position,
+                          const til::CoordType targetRow,
+                          const til::CoordType viewportLeft,
+                          const std::span<const uint8_t> defaultBackgroundMask,
+                          const std::span<const COLORREF> cellBackgrounds)
+        {
+            PaintedImage image{
+                targetRow,
+                imageSlice.ColumnOffset() - viewportLeft,
+            };
+            image.defaultBackgroundMask.assign(defaultBackgroundMask.begin(), defaultBackgroundMask.end());
+            image.cellBackgrounds.assign(cellBackgrounds.begin(), cellBackgrounds.end());
+
+            const auto columnCount = imageSlice.PixelWidth() / std::max(1, imageSlice.CellSize().width);
+            const auto pixels = imageSlice.Pixels(position);
+            if (pixels.empty())
+            {
+                return;
+            }
+            image.columnOwners.reserve(columnCount);
+            for (til::CoordType i = 0; i < columnCount; ++i)
+            {
+                const auto column = imageSlice.ColumnOffset() + i;
+                image.columnOwners.emplace_back(imageSlice.ColumnOwner(column));
+                auto pixel = std::next(pixels.data(), i * imageSlice.CellSize().width);
+                auto containsRed = false;
+                auto containsGreen = false;
+                for (auto y = 0; y < imageSlice.CellSize().height && !(containsRed && containsGreen); ++y)
+                {
+                    for (auto x = 0; x < imageSlice.CellSize().width; ++x)
+                    {
+                        if (pixel[x].rgbRed == 255 && pixel[x].rgbGreen == 0 && pixel[x].rgbBlue == 0)
+                        {
+                            containsRed = true;
+                        }
+                        if (pixel[x].rgbRed == 0 && pixel[x].rgbGreen == 255 && pixel[x].rgbBlue == 0)
+                        {
+                            containsGreen = true;
+                        }
+                    }
+                    std::advance(pixel, imageSlice.PixelWidth());
+                }
+                image.columnsContainRed.emplace_back(containsRed);
+                image.columnsContainGreen.emplace_back(containsGreen);
+            }
+
+            const auto guard = _lock.lock_exclusive();
+            _images.emplace_back(std::move(image));
+        }
+
+        HRESULT PaintSelection(const til::rect& /*rect*/) noexcept override
+        {
+            return S_OK;
+        }
+
+        HRESULT PaintCursor(const CursorOptions& /*options*/) noexcept override
+        {
+            return S_OK;
+        }
+
+        HRESULT UpdateDrawingBrushes(const TextAttribute& textAttributes,
+                                     const RenderSettings& /*renderSettings*/,
+                                     gsl::not_null<IRenderData*> /*renderData*/,
+                                     bool /*usingSoftFont*/,
+                                     bool /*isSettingDefaultBrushes*/) noexcept override
+        {
+            const auto guard = _lock.lock_exclusive();
+            _currentAttribute = textAttributes;
+            return S_OK;
+        }
+
+        HRESULT UpdateFont(const FontInfoDesired& /*desired*/, _Out_ FontInfo& /*actual*/) noexcept override
+        {
+            return S_OK;
+        }
+
+        HRESULT UpdateDpi(int /*dpi*/) noexcept override
+        {
+            return S_OK;
+        }
+
+        HRESULT UpdateViewport(const til::inclusive_rect& /*viewport*/) noexcept override
+        {
+            return S_OK;
+        }
+
+        HRESULT GetProposedFont(const FontInfoDesired& /*desired*/, _Out_ FontInfo& /*actual*/, int /*dpi*/) noexcept override
+        {
+            return S_OK;
+        }
+
+        HRESULT GetDirtyArea(std::span<const til::rect>& area) noexcept override
+        {
+            area = { &_dirtyArea, 1 };
+            return S_OK;
+        }
+
+        HRESULT GetFontSize(_Out_ til::size* const fontSize) noexcept override
+        {
+            *fontSize = { 10, 20 };
+            return S_OK;
+        }
+
+        HRESULT IsGlyphWideByFont(std::wstring_view /*glyph*/, _Out_ bool* const isWide) noexcept override
+        {
+            *isWide = false;
+            return S_OK;
+        }
+
+        void WaitUntilCanRender() noexcept override
+        {
+        }
+
+        PaintedFrame Snapshot() const
+        {
+            const auto guard = _lock.lock_shared();
+            return { _presentedClusters, _presentedImages };
+        }
+
+    protected:
+        HRESULT _DoUpdateTitle(const std::wstring_view /*title*/) noexcept override
+        {
+            return S_OK;
+        }
+
+    private:
+        mutable wil::srwlock _lock;
+        til::rect _dirtyArea{ 0, 0, SHRT_MAX, SHRT_MAX };
+        TextAttribute _currentAttribute;
+        std::vector<PaintedCluster> _clusters;
+        std::vector<PaintedImage> _images;
+        std::vector<PaintedCluster> _presentedClusters;
+        std::vector<PaintedImage> _presentedImages;
+    };
+
+    class KittyRenderFixture
+    {
+    public:
+        KittyRenderFixture(const til::size viewport, const til::CoordType history) :
+            terminal{ Terminal::TestDummyMarker{} },
+            renderer{ &terminal }
+        {
+            renderer.AddRenderEngine(&engine);
+            terminal.Create(viewport, history, renderer);
+        }
+
+        ~KittyRenderFixture()
+        {
+            renderer.TriggerTeardown();
+        }
+
+        // Painting normally happens on the renderer's own thread, but a test that starts
+        // one is at the mercy of the scheduler: on a machine busy with I/O the thread can
+        // fail to run at all for tens of seconds, and every wait for a frame then expires
+        // for reasons that have nothing to do with what is being tested. Paint on the
+        // calling thread instead. Nothing here needs a frame to arrive on its own -- the
+        // tests write to the buffer, ask for a paint, and look at what the engine was
+        // handed -- so the thread bought nothing but flakiness.
+        void StartPainting()
+        {
+            Repaint();
+        }
+
+        void Repaint()
+        {
+            renderer.TriggerRedrawAll();
+            THROW_IF_FAILED(renderer.PaintFrame());
+        }
+
+        KittyRecordingRenderEngine engine;
+        Terminal terminal;
+        DummyRenderer renderer;
+    };
+
+    constexpr std::wstring_view StoreRedKittyImage{ L"\x1b_Ga=T,U=1,i=1,f=24,s=1,v=1,c=1,r=1,q=2;/wAA\x1b\\" };
+    constexpr std::wstring_view SelectKittyImageAndBackground{ L"\x1b[38;2;0;0;1;48;2;4;5;6m" };
+    constexpr std::wstring_view KittyPlaceholder{ L"\xDBFB\xDEEE\x0305\x0305\x0305" };
+    constexpr std::wstring_view OrdinaryCombiningText{ L"A\x0301" };
+    // A 4x1 red image drawn across four columns, between the background and the text.
+    constexpr std::wstring_view PlaceRedKittyImageBehindText{ L"\x1b_Ga=T,f=24,s=4,v=1,c=4,r=1,z=-1,q=2;/wAA/wAA/wAA/wAA\x1b\\" };
+
+    std::optional<til::point> FindKittyPlaceholder(const TextBuffer& buffer)
+    {
+        for (til::CoordType y = 0; y < buffer.GetSize().Height(); ++y)
+        {
+            const auto& row = buffer.GetRowByOffset(y);
+            for (til::CoordType x = 0; x < buffer.GetSize().Width(); ++x)
+            {
+                if (row.GetImageCellRef(x))
+                {
+                    return til::point{ x, y };
+                }
+            }
+        }
+        return std::nullopt;
+    }
+
+    void VerifyPlaceholderFrame(const PaintedFrame& frame,
+                                const til::point screenPosition,
+                                const TextAttribute& expectedAttribute,
+                                const uint32_t imageId)
+    {
+        const auto leakedPlaceholder = std::ranges::any_of(frame.clusters, [](const auto& cluster) {
+            return cluster.text.find(L'\xDBFB') != std::wstring::npos ||
+                   cluster.text.find(L'\xDEEE') != std::wstring::npos ||
+                   cluster.text.find(L'\x0305') != std::wstring::npos;
+        });
+        VERIFY_IS_FALSE(leakedPlaceholder, L"the KGP placeholder grapheme reached the glyph renderer");
+
+        const auto cluster = std::ranges::find(frame.clusters, screenPosition, &PaintedCluster::position);
+        VERIFY_IS_TRUE(cluster != frame.clusters.end(), L"the placeholder cell was not painted");
+        if (cluster != frame.clusters.end())
+        {
+            VERIFY_ARE_EQUAL(std::wstring{ L" " }, cluster->text, L"the full placeholder grapheme must be replaced by one non-rendering cell");
+            VERIFY_ARE_EQUAL(1, cluster->columns, L"the placeholder must retain its cell occupancy");
+            VERIFY_IS_TRUE(cluster->attribute == expectedAttribute, L"placeholder colors and attributes must survive glyph suppression");
+        }
+
+        auto imageAtPlaceholder = false;
+        for (const auto& image : frame.images)
+        {
+            const auto relativeColumn = screenPosition.x - image.columnOffset;
+            if (image.targetRow == screenPosition.y &&
+                relativeColumn >= 0 &&
+                relativeColumn < gsl::narrow_cast<til::CoordType>(image.columnOwners.size()) &&
+                til::at(image.columnOwners, relativeColumn) == imageId &&
+                til::at(image.columnsContainRed, relativeColumn))
+            {
+                imageAtPlaceholder = true;
+                break;
+            }
+        }
+        VERIFY_IS_TRUE(imageAtPlaceholder, L"the KGP image must remain painted at the placeholder cell");
+    }
+
+    bool FrameContainsKittyColor(const PaintedFrame& frame, const uint32_t imageId, const bool green)
+    {
+        return std::ranges::any_of(frame.images, [&](const auto& image) {
+            for (size_t column = 0; column < image.columnOwners.size(); ++column)
+            {
+                if (til::at(image.columnOwners, column) == imageId &&
+                    til::at(green ? image.columnsContainGreen : image.columnsContainRed, column))
+                {
+                    return true;
+                }
+            }
+            return false;
+        });
+    }
+}
 
 namespace TerminalCoreUnitTests
 {
@@ -39,6 +424,15 @@ namespace TerminalCoreUnitTests
 
         TEST_METHOD(SetTaskbarProgress);
         TEST_METHOD(SetWorkingDirectory);
+
+        TEST_METHOD(GetCellSizeFallsBackWhenFontUnset);
+
+        TEST_METHOD(KittyPlaceholderRendersInRealTerminal);
+        TEST_METHOD(KittyImageRowCarriesEachCellsBackgroundColor);
+        TEST_METHOD(KittyPlaceholderSuppressesGlyphOnPaintAndRepaint);
+        TEST_METHOD(KittyPlaceholderLeavesUnrecognizedTextUntouched);
+        TEST_METHOD(KittyPlaceholderSuppressesGlyphAfterResize);
+        TEST_METHOD(KittyPlaceholderSuppressesGlyphAfterScroll);
     };
 };
 
@@ -390,4 +784,256 @@ void TerminalCoreUnitTests::TerminalApiTest::SetWorkingDirectory()
 
     stateMachine.ProcessString(L"\x1b]9;9;D:\\中文\x1b\\");
     VERIFY_ARE_EQUAL(term.GetWorkingDirectory(), L"D:\\中文");
+}
+
+void TerminalApiTest::GetCellSizeFallsBackWhenFontUnset()
+{
+    Terminal term{ Terminal::TestDummyMarker{} };
+    DummyRenderer renderer{ &term };
+    term.Create({ 100, 100 }, 0, renderer);
+
+    // Before the renderer reports the real font, _fontInfo is a placeholder whose
+    // width is 0. GetCellSize must fall back to a real grid, not a degenerate 1px
+    // cell that would stretch Kitty/Sixel images ~cell-width times horizontally.
+    const auto cellSize = term.GetCellSize();
+    VERIFY_IS_GREATER_THAN(cellSize.width, 1, L"cell width must not be a degenerate 1px");
+    VERIFY_IS_GREATER_THAN(cellSize.height, 1, L"cell height must not be a degenerate 1px");
+}
+
+void TerminalApiTest::KittyPlaceholderRendersInRealTerminal()
+{
+    Terminal term{ Terminal::TestDummyMarker{} };
+    DummyRenderer renderer{ &term };
+    term.Create({ 100, 100 }, 0, renderer);
+
+    auto& tbi = *(term._mainBuffer);
+    auto& sm = *(term._stateMachine);
+
+    // Virtually store a 1x1 red image as id 1 (U=1 => no cursor draw).
+    sm.ProcessString(L"\x1b_Ga=T,i=1,U=1,f=24,s=1,v=1;/wAA\x1b\\");
+    // Foreground = image id 1 (RGB 0,0,1), then print one U+10EEEE placeholder cell.
+    sm.ProcessString(L"\x1b[38;2;0;0;1m");
+    sm.ProcessString(std::wstring{ L'\xDBFB', L'\xDEEE' });
+
+    // The placeholder must render the stored image's actual color (red), not merely produce
+    // an empty slice. Scan every slice's pixels for RGB(255,0,0).
+    auto renderedRed = false;
+    for (til::CoordType y = 0; y < 100 && !renderedRed; ++y)
+    {
+        if (const auto slice = tbi.GetRowByOffset(y).GetImageSlice())
+        {
+            for (const auto& px : slice->Pixels(ImageSlice::RenderPosition::AboveText))
+            {
+                if (px.rgbRed == 255 && px.rgbGreen == 0 && px.rgbBlue == 0)
+                {
+                    renderedRed = true;
+                    break;
+                }
+            }
+        }
+    }
+    VERIFY_IS_TRUE(renderedRed, L"a placeholder cell must render the stored image's red pixels in the real Terminal");
+}
+
+// An engine that withholds the text pass's background fill from the cells an image
+// covers has to paint those backgrounds itself, or the image composites over the
+// default background instead of the cell's own. That means the row's per-column
+// background colors have to reach the engine, not just which of them are default.
+void TerminalApiTest::KittyImageRowCarriesEachCellsBackgroundColor()
+{
+    KittyRenderFixture fixture{ { 8, 3 }, 0 };
+    auto& stateMachine = *fixture.terminal._stateMachine;
+
+    // Two cells with an explicit background, then two that keep the default one.
+    stateMachine.ProcessString(L"\x1b[48;2;4;5;6m  \x1b[0m  ");
+    stateMachine.ProcessString(L"\x1b[1;1H");
+    stateMachine.ProcessString(PlaceRedKittyImageBehindText);
+
+    fixture.StartPainting();
+    const auto frame = fixture.engine.Snapshot();
+
+    const auto painted = std::ranges::find(frame.images, til::CoordType{ 0 }, &PaintedImage::targetRow);
+    VERIFY_IS_TRUE(painted != frame.images.end(), L"the image row was never handed to the engine");
+
+    const std::vector<uint8_t> expectedMask{ 0, 0, 1, 1 };
+    VERIFY_ARE_EQUAL(expectedMask, painted->defaultBackgroundMask, L"only the two cells with an explicit background are non-default");
+
+    VERIFY_ARE_EQUAL(size_t{ 4 }, painted->cellBackgrounds.size(), L"the engine needs one color per column of the slice");
+    VERIFY_ARE_EQUAL(RGB(4, 5, 6), painted->cellBackgrounds.at(0), L"a cell's own background color must survive to the engine");
+    VERIFY_ARE_EQUAL(RGB(4, 5, 6), painted->cellBackgrounds.at(1), L"a cell's own background color must survive to the engine");
+    VERIFY_ARE_EQUAL(painted->cellBackgrounds.at(2), painted->cellBackgrounds.at(3), L"the default-background cells must agree");
+    VERIFY_ARE_NOT_EQUAL(RGB(4, 5, 6), painted->cellBackgrounds.at(2), L"a default cell must not inherit the colored one");
+}
+
+void TerminalApiTest::KittyPlaceholderSuppressesGlyphOnPaintAndRepaint()
+{
+    KittyRenderFixture fixture{ { 8, 3 }, 0 };
+    auto& buffer = *fixture.terminal._mainBuffer;
+    auto& stateMachine = *fixture.terminal._stateMachine;
+
+    stateMachine.ProcessString(StoreRedKittyImage);
+    stateMachine.ProcessString(L"XY");
+    stateMachine.ProcessString(SelectKittyImageAndBackground);
+    stateMachine.ProcessString(KittyPlaceholder);
+
+    const til::point placeholderPosition{ 2, 0 };
+    VERIFY_ARE_EQUAL((til::point{ 3, 0 }), buffer.GetCursor().GetPosition(), L"the placeholder must advance the cursor by one cell");
+    VERIFY_ARE_EQUAL(std::wstring{ KittyPlaceholder }, std::wstring{ buffer.GetRowByOffset(0).GlyphAt(2) }, L"glyph suppression must not alter stored text");
+    const auto placeholderAttribute = buffer.GetRowByOffset(0).GetAttrByColumn(2);
+
+    stateMachine.ProcessString(L"\x1b[0m\x1b[2;1H");
+    stateMachine.ProcessString(OrdinaryCombiningText);
+
+    fixture.StartPainting();
+    auto frame = fixture.engine.Snapshot();
+    VerifyPlaceholderFrame(frame, placeholderPosition, placeholderAttribute, 1);
+
+    const auto ordinary = std::ranges::find(frame.clusters, til::point{ 0, 1 }, &PaintedCluster::position);
+    VERIFY_IS_TRUE(ordinary != frame.clusters.end(), L"the ordinary combining sequence was not painted");
+    if (ordinary != frame.clusters.end())
+    {
+        VERIFY_ARE_EQUAL(std::wstring{ OrdinaryCombiningText }, ordinary->text, L"ordinary Unicode combining sequences must remain unchanged");
+    }
+
+    fixture.Repaint();
+    VerifyPlaceholderFrame(fixture.engine.Snapshot(), placeholderPosition, placeholderAttribute, 1);
+}
+
+void TerminalApiTest::KittyPlaceholderLeavesUnrecognizedTextUntouched()
+{
+    KittyRenderFixture fixture{ { 6, 2 }, 0 };
+    auto& buffer = *fixture.terminal._mainBuffer;
+    fixture.terminal._stateMachine->ProcessString(KittyPlaceholder);
+
+    VERIFY_IS_NULL(buffer.GetRowByOffset(0).GetImageCellRef(0), L"no stored virtual placement should leave the private-use text unrecognized");
+    fixture.StartPainting();
+
+    const auto frame = fixture.engine.Snapshot();
+    const auto cluster = std::ranges::find(frame.clusters, til::point{ 0, 0 }, &PaintedCluster::position);
+    VERIFY_IS_TRUE(cluster != frame.clusters.end(), L"the unrecognized private-use text was not painted");
+    if (cluster != frame.clusters.end())
+    {
+        VERIFY_ARE_EQUAL(std::wstring{ KittyPlaceholder }, cluster->text, L"unrecognized private-use text must reach the glyph renderer unchanged");
+        VERIFY_ARE_EQUAL(1, cluster->columns);
+    }
+}
+
+void TerminalApiTest::KittyPlaceholderSuppressesGlyphAfterResize()
+{
+    KittyRenderFixture fixture{ { 12, 4 }, 0 };
+    auto& initialBuffer = *fixture.terminal._mainBuffer;
+    auto& stateMachine = *fixture.terminal._stateMachine;
+
+    stateMachine.ProcessString(StoreRedKittyImage);
+    stateMachine.ProcessString(L"0123456789");
+    stateMachine.ProcessString(SelectKittyImageAndBackground);
+    stateMachine.ProcessString(KittyPlaceholder);
+
+    const til::point oldPosition{ 10, 0 };
+    VERIFY_IS_NOT_NULL(initialBuffer.GetRowByOffset(oldPosition.y).GetImageCellRef(oldPosition.x));
+    auto initialSlice = initialBuffer.GetMutableRowByOffset(0).GetMutableImageSlice();
+    VERIFY_IS_NOT_NULL(initialSlice);
+    if (initialSlice)
+    {
+        auto sixelPixels = initialSlice->MutablePixels(0, 1);
+        for (auto y = 0; y < initialSlice->CellSize().height; ++y)
+        {
+            for (auto x = 0; x < initialSlice->CellSize().width; ++x)
+            {
+                *sixelPixels++ = RGBQUAD{ 255, 0, 0, 0 };
+            }
+            std::advance(sixelPixels, initialSlice->PixelWidth() - initialSlice->CellSize().width);
+        }
+    }
+    fixture.StartPainting();
+
+    fixture.terminal.LockConsole();
+    auto unlockAfterResize = wil::scope_exit([&fixture]() {
+        fixture.terminal.UnlockConsole();
+    });
+    VERIFY_SUCCEEDED(fixture.terminal.UserResize({ 6, 4 }));
+    unlockAfterResize.reset();
+    fixture.Repaint();
+
+    const auto& resizedBuffer = *fixture.terminal._mainBuffer;
+    const auto movedPosition = FindKittyPlaceholder(resizedBuffer);
+    VERIFY_IS_TRUE(movedPosition.has_value(), L"the placeholder metadata was lost during reflow");
+    if (movedPosition)
+    {
+        VERIFY_ARE_EQUAL((til::point{ 4, 1 }), *movedPosition, L"the placeholder must reflow with its text cell");
+        VERIFY_ARE_NOT_EQUAL(oldPosition, *movedPosition, L"the placeholder did not move during reflow");
+        VERIFY_ARE_EQUAL(std::wstring{ KittyPlaceholder }, std::wstring{ resizedBuffer.GetRowByOffset(movedPosition->y).GlyphAt(movedPosition->x) });
+
+        const auto screenPosition = *movedPosition - til::point{ 0, fixture.terminal.GetViewport().Top() };
+        const auto attribute = resizedBuffer.GetRowByOffset(movedPosition->y).GetAttrByColumn(movedPosition->x);
+        VerifyPlaceholderFrame(fixture.engine.Snapshot(), screenPosition, attribute, 1);
+    }
+    const auto resizedFirstSlice = resizedBuffer.GetRowByOffset(0).GetImageSlice();
+    VERIFY_IS_NOT_NULL(resizedFirstSlice, L"relocating Kitty pixels must not drop unowned legacy image data");
+    if (resizedFirstSlice)
+    {
+        const auto pixel = resizedFirstSlice->Pixels(0);
+        VERIFY_ARE_EQUAL(static_cast<BYTE>(255), pixel->rgbBlue, L"the unowned legacy image column must survive Kitty relocation");
+        VERIFY_ARE_EQUAL(0u, resizedFirstSlice->ColumnOwner(0));
+    }
+
+    fixture.terminal.LockConsole();
+    auto unlockAfterWiden = wil::scope_exit([&fixture]() {
+        fixture.terminal.UnlockConsole();
+    });
+    VERIFY_SUCCEEDED(fixture.terminal.UserResize({ 12, 4 }));
+    unlockAfterWiden.reset();
+    fixture.Repaint();
+
+    const auto& widenedBuffer = *fixture.terminal._mainBuffer;
+    const auto widenedPosition = FindKittyPlaceholder(widenedBuffer);
+    VERIFY_IS_TRUE(widenedPosition.has_value(), L"the placeholder metadata was lost while joining wrapped rows");
+    if (widenedPosition)
+    {
+        VERIFY_ARE_EQUAL(oldPosition, *widenedPosition, L"widening must join the placeholder back into its original logical row");
+        const auto attribute = widenedBuffer.GetRowByOffset(widenedPosition->y).GetAttrByColumn(widenedPosition->x);
+        VerifyPlaceholderFrame(fixture.engine.Snapshot(), *widenedPosition, attribute, 1);
+    }
+    const auto widenedFirstSlice = widenedBuffer.GetRowByOffset(0).GetImageSlice();
+    VERIFY_IS_NOT_NULL(widenedFirstSlice, L"joining wrapped rows must preserve unowned legacy image data");
+    if (widenedFirstSlice)
+    {
+        const auto pixel = widenedFirstSlice->Pixels(0);
+        VERIFY_ARE_EQUAL(static_cast<BYTE>(255), pixel->rgbBlue, L"widening must not replace an earlier row's unowned legacy image column");
+        VERIFY_ARE_EQUAL(0u, widenedFirstSlice->ColumnOwner(0));
+    }
+}
+
+void TerminalApiTest::KittyPlaceholderSuppressesGlyphAfterScroll()
+{
+    KittyRenderFixture fixture{ { 6, 3 }, 0 };
+    auto& buffer = *fixture.terminal._mainBuffer;
+    auto& stateMachine = *fixture.terminal._stateMachine;
+
+    stateMachine.ProcessString(StoreRedKittyImage);
+    stateMachine.ProcessString(L"\x1b[2;2H");
+    stateMachine.ProcessString(SelectKittyImageAndBackground);
+    stateMachine.ProcessString(KittyPlaceholder);
+
+    const til::point oldPosition{ 1, 1 };
+    fixture.StartPainting();
+    fixture.terminal.LockConsole();
+    auto unlockAfterScroll = wil::scope_exit([&fixture]() {
+        fixture.terminal.UnlockConsole();
+    });
+    stateMachine.ProcessString(L"\x1b[3;1H\n");
+    unlockAfterScroll.reset();
+    fixture.Repaint();
+
+    const auto movedPosition = FindKittyPlaceholder(buffer);
+    VERIFY_IS_TRUE(movedPosition.has_value(), L"the placeholder metadata was lost during scrolling");
+    if (movedPosition)
+    {
+        VERIFY_ARE_EQUAL((til::point{ 1, 0 }), *movedPosition, L"the placeholder must move with the scrolled row");
+        VERIFY_ARE_NOT_EQUAL(oldPosition, *movedPosition);
+        VERIFY_ARE_EQUAL(std::wstring{ KittyPlaceholder }, std::wstring{ buffer.GetRowByOffset(movedPosition->y).GlyphAt(movedPosition->x) });
+
+        const auto attribute = buffer.GetRowByOffset(movedPosition->y).GetAttrByColumn(movedPosition->x);
+        VerifyPlaceholderFrame(fixture.engine.Snapshot(), *movedPosition, attribute, 1);
+    }
 }

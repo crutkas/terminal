@@ -34,6 +34,30 @@ constexpr bool allWhitespace(const std::wstring_view& text) noexcept
     return true;
 }
 
+static uint32_t imageCellRefImageId(const ROW& row, const til::CoordType column) noexcept
+{
+    const auto metadata = row.GetImageCellRef(column);
+    if (!metadata)
+    {
+        return 0;
+    }
+
+    const auto foreground = row.GetAttrByColumn(column).GetForeground();
+    const auto low = foreground.IsRgb() ?
+                         (static_cast<uint32_t>(GetRValue(foreground.GetRGB())) << 16) |
+                             (static_cast<uint32_t>(GetGValue(foreground.GetRGB())) << 8) |
+                             GetBValue(foreground.GetRGB()) :
+                     foreground.IsIndex256() ? static_cast<uint32_t>(foreground.GetIndex()) :
+                                               0u;
+    return low | (static_cast<uint32_t>(metadata->imageIdHighByte) << 24);
+}
+
+static uint64_t imageCellRefLayerId(const ROW& row, const til::CoordType column) noexcept
+{
+    const auto metadata = row.GetImageCellRef(column);
+    return metadata ? metadata->layerId : 0;
+}
+
 static std::atomic<uint64_t> s_lastMutationIdInitialValue;
 
 // Routine Description:
@@ -570,6 +594,7 @@ void TextBuffer::Insert(til::CoordType row, const TextAttribute& attributes, Row
         const auto& scratchAttr = scratch.Attributes();
         const auto restoreAttr = scratchAttr.slice(gsl::narrow<uint16_t>(state.columnBegin), gsl::narrow<uint16_t>(state.columnBegin + copyAmount));
         rowAttr.replace(gsl::narrow<uint16_t>(restoreState.columnBegin), gsl::narrow<uint16_t>(restoreState.columnEnd), restoreAttr);
+        r.CopyImageCellRefs(scratch, state.columnBegin, restoreState.columnBegin, restoreState.columnEnd);
         // If there is any image content, that needs to be copied too.
         ImageSlice::CopyCells(r, state.columnBegin, r, restoreState.columnBegin, restoreState.columnEnd);
     }
@@ -2747,6 +2772,15 @@ void TextBuffer::Reflow(TextBuffer& oldBuffer, TextBuffer& newBuffer, const View
     const auto newHeight = newBuffer.GetSize().Height();
     const auto newWidthU16 = gsl::narrow_cast<uint16_t>(newWidth);
 
+    struct ImageCellMove
+    {
+        til::point source;
+        til::point destination;
+        uint32_t imageId = 0;
+        uint64_t layerId = 0;
+    };
+    std::vector<ImageCellMove> imageCellMoves;
+
     // Copy oldBuffer into newBuffer until oldBuffer has been fully consumed.
     for (; oldY < oldHeight && newY < newYLimit; ++oldY)
     {
@@ -2866,7 +2900,47 @@ void TextBuffer::Reflow(TextBuffer& oldBuffer, TextBuffer& newBuffer, const View
             // If we're at the start of the old row, copy its image content.
             if (oldX == 0)
             {
+                auto preservedSlice = ImageSlice::Pointer{};
+                if (state.columnBegin != 0)
+                {
+                    if (const auto slice = newRow.GetMutableImageSlice())
+                    {
+                        preservedSlice = std::make_unique<ImageSlice>(std::move(*slice));
+                    }
+                }
                 ImageSlice::CopyRow(oldRow, newRow);
+                for (auto column = 0; column < oldRowLimit; ++column)
+                {
+                    if (oldRow.GetImageCellRef(column))
+                    {
+                        const auto layerId = imageCellRefLayerId(oldRow, column);
+                        if (layerId != 0)
+                        {
+                            ImageSlice::EraseLayerCells(newRow, column, column + 1, { imageCellRefImageId(oldRow, column), layerId });
+                        }
+                    }
+                }
+                if (preservedSlice)
+                {
+                    ImageSlice::MergePreservedCells(std::move(preservedSlice), newRow);
+                }
+            }
+
+            for (auto sourceColumn = oldX; sourceColumn < state.sourceColumnEnd; ++sourceColumn)
+            {
+                if (oldRow.GetImageCellRef(sourceColumn))
+                {
+                    const auto layerId = imageCellRefLayerId(oldRow, sourceColumn);
+                    if (layerId != 0)
+                    {
+                        imageCellMoves.push_back({
+                            .source = { sourceColumn, oldY },
+                            .destination = { newX + sourceColumn - oldX, newY },
+                            .imageId = imageCellRefImageId(oldRow, sourceColumn),
+                            .layerId = layerId,
+                        });
+                    }
+                }
             }
 
             const auto& oldAttr = oldRow.Attributes();
@@ -2932,6 +3006,20 @@ void TextBuffer::Reflow(TextBuffer& oldBuffer, TextBuffer& newBuffer, const View
         auto& newAttr = newRow.Attributes();
         newAttr = oldRow.Attributes();
         newAttr.resize_trailing_extent(newWidthU16);
+    }
+
+    // Relocate pixels only after every whole-row clone so wrapped rows
+    // joining cannot overwrite an earlier move.
+    for (const auto& move : imageCellMoves)
+    {
+        auto& destinationRow = newBuffer.GetMutableRowByOffset(move.destination.y);
+        if (destinationRow.GetImageCellRef(move.destination.x) &&
+            imageCellRefImageId(destinationRow, move.destination.x) == move.imageId &&
+            imageCellRefLayerId(destinationRow, move.destination.x) == move.layerId)
+        {
+            const auto& sourceRow = oldBuffer.GetRowByOffset(move.source.y);
+            ImageSlice::CopyLayerCells(sourceRow, move.source.x, destinationRow, move.destination.x, move.destination.x + 1, { move.imageId, move.layerId });
+        }
     }
 
     // Since we didn't use IncrementCircularBuffer() we need to compute the proper
