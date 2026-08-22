@@ -158,31 +158,54 @@ void Renderer::_waitUntilCanRender() noexcept
     }
 }
 
-TimerHandle Renderer::RegisterTimer(const char* description, TimerCallback routine)
+TimerHandle Renderer::RegisterTimer(const char* description, TimerCallback routine, std::weak_ptr<void> lifetime)
 {
     // If it doesn't crash now, it would crash later.
     WI_ASSERT(routine != nullptr);
 
-    const auto id = _nextTimerId++;
+    auto storedRoutine = std::make_shared<TimerCallback>(std::move(routine));
+    // An already-expired lifetime is indistinguishable from an empty one, so
+    // the intent is captured now rather than inferred later.
+    const auto lifetimeBound = !lifetime.expired();
 
-    _timers.push_back(TimerRoutine{
+    const auto guard = _timerMutex.lock_exclusive();
+
+    // Retired slots are reused, so a caller that registers and drops timers
+    // repeatedly doesn't grow the list without bound.
+    const auto reusable = std::find_if(_timers.begin(), _timers.end(), [](const TimerRoutine& timer) {
+        return !timer.routine || (timer.lifetimeBound && timer.lifetime.expired());
+    });
+
+    auto timer = TimerRoutine{
         .description = description,
         .interval = TimerReprMax,
         .next = TimerReprMax,
-        .routine = std::move(routine),
-    });
+        .routine = std::move(storedRoutine),
+        .lifetime = std::move(lifetime),
+        .lifetimeBound = lifetimeBound,
+    };
 
-    return TimerHandle{ id };
+    if (reusable != _timers.end())
+    {
+        const auto id = gsl::narrow_cast<size_t>(std::distance(_timers.begin(), reusable));
+        *reusable = std::move(timer);
+        return TimerHandle{ id };
+    }
+
+    _timers.push_back(std::move(timer));
+    return TimerHandle{ _timers.size() - 1 };
 }
 
 bool Renderer::IsTimerRunning(TimerHandle handle) const
 {
+    const auto guard = _timerMutex.lock_shared();
     const auto& timer = _timers.at(handle.id);
-    return timer.next != TimerReprMax;
+    return timer.routine && timer.next != TimerReprMax;
 }
 
 TimerDuration Renderer::GetTimerInterval(TimerHandle handle) const
 {
+    const auto guard = _timerMutex.lock_shared();
     const auto& timer = _timers.at(handle.id);
     return TimerDuration{ timer.interval };
 }
@@ -192,6 +215,19 @@ void Renderer::StartTimer(TimerHandle handle, TimerDuration delay)
     _startTimer(handle, delay.count(), TimerReprMax);
 }
 
+// Starts a timer that fires at an absolute deadline rather than after a delay.
+// Callers that track *when* they next have work shouldn't have to know how long
+// a delay this renderer is willing to accept, so the bounds _startTimer asserts
+// on are applied here: a deadline already past becomes the shortest legal delay,
+// and one far in the future is capped so we re-check instead of sleeping through it.
+void Renderer::StartTimerAt(TimerHandle handle, std::chrono::steady_clock::time_point deadline)
+{
+    static constexpr auto shortest = std::chrono::milliseconds{ 1 };
+    static constexpr auto longest = std::chrono::seconds{ 30 };
+    const auto remaining = deadline - std::chrono::steady_clock::now();
+    const auto delay = std::clamp(std::chrono::duration_cast<std::chrono::milliseconds>(remaining), shortest, std::chrono::duration_cast<std::chrono::milliseconds>(longest));
+    StartTimer(handle, std::chrono::duration_cast<TimerDuration>(delay));
+}
 void Renderer::StartRepeatingTimer(TimerHandle handle, TimerDuration interval)
 {
     _startTimer(handle, interval.count(), interval.count());
@@ -209,24 +245,34 @@ void Renderer::_startTimer(TimerHandle handle, TimerRepr delay, TimerRepr interv
     assert(interval > 0 && (interval < one_min_in_100ns || interval == TimerReprMax));
 #endif
 
-    auto& timer = _timers.at(handle.id);
-    timer.interval = interval;
-    timer.next = _timerSaturatingAdd(_timerInstant(), delay);
+    {
+        const auto guard = _timerMutex.lock_exclusive();
+        auto& timer = _timers.at(handle.id);
+        timer.interval = interval;
+        timer.next = _timerSaturatingAdd(_timerInstant(), delay);
+    }
 
-    // Tickle _waitUntilCanRender() into calling _calculateTimerMaxWait() again.
-    // WaitOnAddress() will return with TRUE, even if the atomic didn't change.
-    til::atomic_notify_one(_redraw);
+    // Set the predicate as well as notifying. A start racing the render
+    // thread's wait would otherwise lose the wake-up and sleep past the new
+    // deadline; that was safe while only the render thread started timers.
+    NotifyPaintFrame();
 }
 
 void Renderer::StopTimer(TimerHandle handle)
 {
-    auto& timer = _timers.at(handle.id);
-    timer.interval = TimerReprMax;
-    timer.next = TimerReprMax;
+    {
+        const auto guard = _timerMutex.lock_exclusive();
+        auto& timer = _timers.at(handle.id);
+        timer.interval = TimerReprMax;
+        timer.next = TimerReprMax;
+    }
+    NotifyPaintFrame();
 }
 
 DWORD Renderer::_calculateTimerMaxWait() noexcept
 {
+    const auto guard = _timerMutex.lock_exclusive();
+
     if (_timers.empty())
     {
         return INFINITE;
@@ -235,8 +281,15 @@ DWORD Renderer::_calculateTimerMaxWait() noexcept
     const auto now = _timerInstant();
     auto wait = TimerReprMax;
 
-    for (const auto& timer : _timers)
+    for (auto& timer : _timers)
     {
+        // Retiring here as well as in _tickTimers means an expired timer stops
+        // holding the wait down even if it never comes due again.
+        if (!timer.routine || (timer.lifetimeBound && timer.lifetime.expired()))
+        {
+            timer = {};
+            continue;
+        }
         wait = std::min(wait, _timerSaturatingSub(timer.next, now));
     }
 
@@ -275,12 +328,44 @@ void Renderer::_waitUntilTimerOrRedraw() noexcept
 void Renderer::_tickTimers() noexcept
 {
     const auto now = _timerInstant();
-    size_t id = 0;
 
-    for (auto& timer : _timers)
+    // Indexed rather than iterated: a callback may register a timer, which can
+    // reallocate the list out from under an iterator. The lock is also dropped
+    // across the callback, so a callback is free to start or stop timers.
+    for (size_t id = 0;; ++id)
     {
-        if (now >= timer.next)
+        std::shared_ptr<TimerCallback> routine;
+        std::shared_ptr<void> lifetime;
+
         {
+            const auto guard = _timerMutex.lock_exclusive();
+            if (id >= _timers.size())
+            {
+                break;
+            }
+
+            auto& timer = _timers.at(id);
+            if (!timer.routine || (timer.lifetimeBound && timer.lifetime.expired()))
+            {
+                timer = {};
+                continue;
+            }
+            if (timer.lifetimeBound)
+            {
+                // Pinning the owner for the duration of the call is what makes
+                // a lifetime-bound callback safe to run without the lock.
+                lifetime = timer.lifetime.lock();
+                if (!lifetime)
+                {
+                    timer = {};
+                    continue;
+                }
+            }
+            if (now < timer.next)
+            {
+                continue;
+            }
+
             // Prevent clock drift by incrementing the originally scheduled time.
             timer.next = _timerSaturatingAdd(timer.next, timer.interval);
             // ...but still take care to not schedule in the past.
@@ -289,14 +374,14 @@ void Renderer::_tickTimers() noexcept
                 timer.next = now + timer.interval;
             }
 
-            try
-            {
-                timer.routine(*this, TimerHandle{ id });
-            }
-            CATCH_LOG();
+            routine = timer.routine;
         }
 
-        id++;
+        try
+        {
+            (*routine)(*this, TimerHandle{ id });
+        }
+        CATCH_LOG();
     }
 }
 
@@ -1099,15 +1184,77 @@ void Renderer::_PaintBufferOutput(_In_ IRenderEngine* const pEngine)
             // Prepare the appropriate line transform for the current row and viewport offset.
             LOG_IF_FAILED(pEngine->PrepareLineTransform(lineRendition, screenPosition.y, _viewport.Left()));
 
+            // Image content is painted around the text so that it can sit below
+            // it. The engine decides how; all we do is bracket the text.
+            const auto imageSlice = r.GetImageSlice();
+            const auto hasImages = imageSlice && (imageSlice->HasPixels(ImageSlice::RenderPosition::BehindBackground) ||
+                                                  imageSlice->HasPixels(ImageSlice::RenderPosition::BehindText) ||
+                                                  imageSlice->HasPixels(ImageSlice::RenderPosition::AboveText));
+            if (hasImages) [[unlikely]]
+            {
+                _buildImageRowBackgrounds(r, *imageSlice);
+                LOG_IF_FAILED(pEngine->BeginRowImages(*imageSlice, screenPosition.y, _viewport.Left(), _backgroundMask, _backgroundColors));
+            }
+
+            // Painting text can throw, and an engine left mid-row would keep
+            // suppressing cell backgrounds on every row after it.
+            const auto endRowImages = wil::scope_exit([&]() noexcept {
+                if (hasImages)
+                {
+                    LOG_IF_FAILED(pEngine->EndRowImages());
+                }
+            });
+
             // Ask the helper to paint through this specific line.
             _PaintBufferOutputHelper(pEngine, it, screenPosition);
+        }
+    }
+}
 
-            // Paint any image content on top of the text.
-            const auto imageSlice = buffer.GetRowByOffset(row).GetImageSlice();
-            if (imageSlice) [[unlikely]]
-            {
-                LOG_IF_FAILED(pEngine->PaintImageSlice(*imageSlice, screenPosition.y, _viewport.Left()));
-            }
+// Resolves, for each column of `imageSlice`, whether the cell's background is the
+// default one - content below the background only shows through where it is - and
+// what that background's color is, which content above the background has to be
+// composited over. Both are left empty when the slice has nothing to draw beneath
+// the text, which is the case for every image that predates layering.
+void Renderer::_buildImageRowBackgrounds(const ROW& r, const ImageSlice& imageSlice)
+{
+    _backgroundMask.clear();
+    _backgroundColors.clear();
+
+    if (!imageSlice.HasPixels(ImageSlice::RenderPosition::BehindBackground) &&
+        !imageSlice.HasPixels(ImageSlice::RenderPosition::BehindText))
+    {
+        return;
+    }
+
+    const auto cellWidth = imageSlice.CellSize().width;
+    if (cellWidth <= 0)
+    {
+        return;
+    }
+
+    const auto columnCount = gsl::narrow_cast<size_t>(imageSlice.PixelWidth() / cellWidth);
+    // Reused across rows and frames; painting is hot and this would otherwise
+    // be a heap allocation per row per frame. Columns we can't resolve keep the
+    // default background, which hides content below it rather than letting it
+    // bleed through, and makes the fill above it a no-op.
+    const auto defaultBackground = _renderSettings.GetAttributeColors({}).second;
+    _backgroundMask.assign(columnCount, uint8_t{ 0 });
+    _backgroundColors.assign(columnCount, defaultBackground);
+
+    // A slice indexes screen columns, which a non-single-width rendition
+    // doubles; the row's attributes are indexed by buffer column.
+    const auto scale = r.GetLineRendition() != LineRendition::SingleWidth ? 1 : 0;
+    const auto readableColumns = r.GetReadableColumnCount();
+    for (size_t column = 0; column < columnCount; column++)
+    {
+        const auto sliceColumn = imageSlice.ColumnOffset() + gsl::narrow_cast<til::CoordType>(column);
+        const auto bufferColumn = sliceColumn >> scale;
+        if (bufferColumn >= 0 && bufferColumn < readableColumns)
+        {
+            const auto attributes = r.GetAttrByColumn(bufferColumn);
+            til::at(_backgroundMask, column) = attributes.GetBackground().IsDefault() ? 1 : 0;
+            til::at(_backgroundColors, column) = _renderSettings.GetAttributeColors(attributes).second;
         }
     }
 }
@@ -1219,6 +1366,13 @@ static bool _IsAllSpaces(const std::wstring_view v)
     return v.find_first_not_of(L' ') == decltype(v)::npos;
 }
 
+// A cell that stands in for part of an image carries its grid coordinates in
+// its grapheme and its colors. Those must survive in the buffer, but the glyph
+// renderer must never draw them, so it is shown a blank instead.
+static std::wstring_view _GetForegroundRenderText(const TextBufferCellIterator& it) noexcept
+{
+    return it.HasImageCellRef() ? std::wstring_view{ L" " } : it->Chars();
+}
 void Renderer::_PaintBufferOutputHelper(_In_ IRenderEngine* const pEngine,
                                         TextBufferCellIterator it,
                                         const til::point target)
@@ -1239,7 +1393,7 @@ void Renderer::_PaintBufferOutputHelper(_In_ IRenderEngine* const pEngine,
         // Retrieve the first pattern id
         auto patternIds = _pData->GetPatternId(target);
         // Determine whether we're using a soft font.
-        auto usingSoftFont = s_IsSoftFontChar(it->Chars(), _firstSoftFontChar, _lastSoftFontChar);
+        auto usingSoftFont = s_IsSoftFontChar(_GetForegroundRenderText(it), _firstSoftFontChar, _lastSoftFontChar);
 
         // And hold the point where we should start drawing.
         auto screenPoint = target;
@@ -1286,14 +1440,15 @@ void Renderer::_PaintBufferOutputHelper(_In_ IRenderEngine* const pEngine,
             {
                 til::point thisPoint{ screenPoint.x + cols, screenPoint.y };
                 const auto thisPointPatterns = _pData->GetPatternId(thisPoint);
-                const auto thisUsingSoftFont = s_IsSoftFontChar(it->Chars(), _firstSoftFontChar, _lastSoftFontChar);
+                const auto renderText = _GetForegroundRenderText(it);
+                const auto thisUsingSoftFont = s_IsSoftFontChar(renderText, _firstSoftFontChar, _lastSoftFontChar);
                 const auto changedPatternOrFont = patternIds != thisPointPatterns || usingSoftFont != thisUsingSoftFont;
                 if (color != it->TextAttr() || changedPatternOrFont)
                 {
                     auto newAttr{ it->TextAttr() };
                     // foreground doesn't matter for runs of spaces (!)
                     // if we trick it . . . we call Paint far fewer times for cmatrix
-                    if (!_IsAllSpaces(it->Chars()) || !newAttr.HasIdenticalVisualRepresentationForBlankSpace(color, globalInvert) || changedPatternOrFont)
+                    if (!_IsAllSpaces(renderText) || !newAttr.HasIdenticalVisualRepresentationForBlankSpace(color, globalInvert) || changedPatternOrFont)
                     {
                         color = newAttr;
                         patternIds = thisPointPatterns;
@@ -1324,7 +1479,7 @@ void Renderer::_PaintBufferOutputHelper(_In_ IRenderEngine* const pEngine,
                 }
 
                 // Advance the cluster and column counts.
-                _clusterBuffer.emplace_back(it->Chars(), columnCount);
+                _clusterBuffer.emplace_back(renderText, columnCount);
                 it += std::max(it->Columns(), 1); // prevent infinite loop for no visible columns
                 cols += columnCount;
 

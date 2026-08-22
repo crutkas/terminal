@@ -231,6 +231,7 @@ void ROW::Reset(const TextAttribute& attr) noexcept
     // Modifying the existing object is _much_ faster.
     *_attr.runs().unsafe_shrink_to_size(1) = til::rle_pair{ attr, _columnCount };
     _imageSlice = nullptr;
+    _imageCellRefs.reset();
     _lineRendition = LineRendition::SingleWidth;
     _wrapForced = false;
     _doubleBytePadded = false;
@@ -357,6 +358,7 @@ void ROW::CopyFrom(const ROW& source)
 {
     _lineRendition = source._lineRendition;
     _wrapForced = source._wrapForced;
+    _imageCellRefs.reset();
 
     RowCopyTextFromState state{
         .source = source,
@@ -580,6 +582,7 @@ try
     }
     h.ReplaceCharacters(width);
     h.Finish();
+    _clearImageCellRefs(h.colBegDirty, h.colEndDirty);
 }
 catch (...)
 {
@@ -623,6 +626,7 @@ try
     }
     h.ReplaceText();
     h.Finish();
+    _clearImageCellRefs(h.colBegDirty, h.colEndDirty);
 
     state.text = state.text.substr(h.charsConsumed);
     // Here's why we set `state.columnEnd` to `colLimit` if there's remaining text:
@@ -802,6 +806,8 @@ try
 
     h.CopyTextFrom(charOffsets);
     h.Finish();
+    _clearImageCellRefs(h.colBegDirty, h.colEndDirty);
+    CopyImageCellRefs(source, sourceColBeg, h.colBeg, h.colEnd);
 
     // state.columnEnd is computed identical to ROW::ReplaceText. Check it out for more information.
     state.columnEnd = h.charsConsumed == chars.size() ? h.colEnd : h.colLimit;
@@ -1131,6 +1137,73 @@ std::wstring_view ROW::GetText(til::CoordType columnBegin, til::CoordType column
     const size_t chEnd = _uncheckedCharOffset(gsl::narrow_cast<size_t>(colEnd));
 #pragma warning(suppress : 26481) // Don't use pointer arithmetic. Use span instead (bounds.1).
     return { _chars.data() + chBeg, chEnd - chBeg };
+}
+
+const ImageCellRef* ROW::GetImageCellRef(const til::CoordType column) const noexcept
+{
+    if (!_imageCellRefs || column < 0 || column >= _columnCount)
+    {
+        return nullptr;
+    }
+
+    const auto& metadata = til::at(_imageCellRefs, column);
+    return metadata.valid ? &metadata : nullptr;
+}
+
+void ROW::SetImageCellRef(const til::CoordType column, const ImageCellRef& metadata)
+{
+    if (column < 0 || column >= _columnCount)
+    {
+        return;
+    }
+
+    if (!_imageCellRefs)
+    {
+        _imageCellRefs = std::make_unique<ImageCellRef[]>(_columnCount);
+    }
+    til::at(_imageCellRefs, column) = metadata;
+}
+
+void ROW::_clearImageCellRefs(const til::CoordType columnBegin, const til::CoordType columnEnd) noexcept
+{
+    if (!_imageCellRefs)
+    {
+        return;
+    }
+
+    const auto begin = std::clamp<til::CoordType>(columnBegin, 0, _columnCount);
+    const auto end = std::clamp<til::CoordType>(columnEnd, begin, _columnCount);
+    std::fill_n(_imageCellRefs.get() + begin, end - begin, ImageCellRef{});
+}
+
+void ROW::CopyImageCellRefs(const ROW& source, const til::CoordType sourceColumnBegin, const til::CoordType columnBegin, const til::CoordType columnEnd)
+{
+    const auto destinationBegin = std::clamp<til::CoordType>(columnBegin, 0, _columnCount);
+    const auto destinationEnd = std::clamp<til::CoordType>(columnEnd, destinationBegin, _columnCount);
+    const auto sourceBegin = std::clamp<til::CoordType>(sourceColumnBegin, 0, source._columnCount);
+    const auto count = std::min(destinationEnd - destinationBegin, source._columnCount - sourceBegin);
+
+    std::vector<ImageCellRef> copied;
+    if (count > 0 && source._imageCellRefs)
+    {
+        copied.reserve(count);
+        for (auto i = 0; i < count; ++i)
+        {
+            copied.emplace_back(til::at(source._imageCellRefs, sourceBegin + i));
+        }
+    }
+
+    _clearImageCellRefs(destinationBegin, destinationEnd);
+    if (copied.empty() || std::none_of(copied.begin(), copied.end(), [](const auto& metadata) { return metadata.valid; }))
+    {
+        return;
+    }
+
+    if (!_imageCellRefs)
+    {
+        _imageCellRefs = std::make_unique<ImageCellRef[]>(_columnCount);
+    }
+    std::copy(copied.begin(), copied.end(), _imageCellRefs.get() + destinationBegin);
 }
 
 til::CoordType ROW::GetLeadingColumnAtCharOffset(const ptrdiff_t offset) const noexcept

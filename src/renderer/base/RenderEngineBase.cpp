@@ -69,9 +69,16 @@ HRESULT RenderEngineBase::PrepareLineTransform(const LineRendition /*lineRenditi
     return S_FALSE;
 }
 
-HRESULT RenderEngineBase::PaintImageSlice(const ImageSlice& /*imageSlice*/,
-                                          const til::CoordType /*targetRow*/,
-                                          const til::CoordType /*viewportLeft*/) noexcept
+HRESULT RenderEngineBase::BeginRowImages(const ImageSlice& /*imageSlice*/,
+                                         const til::CoordType /*targetRow*/,
+                                         const til::CoordType /*viewportLeft*/,
+                                         const std::span<const uint8_t> /*defaultBackgroundMask*/,
+                                         const std::span<const COLORREF> /*cellBackgrounds*/) noexcept
+{
+    return S_FALSE;
+}
+
+HRESULT RenderEngineBase::EndRowImages() noexcept
 {
     return S_FALSE;
 }

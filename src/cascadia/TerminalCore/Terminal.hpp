@@ -16,6 +16,7 @@
 #include "../../cascadia/terminalcore/ITerminalInput.hpp"
 
 #include <til/generational.h>
+#include <til/io.h>
 #include <til/ticket_lock.h>
 #include <til/winrt.h>
 
@@ -166,6 +167,14 @@ public:
     void SearchMissingCommand(const std::wstring_view command) override;
 
     void ShowNotification(const std::wstring_view title, const std::wstring_view body) override;
+
+    bool DecodeImageToBgra(const std::span<const uint8_t> data, std::vector<RGBQUAD>& pixels, til::size& size) noexcept override;
+    til::size GetCellSize() const noexcept override;
+    til::read_file_result ReadLocalFile(const std::wstring_view path, uint64_t offset, uint64_t size, bool deleteAfter, const std::wstring_view deleteNameMarker, std::vector<uint8_t>& out) noexcept override;
+    Microsoft::Console::Utils::ReadSharedMemoryResult ReadSharedMemory(const std::wstring_view name, uint64_t offset, uint64_t size, std::vector<uint8_t>& out) noexcept override;
+
+    void SetTimedContentHandler(std::function<void()> handler) override;
+    void RequestTimedContentUpdate(const std::optional<std::chrono::steady_clock::time_point> deadline) override;
 
 #pragma endregion
 
@@ -348,6 +357,15 @@ private:
     std::function<void()> _pfnClearQuickFix;
     std::function<void(int32_t, int32_t)> _pfnWindowSizeChanged;
 
+    // Timed content state. The handler runs on the render thread, so the mutex
+    // guards it against a concurrent SetTimedContentHandler on the writing thread.
+    std::mutex _timedContentMutex;
+    std::function<void()> _timedContentHandler;
+    Microsoft::Console::Render::TimerHandle _timedContentTimer{};
+    std::shared_ptr<int> _timedContentLifetime = std::make_shared<int>(0);
+    // Stored in Create(); null until then and also in the test-dummy constructor.
+    Microsoft::Console::Render::Renderer* _renderer = nullptr;
+
     RenderSettings _renderSettings;
     std::unique_ptr<::Microsoft::Console::VirtualTerminal::StateMachine> _stateMachine;
     ::Microsoft::Console::VirtualTerminal::TerminalInput _terminalInput;
@@ -470,6 +488,7 @@ private:
     void _NotifyScrollEvent();
     bool _inAltBuffer() const noexcept;
     TextBuffer& _activeBuffer() const noexcept;
+    void _notifyFontChanged();
     void _updateUrlDetection();
     interval_tree::IntervalTree<til::point, size_t> _getPatterns(til::CoordType beg, til::CoordType end) const;
 

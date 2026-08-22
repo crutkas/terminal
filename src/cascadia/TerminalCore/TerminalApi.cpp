@@ -6,6 +6,13 @@
 #include "tracing.hpp"
 
 #include "../src/inc/unicode.hpp"
+#include "../../renderer/base/renderer.hpp"
+
+#include <wincodec.h>
+#include <wil/com.h>
+#include <wil/resource.h>
+
+#include <til/io.h>
 
 using namespace Microsoft::Terminal::Core;
 using namespace Microsoft::Console::Render;
@@ -388,6 +395,104 @@ void Terminal::ShowNotification(const std::wstring_view title, const std::wstrin
     }
 }
 
+// Decodes an encoded image (PNG etc.) into premultiplied BGRA pixels using WIC.
+// Returns false on any failure; never throws.
+bool Terminal::DecodeImageToBgra(const std::span<const uint8_t> data, std::vector<RGBQUAD>& pixels, til::size& size) noexcept
+try
+{
+    pixels.clear();
+    if (data.empty())
+    {
+        return false;
+    }
+
+    // WIC requires COM. It may already be initialized on this thread (in either
+    // apartment, both fine for WIC); only balance the call we actually made.
+    const auto coInitHr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    const auto coUninit = wil::scope_exit([coInitHr]() noexcept {
+        if (SUCCEEDED(coInitHr))
+        {
+            CoUninitialize();
+        }
+    });
+
+    const auto factory = wil::CoCreateInstance<IWICImagingFactory2>(CLSID_WICImagingFactory2);
+
+    wil::com_ptr<IWICStream> stream;
+    THROW_IF_FAILED(factory->CreateStream(stream.addressof()));
+    THROW_IF_FAILED(stream->InitializeFromMemory(const_cast<WICInProcPointer>(data.data()), gsl::narrow<DWORD>(data.size())));
+
+    wil::com_ptr<IWICBitmapDecoder> decoder;
+    THROW_IF_FAILED(factory->CreateDecoderFromStream(stream.get(), nullptr, WICDecodeMetadataCacheOnDemand, decoder.addressof()));
+
+    // Kitty's f=100 means PNG specifically; reject any other container WIC accepts.
+    GUID container{};
+    THROW_IF_FAILED(decoder->GetContainerFormat(&container));
+    if (container != GUID_ContainerFormatPng)
+    {
+        return false;
+    }
+
+    wil::com_ptr<IWICBitmapFrameDecode> frame;
+    THROW_IF_FAILED(decoder->GetFrame(0, frame.addressof()));
+
+    UINT width = 0;
+    UINT height = 0;
+    THROW_IF_FAILED(frame->GetSize(&width, &height));
+    // Bound the decoded size so a small but hostile image can't claim enormous
+    // dimensions and force a multi-gigabyte allocation.
+    if (width == 0 || height == 0 || static_cast<uint64_t>(width) * height > 64ull * 1024 * 1024)
+    {
+        return false;
+    }
+
+    wil::com_ptr<IWICFormatConverter> converter;
+    THROW_IF_FAILED(factory->CreateFormatConverter(converter.addressof()));
+    THROW_IF_FAILED(converter->Initialize(frame.get(), GUID_WICPixelFormat32bppPBGRA, WICBitmapDitherTypeNone, nullptr, 0.0, WICBitmapPaletteTypeCustom));
+
+    pixels.resize(static_cast<size_t>(width) * height);
+    const auto stride = width * static_cast<UINT>(sizeof(RGBQUAD));
+    const auto bufferSize = gsl::narrow<UINT>(pixels.size() * sizeof(RGBQUAD));
+    THROW_IF_FAILED(converter->CopyPixels(nullptr, stride, bufferSize, reinterpret_cast<BYTE*>(pixels.data())));
+
+    size = { static_cast<til::CoordType>(width), static_cast<til::CoordType>(height) };
+    return true;
+}
+catch (...)
+{
+    pixels.clear();
+    return false;
+}
+
+til::size Terminal::GetCellSize() const noexcept
+{
+    const auto size = _fontInfo.GetSize();
+    // Before the renderer reports the real font (via SetFontInfo), _fontInfo is a
+    // placeholder whose width is 0. Clamping that to 1 would lay images out on a
+    // degenerate 1px-per-cell grid, stretching them ~cell-width times horizontally.
+    // Fall back to a sane default cell (matching conhost/Sixel) until the real font
+    // is known, so images render at a correct grid rather than badly stretched.
+    if (size.width < 2 || size.height < 2)
+    {
+        return { 10, 20 };
+    }
+    return size;
+}
+
+til::read_file_result Terminal::ReadLocalFile(const std::wstring_view path, uint64_t offset, uint64_t size, bool deleteAfter, const std::wstring_view deleteNameMarker, std::vector<uint8_t>& out) noexcept
+{
+    // Windows Terminal is the final terminal in the chain, so it owns deletion of a t=t
+    // temporary file (conhost suppresses its own delete under ConPTY). The shared helper
+    // still enforces local fixed-drive reads and temp-dir + marker containment before it
+    // removes anything.
+    return til::read_file_as_bytes(path, offset, size, deleteAfter, deleteNameMarker, out);
+}
+
+Microsoft::Console::Utils::ReadSharedMemoryResult Terminal::ReadSharedMemory(const std::wstring_view name, uint64_t offset, uint64_t size, std::vector<uint8_t>& out) noexcept
+{
+    return Microsoft::Console::Utils::ReadSharedMemory(name, offset, size, out);
+}
+
 void Terminal::NotifyBufferRotation(const int delta)
 {
     // Update our selection, so it doesn't move as the buffer is cycled
@@ -428,4 +533,62 @@ void Terminal::NotifyShellIntegrationMark()
 {
     // Notify the scrollbar that marks have been added so it can refresh the mark indicators
     _NotifyScrollEvent();
+}
+
+// Stores the handler the adapter wants called when timed content advances.
+// A null handler clears any prior registration and stops the outstanding timer.
+void Terminal::SetTimedContentHandler(std::function<void()> handler)
+{
+    const auto stop = !handler;
+    {
+        std::lock_guard lock(_timedContentMutex);
+        _timedContentHandler = std::move(handler);
+    }
+    if (stop && _renderer && _timedContentTimer)
+    {
+        _renderer->StopTimer(_timedContentTimer);
+    }
+}
+
+// Arms the render-thread timer so the adapter is woken at `deadline`.
+// No value means the adapter no longer needs a wakeup; stop the timer.
+void Terminal::RequestTimedContentUpdate(
+    const std::optional<std::chrono::steady_clock::time_point> deadline)
+{
+    if (!_renderer)
+    {
+        return;
+    }
+
+    if (!deadline)
+    {
+        if (_timedContentTimer)
+        {
+            _renderer->StopTimer(_timedContentTimer);
+        }
+        return;
+    }
+
+    if (!_timedContentTimer)
+    {
+        // Registered lazily, so a session that never shows timed content never
+        // takes a timer slot. Binding the callback to _timedContentLifetime lets
+        // the renderer retire the slot on its own once this object is gone.
+        _timedContentTimer = _renderer->RegisterTimer(
+            "timed content",
+            [this](Renderer&, TimerHandle) {
+                std::function<void()> handler;
+                {
+                    std::lock_guard lock(_timedContentMutex);
+                    handler = _timedContentHandler;
+                }
+                if (handler)
+                {
+                    handler();
+                }
+            },
+            _timedContentLifetime);
+    }
+
+    _renderer->StartTimerAt(_timedContentTimer, *deadline);
 }

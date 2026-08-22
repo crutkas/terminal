@@ -16,12 +16,19 @@ Author(s):
 
 #include "../parser/stateMachine.hpp"
 #include "../../types/inc/IInputEvent.hpp"
+#include "../../types/inc/sharedMemory.hpp"
 #include "../../buffer/out/LineRendition.hpp"
 #include "../../buffer/out/textBuffer.hpp"
 #include "../../renderer/inc/RenderSettings.hpp"
 
+#include <chrono>
 #include <deque>
+#include <functional>
 #include <memory>
+#include <optional>
+#include <span>
+
+#include <til/io.h>
 
 namespace Microsoft::Console::VirtualTerminal
 {
@@ -94,5 +101,35 @@ namespace Microsoft::Console::VirtualTerminal
         virtual void SearchMissingCommand(const std::wstring_view command) = 0;
 
         virtual void ShowNotification(const std::wstring_view title, const std::wstring_view body) = 0;
+
+        // Decodes an encoded image (e.g. PNG) into premultiplied BGRA pixels. Not every
+        // host has an image decoder; one that does not returns false and its caller goes
+        // without the image.
+        virtual bool DecodeImageToBgra(const std::span<const uint8_t> data, std::vector<RGBQUAD>& pixels, til::size& size) noexcept = 0;
+
+        // Some content changes on a clock rather than on input, so the adapter has work
+        // to do when nothing is arriving to drive it. It hands the host a routine to run
+        // and then reports the deadline it next wants that routine run at; no deadline
+        // withdraws the request. Arranging the wakeup is the host's business, because the
+        // host owns the render thread: the adapter says when it has work, not when to run.
+        virtual void SetTimedContentHandler(std::function<void()> handler) = 0;
+        virtual void RequestTimedContentUpdate(const std::optional<std::chrono::steady_clock::time_point> deadline) = 0;
+        // Reads up to 'size' bytes of a local file (or to EOF when size == 0) starting at
+        // byte 'offset'. The path came off the wire, so the host is expected to be strict
+        // about what it will open and to bound the read; til::read_file_as_bytes is the
+        // shared implementation of both. 'deleteAfter' asks for the file to be removed
+        // once read, which the host honours only for a temporary file whose name contains
+        // 'deleteNameMarker' -- the caller names its own files, so the caller supplies the
+        // marker. A host that cannot reach the filesystem at all returns read_error.
+        virtual til::read_file_result ReadLocalFile(const std::wstring_view path, uint64_t offset, uint64_t size, bool deleteAfter, const std::wstring_view deleteNameMarker, std::vector<uint8_t>& out) noexcept = 0;
+
+        // Copies bytes out of a named shared-memory object. As with a file path, the name
+        // came off the wire; Microsoft::Console::Utils::ReadSharedMemory is the shared
+        // implementation and documents which names are safe to open.
+        virtual Microsoft::Console::Utils::ReadSharedMemoryResult ReadSharedMemory(const std::wstring_view name, uint64_t offset, uint64_t size, std::vector<uint8_t>& out) noexcept = 0;
+
+        // The pixel size of a text cell, for anything that has to lay pixels out against
+        // the grid.
+        virtual til::size GetCellSize() const noexcept = 0;
     };
 }

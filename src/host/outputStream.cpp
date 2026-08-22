@@ -12,6 +12,9 @@
 #include "output.h"
 
 #include "../interactivity/inc/ServiceLocator.hpp"
+#include "../renderer/base/renderer.hpp"
+
+#include <til/io.h>
 
 #pragma hdrstop
 
@@ -462,4 +465,107 @@ void ConhostInternalGetSet::SearchMissingCommand(std::wstring_view /*missingComm
 void ConhostInternalGetSet::ShowNotification(std::wstring_view /*title*/, std::wstring_view /*body*/)
 {
     // Not implemented for conhost.
+}
+
+// Stores the handler the adapter wants called when timed content advances.
+// A null handler clears any prior registration and stops the outstanding timer.
+void ConhostInternalGetSet::SetTimedContentHandler(std::function<void()> handler)
+{
+    const auto stop = !handler;
+    {
+        std::lock_guard lock(_timedContentMutex);
+        _timedContentHandler = std::move(handler);
+    }
+    if (stop && _timedContentTimer)
+    {
+        if (auto* const pRender = ServiceLocator::LocateGlobals().pRender)
+        {
+            pRender->StopTimer(_timedContentTimer);
+        }
+    }
+}
+
+// Arms the render-thread timer so the adapter is woken at `deadline`.
+// No value means the adapter no longer needs a wakeup; stop the timer.
+void ConhostInternalGetSet::RequestTimedContentUpdate(
+    const std::optional<std::chrono::steady_clock::time_point> deadline)
+{
+    auto* const pRender = ServiceLocator::LocateGlobals().pRender;
+    if (!pRender)
+    {
+        return;
+    }
+
+    if (!deadline)
+    {
+        if (_timedContentTimer)
+        {
+            pRender->StopTimer(_timedContentTimer);
+        }
+        return;
+    }
+
+    if (!_timedContentTimer)
+    {
+        // Registered lazily, so a session that never shows timed content never
+        // takes a timer slot. Binding the callback to _timedContentLifetime lets
+        // the renderer retire the slot on its own once this object is gone.
+        _timedContentTimer = pRender->RegisterTimer(
+            "timed content",
+            [this](Microsoft::Console::Render::Renderer&, Microsoft::Console::Render::TimerHandle) {
+                std::function<void()> handler;
+                {
+                    std::lock_guard lock(_timedContentMutex);
+                    handler = _timedContentHandler;
+                }
+                if (handler)
+                {
+                    handler();
+                }
+            },
+            _timedContentLifetime);
+    }
+
+    pRender->StartTimerAt(_timedContentTimer, *deadline);
+}
+
+bool ConhostInternalGetSet::DecodeImageToBgra(const std::span<const uint8_t> /*data*/, std::vector<RGBQUAD>& pixels, til::size& /*size*/) noexcept
+{
+    // conhost has no image decoder. Under ConPTY the connected terminal decodes; standalone,
+    // an encoded image simply isn't displayed.
+    pixels.clear();
+    return false;
+}
+
+til::size ConhostInternalGetSet::GetCellSize() const noexcept
+{
+    return _io.GetActiveOutputBuffer().GetCurrentFont().GetSize();
+}
+
+til::read_file_result ConhostInternalGetSet::ReadLocalFile(const std::wstring_view path, uint64_t offset, uint64_t size, bool deleteAfter, const std::wstring_view deleteNameMarker, std::vector<uint8_t>& out) noexcept
+{
+    // Under ConPTY, conhost is parse-only: it has no renderer, its ACK is suppressed
+    // (ReturnResponse early-returns in VtIo mode), and the raw APC is forwarded verbatim to
+    // the connected terminal (e.g. Windows Terminal), which performs the file read and owns
+    // t=t deletion. Reading the file here would be redundant filesystem access in the wrong
+    // process context (and deleting it would remove it before the terminal can read it), so
+    // skip the read entirely and let the final terminal handle the transmission.
+    if (IsConPTY())
+    {
+        out.clear();
+        return til::read_file_result::read_error;
+    }
+    return til::read_file_as_bytes(path, offset, size, deleteAfter, deleteNameMarker, out);
+}
+
+Microsoft::Console::Utils::ReadSharedMemoryResult ConhostInternalGetSet::ReadSharedMemory(const std::wstring_view name, uint64_t offset, uint64_t size, std::vector<uint8_t>& out) noexcept
+{
+    // Under ConPTY the final terminal receives the raw APC and owns the mapping read.
+    // Avoid a redundant read in conhost, matching the t=f/t=t path above.
+    if (IsConPTY())
+    {
+        out.clear();
+        return Microsoft::Console::Utils::ReadSharedMemoryResult::read_error;
+    }
+    return Microsoft::Console::Utils::ReadSharedMemory(name, offset, size, out);
 }

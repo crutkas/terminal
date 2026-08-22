@@ -6,6 +6,7 @@
 #include "../../buffer/out/textBuffer.hpp"
 #include "../inc/IRenderEngine.hpp"
 #include "../inc/RenderSettings.hpp"
+#include <memory>
 
 namespace Microsoft::Console::Render
 {
@@ -24,10 +25,11 @@ namespace Microsoft::Console::Render
 
         IRenderData* GetRenderData() const noexcept;
 
-        TimerHandle RegisterTimer(const char* description, TimerCallback routine);
+        TimerHandle RegisterTimer(const char* description, TimerCallback routine, std::weak_ptr<void> lifetime = {});
         bool IsTimerRunning(TimerHandle handle) const;
         TimerDuration GetTimerInterval(TimerHandle handle) const;
         void StartTimer(TimerHandle handle, TimerDuration delay);
+        void StartTimerAt(TimerHandle handle, std::chrono::steady_clock::time_point deadline);
         void StartRepeatingTimer(TimerHandle handle, TimerDuration interval);
         void StopTimer(TimerHandle handle);
 
@@ -76,13 +78,27 @@ namespace Microsoft::Console::Render
         void UpdateHyperlinkHoveredId(uint16_t id) noexcept;
         void UpdateLastHoveredInterval(const std::optional<interval_tree::IntervalTree<til::point, size_t>::interval>& newInterval);
 
+    protected:
+        // Paints one frame on the calling thread. The render thread is the only caller in
+        // a real host, which is why this is not public; it is reachable by a derived class
+        // so that DummyRenderer can offer tests a paint that does not depend on a thread
+        // being scheduled.
+        [[nodiscard]] HRESULT PaintFrame();
+
     private:
         struct TimerRoutine
         {
             const char* description = nullptr;
-            TimerRepr interval = 0; // Timers with a 0 interval are marked for deletion.
+            TimerRepr interval = 0;
             TimerRepr next = 0;
-            TimerCallback routine;
+            // Held by shared_ptr so the render thread can run a callback after
+            // releasing the lock, without the slot being reused underneath it.
+            std::shared_ptr<TimerCallback> routine;
+            // A lifetime-bound timer retires itself once its owner is gone, so a
+            // caller that can outlive its own registration doesn't have to
+            // unregister from a destructor racing the render thread.
+            std::weak_ptr<void> lifetime;
+            bool lifetimeBound = false;
         };
 
         // Caches some essential information about the active composition.
@@ -112,7 +128,6 @@ namespace Microsoft::Console::Render
         static DWORD _timerToMillis(TimerRepr t) noexcept;
 
         // Actual rendering
-        [[nodiscard]] HRESULT PaintFrame();
         [[nodiscard]] HRESULT _PaintFrame() noexcept;
         [[nodiscard]] HRESULT _PaintFrameForEngine(_In_ IRenderEngine* const pEngine) noexcept;
         void _disablePainting() noexcept;
@@ -123,6 +138,7 @@ namespace Microsoft::Console::Render
         void _PaintBufferOutput(_In_ IRenderEngine* const pEngine);
         ROW* _PaintBufferOutputComposition(TextBuffer& buffer, const ROW& r, const Composition& activeComposition);
         void _PaintBufferOutputHelper(_In_ IRenderEngine* const pEngine, TextBufferCellIterator it, const til::point target);
+        void _buildImageRowBackgrounds(const ROW& r, const ImageSlice& imageSlice);
         void _PaintBufferOutputGridLineHelper(_In_ IRenderEngine* const pEngine, const TextAttribute textAttribute, const size_t cchLine, const til::point coordTarget);
         bool _isHoveredHyperlink(const TextAttribute& textAttribute) const noexcept;
         void _PaintSelection(_In_ IRenderEngine* const pEngine);
@@ -149,8 +165,11 @@ namespace Microsoft::Console::Render
         std::atomic<bool> _redraw;
         std::atomic<bool> _threadKeepRunning{ false };
         til::small_vector<IRenderEngine*, 2> _engines;
+        // Timers may now be registered and stopped from threads other than the
+        // render thread, so the list needs a lock; the two built-in timers no
+        // longer have it to themselves.
+        mutable wil::srwlock _timerMutex;
         til::small_vector<TimerRoutine, 4> _timers;
-        size_t _nextTimerId = 0;
 
         static constexpr size_t _firstSoftFontChar = 0xEF20;
         size_t _lastSoftFontChar = 0;
@@ -171,6 +190,8 @@ namespace Microsoft::Console::Render
         Microsoft::Console::Types::Viewport _viewport;
         std::optional<CompositionCache> _compositionCache;
         std::vector<Cluster> _clusterBuffer;
+        std::vector<uint8_t> _backgroundMask;
+        std::vector<COLORREF> _backgroundColors;
         std::function<void()> _pfnBackgroundColorChanged;
         std::function<void()> _pfnFrameColorChanged;
         std::function<void()> _pfnRendererEnteredErrorState;

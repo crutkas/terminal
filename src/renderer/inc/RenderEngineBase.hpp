@@ -43,9 +43,12 @@ namespace Microsoft::Console::Render
                                                    const til::CoordType targetRow,
                                                    const til::CoordType viewportLeft) noexcept override;
 
-        [[nodiscard]] HRESULT PaintImageSlice(const ImageSlice& imageSlice,
-                                              const til::CoordType targetRow,
-                                              const til::CoordType viewportLeft) noexcept override;
+        [[nodiscard]] HRESULT BeginRowImages(const ImageSlice& imageSlice,
+                                             til::CoordType targetRow,
+                                             til::CoordType viewportLeft,
+                                             std::span<const uint8_t> defaultBackgroundMask,
+                                             std::span<const COLORREF> cellBackgrounds) noexcept override;
+        [[nodiscard]] HRESULT EndRowImages() noexcept override;
 
         [[nodiscard]] bool RequiresContinuousRedraw() noexcept override;
 

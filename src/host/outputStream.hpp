@@ -18,6 +18,7 @@ Author:
 #include "../types/inc/IInputEvent.hpp"
 #include "../inc/conattrs.hpp"
 #include "IIoProvider.hpp"
+#include "../renderer/inc/IRenderData.hpp"
 
 // The ConhostInternalGetSet is for the Conhost process to call the entrypoints for its own Get/Set APIs.
 // Normally, these APIs are accessible from the outside of the conhost process (like by the process being "hosted") through
@@ -76,6 +77,21 @@ public:
 
     void ShowNotification(std::wstring_view title, std::wstring_view body) override;
 
+    bool DecodeImageToBgra(const std::span<const uint8_t> data, std::vector<RGBQUAD>& pixels, til::size& size) noexcept override;
+    til::size GetCellSize() const noexcept override;
+
+    void SetTimedContentHandler(std::function<void()> handler) override;
+    void RequestTimedContentUpdate(const std::optional<std::chrono::steady_clock::time_point> deadline) override;
+    til::read_file_result ReadLocalFile(const std::wstring_view path, uint64_t offset, uint64_t size, bool deleteAfter, const std::wstring_view deleteNameMarker, std::vector<uint8_t>& out) noexcept override;
+    Microsoft::Console::Utils::ReadSharedMemoryResult ReadSharedMemory(const std::wstring_view name, uint64_t offset, uint64_t size, std::vector<uint8_t>& out) noexcept override;
+
 private:
     Microsoft::Console::IIoProvider& _io;
+
+    // Timed content state. The handler runs on the render thread, so the mutex
+    // guards it against a concurrent SetTimedContentHandler on the writing thread.
+    std::mutex _timedContentMutex;
+    std::function<void()> _timedContentHandler;
+    Microsoft::Console::Render::TimerHandle _timedContentTimer{};
+    std::shared_ptr<int> _timedContentLifetime = std::make_shared<int>(0);
 };
